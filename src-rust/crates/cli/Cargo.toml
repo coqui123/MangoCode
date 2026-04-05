@@ -1,0 +1,44 @@
+[package]
+name = "mangocode"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mangocode"
+path = "src/main.rs"
+
+[dependencies]
+mangocode-core = { workspace = true, features = ["voice"] }
+mangocode-api = { workspace = true }
+mangocode-acp = { workspace = true }
+mangocode-tools = { workspace = true }
+mangocode-query = { workspace = true }
+mangocode-tui = { workspace = true }
+mangocode-commands = { workspace = true }
+mangocode-mcp = { workspace = true }
+mangocode-bridge = { workspace = true }
+mangocode-plugins = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+tokio-util = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+crossterm = { workspace = true }
+parking_lot = { workspace = true }
+dirs = { workspace = true }
+nix = { workspace = true }
+base64 = "0.22"
+sha2 = "0.10"
+open = "5"
+urlencoding = "2"
+
+[build-dependencies]
+chrono = { workspace = true }

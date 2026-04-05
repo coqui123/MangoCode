@@ -1,0 +1,83 @@
+[package]
+name = "mangocode-tui"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Enable real microphone capture for voice PTT mode.
+voice = ["mangocode-core/voice", "dep:cpal", "dep:hound"]
+
+# UI & Interaction features (pass-through from cc-core)
+token_budget = ["mangocode-core/token_budget"]
+ultraplan = ["mangocode-core/ultraplan"]
+ultrathink = ["mangocode-core/ultrathink"]
+history_picker = ["mangocode-core/history_picker"]
+message_actions = ["mangocode-core/message_actions"]
+quick_search = ["mangocode-core/quick_search"]
+away_summary = ["mangocode-core/away_summary"]
+hook_prompts = ["mangocode-core/hook_prompts"]
+kairos_brief = ["mangocode-core/kairos_brief"]
+kairos_channels = ["mangocode-core/kairos_channels"]
+lodestone = ["mangocode-core/lodestone"]
+
+# Agents & Memory features (pass-through from cc-core)
+agent_triggers = ["mangocode-core/agent_triggers"]
+agent_triggers_remote = ["mangocode-core/agent_triggers_remote"]
+extract_memories = ["mangocode-core/extract_memories"]
+verification_agent = ["mangocode-core/verification_agent"]
+builtin_explore_plan_agents = ["mangocode-core/builtin_explore_plan_agents"]
+cached_microcompact = ["mangocode-core/cached_microcompact"]
+compaction_reminders = ["mangocode-core/compaction_reminders"]
+agent_memory_snapshot = ["mangocode-core/agent_memory_snapshot"]
+teammem = ["mangocode-core/teammem"]
+
+# Tools & Infrastructure features (pass-through from cc-core)
+bash_classifier = ["mangocode-core/bash_classifier"]
+bridge_mode = ["mangocode-core/bridge_mode"]
+mcp_rich_output = ["mangocode-core/mcp_rich_output"]
+connector_text = ["mangocode-core/connector_text"]
+unattended_retry = ["mangocode-core/unattended_retry"]
+new_init = ["mangocode-core/new_init"]
+powershell_auto_mode = ["mangocode-core/powershell_auto_mode"]
+shot_stats = ["mangocode-core/shot_stats"]
+tree_sitter_bash = ["mangocode-core/tree_sitter_bash"]
+tree_sitter_bash_shadow = ["mangocode-core/tree_sitter_bash_shadow"]
+native_clipboard_image = ["mangocode-core/native_clipboard_image"]
+prompt_cache_break_detection = ["mangocode-core/prompt_cache_break_detection"]
+ccr_auto_connect = ["mangocode-core/ccr_auto_connect"]
+ccr_mirror = ["mangocode-core/ccr_mirror"]
+ccr_remote_setup = ["mangocode-core/ccr_remote_setup"]
+
+[dependencies]
+mangocode-core = { workspace = true }
+mangocode-api = { workspace = true }
+mangocode-tools = { workspace = true }
+mangocode-query = { workspace = true }
+mangocode-mcp = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+dirs = { workspace = true }
+similar = { workspace = true }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+once_cell = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+dashmap = { workspace = true }
+icy_sixel = { workspace = true }
+image = { workspace = true }
+regex = { workspace = true }
+# Optional audio capture for voice PTT (gated behind the `voice` feature)
+cpal = { version = "0.15", optional = true }
+hound = { version = "3.5", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
