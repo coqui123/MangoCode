@@ -65,22 +65,22 @@ pub struct VertexConfig {
 impl VertexConfig {
     /// Load configuration from environment variables.
     ///
-    /// Returns `None` if `CLAURST_VERTEX_PROJECT_ID` is not set.
-    /// `CLAURST_VERTEX_ENABLED` is accepted for backwards-compatibility but
+    /// Returns `None` if `VERTEX_PROJECT_ID` is not set.
+    /// `VERTEX_ENABLED` is accepted for backwards-compatibility but
     /// is no longer required — having a project ID is sufficient.
     pub fn from_env() -> Option<Self> {
-        let project_id = std::env::var("CLAURST_VERTEX_PROJECT_ID").ok()?;
+        let project_id = std::env::var("VERTEX_PROJECT_ID").ok()?;
         if project_id.is_empty() {
             return None;
         }
 
-        let location = std::env::var("CLAURST_VERTEX_LOCATION")
+        let location = std::env::var("VERTEX_LOCATION")
             .unwrap_or_else(|_| "us-central1".to_string());
 
-        let model = std::env::var("CLAURST_VERTEX_MODEL")
+        let model = std::env::var("VERTEX_MODEL")
             .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
 
-        let auth_mode = match std::env::var("CLAURST_VERTEX_AUTH_MODE")
+        let auth_mode = match std::env::var("VERTEX_AUTH_MODE")
             .as_deref()
             .unwrap_or("adc")
         {
@@ -89,8 +89,8 @@ impl VertexConfig {
             _ => VertexAuthMode::Adc,
         };
 
-        let access_token = std::env::var("CLAURST_VERTEX_ACCESS_TOKEN").ok();
-        let base_url_override = std::env::var("CLAURST_VERTEX_BASE_URL").ok();
+        let access_token = std::env::var("VERTEX_ACCESS_TOKEN").ok();
+        let base_url_override = std::env::var("VERTEX_BASE_URL").ok();
 
         Some(Self {
             project_id,
@@ -133,7 +133,7 @@ async fn fetch_bearer_token(config: &VertexConfig) -> Result<String, String> {
                 .clone()
                 .filter(|t| !t.is_empty())
                 .ok_or_else(|| {
-                    "CLAURST_VERTEX_ACCESS_TOKEN is not set or empty".to_string()
+                    "VERTEX_ACCESS_TOKEN is not set or empty".to_string()
                 })
         }
         VertexAuthMode::Adc | VertexAuthMode::GcloudCommand => {
@@ -290,7 +290,7 @@ impl VertexOpenAiProvider {
                 provider: self.id.clone(),
                 message: format!(
                     "Vertex auth failed (HTTP {}). Run `gcloud auth application-default login` \
-                     to authenticate, or set CLAURST_VERTEX_ACCESS_TOKEN.",
+                     to authenticate, or set VERTEX_ACCESS_TOKEN.",
                     status
                 ),
             };

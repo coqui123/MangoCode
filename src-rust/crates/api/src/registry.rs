@@ -161,8 +161,8 @@ impl ProviderRegistry {
         self
     }
 
-    /// Register [`VertexOpenAiProvider`] if `CLAURST_VERTEX_ENABLED=true` and
-    /// `CLAURST_VERTEX_PROJECT_ID` are set in the environment.
+    /// Register [`VertexOpenAiProvider`] if `VERTEX_PROJECT_ID` is set in the
+    /// environment.
     /// Returns `&mut self` for builder chaining.
     pub fn with_vertex_if_configured(&mut self) -> &mut Self {
         if let Some(p) = VertexOpenAiProvider::from_env() {
@@ -251,15 +251,15 @@ impl ProviderRegistry {
                     "stepfun" => Some(Arc::new(p::stepfun().with_api_key(key))),
                     "fireworks" => Some(Arc::new(p::fireworks().with_api_key(key))),
                     // Vertex: the stored "key" is an access token; project/location
-                    // still come from env vars (CLAURST_VERTEX_PROJECT_ID, etc.).
+                    // still come from VERTEX_* env vars.
                     "google-vertex" => {
                         use crate::providers::vertex_openai::{VertexAuthMode, VertexConfig};
-                        let project_id = std::env::var("CLAURST_VERTEX_PROJECT_ID")
+                        let project_id = std::env::var("VERTEX_PROJECT_ID")
                             .unwrap_or_default();
                         if !project_id.is_empty() {
-                            let location = std::env::var("CLAURST_VERTEX_LOCATION")
+                            let location = std::env::var("VERTEX_LOCATION")
                                 .unwrap_or_else(|_| "us-central1".to_string());
-                            let model = std::env::var("CLAURST_VERTEX_MODEL")
+                            let model = std::env::var("VERTEX_MODEL")
                                 .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
                             let cfg = VertexConfig {
                                 project_id,

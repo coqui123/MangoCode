@@ -840,14 +840,15 @@ impl LlmProvider for GoogleProvider {
                 // Check logical inactivity watchdog *before* processing the chunk.
                 // If we started a message but haven't had meaningful progress,
                 // break out so the cleanup code below emits MessageStop.
-                if emitted_message_start && !emitted_message_stop {
-                    if last_meaningful_event.elapsed() >= inactivity_limit {
-                        warn!(
-                            "Google SSE: logical inactivity timeout ({}s with no meaningful event)",
-                            inactivity_limit.as_secs()
-                        );
-                        break;
-                    }
+                if emitted_message_start
+                    && !emitted_message_stop
+                    && last_meaningful_event.elapsed() >= inactivity_limit
+                {
+                    warn!(
+                        "Google SSE: logical inactivity timeout ({}s with no meaningful event)",
+                        inactivity_limit.as_secs()
+                    );
+                    break;
                 }
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,

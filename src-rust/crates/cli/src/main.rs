@@ -801,7 +801,7 @@ async fn main() -> anyhow::Result<()> {
             || std::env::var("GITHUB_TOKEN").is_ok()
             || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
             || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            || std::env::var("CLAURST_VERTEX_PROJECT_ID").is_ok()
+            || std::env::var("VERTEX_PROJECT_ID").is_ok()
             // Local providers are always available
             || true; // Ollama/LM Studio don't require keys
         active_provider != "anthropic" || has_non_anthropic_env

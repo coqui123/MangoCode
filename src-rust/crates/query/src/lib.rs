@@ -1272,9 +1272,9 @@ pub async fn run_query_loop(
                             "Stream error with partial response, attempting to use partial content"
                         );
                         if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::Status(format!(
-                                "Stream interrupted — using partial response"
-                            )));
+                            let _ = tx.send(QueryEvent::Status(
+                                "Stream interrupted — using partial response".to_string(),
+                            ));
                         }
                     }
 

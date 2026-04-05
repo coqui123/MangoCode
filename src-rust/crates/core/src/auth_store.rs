@@ -103,6 +103,14 @@ impl AuthStore {
                 _ => {}
             }
         }
+
+        // Vertex token fallback (when auth_mode=AccessToken).
+        if provider_id == "google-vertex" {
+            return std::env::var("VERTEX_ACCESS_TOKEN")
+                .ok()
+            .filter(|k| !k.is_empty());
+        }
+
         // Fall back to environment variable
         let env_var = match provider_id {
             "anthropic" => "ANTHROPIC_API_KEY",
@@ -123,9 +131,6 @@ impl AuthStore {
             "azure" => "AZURE_API_KEY",
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
-            // Vertex stores an access token (when auth_mode=AccessToken).
-            // ADC / gcloud mode needs no stored key.
-            "google-vertex" => "CLAURST_VERTEX_ACCESS_TOKEN",
             _ => return None,
         };
         std::env::var(env_var).ok().filter(|k| !k.is_empty())

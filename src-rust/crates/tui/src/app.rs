@@ -103,7 +103,7 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "google" => "GOOGLE_API_KEY",
-        "google-vertex" => "CLAURST_VERTEX_PROJECT_ID",
+        "google-vertex" => "VERTEX_PROJECT_ID",
         "github-copilot" => "GITHUB_TOKEN",
         "groq" => "GROQ_API_KEY",
         "cerebras" => "CEREBRAS_API_KEY",
@@ -2197,9 +2197,9 @@ impl App {
                             // Show setup instructions and let the user configure env vars.
                             "google-vertex" => {
                                 self.status_message = Some(
-                                    "Vertex AI setup: (1) set CLAURST_VERTEX_ENABLED=true  \
-                                     (2) set CLAURST_VERTEX_PROJECT_ID=<your-gcp-project>  \
-                                     (3) set CLAURST_VERTEX_LOCATION=us-central1 (optional)  \
+                                    "Vertex AI setup: (1) set VERTEX_ENABLED=true  \
+                                     (2) set VERTEX_PROJECT_ID=<your-gcp-project>  \
+                                     (3) set VERTEX_LOCATION=us-central1 (optional)  \
                                      (4) run: gcloud auth application-default login  \
                                      then restart MangoCode."
                                         .to_string(),
