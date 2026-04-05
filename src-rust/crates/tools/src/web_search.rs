@@ -64,7 +64,7 @@ impl Tool for WebSearchTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let num_results = params.num_results.min(10).max(1);
+        let num_results = params.num_results.clamp(1, 10);
         debug!(query = %params.query, num_results, "Web search");
 
         // Try Brave Search API first, then fall back to DuckDuckGo

@@ -106,7 +106,7 @@ impl OutputStyle {
     }
 
     /// Parse from a string (case-insensitive).
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "explanatory" => Self::Explanatory,
             "learning" => Self::Learning,
@@ -249,29 +249,24 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
             )
         });
 
-    let mut parts: Vec<String> = Vec::new();
-
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
 
-    // 1. Attribution header
-    parts.push(prefix.attribution_text().to_string());
-
-    // 2. Core capabilities
-    parts.push(CORE_CAPABILITIES.to_string());
-
-    // 3. Tool use guidelines
-    parts.push(TOOL_USE_GUIDELINES.to_string());
-
-    // 4. Executing actions with care
-    parts.push(ACTIONS_SECTION.to_string());
-
-    // 5. Safety guidelines
-    parts.push(SAFETY_GUIDELINES.to_string());
-
-    // 6. Cyber-risk instruction (owned by safeguards — do not edit)
-    parts.push(CYBER_RISK_INSTRUCTION.to_string());
+    let mut parts: Vec<String> = vec![
+        // 1. Attribution header
+        prefix.attribution_text().to_string(),
+        // 2. Core capabilities
+        CORE_CAPABILITIES.to_string(),
+        // 3. Tool use guidelines
+        TOOL_USE_GUIDELINES.to_string(),
+        // 4. Executing actions with care
+        ACTIONS_SECTION.to_string(),
+        // 5. Safety guidelines
+        SAFETY_GUIDELINES.to_string(),
+        // 6. Cyber-risk instruction (owned by safeguards - do not edit)
+        CYBER_RISK_INSTRUCTION.to_string(),
+    ];
 
     // 7. Output style (cacheable when non-Default; its content is stable)
     if let Some(style_text) = opts
@@ -594,10 +589,10 @@ mod tests {
     }
 
     #[test]
-    fn test_output_style_from_str() {
-        assert_eq!(OutputStyle::from_str("concise"), OutputStyle::Concise);
-        assert_eq!(OutputStyle::from_str("FORMAL"), OutputStyle::Formal);
-        assert_eq!(OutputStyle::from_str("unknown"), OutputStyle::Default);
+    fn test_output_style_parse() {
+        assert_eq!(OutputStyle::parse("concise"), OutputStyle::Concise);
+        assert_eq!(OutputStyle::parse("FORMAL"), OutputStyle::Formal);
+        assert_eq!(OutputStyle::parse("unknown"), OutputStyle::Default);
     }
 
     #[test]

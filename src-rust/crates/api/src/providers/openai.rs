@@ -612,55 +612,6 @@ impl OpenAiProvider {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mangocode_core::types::Message;
-
-    #[test]
-    fn user_tool_results_become_tool_messages() {
-        let messages = vec![
-            Message::assistant_blocks(vec![ContentBlock::ToolUse {
-                id: "call_1".to_string(),
-                name: "search".to_string(),
-                input: json!({ "q": "test" }),
-            }]),
-            Message::user_blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "call_1".to_string(),
-                content: ToolResultContent::Text("done".to_string()),
-                is_error: Some(false),
-            }]),
-        ];
-
-        let wire = OpenAiProvider::to_openai_messages(&messages, None);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("assistant"));
-        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
-        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
-        assert_eq!(wire[1].get("content").and_then(|v| v.as_str()), Some("done"));
-    }
-
-    #[test]
-    fn mixed_user_content_flushes_before_tool_result() {
-        let messages = vec![Message::user_blocks(vec![
-            ContentBlock::Text {
-                text: "preface".to_string(),
-            },
-            ContentBlock::ToolResult {
-                tool_use_id: "call_2".to_string(),
-                content: ToolResultContent::Text("ok".to_string()),
-                is_error: Some(false),
-            },
-        ])];
-
-        let wire = OpenAiProvider::to_openai_messages(&messages, None);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("user"));
-        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
-        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // LlmProvider impl
 // ---------------------------------------------------------------------------
@@ -1042,5 +993,54 @@ impl LlmProvider for OpenAiProvider {
             structured_output: true,
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mangocode_core::types::Message;
+
+    #[test]
+    fn user_tool_results_become_tool_messages() {
+        let messages = vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "search".to_string(),
+                input: json!({ "q": "test" }),
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: ToolResultContent::Text("done".to_string()),
+                is_error: Some(false),
+            }]),
+        ];
+
+        let wire = OpenAiProvider::to_openai_messages(&messages, None);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("assistant"));
+        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_1"));
+        assert_eq!(wire[1].get("content").and_then(|v| v.as_str()), Some("done"));
+    }
+
+    #[test]
+    fn mixed_user_content_flushes_before_tool_result() {
+        let messages = vec![Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "preface".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call_2".to_string(),
+                content: ToolResultContent::Text("ok".to_string()),
+                is_error: Some(false),
+            },
+        ])];
+
+        let wire = OpenAiProvider::to_openai_messages(&messages, None);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("user"));
+        assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
     }
 }

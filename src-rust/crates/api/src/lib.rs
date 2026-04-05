@@ -396,18 +396,13 @@ pub mod client {
     use super::*;
 
     /// Provider selection for API calls.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum Provider {
         /// Use Anthropic's API
+        #[default]
         Anthropic,
         /// Use OpenAI Codex via OAuth
         Codex,
-    }
-
-    impl Default for Provider {
-        fn default() -> Self {
-            Provider::Anthropic
-        }
     }
 
     /// Configuration for the HTTP client.
@@ -1208,6 +1203,12 @@ impl StreamAccumulator {
 
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+}
+
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

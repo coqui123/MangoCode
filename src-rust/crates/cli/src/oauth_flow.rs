@@ -86,8 +86,8 @@ pub async fn run_oauth_login_flow(login_with_claude_ai: bool) -> anyhow::Result<
     } else {
         oauth::CONSOLE_AUTHORIZE_URL
     };
-    let manual_url = oauth::build_auth_url(&authorize_base, &code_challenge, &state, port, true);
-    let automatic_url = oauth::build_auth_url(&authorize_base, &code_challenge, &state, port, false);
+    let manual_url = oauth::build_auth_url(authorize_base, &code_challenge, &state, port, true);
+    let automatic_url = oauth::build_auth_url(authorize_base, &code_challenge, &state, port, false);
 
     // 4. Print URL and try to open browser
     println!("\nOpening browser for authentication...");
@@ -252,11 +252,8 @@ async fn run_callback_server(listener: TcpListener, expected_state: &str) -> any
         .map(|(_, v)| v.to_string());
 
     // Send success redirect to the browser before validating, so the browser shows a page
-    let location = if received_state.as_deref() == Some(expected_state) && code.is_some() {
-        oauth::CLAUDEAI_SUCCESS_URL
-    } else {
-        oauth::CLAUDEAI_SUCCESS_URL // Show same page on error (browser UX)
-    };
+    // Show the same browser UX page regardless of callback validation result.
+    let location = oauth::CLAUDEAI_SUCCESS_URL;
 
     let response = format!(
         "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",

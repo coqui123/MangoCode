@@ -879,7 +879,7 @@ pub mod config {
     }
 
     /// Configuration for a file formatter tool.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct FormatterConfig {
         /// Command to run, e.g. `["prettier", "--write"]`.
         pub command: Vec<String>,
@@ -888,12 +888,6 @@ pub mod config {
         /// Whether this formatter is disabled.
         #[serde(default)]
         pub disabled: bool,
-    }
-
-    impl Default for FormatterConfig {
-        fn default() -> Self {
-            Self { command: Vec::new(), extensions: Vec::new(), disabled: false }
-        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -997,7 +991,7 @@ pub mod config {
         pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
             self.output_style
                 .as_deref()
-                .map(crate::system_prompt::OutputStyle::from_str)
+                .map(crate::system_prompt::OutputStyle::parse)
                 .unwrap_or_default()
         }
 
@@ -1022,7 +1016,7 @@ pub mod config {
         /// Returns `(credential, use_bearer_auth)`.
         /// - For Console OAuth flow: credential is the stored API key, bearer=false.
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
-        /// Silently attempts token refresh when the access token is expired.
+        /// - Silently attempts token refresh when the access token is expired.
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
             // Highest priority: explicit api_key or env var
             if let Some(key) = self.resolve_api_key() {
@@ -1078,11 +1072,9 @@ pub mod config {
                 tokens
             };
 
-            if let Some(cred) = tokens.effective_credential() {
-                Some((cred.to_string(), tokens.uses_bearer_auth()))
-            } else {
-                None
-            }
+            tokens
+                .effective_credential()
+                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
         }
 
         /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
@@ -2547,22 +2539,19 @@ pub mod history {
         }
 
         let mut sessions = vec![];
-        match tokio::fs::read_dir(&dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                            if let Ok(session) =
-                                serde_json::from_str::<ConversationSession>(&content)
-                            {
-                                sessions.push(session);
-                            }
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(session) =
+                            serde_json::from_str::<ConversationSession>(&content)
+                        {
+                            sessions.push(session);
                         }
                     }
                 }
             }
-            Err(_) => {}
         }
 
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -3392,8 +3381,10 @@ mod tests {
 
     #[test]
     fn test_config_effective_model_override() {
-        let mut cfg = crate::config::Config::default();
-        cfg.model = Some("claude-haiku-4-5-20251001".to_string());
+        let cfg = crate::config::Config {
+            model: Some("claude-haiku-4-5-20251001".to_string()),
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
     }
 
@@ -3405,8 +3396,10 @@ mod tests {
 
     #[test]
     fn test_config_effective_max_tokens_override() {
-        let mut cfg = crate::config::Config::default();
-        cfg.max_tokens = Some(8192);
+        let cfg = crate::config::Config {
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_max_tokens(), 8192);
     }
 
@@ -3417,8 +3410,10 @@ mod tests {
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let mut cfg = crate::config::Config::default();
-        cfg.api_key = Some("sk-ant-config-key".to_string());
+        let cfg = crate::config::Config {
+            api_key: Some("sk-ant-config-key".to_string()),
+            ..Default::default()
+        };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
 
         if let Some(k) = orig {

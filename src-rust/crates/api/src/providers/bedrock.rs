@@ -226,13 +226,12 @@ impl BedrockProvider {
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            let k_signing = {
+            {
                 let mut mac = HmacSha256::new_from_slice(&k_service)
                     .expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
-            };
-            k_signing
+            }
         };
 
         let signature = {
@@ -343,6 +342,7 @@ impl BedrockProvider {
     }
 
     fn content_block_to_converse(block: &ContentBlock, role: &Role) -> Option<Value> {
+        let _ = role;
         match block {
             ContentBlock::Text { text } => Some(json!({ "text": text })),
             ContentBlock::Image { source } => {
@@ -735,11 +735,8 @@ impl LlmProvider for BedrockProvider {
             }
 
             // Drain any remaining complete JSON in the buffer.
-            loop {
-                let start = match buf.iter().position(|&b| b == b'{') {
-                    Some(p) => p,
-                    None => break,
-                };
+            while let Some(p) = buf.iter().position(|&b| b == b'{') {
+                let start = p;
                 buf.drain(..start);
                 match serde_json::from_slice::<Value>(&buf) {
                     Ok(val) => {

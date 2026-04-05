@@ -40,8 +40,12 @@ struct ReplSession {
     stdout: BufReader<ChildStdout>,
 }
 
+type ReplSessionKey = (String, String);
+type SharedReplSession = Arc<Mutex<ReplSession>>;
+type ReplSessionMap = DashMap<ReplSessionKey, SharedReplSession>;
+
 /// Key: (session_id, language)
-static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<Mutex<ReplSession>>>>> =
+static REPL_SESSIONS: Lazy<Arc<ReplSessionMap>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 // ---------------------------------------------------------------------------

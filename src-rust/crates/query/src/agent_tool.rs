@@ -10,9 +10,9 @@
 //   - Returns its final output as the tool result
 //
 // New capabilities (TS parity):
-//   - `isolation: "worktree"` — run the agent in a dedicated git worktree so
+//   - `isolation: "worktree"` - run the agent in a dedicated git worktree so
 //     file edits don't conflict with the parent checkout or sibling agents.
-//   - `run_in_background: true` — fire-and-forget; returns agent_id immediately.
+//   - `run_in_background: true` - fire-and-forget; returns agent_id immediately.
 //     Use poll_background_agent() to check completion status.
 
 use async_trait::async_trait;
@@ -118,6 +118,32 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
         .current_dir(git_root)
         .output()
         .await;
+}
+
+fn build_provider_and_model_registries(
+    ctx: &ToolContext,
+    credential: String,
+    use_bearer_auth: bool,
+) -> (
+    std::sync::Arc<mangocode_api::ProviderRegistry>,
+    std::sync::Arc<mangocode_api::ModelRegistry>,
+) {
+    let provider_registry = std::sync::Arc::new(
+        mangocode_api::ProviderRegistry::from_environment_with_auth_store(ClientConfig {
+            api_key: credential,
+            api_base: ctx.config.resolve_api_base(),
+            use_bearer_auth,
+            ..Default::default()
+        }),
+    );
+
+    let mut model_registry = mangocode_api::ModelRegistry::new();
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let cache_path = cache_dir.join("mangocode").join("models_dev.json");
+        model_registry.load_cache(&cache_path);
+    }
+
+    (provider_registry, std::sync::Arc::new(model_registry))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,27 +252,25 @@ impl Tool for AgentTool {
 
         info!(description = %params.description, "Spawning sub-agent");
 
-        // Resolve API key from environment.
-        let api_key = match std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-        {
-            Some(k) => k,
-            None => {
-                return ToolResult::error(
-                    "ANTHROPIC_API_KEY not set - cannot spawn sub-agent".to_string(),
-                )
-            }
-        };
+        let (credential, use_bearer_auth) = ctx
+            .config
+            .resolve_auth_async()
+            .await
+            .unwrap_or_else(|| (String::new(), false));
 
         // Dedicated Anthropic client for the sub-agent.
         let client = match AnthropicClient::new(ClientConfig {
-            api_key,
+            api_key: credential.clone(),
+            api_base: ctx.config.resolve_api_base(),
+            use_bearer_auth,
             ..Default::default()
         }) {
             Ok(c) => Arc::new(c),
             Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
         };
+
+        let (provider_registry, model_registry) =
+            build_provider_and_model_registries(ctx, credential, use_bearer_auth);
 
         // Build the tool list for the sub-agent.
         // Always exclude AgentTool itself to prevent unbounded recursion.
@@ -265,7 +289,7 @@ impl Tool for AgentTool {
         let model = params
             .model
             .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| mangocode_core::constants::DEFAULT_MODEL.to_string());
+            .unwrap_or_else(|| ctx.config.effective_model().to_string());
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
             let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
@@ -280,7 +304,7 @@ impl Tool for AgentTool {
                     if let Ok(entries) = std::fs::read_dir(&agent_dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "md") {
+                            if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
                                     let name = p
                                         .file_stem()
@@ -353,73 +377,26 @@ impl Tool for AgentTool {
             skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
-            provider_registry: None,
+            provider_registry: Some(provider_registry),
             agent_name: None,
             agent_definition: None,
-            model_registry: None,
+            model_registry: Some(model_registry),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
         // -----------------------------------------------------------------------
         if params.run_in_background {
-            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-            BACKGROUND_AGENTS.insert(agent_id.clone(), rx);
-
-            // Re-create the tool list inside the closure so it is owned and Send.
-            let agent_tools_bg: Vec<Box<dyn Tool>> = mangocode_tools::all_tools()
-                .into_iter()
-                .filter(|t| t.name() != mangocode_core::constants::TOOL_NAME_AGENT)
-                .collect();
-
-            let client_bg = client.clone();
-            let ctx_bg = ctx.clone();
-            let config_bg = query_config.clone();
-            let cost_tracker_bg = ctx.cost_tracker.clone();
-            let description_bg = params.description.clone();
-            let prompt_bg = params.prompt.clone();
-            let agent_id_bg = agent_id.clone();
-
-            tokio::spawn(async move {
-                let cancel = CancellationToken::new();
-                let mut messages = vec![Message::user(prompt_bg)];
-                let outcome = run_query_loop(
-                    client_bg.as_ref(),
-                    &mut messages,
-                    &agent_tools_bg,
-                    &ctx_bg,
-                    &config_bg,
-                    cost_tracker_bg,
-                    None,
-                    cancel,
-                    None,
-                )
-                .await;
-
-                // Cleanup worktree if one was created.
-                if let (Some(root), Some(wt)) = (git_root, worktree_path) {
-                    remove_worktree(&root, &wt).await;
-                }
-
-                let result_text = format_outcome(outcome);
-                debug!(
-                    agent_id = %agent_id_bg,
-                    description = %description_bg,
-                    "Background agent completed"
-                );
-                let _ = tx.send(result_text);
+            return spawn_background_agent(BackgroundAgentSpec {
+                agent_id,
+                description: params.description.clone(),
+                prompt: params.prompt.clone(),
+                agent_tools_bg: agent_tools,
+                client_bg: client.clone(),
+                ctx_bg: ctx.clone(),
+                config_bg: query_config,
+                git_root,
+                worktree_path,
             });
-
-            return ToolResult::success(
-                serde_json::json!({
-                    "agent_id": agent_id,
-                    "status": "running",
-                    "message": format!(
-                        "Agent '{}' started in background. Use poll_background_agent with agent_id '{}' to check status.",
-                        params.description, agent_id
-                    )
-                })
-                .to_string(),
-            );
         }
 
         // -----------------------------------------------------------------------
@@ -479,6 +456,351 @@ impl Tool for AgentTool {
     }
 }
 
+struct BackgroundAgentSpec {
+    agent_id: String,
+    description: String,
+    prompt: String,
+    agent_tools_bg: Vec<Box<dyn Tool>>,
+    client_bg: Arc<AnthropicClient>,
+    ctx_bg: ToolContext,
+    config_bg: QueryConfig,
+    git_root: Option<PathBuf>,
+    worktree_path: Option<PathBuf>,
+}
+
+fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
+    let BackgroundAgentSpec {
+        agent_id,
+        description,
+        prompt,
+        agent_tools_bg,
+        client_bg,
+        ctx_bg,
+        config_bg,
+        git_root,
+        worktree_path,
+    } = spec;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    BACKGROUND_AGENTS.insert(agent_id.clone(), rx);
+
+    let description_for_msg = description.clone();
+    let description_for_log = description;
+    let agent_id_for_log = agent_id.clone();
+
+    tokio::spawn(async move {
+        let cancel = CancellationToken::new();
+        let mut messages = vec![Message::user(prompt)];
+        let outcome = run_query_loop(
+            client_bg.as_ref(),
+            &mut messages,
+            &agent_tools_bg,
+            &ctx_bg,
+            &config_bg,
+            ctx_bg.cost_tracker.clone(),
+            None,
+            cancel,
+            None,
+        )
+        .await;
+
+        if let (Some(root), Some(wt)) = (git_root, worktree_path) {
+            remove_worktree(&root, &wt).await;
+        }
+
+        let result_text = format_outcome(outcome);
+        debug!(
+            agent_id = %agent_id_for_log,
+            description = %description_for_log,
+            "Background agent completed"
+        );
+        let _ = tx.send(result_text);
+    });
+
+    ToolResult::success(
+        serde_json::json!({
+            "agent_id": agent_id,
+            "status": "running",
+            "message": format!(
+                "Agent '{}' started in background. Use poll_background_agent with agent_id '{}' to check status.",
+                description_for_msg, agent_id
+            )
+        })
+        .to_string(),
+    )
+}
+
+/// Execute AgentTool using the active query runtime so subagents can inherit
+/// the current provider setup (Vertex/OpenAI/etc.) instead of requiring a
+/// separate Anthropic-only client.
+pub async fn execute_with_runtime(
+    input: Value,
+    ctx: &ToolContext,
+    runtime_client: &mangocode_api::AnthropicClient,
+    parent_query_config: &QueryConfig,
+    parent_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::QueryEvent>>,
+    parent_tool_use_id: Option<String>,
+) -> ToolResult {
+    let params: AgentInput = match serde_json::from_value(input.clone()) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+    };
+
+    info!(description = %params.description, "Spawning sub-agent");
+
+    // Build the tool list for the sub-agent.
+    // Always exclude AgentTool itself to prevent unbounded recursion.
+    let all = mangocode_tools::all_tools();
+    let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
+        all.into_iter()
+            .filter(|t| allowed.contains(&t.name().to_string()))
+            .collect()
+    } else {
+        all.into_iter()
+            .filter(|t| t.name() != mangocode_core::constants::TOOL_NAME_AGENT)
+            .collect()
+    };
+
+    // Resolve model: explicit override > parent query model > default.
+    let model = params
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            (!parent_query_config.model.is_empty()).then(|| parent_query_config.model.clone())
+        })
+        .unwrap_or_else(|| mangocode_core::constants::DEFAULT_MODEL.to_string());
+
+    let system_prompt = params.system_prompt.clone().unwrap_or_else(|| {
+        let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
+             Complete the task thoroughly and return your findings."
+            .to_string();
+
+        if let Some(registry) = mangocode_plugins::global_plugin_registry() {
+            let mut agent_defs = String::new();
+            for agent_dir in registry.all_agent_paths() {
+                if let Ok(entries) = std::fs::read_dir(&agent_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().is_some_and(|e| e == "md") {
+                            if let Ok(content) = std::fs::read_to_string(&p) {
+                                let name = p
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("agent");
+                                agent_defs.push_str(&format!(
+                                    "\n\n## Agent: {}\n{}",
+                                    name,
+                                    content.trim()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !agent_defs.is_empty() {
+                prompt.push_str("\n\nThe following specialized agents are available:");
+                prompt.push_str(&agent_defs);
+            }
+        }
+
+        prompt
+    });
+
+    // Determine working directory - optionally isolate in a git worktree.
+    let use_isolation = params.isolation.as_deref() == Some("worktree");
+    let agent_id = uuid::Uuid::new_v4().to_string();
+
+    let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
+        if use_isolation {
+            let git_root = find_git_root(&ctx.working_dir);
+            if let Some(ref root) = git_root {
+                if let Some(wt) = create_worktree(root, &agent_id).await {
+                    let wd = wt.display().to_string();
+                    (wd, Some(wt), git_root)
+                } else {
+                    warn!(
+                        agent_id = %agent_id,
+                        "Worktree creation failed; running agent in shared working directory"
+                    );
+                    (ctx.working_dir.display().to_string(), None, None)
+                }
+            } else {
+                warn!(
+                    agent_id = %agent_id,
+                    "No git root found; isolation=worktree ignored"
+                );
+                (ctx.working_dir.display().to_string(), None, None)
+            }
+        } else {
+            (ctx.working_dir.display().to_string(), None, None)
+        };
+
+    let mut query_config = parent_query_config.clone();
+    query_config.model = model;
+    query_config.max_tokens = mangocode_core::constants::DEFAULT_MAX_TOKENS;
+    query_config.max_turns = params.max_turns.unwrap_or(10);
+    query_config.system_prompt = Some(system_prompt);
+    query_config.append_system_prompt = None;
+    query_config.output_style = ctx.config.effective_output_style();
+    query_config.output_style_prompt = ctx.config.resolve_output_style_prompt();
+    query_config.working_directory = Some(working_dir_str);
+    query_config.command_queue = None;
+    query_config.skill_index = None;
+    query_config.agent_name = None;
+    query_config.agent_definition = None;
+
+    // Background mode: launch a detached sub-agent while preserving the active
+    // provider/model runtime context from the parent query config.
+    if params.run_in_background {
+        let (credential, use_bearer_auth) = ctx
+            .config
+            .resolve_auth_async()
+            .await
+            .unwrap_or_else(|| (String::new(), false));
+
+        let client_bg = match AnthropicClient::new(ClientConfig {
+            api_key: credential,
+            api_base: ctx.config.resolve_api_base(),
+            use_bearer_auth,
+            ..Default::default()
+        }) {
+            Ok(c) => Arc::new(c),
+            Err(e) => return ToolResult::error(format!("Failed to create client: {}", e)),
+        };
+
+        return spawn_background_agent(BackgroundAgentSpec {
+            agent_id,
+            description: params.description.clone(),
+            prompt: params.prompt.clone(),
+            agent_tools_bg: agent_tools,
+            client_bg,
+            ctx_bg: ctx.clone(),
+            config_bg: query_config,
+            git_root,
+            worktree_path,
+        });
+    }
+
+    // Foreground mode: optionally forward child events and attach parent tool id.
+    let (event_tx, forward_task) = if let Some(parent_tx) = parent_event_tx {
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<crate::QueryEvent>();
+        let parent_id = parent_tool_use_id.clone();
+        let fwd = tokio::spawn(async move {
+            while let Some(evt) = sub_rx.recv().await {
+                let mapped = if let Some(ref pid) = parent_id {
+                    attach_parent_to_event(evt, pid)
+                } else {
+                    evt
+                };
+                let _ = parent_tx.send(mapped);
+            }
+        });
+        (Some(sub_tx), Some(fwd))
+    } else {
+        (None, None)
+    };
+
+    let mut messages = vec![Message::user(params.prompt)];
+    let cancel = CancellationToken::new();
+
+    let outcome = run_query_loop(
+        runtime_client,
+        &mut messages,
+        &agent_tools,
+        ctx,
+        &query_config,
+        ctx.cost_tracker.clone(),
+        event_tx.clone(),
+        cancel,
+        None,
+    )
+    .await;
+
+    drop(event_tx);
+    if let Some(task) = forward_task {
+        let _ = task.await;
+    }
+
+    // Cleanup worktree if one was created.
+    if let (Some(root), Some(wt)) = (git_root, worktree_path) {
+        remove_worktree(&root, &wt).await;
+    }
+
+    match outcome {
+        QueryOutcome::EndTurn { message, usage } => {
+            let text = message.get_all_text();
+            debug!(
+                description = %params.description,
+                output_tokens = usage.output_tokens,
+                "Sub-agent completed"
+            );
+            ToolResult::success(text)
+        }
+        QueryOutcome::MaxTokens { partial_message, .. } => {
+            let text = partial_message.get_all_text();
+            ToolResult::success(format!(
+                "{}\n\n[Note: Agent hit max_tokens limit]",
+                text
+            ))
+        }
+        QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
+        QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
+        QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => ToolResult::error(format!(
+            "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
+            cost_usd, limit_usd
+        )),
+    }
+}
+
+fn attach_parent_to_event(
+    event: crate::QueryEvent,
+    default_parent_tool_use_id: &str,
+) -> crate::QueryEvent {
+    match event {
+        crate::QueryEvent::Stream(event) => crate::QueryEvent::StreamWithParent {
+            event,
+            parent_tool_use_id: default_parent_tool_use_id.to_string(),
+        },
+        crate::QueryEvent::StreamWithParent {
+            event,
+            parent_tool_use_id,
+        } => crate::QueryEvent::StreamWithParent {
+            event,
+            parent_tool_use_id,
+        },
+        crate::QueryEvent::ToolStart {
+            tool_name,
+            tool_id,
+            input_json,
+            parent_tool_use_id,
+        } => crate::QueryEvent::ToolStart {
+            tool_name,
+            tool_id,
+            input_json,
+            parent_tool_use_id: Some(
+                parent_tool_use_id.unwrap_or_else(|| default_parent_tool_use_id.to_string()),
+            ),
+        },
+        crate::QueryEvent::ToolEnd {
+            tool_name,
+            tool_id,
+            result,
+            is_error,
+            parent_tool_use_id,
+        } => crate::QueryEvent::ToolEnd {
+            tool_name,
+            tool_id,
+            result,
+            is_error,
+            parent_tool_use_id: Some(
+                parent_tool_use_id.unwrap_or_else(|| default_parent_tool_use_id.to_string()),
+            ),
+        },
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper: convert a QueryOutcome into a result string for background agents
 // ---------------------------------------------------------------------------
@@ -524,22 +846,16 @@ pub fn init_team_swarm_runner() {
          ctx: Arc<mangocode_tools::ToolContext>| {
             // We must return a Pin<Box<dyn Future<...> + Send>>.
             Box::pin(async move {
-                // Resolve API key.
-                let api_key = match std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-                {
-                    Some(k) => k,
-                    None => {
-                        return format!(
-                            "[Agent '{}' failed: ANTHROPIC_API_KEY not set]",
-                            description
-                        )
-                    }
-                };
+                let (credential, use_bearer_auth) = ctx
+                    .config
+                    .resolve_auth_async()
+                    .await
+                    .unwrap_or_else(|| (String::new(), false));
 
                 let client = match mangocode_api::AnthropicClient::new(mangocode_api::client::ClientConfig {
-                    api_key,
+                    api_key: credential.clone(),
+                    api_base: ctx.config.resolve_api_base(),
+                    use_bearer_auth,
                     ..Default::default()
                 }) {
                     Ok(c) => Arc::new(c),
@@ -550,6 +866,9 @@ pub fn init_team_swarm_runner() {
                         )
                     }
                 };
+
+                let (provider_registry, model_registry) =
+                    build_provider_and_model_registries(&ctx, credential, use_bearer_auth);
 
                 // Build the tool list, filtering to the allowlist if provided.
                 let all = mangocode_tools::all_tools();
@@ -564,7 +883,7 @@ pub fn init_team_swarm_runner() {
                             .collect()
                     };
 
-                let model = mangocode_core::constants::DEFAULT_MODEL.to_string();
+                let model = ctx.config.effective_model().to_string();
 
                 let system_prompt = system.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
@@ -580,6 +899,8 @@ pub fn init_team_swarm_runner() {
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    provider_registry: Some(provider_registry),
+                    model_registry: Some(model_registry),
                     ..Default::default()
                 };
 
@@ -604,4 +925,67 @@ pub fn init_team_swarm_runner() {
     );
 
     mangocode_tools::register_agent_runner(runner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attach_parent_to_event;
+
+    #[test]
+    fn attaches_parent_to_plain_stream_events() {
+        let evt = crate::QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: mangocode_api::streaming::ContentDelta::TextDelta {
+                text: "hello".to_string(),
+            },
+        });
+
+        let out = attach_parent_to_event(evt, "parent-1");
+        match out {
+            crate::QueryEvent::StreamWithParent {
+                parent_tool_use_id,
+                ..
+            } => assert_eq!(parent_tool_use_id, "parent-1"),
+            _ => panic!("expected StreamWithParent"),
+        }
+    }
+
+    #[test]
+    fn preserves_existing_parent_on_tool_events() {
+        let evt = crate::QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            input_json: "{}".to_string(),
+            parent_tool_use_id: Some("existing-parent".to_string()),
+        };
+
+        let out = attach_parent_to_event(evt, "fallback-parent");
+        match out {
+            crate::QueryEvent::ToolStart {
+                parent_tool_use_id,
+                ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("existing-parent")),
+            _ => panic!("expected ToolStart"),
+        }
+    }
+
+    #[test]
+    fn applies_fallback_parent_on_tool_end() {
+        let evt = crate::QueryEvent::ToolEnd {
+            tool_name: "Read".to_string(),
+            tool_id: "tool-2".to_string(),
+            result: "ok".to_string(),
+            is_error: false,
+            parent_tool_use_id: None,
+        };
+
+        let out = attach_parent_to_event(evt, "fallback-parent");
+        match out {
+            crate::QueryEvent::ToolEnd {
+                parent_tool_use_id,
+                ..
+            } => assert_eq!(parent_tool_use_id.as_deref(), Some("fallback-parent")),
+            _ => panic!("expected ToolEnd"),
+        }
+    }
 }

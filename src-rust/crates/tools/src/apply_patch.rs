@@ -67,7 +67,7 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
             // Don't extract the path here — we do it from the +++ line.
         } else if line.starts_with("+++ ") {
             // Extract target path, stripping the "b/" prefix if present.
-            let raw = &line[4..];
+            let raw = line.strip_prefix("+++ ").unwrap_or(line);
             let path = raw
                 .trim_start_matches("b/")
                 .trim()
@@ -87,12 +87,12 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
                 lines: Vec::new(),
             });
         } else if let Some(ref mut hunk) = current_hunk {
-            if line.starts_with('+') {
-                hunk.lines.push(('+', line[1..].to_string()));
-            } else if line.starts_with('-') {
-                hunk.lines.push(('-', line[1..].to_string()));
-            } else if line.starts_with(' ') {
-                hunk.lines.push((' ', line[1..].to_string()));
+            if let Some(stripped) = line.strip_prefix('+') {
+                hunk.lines.push(('+', stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix('-') {
+                hunk.lines.push(('-', stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix(' ') {
+                hunk.lines.push((' ', stripped.to_string()));
             } else if line.starts_with('\\') {
                 // "\ No newline at end of file" — ignore.
             }

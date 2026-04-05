@@ -217,7 +217,7 @@ fn open_with_system(target: &str) -> std::io::Result<()> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -2699,7 +2699,7 @@ impl SlashCommand for McpCommand {
                 let endpoint = srv
                     .url
                     .as_deref()
-                    .or_else(|| srv.command.as_deref())
+                    .or(srv.command.as_deref())
                     .unwrap_or("(unknown)");
 
                 // Fetch live status from the manager if available.
@@ -3822,7 +3822,7 @@ impl SlashCommand for SkillsCommand {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.extension().map_or(false, |e| e == "md") {
+                    if p.extension().is_some_and(|e| e == "md") {
                         if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                             let name = stem.to_string();
                             if !found.contains(&name) {
@@ -3850,7 +3850,7 @@ impl SlashCommand for SkillsCommand {
                                     }
                                 }
                             }
-                        } else if p.extension().map_or(false, |e| e == "md") {
+                        } else if p.extension().is_some_and(|e| e == "md") {
                             if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
                                 let name = stem.to_string();
                                 if !found.contains(&name) {
@@ -4181,9 +4181,7 @@ impl SlashCommand for EffortCommand {
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         match args.trim() {
-            "" => CommandResult::Message(format!(
-                "Current effort: normal\nUse /effort [low|normal|high] to change."
-            )),
+            "" => CommandResult::Message("Current effort: normal\nUse /effort [low|normal|high] to change.".to_string()),
             "low" => {
                 // Low effort: smaller max_tokens
                 ctx.config.max_tokens = Some(4096);
@@ -4581,18 +4579,8 @@ impl SlashCommand for ContextCommand {
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let model = ctx.config.effective_model();
 
-        // Determine context window size from known model names
-        let context_window: u64 = if model.contains("claude-3-5") || model.contains("claude-3.5") {
-            200_000
-        } else if model.contains("opus") {
-            200_000
-        } else if model.contains("sonnet") {
-            200_000
-        } else if model.contains("haiku") {
-            200_000
-        } else {
-            200_000 // safe default for any Claude model
-        };
+        // Current Claude-family models share the same context window.
+        let context_window: u64 = 200_000;
 
         let used_tokens = ctx.cost_tracker.total_tokens();
         let pct = if context_window > 0 {
@@ -4762,7 +4750,7 @@ mod chrome_cdp {
     ) -> anyhow::Result<Value> {
         let id = next_id();
         let request = json!({ "id": id, "method": method, "params": params });
-        ws.send(WsMessage::Text(request.to_string().into())).await?;
+        ws.send(WsMessage::Text(request.to_string())).await?;
 
         // Drain messages until we get the one with our id (ignore events).
         loop {

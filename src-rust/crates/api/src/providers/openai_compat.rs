@@ -149,7 +149,7 @@ impl OpenAiCompatProvider {
 
     /// Apply `scrub_tool_id` to every tool-call id/tool_call_id in a messages
     /// array that was already built by `OpenAiProvider::to_openai_messages`.
-    fn apply_tool_id_quirks(&self, messages: &mut Vec<Value>) {
+    fn apply_tool_id_quirks(&self, messages: &mut [Value]) {
         if self.quirks.tool_id_max_len.is_none() && !self.quirks.tool_id_alphanumeric_only {
             return;
         }

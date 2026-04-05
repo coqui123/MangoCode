@@ -32,7 +32,7 @@ pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
 use anyhow::Context;
 use mangocode_core::{
-    config::{Config, PermissionMode, Settings},
+    config::{Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, Settings},
     constants::{APP_VERSION, DEFAULT_MODEL},
     context::ContextBuilder,
     cost::CostTracker,
@@ -43,7 +43,7 @@ use mangocode_core::types::ToolDefinition;
 use mangocode_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -54,6 +54,7 @@ use tracing_subscriber::EnvFilter;
 struct McpToolWrapper {
     tool_def: ToolDefinition,
     server_name: String,
+    manager_tool_name: String,
     manager: Arc<mangocode_mcp::McpManager>,
 }
 
@@ -78,7 +79,7 @@ impl Tool for McpToolWrapper {
 
     async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
         // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
+        let prefix = format!("mcp__{}__", self.server_name);
         let bare_name = self
             .tool_def
             .name
@@ -87,7 +88,7 @@ impl Tool for McpToolWrapper {
 
         let args = if input.is_null() { None } else { Some(input) };
 
-        match self.manager.call_tool(&self.tool_def.name, args).await {
+        match self.manager.call_tool(&self.manager_tool_name, args).await {
             Ok(result) => {
                 let text = mangocode_mcp::mcp_result_to_string(&result);
                 if result.is_error {
@@ -180,6 +181,10 @@ struct Cli {
     #[arg(long = "mcp-config")]
     mcp_config: Option<String>,
 
+    /// Claude-compatible settings override (JSON string or path to JSON file)
+    #[arg(long = "settings")]
+    settings_override: Option<String>,
+
     /// Disable auto-compaction
     #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
     no_auto_compact: bool,
@@ -216,13 +221,25 @@ struct Cli {
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
-    /// Tools to allow (comma-separated, default: all)
-    #[arg(long = "allowed-tools", value_name = "TOOLS")]
-    allowed_tools: Option<String>,
+    /// Tools to allow (comma- or space-separated, default: all)
+    #[arg(
+        long = "allowed-tools",
+        alias = "allowedTools",
+        value_name = "TOOLS",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    allowed_tools: Vec<String>,
 
-    /// Tools to disallow (comma-separated)
-    #[arg(long = "disallowed-tools", value_name = "TOOLS")]
-    disallowed_tools: Option<String>,
+    /// Tools to disallow (comma- or space-separated)
+    #[arg(
+        long = "disallowed-tools",
+        alias = "disallowedTools",
+        value_name = "TOOLS",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    disallowed_tools: Vec<String>,
 
     /// Extra beta feature headers to send (comma-separated)
     #[arg(long = "betas", value_name = "HEADERS")]
@@ -330,6 +347,218 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
+fn normalize_tool_list(raw_values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in raw_values {
+        for token in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+            let t = token.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_hook_event(name: &str) -> Option<HookEvent> {
+    let normalized = name.replace(['-', '_'], "").to_ascii_lowercase();
+    match normalized.as_str() {
+        "pretooluse" => Some(HookEvent::PreToolUse),
+        "posttooluse" => Some(HookEvent::PostToolUse),
+        "postmodelturn" => Some(HookEvent::PostModelTurn),
+        "userpromptsubmit" => Some(HookEvent::UserPromptSubmit),
+        "notification" => Some(HookEvent::Notification),
+        "stop" => Some(HookEvent::Stop),
+        _ => None,
+    }
+}
+
+fn parse_hook_entries(value: &serde_json::Value) -> Vec<HookEntry> {
+    let mut entries = Vec::new();
+
+    match value {
+        serde_json::Value::String(command) => {
+            if !command.trim().is_empty() {
+                entries.push(HookEntry {
+                    command: command.trim().to_string(),
+                    tool_filter: None,
+                    blocking: true,
+                });
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                entries.extend(parse_hook_entries(item));
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(nested) = obj.get("hooks") {
+                entries.extend(parse_hook_entries(nested));
+            }
+
+            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                let command = cmd.trim();
+                if !command.is_empty() {
+                    entries.push(HookEntry {
+                        command: command.to_string(),
+                        tool_filter: obj
+                            .get("tool_filter")
+                            .or_else(|| obj.get("toolFilter"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        blocking: obj
+                            .get("blocking")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    entries
+}
+
+fn parse_mcp_server_from_value(name: &str, value: &serde_json::Value) -> Option<McpServerConfig> {
+    let obj = value.as_object()?;
+    let command = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let args = obj
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = obj
+        .get("env")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let url = obj
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let server_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if url.is_some() {
+                "sse".to_string()
+            } else {
+                "stdio".to_string()
+            }
+        });
+
+    Some(McpServerConfig {
+        name: name.to_string(),
+        command,
+        args,
+        env,
+        url,
+        server_type,
+    })
+}
+
+fn merge_mcp_servers(config: &mut Config, servers: Vec<McpServerConfig>) {
+    for server in servers {
+        if let Some(existing) = config
+            .mcp_servers
+            .iter_mut()
+            .find(|s| s.name == server.name)
+        {
+            *existing = server;
+        } else {
+            config.mcp_servers.push(server);
+        }
+    }
+}
+
+fn apply_settings_override(config: &mut Config, raw: &str) -> anyhow::Result<()> {
+    let trimmed = raw.trim();
+    let value: serde_json::Value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("Invalid --settings JSON: {e}"))?
+    } else {
+        let content = std::fs::read_to_string(trimmed)
+            .map_err(|e| anyhow::anyhow!("Failed to read --settings file '{trimmed}': {e}"))?;
+        let content = content.trim_start_matches('\u{feff}');
+        serde_json::from_str(content)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON in --settings file '{trimmed}': {e}"))?
+    };
+
+    let hooks_value = value
+        .get("hooks")
+        .or_else(|| value.get("config").and_then(|cfg| cfg.get("hooks")));
+    if let Some(hooks_obj) = hooks_value.and_then(|v| v.as_object()) {
+        for (event_name, entries_value) in hooks_obj {
+            if let Some(event) = parse_hook_event(event_name) {
+                let entries = parse_hook_entries(entries_value);
+                if !entries.is_empty() {
+                    config.hooks.insert(event, entries);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_mcp_config_override(config: &mut Config, raw: &str) -> anyhow::Result<()> {
+    let trimmed = raw.trim();
+    let value: serde_json::Value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("Invalid --mcp-config JSON: {e}"))?
+    } else {
+        let content = std::fs::read_to_string(trimmed)
+            .map_err(|e| anyhow::anyhow!("Failed to read --mcp-config file '{trimmed}': {e}"))?;
+        let content = content.trim_start_matches('\u{feff}');
+        serde_json::from_str(content)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON in --mcp-config file '{trimmed}': {e}"))?
+    };
+
+    let mut parsed = Vec::new();
+
+    if let Some(obj) = value.get("mcpServers").and_then(|v| v.as_object()) {
+        for (name, server_value) in obj {
+            if let Some(server) = parse_mcp_server_from_value(name, server_value) {
+                parsed.push(server);
+            }
+        }
+    } else if let Some(arr) = value.as_array() {
+        for item in arr {
+            if let Ok(server) = serde_json::from_value::<McpServerConfig>(item.clone()) {
+                parsed.push(server);
+            }
+        }
+    }
+
+    if parsed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--mcp-config did not contain any valid MCP servers"
+        ));
+    }
+
+    merge_mcp_servers(config, parsed);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -365,8 +594,8 @@ async fn main() -> anyhow::Result<()> {
         let mut entries = registry.list_all();
         // Sort by provider then model id for stable output.
         entries.sort_by(|a, b| {
-            (&*a.info.provider_id).cmp(&*b.info.provider_id)
-                .then_with(|| (&*a.info.id).cmp(&*b.info.id))
+            (*a.info.provider_id).cmp(&*b.info.provider_id)
+                .then_with(|| (*a.info.id).cmp(&*b.info.id))
         });
         for entry in entries {
             println!(
@@ -435,6 +664,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .without_time()
         .init();
 
@@ -495,6 +725,18 @@ async fn main() -> anyhow::Result<()> {
             .entry(provider_id)
             .or_default()
             .api_base = Some(base.clone());
+    }
+    if !cli.allowed_tools.is_empty() {
+        config.allowed_tools = normalize_tool_list(&cli.allowed_tools);
+    }
+    if !cli.disallowed_tools.is_empty() {
+        config.disallowed_tools = normalize_tool_list(&cli.disallowed_tools);
+    }
+    if let Some(ref settings_override) = cli.settings_override {
+        apply_settings_override(&mut config, settings_override)?;
+    }
+    if let Some(ref mcp_config) = cli.mcp_config {
+        apply_mcp_config_override(&mut config, mcp_config)?;
     }
 
     // --dump-system-prompt fast path
@@ -638,6 +880,7 @@ async fn main() -> anyhow::Result<()> {
     let session_id = cli
         .session_id_flag
         .clone()
+        .or_else(|| cli.resume.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let file_history = Arc::new(ParkingMutex::new(
         mangocode_core::file_history::FileHistory::new(),
@@ -666,13 +909,17 @@ async fn main() -> anyhow::Result<()> {
     // but we guard with a std::sync::OnceLock internally).
     {
         static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        SWARM_INIT.get_or_init(|| mangocode_query::init_team_swarm_runner());
+        SWARM_INIT.get_or_init(mangocode_query::init_team_swarm_runner);
     }
 
     // Build the full tool list: built-ins from cc-tools plus AgentTool from cc-query
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
-    let tools = build_tools_with_mcp(mcp_manager_arc.clone());
+    let tools = build_tools_with_mcp(
+        mcp_manager_arc.clone(),
+        &config.allowed_tools,
+        &config.disallowed_tools,
+    );
 
     // Load plugins and register any plugin-provided MCP servers into the
     // in-memory config (does not modify the settings file on disk).
@@ -729,7 +976,7 @@ async fn main() -> anyhow::Result<()> {
         query_config.thinking_budget = Some(tokens);
     }
     if let Some(ref level_str) = cli.effort {
-        if let Some(level) = mangocode_core::effort::EffortLevel::from_str(level_str) {
+        if let Some(level) = mangocode_core::effort::EffortLevel::parse(level_str) {
             query_config.effort_level = Some(level);
         } else {
             eprintln!("Warning: unknown effort level '{}' — expected low/medium/high/max", level_str);
@@ -792,7 +1039,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // Capture provider before `config` is moved into run_interactive.
         let is_non_anthropic_provider = config.provider.as_deref().map(|p| p != "anthropic").unwrap_or(false);
-        run_interactive(
+        run_interactive(InteractiveRunArgs {
             config,
             settings,
             client,
@@ -800,14 +1047,14 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
-            cli.resume,
+            resume_id: cli.resume,
             bridge_config,
             // has_credentials: true if we have an Anthropic key, OR if a
             // non-Anthropic provider is selected (its own auth is checked at
-            // request time — we don't want to block TUI startup here).
-            !api_key.is_empty() || is_non_anthropic_provider,
+            // request time - we don't want to block TUI startup here).
+            has_credentials: !api_key.is_empty() || is_non_anthropic_provider,
             model_registry,
-        )
+        })
         .await
     };
 
@@ -829,20 +1076,48 @@ async fn connect_mcp_manager_arc(
 
 fn build_tools_with_mcp(
     mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    allowed_tools: &[String],
+    disallowed_tools: &[String],
 ) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
     let mut v: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools();
     v.push(Box::new(mangocode_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
+        for (server_name, original_tool_def) in manager_arc.all_tool_definitions() {
+            let internal_prefix = format!("{}_", server_name);
+            let bare_tool_name = original_tool_def
+                .name
+                .strip_prefix(&internal_prefix)
+                .unwrap_or(&original_tool_def.name)
+                .to_string();
+
+            let compat_tool_name = format!("mcp__{}__{}", server_name, bare_tool_name);
+            let manager_tool_name = original_tool_def.name.clone();
+            let tool_def = ToolDefinition {
+                name: compat_tool_name,
+                description: original_tool_def.description,
+                input_schema: original_tool_def.input_schema,
+            };
+
             let wrapper = McpToolWrapper {
                 tool_def,
                 server_name,
+                manager_tool_name,
                 manager: manager_arc.clone(),
             };
             v.push(Box::new(wrapper));
         }
         debug!(total_tools = v.len(), "MCP tools registered");
+    }
+
+    if !allowed_tools.is_empty() {
+        let allowed: HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
+        v.retain(|t| allowed.contains(t.name()));
+    }
+
+    if !disallowed_tools.is_empty() {
+        let denied: HashSet<&str> = disallowed_tools.iter().map(|s| s.as_str()).collect();
+        v.retain(|t| !denied.contains(t.name()));
     }
 
     Arc::new(v)
@@ -903,11 +1178,70 @@ async fn run_headless(
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    // Build initial messages list from input.
+    fn permission_mode_name(mode: &PermissionMode) -> &'static str {
+        match mode {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::BypassPermissions => "bypassPermissions",
+            PermissionMode::Plan => "plan",
+        }
+    }
+
+    fn emit_ndjson(value: serde_json::Value) {
+        println!("{}", value);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    fn model_usage_json(
+        model: &str,
+        usage: &mangocode_core::types::UsageInfo,
+        cost_usd: f64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            model: {
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+                "costUSD": cost_usd,
+            }
+        })
+    }
+
+    let start_time = std::time::Instant::now();
+
+    // Load prior conversation when --resume is provided; headless mode keeps
+    // using the active tool-context session ID for event/session linkage.
+    let mut session = if let Some(ref id) = cli.resume {
+        match mangocode_core::history::load_session(id).await {
+            Ok(mut s) => {
+                if s.id != tool_ctx.session_id {
+                    s.id = tool_ctx.session_id.clone();
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("Warning: could not load session {}: {}", id, e);
+                let mut fresh = mangocode_core::history::ConversationSession::new(query_config.model.clone());
+                fresh.id = tool_ctx.session_id.clone();
+                fresh
+            }
+        }
+    } else {
+        let mut fresh = mangocode_core::history::ConversationSession::new(query_config.model.clone());
+        fresh.id = tool_ctx.session_id.clone();
+        fresh
+    };
+
+    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    if session.model.is_empty() {
+        session.model = query_config.model.clone();
+    }
+
+    // Build new input messages for this invocation.
     // --input-format stream-json: stdin is newline-delimited JSON, each line is
     //   {"role":"user"|"assistant","content":"..."} (mirrors TS --input-format stream-json).
     // --input-format text (default): read prompt from positional arg or entire stdin as text.
-    let mut messages: Vec<mangocode_core::types::Message> = if cli.input_format == CliInputFormat::StreamJson {
+    let mut incoming_messages: Vec<mangocode_core::types::Message> = if cli.input_format == CliInputFormat::StreamJson {
         use tokio::io::{self, AsyncBufReadExt, BufReader};
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin);
@@ -972,8 +1306,11 @@ async fn run_headless(
     // --prefill: inject a partial assistant turn before the query so the model
     // continues from that text (mirrors TS --prefill flag).
     if let Some(ref prefill_text) = cli.prefill {
-        messages.push(mangocode_core::types::Message::assistant(prefill_text.clone()));
+        incoming_messages.push(mangocode_core::types::Message::assistant(prefill_text.clone()));
     }
+
+    let mut messages = session.messages.clone();
+    messages.extend(incoming_messages);
 
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
@@ -983,76 +1320,276 @@ async fn run_headless(
     let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
     let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
-    let cancel = CancellationToken::new();
-    let client_clone = client.clone();
-    let tool_ctx_clone = tool_ctx.clone();
-    let qcfg = query_config.clone();
-    let tracker_clone = cost_tracker.clone();
-    let event_tx_clone = event_tx.clone();
-    let cancel_clone = cancel.clone();
+    if is_stream_json {
+        let mut tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        tool_names.sort();
 
-    let query_handle = tokio::spawn(async move {
-        mangocode_query::run_query_loop(
-            client_clone.as_ref(),
-            &mut messages,
-            tools.as_slice(),
-            &tool_ctx_clone,
-            &qcfg,
-            tracker_clone,
-            Some(event_tx_clone),
-            cancel_clone,
-            None,
-        )
-        .await
-    });
-
-    // Drop the original tx so the channel closes when the task drops its clone
-    drop(event_tx);
-
-    // Drain events and print streaming text
-    let mut full_text = String::new();
-
-    while let Some(event) = event_rx.recv().await {
-        match &event {
-            QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
-                delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
-                ..
-            }) => {
-                full_text.push_str(text);
-                if !is_json_output {
-                    print!("{}", text);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                } else if is_stream_json {
-                    let chunk = serde_json::json!({ "type": "text_delta", "text": text });
-                    println!("{}", chunk);
-                }
+        let mut mcp_servers = Vec::new();
+        if let Some(ref manager) = tool_ctx.mcp_manager {
+            let mut statuses: Vec<(String, mangocode_mcp::McpServerStatus)> = manager
+                .all_statuses()
+                .into_iter()
+                .collect();
+            statuses.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, status) in statuses {
+                let status_name = match status {
+                    mangocode_mcp::McpServerStatus::Connected { .. } => "connected",
+                    mangocode_mcp::McpServerStatus::Connecting => "connecting",
+                    mangocode_mcp::McpServerStatus::Disconnected { .. } => "disconnected",
+                    mangocode_mcp::McpServerStatus::Failed { .. } => "failed",
+                };
+                mcp_servers.push(serde_json::json!({
+                    "name": name,
+                    "status": status_name,
+                }));
             }
-            QueryEvent::ToolStart { tool_name, .. } => {
-                if !is_json_output {
-                    eprintln!("\n[{}...]", tool_name);
-                } else {
-                    let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
-                    println!("{}", ev);
-                }
-            }
-            QueryEvent::Error(msg) => {
-                if is_json_output {
-                    let ev = serde_json::json!({ "type": "error", "error": msg });
-                    eprintln!("{}", ev);
-                } else {
-                    eprintln!("\nError: {}", msg);
-                }
-            }
-            _ => {}
         }
+
+        emit_ndjson(serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": tool_ctx.session_id,
+            "cwd": tool_ctx.working_dir.display().to_string(),
+            "model": query_config.model,
+            "tools": tool_names,
+            "mcp_servers": mcp_servers,
+            "permissionMode": permission_mode_name(&tool_ctx.permission_mode),
+        }));
     }
 
-    // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        mangocode_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    let cancel = CancellationToken::new();
+    let stream_session_id = tool_ctx.session_id.clone();
+    let event_task = tokio::spawn(async move {
+        let mut full_text = String::new();
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                    ..
+                }) => {
+                    full_text.push_str(&text);
+                    if !is_json_output {
+                        print!("{}", text);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    } else if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "text", "text": text }]
+                            },
+                            "parent_tool_use_id": serde_json::Value::Null,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    full_text.push_str(&text);
+                    if !is_json_output {
+                        print!("{}", text);
+                        use std::io::Write;
+                        let _ = std::io::stdout().flush();
+                    } else if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "text", "text": text }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::ThinkingDelta { thinking },
+                    ..
+                }) => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": thinking }]
+                            },
+                            "parent_tool_use_id": serde_json::Value::Null,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::ThinkingDelta { thinking },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": thinking }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::SignatureDelta { signature },
+                    ..
+                }) => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": "", "signature": signature }]
+                            },
+                            "parent_tool_use_id": serde_json::Value::Null,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::SignatureDelta { signature },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": "", "signature": signature }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::ToolStart {
+                    tool_name,
+                    tool_id,
+                    input_json,
+                    parent_tool_use_id,
+                } => {
+                    if !is_json_output {
+                        eprintln!("\n[{}...]", tool_name);
+                    } else if is_stream_json {
+                        let parsed_input = serde_json::from_str::<serde_json::Value>(&input_json)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": input_json }));
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "tool_use",
+                                    "id": tool_id,
+                                    "name": tool_name,
+                                    "input": parsed_input,
+                                }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id
+                                .map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null),
+                            "session_id": stream_session_id,
+                        }));
+                    } else {
+                        emit_ndjson(serde_json::json!({ "type": "tool_start", "tool": tool_name }));
+                    }
+                }
+                QueryEvent::ToolEnd {
+                    tool_id,
+                    result,
+                    is_error,
+                    ..
+                } => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result,
+                                    "is_error": is_error,
+                                }]
+                            },
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Error(msg) => {
+                    if is_stream_json {
+                        let lower = msg.to_ascii_lowercase();
+                        if lower.contains("rate limit") || lower.contains("ratelimit") {
+                            emit_ndjson(serde_json::json!({
+                                "type": "rate_limit_event",
+                                "session_id": stream_session_id,
+                                "rate_limit_info": {
+                                    "message": msg,
+                                }
+                            }));
+                        }
+                        // Stream-json compatibility mode reserves terminal errors
+                        // for the final `result/subtype=error` event.
+                    } else if is_json_output {
+                        eprintln!("{}", serde_json::json!({ "type": "error", "error": msg }));
+                    } else {
+                        eprintln!("\nError: {}", msg);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        full_text
+    });
+
+    let outcome = mangocode_query::run_query_loop(
+        client.as_ref(),
+        &mut messages,
+        tools.as_slice(),
+        &tool_ctx,
+        &query_config,
+        cost_tracker.clone(),
+        Some(event_tx.clone()),
+        cancel,
+        None,
+    )
+    .await;
+
+    drop(event_tx);
+    let full_text = event_task.await.unwrap_or_default();
+
+    session.messages = messages;
+    session.model = query_config.model.clone();
+    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    session.total_cost = cost_tracker.total_cost_usd();
+    session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
+    session.updated_at = chrono::Utc::now();
+
+    if let Err(e) = mangocode_core::history::save_session(&session).await {
+        eprintln!("Warning: failed to save session {}: {}", session.id, e);
+    }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
 
     // Final output
     match cli.output_format {
@@ -1067,6 +1604,29 @@ async fn run_headless(
                     let out = serde_json::json!({
                         "type": "result",
                         "result": result_text,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "end_turn",
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        },
+                        "cost_usd": cost_tracker.total_cost_usd(),
+                    });
+                    println!("{}", out);
+                }
+                QueryOutcome::MaxTokens { partial_message, usage } => {
+                    let result_text = if full_text.is_empty() {
+                        partial_message.get_all_text()
+                    } else {
+                        full_text
+                    };
+                    let out = serde_json::json!({
+                        "type": "result",
+                        "result": result_text,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "max_tokens",
                         "usage": {
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
@@ -1082,29 +1642,107 @@ async fn run_headless(
                     eprintln!("{}", out);
                     std::process::exit(1);
                 }
-                _ => {}
-            }
-        }
-        CliOutputFormat::StreamJson => {
-            // Already streamed above; emit final result event
-            match outcome {
-                QueryOutcome::EndTurn { usage, .. } => {
+                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
                     let out = serde_json::json!({
-                        "type": "result",
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
+                        "type": "error",
+                        "error": format!("Budget limit ${:.4} reached (spent ${:.4})", limit_usd, cost_usd),
                     });
-                    println!("{}", out);
+                    eprintln!("{}", out);
+                    std::process::exit(2);
                 }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
+                QueryOutcome::Cancelled => {
+                    let out = serde_json::json!({ "type": "error", "error": "Cancelled" });
                     eprintln!("{}", out);
                     std::process::exit(1);
                 }
-                _ => {}
+            }
+        }
+        CliOutputFormat::StreamJson => {
+            // Already streamed above; emit final Claude-compatible result event.
+            match outcome {
+                QueryOutcome::EndTurn { usage, .. } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": false,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "end_turn",
+                        "duration_ms": duration_ms,
+                        "cost_usd": cost_tracker.total_cost_usd(),
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        },
+                        "modelUsage": model_usage_json(
+                            &query_config.model,
+                            &usage,
+                            cost_tracker.total_cost_usd(),
+                        ),
+                    }));
+                }
+                QueryOutcome::MaxTokens { usage, .. } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": false,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "max_tokens",
+                        "duration_ms": duration_ms,
+                        "cost_usd": cost_tracker.total_cost_usd(),
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        },
+                        "modelUsage": model_usage_json(
+                            &query_config.model,
+                            &usage,
+                            cost_tracker.total_cost_usd(),
+                        ),
+                    }));
+                }
+                QueryOutcome::Error(e) => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": "Error",
+                            "message": e.to_string(),
+                        }
+                    }));
+                    std::process::exit(1);
+                }
+                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": "BudgetExceeded",
+                            "message": format!("Budget limit ${:.4} reached (spent ${:.4})", limit_usd, cost_usd),
+                        }
+                    }));
+                    std::process::exit(2);
+                }
+                QueryOutcome::Cancelled => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": "Cancelled",
+                            "message": "Cancelled",
+                        }
+                    }));
+                    std::process::exit(1);
+                }
             }
         }
         CliOutputFormat::Text => {
@@ -1142,7 +1780,7 @@ async fn run_headless(
 // Interactive REPL mode
 // ---------------------------------------------------------------------------
 
-async fn run_interactive(
+struct InteractiveRunArgs {
     config: Config,
     settings: mangocode_core::config::Settings,
     client: Arc<mangocode_api::AnthropicClient>,
@@ -1154,13 +1792,29 @@ async fn run_interactive(
     bridge_config: Option<mangocode_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<mangocode_api::ModelRegistry>,
-) -> anyhow::Result<()> {
+}
+
+async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
+    let InteractiveRunArgs {
+        config,
+        settings,
+        client,
+        tools,
+        tool_ctx,
+        query_config,
+        cost_tracker,
+        resume_id,
+        bridge_config,
+        has_credentials,
+        model_registry,
+    } = args;
+
     use mangocode_commands::{execute_command, CommandContext, CommandResult};
     use mangocode_bridge::{BridgeOutbound, TuiBridgeEvent};
     use mangocode_query::{QueryEvent, QueryOutcome};
     use mangocode_tui::{
         bridge_state::BridgeConnectionState, notifications::NotificationKind,
-        render::render_app, restore_terminal, setup_terminal, App,
+        render::{render_app, flush_sixel_blit}, restore_terminal, setup_terminal, App, init_mascot,
         device_auth_dialog::DeviceAuthEvent,
     };
     use crossterm::event::{self, Event, KeyCode};
@@ -1213,6 +1867,7 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    init_mascot(&mut app);
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
         use mangocode_tui::EffortLevel as TuiEL;
@@ -1452,6 +2107,8 @@ async fn run_interactive(
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
+        // Flush any pending Sixel mascot blit after ratatui finishes drawing.
+        flush_sixel_blit(&app);
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         if crossterm::event::poll(Duration::from_millis(16))? {
@@ -1468,7 +2125,7 @@ async fn run_interactive(
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                     {
-                        // Check if there's an active text selection — copy instead of cancel/quit
+                        // Check if there's an active text selection - copy instead of cancel/quit
                         let has_selection = app.selection_anchor.is_some() && !app.selection_text.borrow().is_empty();
                         if has_selection {
                             // Let the app handle the copy via its normal key handler
@@ -1476,7 +2133,7 @@ async fn run_interactive(
                             continue;
                         }
 
-                        // No selection — handle as cancel (if streaming) or quit
+                        // No selection - handle as cancel (if streaming) or quit
                         if app.is_streaming {
                             if let Some(ref ct) = cancel {
                                 ct.cancel();
@@ -1776,7 +2433,7 @@ async fn run_interactive(
                                 && !cmd_args.is_empty()
                             {
                                 if let Some(level) =
-                                    mangocode_core::effort::EffortLevel::from_str(&cmd_args)
+                                    mangocode_core::effort::EffortLevel::parse(&cmd_args)
                                 {
                                     current_effort = Some(level);
                                     app.effort_level = match level {
@@ -1958,7 +2615,23 @@ async fn run_interactive(
                         delta: text.clone(),
                         message_id: format!("msg-{}", index),
                     }),
-                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+                    QueryEvent::StreamWithParent {
+                        event: mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            index,
+                            ..
+                        },
+                        ..
+                    } => Some(BridgeOutbound::TextDelta {
+                        delta: text.clone(),
+                        message_id: format!("msg-{}", index),
+                    }),
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                        ..
+                    } => {
                         Some(BridgeOutbound::ToolStart {
                             id: tool_id.clone(),
                             name: tool_name.clone(),
@@ -1998,7 +2671,22 @@ async fn run_interactive(
                         "type": "text_chunk",
                         "text": text,
                     }).to_string()),
-                    QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+                    QueryEvent::StreamWithParent {
+                        event: mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            ..
+                        },
+                        ..
+                    } => Some(serde_json::json!({
+                        "type": "text_chunk",
+                        "text": text,
+                    }).to_string()),
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                        ..
+                    } => {
                         Some(serde_json::json!({
                             "type": "tool_start",
                             "tool_name": tool_name,
@@ -2006,7 +2694,13 @@ async fn run_interactive(
                             "input": input_json,
                         }).to_string())
                     }
-                    QueryEvent::ToolEnd { tool_name, tool_id, result, is_error } => {
+                    QueryEvent::ToolEnd {
+                        tool_name,
+                        tool_id,
+                        result,
+                        is_error,
+                        ..
+                    } => {
                         Some(serde_json::json!({
                             "type": "tool_end",
                             "tool_name": tool_name,
@@ -2094,15 +2788,14 @@ async fn run_interactive(
                                         Ok(msgs) if !msgs.is_empty() => {
                                             for msg in &msgs {
                                                 since_id = Some(msg.id.clone());
-                                                if msg.role == "user" {
-                                                    if poll_tx
+                                                if msg.role == "user"
+                                                    && poll_tx
                                                         .send(msg.content.clone())
                                                         .await
                                                         .is_err()
                                                     {
                                                         return;
                                                     }
-                                                }
                                             }
                                         }
                                         _ => {}
@@ -2287,13 +2980,8 @@ async fn run_interactive(
 
         // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
         if status_cmd_str.is_some() {
-            loop {
-                match status_cmd_rx.try_recv() {
-                    Ok(text) => {
-                        app.status_line_override = if text.is_empty() { None } else { Some(text) };
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(text) = status_cmd_rx.try_recv() {
+                app.status_line_override = if text.is_empty() { None } else { Some(text) };
             }
         }
 
@@ -2457,7 +3145,11 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            tools_arc = build_tools_with_mcp(
+                new_mcp_manager.clone(),
+                &cmd_ctx.config.allowed_tools,
+                &cmd_ctx.config.disallowed_tools,
+            );
             if app.mcp_view.open {
                 app.refresh_mcp_view();
             }
@@ -2620,9 +3312,7 @@ async fn auth_status(json_output: bool) {
         let uses_bearer = tokens.uses_bearer_auth();
         let method = if uses_bearer { "claude.ai" } else { "oauth_token" };
         (method.to_string(), true)
-    } else if env_api_key.is_some() {
-        ("api_key".to_string(), true)
-    } else if settings_api_key.is_some() {
+    } else if env_api_key.is_some() || settings_api_key.is_some() {
         ("api_key".to_string(), true)
     } else {
         ("none".to_string(), false)

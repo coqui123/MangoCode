@@ -409,10 +409,26 @@ fn build_provider_options(
 pub enum QueryEvent {
     /// A stream event from the API.
     Stream(AnthropicStreamEvent),
+    /// A stream event emitted from a nested sub-agent invocation.
+    StreamWithParent {
+        event: AnthropicStreamEvent,
+        parent_tool_use_id: String,
+    },
     /// A tool is about to be executed.
-    ToolStart { tool_name: String, tool_id: String, input_json: String },
+    ToolStart {
+        tool_name: String,
+        tool_id: String,
+        input_json: String,
+        parent_tool_use_id: Option<String>,
+    },
     /// A tool has finished executing.
-    ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
+    ToolEnd {
+        tool_name: String,
+        tool_id: String,
+        result: String,
+        is_error: bool,
+        parent_tool_use_id: Option<String>,
+    },
     /// The model finished a turn.
     TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
     /// An informational status message.
@@ -657,6 +673,7 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
 /// during tool execution (e.g. by the UI or a command queue).  Each string is
 /// appended as a plain user message between turns.  Callers that do not need
 /// command queuing may pass `None` or an empty `Vec`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_query_loop(
     client: &mangocode_api::AnthropicClient,
     messages: &mut Vec<Message>,
@@ -1059,7 +1076,7 @@ pub async fn run_query_loop(
                         stop_sequences: vec![],
                         thinking: if caps.thinking {
                             effective_thinking_budget
-                                .map(|b| mangocode_api::ThinkingConfig::enabled(b))
+                                .map(mangocode_api::ThinkingConfig::enabled)
                         } else {
                             None
                         },
@@ -1121,10 +1138,11 @@ pub async fn run_query_loop(
                                                 usage.cache_read_input_tokens = u.cache_read_input_tokens;
                                                 usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
                                             }
-                                            mangocode_api::StreamEvent::ContentBlockStart { index, content_block } => {
-                                                if let ContentBlock::ToolUse { id, name, .. } = content_block {
-                                                    tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
-                                                }
+                                            mangocode_api::StreamEvent::ContentBlockStart {
+                                                index,
+                                                content_block: ContentBlock::ToolUse { id, name, .. },
+                                            } => {
+                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
                                             }
                                             mangocode_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1200,7 +1218,37 @@ pub async fn run_query_loop(
                     if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
-                            let result = execute_tool(&*tool_name, &tool_input, tools, &tool_ctx).await;
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::ToolStart {
+                                    tool_name: tool_name.clone(),
+                                    tool_id: tool_id.clone(),
+                                    input_json: tool_input.to_string(),
+                                    parent_tool_use_id: None,
+                                });
+                            }
+
+                            let result = execute_tool(ExecuteToolRequest {
+                                client,
+                                query_config: config,
+                                tool_id: &tool_id,
+                                name: &tool_name,
+                                input: &tool_input,
+                                tools,
+                                ctx: tool_ctx,
+                                event_tx: event_tx.as_ref(),
+                            })
+                            .await;
+
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::ToolEnd {
+                                    tool_name: tool_name.clone(),
+                                    tool_id: tool_id.clone(),
+                                    result: result.content.clone(),
+                                    is_error: result.is_error,
+                                    parent_tool_use_id: None,
+                                });
+                            }
+
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
                                 content: mangocode_core::types::ToolResultContent::Text(result.content),
@@ -1540,13 +1588,17 @@ pub async fn run_query_loop(
                     let messages_clone = messages.clone();
                     let working_dir_clone = tool_ctx.working_dir.clone();
 
-                    // Build a fresh client using the same API key.  This avoids
-                    // requiring an Arc in the existing run_query_loop signature.
-                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                        if !api_key.is_empty() {
+                    // Build a fresh client using resolved auth from config so
+                    // this path is not tied to a single env var.
+                    if let Some((credential, use_bearer_auth)) =
+                        tool_ctx.config.resolve_auth_async().await
+                    {
+                        if !credential.is_empty() {
                             if let Ok(sm_client) = mangocode_api::AnthropicClient::new(
                                 mangocode_api::client::ClientConfig {
-                                    api_key,
+                                    api_key: credential,
+                                    api_base: tool_ctx.config.resolve_api_base(),
+                                    use_bearer_auth,
                                     ..Default::default()
                                 },
                             ) {
@@ -1578,7 +1630,7 @@ pub async fn run_query_loop(
                                         Err(e) => {
                                             tracing::debug!(
                                                 error = %e,
-                                                "Session memory extraction failed (non-fatal)"
+                                                "Session memory extraction skipped/failed"
                                             );
                                         }
                                     }
@@ -1716,6 +1768,7 @@ pub async fn run_query_loop(
                                 tool_name: name.clone(),
                                 tool_id: id.clone(),
                                 input_json: input.to_string(),
+                                parent_tool_use_id: None,
                             });
                         }
 
@@ -1772,14 +1825,26 @@ pub async fn run_query_loop(
                 let exec_futures: Vec<_> = prepared
                     .iter()
                     .map(|p| {
+                        let event_tx_for_exec = event_tx.clone();
                         if p.blocked_result.is_some() {
                             let r = p.blocked_result.clone().unwrap();
                             futures::future::Either::Left(async move { r })
                         } else {
+                            let id = p.id.clone();
                             let name = p.name.clone();
                             let input = p.input.clone();
                             futures::future::Either::Right(async move {
-                                execute_tool(&name, &input, tools, tool_ctx).await
+                                execute_tool(ExecuteToolRequest {
+                                    client,
+                                    query_config: config,
+                                    tool_id: &id,
+                                    name: &name,
+                                    input: &input,
+                                    tools,
+                                    ctx: tool_ctx,
+                                    event_tx: event_tx_for_exec.as_ref(),
+                                })
+                                .await
                             })
                         }
                     })
@@ -1823,6 +1888,7 @@ pub async fn run_query_loop(
                             tool_id: p.id.clone(),
                             result: result.content.clone(),
                             is_error: result.is_error,
+                            parent_tool_use_id: None,
                         });
                     }
 
@@ -1869,22 +1935,40 @@ pub async fn run_query_loop(
 }
 
 /// Execute a single tool invocation.
-async fn execute_tool(
-    name: &str,
-    input: &Value,
-    tools: &[Box<dyn Tool>],
-    ctx: &ToolContext,
-) -> ToolResult {
-    let tool = tools.iter().find(|t| t.name() == name);
+struct ExecuteToolRequest<'a> {
+    client: &'a mangocode_api::AnthropicClient,
+    query_config: &'a QueryConfig,
+    tool_id: &'a str,
+    name: &'a str,
+    input: &'a Value,
+    tools: &'a [Box<dyn Tool>],
+    ctx: &'a ToolContext,
+    event_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<QueryEvent>>,
+}
+
+async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
+    if req.name == mangocode_core::constants::TOOL_NAME_AGENT {
+        return Box::pin(crate::agent_tool::execute_with_runtime(
+            req.input.clone(),
+            req.ctx,
+            req.client,
+            req.query_config,
+            req.event_tx.cloned(),
+            Some(req.tool_id.to_string()),
+        ))
+        .await;
+    }
+
+    let tool = req.tools.iter().find(|t| t.name() == req.name);
 
     match tool {
         Some(tool) => {
-            debug!(tool = name, "Executing tool");
-            tool.execute(input.clone(), ctx).await
+            debug!(tool = req.name, "Executing tool");
+            tool.execute(req.input.clone(), req.ctx).await
         }
         None => {
-            warn!(tool = name, "Unknown tool requested");
-            ToolResult::error(format!("Unknown tool: {}", name))
+            warn!(tool = req.name, "Unknown tool requested");
+            ToolResult::error(format!("Unknown tool: {}", req.name))
         }
     }
 }
@@ -1895,7 +1979,7 @@ fn build_todo_nudge(session_id: &str) -> String {
     let todos = mangocode_tools::todo_write::load_todos(session_id);
     let incomplete_count = todos
         .iter()
-        .filter(|t| t["status"].as_str().map_or(true, |s| s != "completed"))
+        .filter(|t| t["status"].as_str() != Some("completed"))
         .count();
     if incomplete_count == 0 {
         String::new()
@@ -2028,6 +2112,51 @@ fn map_to_anthropic_event(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Stream handler that forwards events to an unbounded channel.
+struct ChannelStreamHandler {
+    tx: mpsc::UnboundedSender<QueryEvent>,
+}
+
+impl StreamHandler for ChannelStreamHandler {
+    fn on_event(&self, event: &AnthropicStreamEvent) {
+        let _ = self.tx.send(QueryEvent::Stream(event.clone()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-shot query (non-looping, for simple one-off calls)
+// ---------------------------------------------------------------------------
+
+/// Run a single (non-agentic) query - no tool loop, just one API call.
+pub async fn run_single_query(
+    client: &mangocode_api::AnthropicClient,
+    messages: Vec<Message>,
+    config: &QueryConfig,
+) -> Result<Message, ClaudeError> {
+    let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+    let system = build_system_prompt(config);
+
+    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
+        .messages(api_messages)
+        .system(system)
+        .build();
+
+    let handler: Arc<dyn StreamHandler> = Arc::new(mangocode_api::streaming::NullStreamHandler);
+
+    let mut rx = client.create_message_stream(request, handler).await?;
+    let mut acc = StreamAccumulator::new();
+
+    while let Some(evt) = rx.recv().await {
+        acc.on_event(&evt);
+        if matches!(evt, AnthropicStreamEvent::MessageStop) {
+            break;
+        }
+    }
+
+    let (msg, _usage, _stop) = acc.finish();
+    Ok(msg)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2229,49 +2358,4 @@ mod tests {
             serde_json::json!(10_000)
         );
     }
-}
-
-/// Stream handler that forwards events to an unbounded channel.
-struct ChannelStreamHandler {
-    tx: mpsc::UnboundedSender<QueryEvent>,
-}
-
-impl StreamHandler for ChannelStreamHandler {
-    fn on_event(&self, event: &AnthropicStreamEvent) {
-        let _ = self.tx.send(QueryEvent::Stream(event.clone()));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Single-shot query (non-looping, for simple one-off calls)
-// ---------------------------------------------------------------------------
-
-/// Run a single (non-agentic) query – no tool loop, just one API call.
-pub async fn run_single_query(
-    client: &mangocode_api::AnthropicClient,
-    messages: Vec<Message>,
-    config: &QueryConfig,
-) -> Result<Message, ClaudeError> {
-    let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
-    let system = build_system_prompt(config);
-
-    let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
-        .messages(api_messages)
-        .system(system)
-        .build();
-
-    let handler: Arc<dyn StreamHandler> = Arc::new(mangocode_api::streaming::NullStreamHandler);
-
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
-
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
-    }
-
-    let (msg, _usage, _stop) = acc.finish();
-    Ok(msg)
 }

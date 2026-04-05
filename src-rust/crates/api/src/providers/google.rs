@@ -144,15 +144,15 @@ impl GoogleProvider {
                             "mimeType": mime
                         }
                     }))
-                } else if let Some(url) = &source.url {
-                    Some(json!({
-                        "fileData": {
-                            "fileUri": url,
-                            "mimeType": source.media_type.as_deref().unwrap_or("image/jpeg")
-                        }
-                    }))
                 } else {
-                    None
+                    source.url.as_ref().map(|url| {
+                        json!({
+                            "fileData": {
+                                "fileUri": url,
+                                "mimeType": source.media_type.as_deref().unwrap_or("image/jpeg")
+                            }
+                        })
+                    })
                 }
             }
 
@@ -176,15 +176,15 @@ impl GoogleProvider {
                             "mimeType": mime
                         }
                     }))
-                } else if let Some(url) = &source.url {
-                    Some(json!({
-                        "fileData": {
-                            "fileUri": url,
-                            "mimeType": source.media_type.as_deref().unwrap_or("application/pdf")
-                        }
-                    }))
                 } else {
-                    None
+                    source.url.as_ref().map(|url| {
+                        json!({
+                            "fileData": {
+                                "fileUri": url,
+                                "mimeType": source.media_type.as_deref().unwrap_or("application/pdf")
+                            }
+                        })
+                    })
                 }
             }
 
@@ -279,24 +279,22 @@ impl GoogleProvider {
                     }
 
                     // Filter required to only include keys present in properties.
-                    if let Some(required) = map.get("required").cloned() {
-                        if let Value::Array(req_arr) = required {
-                            let prop_keys: std::collections::HashSet<String> = map
-                                .get("properties")
-                                .and_then(|p| p.as_object())
-                                .map(|o| o.keys().cloned().collect())
-                                .unwrap_or_default();
+                    if let Some(Value::Array(req_arr)) = map.get("required").cloned() {
+                        let prop_keys: std::collections::HashSet<String> = map
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .map(|o| o.keys().cloned().collect())
+                            .unwrap_or_default();
 
-                            let filtered: Vec<Value> = req_arr
-                                .into_iter()
-                                .filter(|v| {
-                                    v.as_str()
-                                        .map(|s| prop_keys.contains(s))
-                                        .unwrap_or(false)
-                                })
-                                .collect();
-                            map.insert("required".to_string(), Value::Array(filtered));
-                        }
+                        let filtered: Vec<Value> = req_arr
+                            .into_iter()
+                            .filter(|v| {
+                                v.as_str()
+                                    .map(|s| prop_keys.contains(s))
+                                    .unwrap_or(false)
+                            })
+                            .collect();
+                        map.insert("required".to_string(), Value::Array(filtered));
                     }
                 } else {
                     // Non-object types must not carry properties/required.

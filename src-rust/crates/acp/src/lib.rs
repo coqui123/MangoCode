@@ -219,9 +219,9 @@ async fn handle_request(req: JsonRpcRequest) -> JsonRpcResponse {
             let registry = mangocode_api::ModelRegistry::new();
             let mut entries = registry.list_all();
             entries.sort_by(|a, b| {
-                (&*a.info.provider_id)
+                (*a.info.provider_id)
                     .cmp(&*b.info.provider_id)
-                    .then_with(|| (&*a.info.id).cmp(&*b.info.id))
+                    .then_with(|| (*a.info.id).cmp(&*b.info.id))
             });
             let models: Vec<_> = entries
                 .iter()

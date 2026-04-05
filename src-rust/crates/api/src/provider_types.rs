@@ -17,10 +17,11 @@ pub use crate::types::{ThinkingConfig, SystemPrompt};
 // ---------------------------------------------------------------------------
 
 /// The reason a model stopped generating tokens.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The model reached a natural stopping point.
+    #[default]
     EndTurn,
     /// The model generated a stop sequence.
     StopSequence,
@@ -32,12 +33,6 @@ pub enum StopReason {
     ContentFiltered,
     /// The provider returned an unknown or unrecognised stop reason.
     Other(String),
-}
-
-impl Default for StopReason {
-    fn default() -> Self {
-        StopReason::EndTurn
-    }
 }
 
 // ---------------------------------------------------------------------------

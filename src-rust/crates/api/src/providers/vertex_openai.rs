@@ -542,7 +542,7 @@ fn vertex_model_display_name(publisher: &str, model_id: &str) -> String {
             format!("{} (Vertex)", pretty)
         }
         "meta" => {
-            let pretty = model_id.replace('-', " ").replace('_', " ");
+            let pretty = model_id.replace(['-', '_'], " ");
             format!("{} (Vertex)", pretty)
         }
         "nvidia" => {
@@ -968,7 +968,6 @@ impl LlmProvider for VertexOpenAiProvider {
                         "anthropic" => 200_000,
                         "mistralai" => {
                             if model_id.contains("codestral") { 256_000 }
-                            else if model_id.contains("large") { 128_000 }
                             else { 128_000 }
                         }
                         "meta" => 128_000,

@@ -519,7 +519,7 @@ impl NamedCommand for IdeCommand {
         if let Ok(entries) = std::fs::read_dir(&lockfile_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "lock") {
+                if path.extension().is_some_and(|e| e == "lock") {
                     if let Ok(lock_content) = std::fs::read_to_string(&path) {
                         if let Ok(info) = serde_json::from_str::<serde_json::Value>(&lock_content) {
                             let pid = info["pid"].as_u64().unwrap_or(0);
@@ -665,7 +665,7 @@ impl NamedCommand for DesktopCommand {
         // If a remote session is active the user is already bridged — show a
         // deep link so they can open the current session in Desktop.
         if let Some(ref session_url) = ctx.remote_session_url {
-            let session_id = session_url.split('/').last().unwrap_or("");
+            let session_id = session_url.split('/').next_back().unwrap_or("");
             let deep_link = format!("claude://session/{}", session_id);
 
             let mut msg = String::new();
@@ -1156,7 +1156,6 @@ mod tests {
 
     #[test]
     fn test_branch_create_no_session_returns_error() {
-        let ctx = make_ctx(); // session_id = "named-test-session" — no saved session
         let cmd = BranchCommand;
         // Calling create on a session that isn't "pre-session" but also doesn't exist
         // on disk: we can't call block_in_place outside a tokio runtime in a sync test,

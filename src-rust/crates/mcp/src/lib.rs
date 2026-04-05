@@ -778,9 +778,6 @@ pub mod client {
         ///   to the matching sender in `resource_subscriptions`.
         /// - `notifications/tools/list_changed` — logged at info level.
         /// - anything else — logged at debug level.
-        /// Drain any pending server-initiated notifications from the transport
-        /// and route them to the appropriate subscribers in `resource_subscriptions`.
-        /// This method is kept for backward compatibility and fallback use.
         #[allow(dead_code)]
         pub(crate) async fn poll_notifications(
             &self,
@@ -1496,7 +1493,7 @@ impl McpManager {
 
         // Spawn a task for each client to handle notifications via the stream
         for client in clients.values() {
-            let client_clone = Arc::clone(&client);
+            let client_clone = Arc::clone(client);
             let manager_weak = Arc::downgrade(&self);
 
             tokio::spawn(async move {
@@ -1920,7 +1917,7 @@ mod notification_tests {
                 self.queue
                     .blocking_lock()
                     .iter()
-                    .map(|s| s.clone())
+                    .cloned()
                     .collect::<std::collections::VecDeque<_>>(),
             ));
 
