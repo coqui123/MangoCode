@@ -57,6 +57,12 @@ pub struct SessionBranchingState {
     pub branch_at_message: usize,
 }
 
+impl Default for SessionBranchingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------

@@ -71,7 +71,7 @@ impl NotificationQueue {
     pub fn tick(&mut self) {
         let now = Instant::now();
         self.notifications.retain(|n| {
-            n.expires_at.map_or(true, |exp| exp > now)
+            n.expires_at.is_none_or(|exp| exp > now)
         });
     }
 

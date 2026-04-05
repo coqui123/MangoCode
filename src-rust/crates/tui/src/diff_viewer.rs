@@ -476,10 +476,10 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiffStats> {
                 if let Some(f) = current_file.as_mut() {
                     f.removed += 1;
                 }
-            } else if raw_line.starts_with(' ') {
+            } else if let Some(stripped) = raw_line.strip_prefix(' ') {
                 hunk.lines.push(DiffLine {
                     kind: DiffLineKind::Context,
-                    content: raw_line[1..].to_string(),
+                    content: stripped.to_string(),
                     old_line_no: Some(old_line),
                     new_line_no: Some(new_line),
                 });
@@ -645,11 +645,7 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         let y = inner.y + i as u16;
         if y >= area.y + area.height { break; }
 
-        let collapse_style = if is_collapsed {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let collapse_style = Style::default().fg(Color::DarkGray);
         let line = Line::from(vec![
             Span::styled(
                 if selected { "> " } else { "  " },
@@ -777,7 +773,7 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
                 '\u{25b2}'  // ▲
             } else if row == bar_h - 1 {
                 '\u{25bc}'  // ▼
-            } else if row >= thumb_top + 1 && row < thumb_top + thumb_size + 1 {
+            } else if row > thumb_top && row < thumb_top + thumb_size + 1 {
                 '\u{2588}'  // █ (thumb)
             } else {
                 '\u{2502}'  // │ (track)

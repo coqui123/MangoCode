@@ -467,11 +467,10 @@ fn render_hook_detail(state: &HooksConfigMenuState) -> (&'static str, Vec<Line<'
         Style::default().fg(Color::DarkGray),
     )]));
     // Wrap long target strings across multiple lines
-    for (i, chunk) in hook.target.chars().collect::<Vec<_>>().chunks(60).enumerate() {
+    for chunk in hook.target.chars().collect::<Vec<_>>().chunks(60) {
         let text: String = chunk.iter().collect();
-        let indent = if i == 0 { "    " } else { "    " };
         lines.push(Line::from(vec![Span::styled(
-            format!("{indent}{text}"),
+            format!("    {text}"),
             Style::default().fg(Color::White),
         )]));
     }
@@ -490,7 +489,7 @@ fn render_hook_detail(state: &HooksConfigMenuState) -> (&'static str, Vec<Line<'
 fn push_list_row(lines: &mut Vec<Line<'static>>, label: &str, badge: &str, selected: bool) {
     let arrow = if selected { "\u{203a} " } else { "  " };
     let row_style = if selected {
-        Style::default().fg(Color::Rgb(233, 30, 99)).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Rgb(255, 176, 32)).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };

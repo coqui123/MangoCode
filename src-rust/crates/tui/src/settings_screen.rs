@@ -886,7 +886,7 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     if cfg.env.is_empty() {
         lines.push(indent_line("  (none configured)", Color::DarkGray));
     } else {
-        for (key, _val) in &cfg.env {
+        for key in cfg.env.keys() {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {:<25}", key),
@@ -906,15 +906,15 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 
 fn build_keybindings_lines(_screen: &SettingsScreen) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    lines.push(section_header("Key Bindings"));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Edit ~/.mangocode/keybindings.json to customise bindings.",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
-    )]));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line<'static>> = vec![
+        section_header("Key Bindings"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Edit ~/.mangocode/keybindings.json to customise bindings.",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+        )]),
+        Line::from(""),
+    ];
 
     // Group bindings by context
     let mut by_context: std::collections::HashMap<String, Vec<(String, String)>> =
@@ -1227,15 +1227,12 @@ pub fn handle_settings_key(
                 toggle_current_field(screen, config);
             } else {
                 // Start editing the first editable text field
-                match &screen.active_tab {
-                    SettingsTab::General => {
-                        let cfg = &screen.settings_snapshot.config;
-                        let model_val = cfg.model.clone().unwrap_or_else(|| {
-                            mangocode_core::constants::DEFAULT_MODEL.to_string()
-                        });
-                        screen.start_edit("model", &model_val);
-                    }
-                    _ => {}
+                if screen.active_tab == SettingsTab::General {
+                    let cfg = &screen.settings_snapshot.config;
+                    let model_val = cfg.model.clone().unwrap_or_else(|| {
+                        mangocode_core::constants::DEFAULT_MODEL.to_string()
+                    });
+                    screen.start_edit("model", &model_val);
                 }
             }
         }

@@ -96,7 +96,7 @@ impl FeedbackSurveyState {
                 true
             }
             FeedbackSurveyStage::SharePrompt => {
-                if matches!(digit, 1 | 2 | 3) {
+                if matches!(digit, 1..=3) {
                     self.stage = FeedbackSurveyStage::Thanks;
                 }
                 true
@@ -206,7 +206,7 @@ pub fn render_feedback_survey(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Rgb(233, 30, 99)));
+        .border_style(Style::default().fg(Color::Rgb(255, 176, 32)));
 
     let para = Paragraph::new(body_lines)
         .block(block)

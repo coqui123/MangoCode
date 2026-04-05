@@ -40,15 +40,20 @@ impl ContextVizState {
 // Rendering
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContextVizMetrics {
+    pub context_used: u64,
+    pub context_total: u64,
+    pub rate_5h: Option<f32>,
+    pub rate_7d: Option<f32>,
+    pub cost_usd: f64,
+}
+
 pub fn render_context_viz(
     frame: &mut Frame,
     state: &ContextVizState,
     area: Rect,
-    context_used: u64,
-    context_total: u64,
-    rate_5h: Option<f32>,
-    rate_7d: Option<f32>,
-    cost_usd: f64,
+    metrics: ContextVizMetrics,
 ) {
     if !state.visible {
         return;
@@ -74,8 +79,8 @@ pub fn render_context_viz(
     // bar_width: leave room for "  label  [" prefix (14 chars) and "] 100%" suffix (6 chars)
     let bar_width = (inner.width as usize).saturating_sub(22).max(4);
 
-    let ctx_pct = if context_total > 0 {
-        (context_used as f32 / context_total as f32).min(1.0)
+    let ctx_pct = if metrics.context_total > 0 {
+        (metrics.context_used as f32 / metrics.context_total as f32).min(1.0)
     } else {
         0.0
     };
@@ -105,8 +110,8 @@ pub fn render_context_viz(
         Span::styled(
             format!("]  {:.0}%  ({} / {})",
                 ctx_pct * 100.0,
-                format_tokens(context_used),
-                format_tokens(context_total),
+                format_tokens(metrics.context_used),
+                format_tokens(metrics.context_total),
             ),
             Style::default().fg(ctx_color),
         ),
@@ -120,7 +125,7 @@ pub fn render_context_viz(
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
     )]));
 
-    for (label, pct_opt) in &[("  5-hour ", rate_5h), ("  7-day  ", rate_7d)] {
+    for (label, pct_opt) in &[("  5-hour ", metrics.rate_5h), ("  7-day  ", metrics.rate_7d)] {
         match pct_opt {
             Some(pct) => {
                 let p = pct.clamp(0.0, 1.0);
@@ -159,7 +164,7 @@ pub fn render_context_viz(
     lines.push(Line::from(vec![
         Span::styled("  Session cost:  ", Style::default().fg(Color::White)),
         Span::styled(
-            format!("${:.4}", cost_usd),
+            format!("${:.4}", metrics.cost_usd),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -218,7 +223,18 @@ mod tests {
         let mut state = ContextVizState::new();
         state.open();
         terminal.draw(|frame| {
-            render_context_viz(frame, &state, frame.area(), 50_000, 200_000, Some(0.3), Some(0.1), 0.42);
+            render_context_viz(
+                frame,
+                &state,
+                frame.area(),
+                ContextVizMetrics {
+                    context_used: 50_000,
+                    context_total: 200_000,
+                    rate_5h: Some(0.3),
+                    rate_7d: Some(0.1),
+                    cost_usd: 0.42,
+                },
+            );
         }).unwrap();
         let content: String = terminal.backend().buffer().clone().content().iter()
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
@@ -232,7 +248,7 @@ mod tests {
         let state = ContextVizState::new();
         let before = terminal.backend().buffer().clone();
         terminal.draw(|frame| {
-            render_context_viz(frame, &state, frame.area(), 0, 0, None, None, 0.0);
+            render_context_viz(frame, &state, frame.area(), ContextVizMetrics::default());
         }).unwrap();
         assert_eq!(terminal.backend().buffer().content(), before.content());
     }

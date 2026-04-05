@@ -17,7 +17,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
+const CLAUDE_ORANGE: Color = Color::Rgb(255, 107, 0);    // #FF6B00 mango skin prompt accent
 const PROMPT_POINTER: &str = "\u{276f}";
 
 // ---------------------------------------------------------------------------
@@ -520,6 +520,7 @@ fn vim_idle(
     vim_normal(mode, text, cursor, key, yank_buf, pending, last_find, 1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vim_count(
     mode: &mut VimMode,
     text: &mut String,
@@ -779,7 +780,7 @@ fn vim_normal(
 }
 
 fn vim_g(
-    text: &mut String,
+    text: &str,
     cursor: &mut usize,
     key: &str,
     pending: &mut VimPendingState,
@@ -890,7 +891,7 @@ fn vim_operator(
     if key == "g" { *pending = VimPendingState::OperatorG { op, count }; return false; }
     // Simple motions
     let target = match key {
-        "h" => { let mut p = *cursor; for _ in 0..count.max(1) { if p > 0 { p -= 1; } } p }
+        "h" => { let mut p = *cursor; for _ in 0..count.max(1) { p = p.saturating_sub(1); } p }
         "l" => { let mut p = *cursor; for _ in 0..count.max(1) { if p < text.len() { p = text[p..].char_indices().nth(1).map(|(b,_)| p+b).unwrap_or(text.len()); } } p }
         "w" => { let mut p = *cursor; for _ in 0..count.max(1) { p = motion_w(text, p); } p }
         "b" => { let mut p = *cursor; for _ in 0..count.max(1) { p = motion_b(text, p); } p }
@@ -1619,7 +1620,7 @@ impl PromptInputState {
         while idx < chars.len() && chars[idx].is_whitespace() {
             idx += 1;
         }
-        self.cursor = self.cursor + char_idx_to_byte(rest, idx);
+        self.cursor += char_idx_to_byte(rest, idx);
     }
 
     /// Alt+D: Delete word after cursor.
@@ -2378,7 +2379,7 @@ impl PromptInputState {
 
     /// Rough token estimate: ~4 chars per token.
     fn update_token_estimate(&mut self) {
-        self.token_estimate = (self.text.len() + 3) / 4;
+        self.token_estimate = self.text.len().div_ceil(4);
     }
 
     pub fn is_empty(&self) -> bool { self.text.trim().is_empty() }
@@ -2401,7 +2402,7 @@ pub fn input_height(state: &PromptInputState) -> u16 {
         state.text.lines().count().max(1)
     };
     // top-line + text rows + bottom-line + 1 breathing-room row, at least 4, at most 12
-    let base = ((line_count as u16) + 3).max(4).min(12);
+    let base = ((line_count as u16) + 3).clamp(4, 12);
     // +1 for image pill row when images are pending
     base + if state.pending_images.is_empty() { 0 } else { 1 }
 }
@@ -3006,14 +3007,14 @@ mod tests {
     }
 
     #[test]
-    fn motion_W_B_basic() {
+    fn motion_w_b_basic() {
         // "foo.bar baz"  W from 0 → 8 ('b' of 'baz')
         assert_eq!(motion_W("foo.bar baz", 0), 8);
         assert_eq!(motion_B("foo.bar baz", 8), 0);
     }
 
     #[test]
-    fn motion_E_basic() {
+    fn motion_e_big_basic() {
         assert_eq!(motion_E("foo.bar baz", 0), 6); // end of 'foo.bar' WORD
     }
 
@@ -3024,7 +3025,7 @@ mod tests {
     }
 
     #[test]
-    fn motion_G_basic() {
+    fn motion_g_basic() {
         assert_eq!(motion_G("foo\nbar"), 4);
         assert_eq!(motion_G("single line"), 0);
     }
@@ -3051,7 +3052,7 @@ mod tests {
     }
 
     #[test]
-    fn motion_find_char_bigF() {
+    fn motion_find_char_big_f() {
         // F: search backward
         assert_eq!(motion_find_char("hello", 4, 'h', VimFindKind::BigF, 1), Some(0));
     }
@@ -3071,7 +3072,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_key_W_motion() {
+    fn vim_key_w_motion() {
         let mut mode = VimMode::Normal;
         let mut text = "foo.bar baz".to_string();
         let mut cursor = 0usize;
@@ -3083,7 +3084,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_key_G_last_line() {
+    fn vim_key_g_last_line() {
         let mut mode = VimMode::Normal;
         let mut text = "first\nsecond\nthird".to_string();
         let mut cursor = 0usize;
@@ -3212,7 +3213,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_key_X_delete_before_cursor() {
+    fn vim_key_x_delete_before_cursor() {
         let mut mode = VimMode::Normal;
         let mut text = "hello".to_string();
         let mut cursor = 4usize;
@@ -3251,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn vim_key_D_delete_to_eol() {
+    fn vim_key_d_delete_to_eol() {
         let mut mode = VimMode::Normal;
         let mut text = "hello world".to_string();
         let mut cursor = 6usize;
@@ -3688,7 +3689,7 @@ mod tests {
     }
 
     #[test]
-    fn search_N_finds_prev() {
+    fn search_n_big_finds_prev() {
         let mut s = PromptInputState::new();
         s.vim_mode = VimMode::Normal;
         s.text = "aa bb aa".to_string();

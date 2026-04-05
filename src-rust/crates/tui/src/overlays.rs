@@ -1,5 +1,5 @@
 // overlays.rs — All full-screen and floating overlays:
-//   - HelpOverlay (? / F1 / /help)
+//   - HelpOverlay (F1 / /help)
 //   - HistorySearchOverlay (Ctrl+R)
 //   - MessageSelectorOverlay (/rewind step 1)
 //   - RewindFlowOverlay (/rewind full multi-step flow)
@@ -12,12 +12,12 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-pub const MANGOCODE_ACCENT: Color = Color::Rgb(233, 30, 99);
-pub const MANGOCODE_PANEL_BG: Color = Color::Rgb(30, 30, 35);
-pub const MANGOCODE_PANEL_BORDER: Color = Color::Rgb(72, 72, 80);
-pub const MANGOCODE_TEXT: Color = Color::Rgb(235, 235, 240);
-pub const MANGOCODE_MUTED: Color = Color::Rgb(110, 110, 118);
-pub const MANGOCODE_OVERLAY_BG: Color = Color::Rgb(10, 10, 14);
+pub const MANGOCODE_ACCENT: Color = Color::Rgb(255, 176, 32);       // #FFB020 golden mango
+pub const MANGOCODE_PANEL_BG: Color = Color::Rgb(26, 20, 15);       // #1A140F warm dark brown
+pub const MANGOCODE_PANEL_BORDER: Color = Color::Rgb(90, 78, 65);   // warm medium brown
+pub const MANGOCODE_TEXT: Color = Color::Rgb(253, 246, 227);         // #FDF6E3 cream
+pub const MANGOCODE_MUTED: Color = Color::Rgb(138, 125, 115);       // #8A7D73 warm muted
+pub const MANGOCODE_OVERLAY_BG: Color = Color::Rgb(18, 14, 10);     // #120E0A deep warm brown
 
 // ---------------------------------------------------------------------------
 // Geometry helper (shared)
@@ -77,7 +77,7 @@ pub fn render_dialog_bg_buf(buf: &mut Buffer, area: Rect) {
 // HelpOverlay
 // ============================================================================
 
-/// State for the full-screen help overlay (? / F1 / /help).
+/// State for the full-screen help overlay (F1 / /help).
 #[derive(Debug, Default)]
 pub struct HelpOverlay {
     pub visible: bool,
@@ -275,7 +275,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
     for (key, desc) in &[
-        ("F1 / ?",          "Toggle help"),
+        ("F1",              "Toggle help"),
         ("Ctrl+C",          "Cancel / quit"),
         ("Ctrl+D",          "Quit (empty input)"),
         ("Ctrl+L",          "Clear screen"),
@@ -697,8 +697,8 @@ impl HistorySearchOverlay {
         // Sort: pinned entries always first, then by score descending.
         // Stable sort preserves insertion order for ties within each group.
         scored.sort_by(|a, b| {
-            let a_pinned = self.snapshot.get(a.snapshot_idx).map_or(false, |e| e.pinned);
-            let b_pinned = self.snapshot.get(b.snapshot_idx).map_or(false, |e| e.pinned);
+            let a_pinned = self.snapshot.get(a.snapshot_idx).is_some_and(|e| e.pinned);
+            let b_pinned = self.snapshot.get(b.snapshot_idx).is_some_and(|e| e.pinned);
             match (b_pinned, a_pinned) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
@@ -852,7 +852,7 @@ pub fn render_history_search_overlay(
                 })
                 .unwrap_or("");
 
-            let is_pinned = snap_entry.map_or(false, |e| e.pinned);
+            let is_pinned = snap_entry.is_some_and(|e| e.pinned);
 
             // Relative timestamp (right-aligned suffix)
             let time_suffix: String = snap_entry
@@ -953,10 +953,9 @@ fn build_highlighted_spans<'a>(
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut current_text = String::new();
     let mut current_highlighted = false;
-    let mut char_count = 0usize;
     let mut truncated = false;
 
-    for (byte_off, ch) in &chars {
+    for (char_count, (byte_off, ch)) in chars.iter().enumerate() {
         if char_count >= max_chars {
             truncated = true;
             break;
@@ -975,7 +974,6 @@ fn build_highlighted_spans<'a>(
         }
         current_highlighted = is_hl;
         current_text.push(*ch);
-        char_count += 1;
     }
     if !current_text.is_empty() {
         let style = if current_highlighted {
@@ -1398,25 +1396,22 @@ impl GlobalSearchState {
         if let Ok(out) = output {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    match val["type"].as_str() {
-                        Some("match") => {
-                            let data = &val["data"];
-                            let file = data["path"]["text"].as_str().unwrap_or("").to_string();
-                            let line_no = data["line_number"].as_u64().unwrap_or(0) as u32;
-                            let text = data["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n').to_string();
-                            let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
-                            self.results.push(SearchResult {
-                                file,
-                                line: line_no,
-                                col,
-                                text,
-                                context_before: Vec::new(),
-                                context_after: Vec::new(),
-                            });
-                            self.total_matches += 1;
-                            if self.results.len() >= 500 { break; }
-                        }
-                        _ => {}
+                    if let Some("match") = val["type"].as_str() {
+                        let data = &val["data"];
+                        let file = data["path"]["text"].as_str().unwrap_or("").to_string();
+                        let line_no = data["line_number"].as_u64().unwrap_or(0) as u32;
+                        let text = data["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n').to_string();
+                        let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
+                        self.results.push(SearchResult {
+                            file,
+                            line: line_no,
+                            col,
+                            text,
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        });
+                        self.total_matches += 1;
+                        if self.results.len() >= 500 { break; }
                     }
                 }
             }

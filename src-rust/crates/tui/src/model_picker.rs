@@ -21,8 +21,10 @@ use crate::overlays::centered_rect;
 /// is silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum EffortLevel {
     Low,
+    #[default]
     Normal,
     High,
     Max,
@@ -81,9 +83,6 @@ impl EffortLevel {
     }
 }
 
-impl Default for EffortLevel {
-    fn default() -> Self { Self::Normal }
-}
 
 // ---------------------------------------------------------------------------
 // Model capability helpers
@@ -715,18 +714,18 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         return;
     }
 
-    let _pink = Color::Rgb(233, 30, 99);
-    let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = Color::Rgb(30, 30, 35);
-    let highlight_bg = Color::Rgb(233, 30, 99);
+    let _pink = Color::Rgb(255, 176, 32);     // golden mango accent
+    let dim = Color::Rgb(138, 125, 115);      // warm muted
+    let dialog_bg = Color::Rgb(26, 20, 15);   // warm dark brown
+    let highlight_bg = Color::Rgb(255, 176, 32);
     let highlight_fg = Color::White;
 
     // ── Dark overlay ──
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_bg(Color::Rgb(10, 10, 14));
-                cell.set_fg(Color::Rgb(40, 40, 45));
+                cell.set_bg(Color::Rgb(18, 14, 10));     // warm dark overlay
+                cell.set_fg(Color::Rgb(60, 52, 45));     // warm dim text
             }
         }
     }

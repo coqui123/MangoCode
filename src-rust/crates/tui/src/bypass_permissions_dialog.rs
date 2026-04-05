@@ -89,46 +89,46 @@ pub fn render_bypass_permissions_dialog(
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // Body text (matches TS dialog copy)
-    lines.push(Line::from(vec![Span::styled(
-        "MangoCode running in Bypass Permissions mode",
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "In Bypass Permissions mode, MangoCode will NOT ask for your",
-        Style::default().fg(Color::White),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "approval before running potentially dangerous commands.",
-        Style::default().fg(Color::White),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "This mode should only be used in a sandboxed container or VM",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "that has restricted internet access and can easily be restored",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "if damaged.",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "By proceeding, you accept all responsibility for actions taken",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(vec![Span::styled(
-        "while running in Bypass Permissions mode.",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line<'static>> = vec![
+        // Body text (matches TS dialog copy)
+        Line::from(vec![Span::styled(
+            "MangoCode running in Bypass Permissions mode",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "In Bypass Permissions mode, MangoCode will NOT ask for your",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(vec![Span::styled(
+            "approval before running potentially dangerous commands.",
+            Style::default().fg(Color::White),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "This mode should only be used in a sandboxed container or VM",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            "that has restricted internet access and can easily be restored",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            "if damaged.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "By proceeding, you accept all responsibility for actions taken",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(vec![Span::styled(
+            "while running in Bypass Permissions mode.",
+            Style::default().fg(Color::DarkGray),
+        )]),
+        Line::from(""),
+        Line::from(""),
+    ];
 
     // Options
     let opt_no_style = if state.selected == 0 {

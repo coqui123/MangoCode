@@ -136,6 +136,12 @@ pub struct AgentEditorState {
     pub saved_message: Option<String>,
 }
 
+impl Default for AgentEditorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentEditorState {
     pub fn new() -> Self {
         Self {
@@ -372,7 +378,7 @@ pub fn load_agent_definitions(project_root: &std::path::Path) -> Vec<AgentDefini
         let Ok(entries) = std::fs::read_dir(dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "md") {
+            if path.extension().is_some_and(|e| e == "md") {
                 if let Some(def) = parse_agent_def(&path) {
                     defs.push(def);
                 }
@@ -387,10 +393,10 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
-    let (name, model, memory, description, tools, instructions) = if content.starts_with("---") {
-        let end = content[3..].find("\n---")? + 3;
-        let front = &content[3..end];
-        let body = content[end + 4..].trim().to_string();
+    let (name, model, memory, description, tools, instructions) = if let Some(stripped) = content.strip_prefix("---") {
+        let end = stripped.find("\n---")?;
+        let front = &stripped[..end];
+        let body = stripped[end + 4..].trim().to_string();
         let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
         let model = extract_yaml_str(front, "model");
         let memory = extract_yaml_str(front, "memory_scope")

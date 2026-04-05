@@ -150,6 +150,26 @@ pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuth
 // Terminal initialization / teardown helpers (public API)
 // ---------------------------------------------------------------------------
 
+/// Initialize the mango mascot Sixel data for high-quality rendering.
+/// Uses the highest-fidelity inline image protocol available:
+/// Kitty (best) -> iTerm -> Sixel -> text fallback.
+pub fn init_mascot(app: &mut App) {
+    use crate::kitty_image::{detect_image_protocol, ImageProtocol};
+    app.mascot_sixel = match detect_image_protocol() {
+        ImageProtocol::Kitty => {
+            crate::rustle::encode_svg_as_kitty_apc()
+                .or_else(crate::rustle::encode_svg_as_iterm_osc1337)
+                .or_else(crate::rustle::encode_svg_as_sixel)
+        }
+        ImageProtocol::Iterm => {
+            crate::rustle::encode_svg_as_iterm_osc1337()
+                .or_else(crate::rustle::encode_svg_as_sixel)
+        }
+        ImageProtocol::Sixel => crate::rustle::encode_svg_as_sixel(),
+        ImageProtocol::Text => None,
+    };
+}
+
 /// Set up the terminal for TUI mode (raw mode + alternate screen + mouse capture).
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
@@ -929,6 +949,7 @@ mod tests {
             tool_name: "Bash".to_string(),
             tool_id: "t1".to_string(),
             input_json: r#"{"command":"ls -la"}"#.to_string(),
+            parent_tool_use_id: None,
         });
         assert_eq!(app.tool_use_blocks.len(), 1);
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Running);
@@ -938,6 +959,7 @@ mod tests {
             tool_id: "t1".to_string(),
             result: "output".to_string(),
             is_error: false,
+            parent_tool_use_id: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Done);
     }
@@ -957,6 +979,7 @@ mod tests {
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
             is_error: true,
+            parent_tool_use_id: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Error);
         assert!(app.status_message.is_some());

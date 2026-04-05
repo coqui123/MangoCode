@@ -46,20 +46,20 @@ impl ColorPalette {
         }
     }
 
-    /// Default MangoCode theme
+    /// Default MangoCode theme — "Ripe Mango" warm tropical palette
     fn default_theme() -> Self {
         Self {
             error: Color::Rgb(255, 87, 51),        // Bright red-orange
-            success: Color::Rgb(76, 175, 80),      // Green
+            success: Color::Rgb(76, 175, 80),      // Mango leaf green (#4CAF50)
             warning: Color::Rgb(255, 152, 0),      // Orange
-            info: Color::Cyan,
-            action: Color::Cyan,
-            disabled: Color::DarkGray,
-            accent: Color::Cyan,
-            secondary_accent: Color::Rgb(233, 30, 99), // Magenta
-            text_light: Color::White,
-            text_dark: Color::Black,
-            border: Color::DarkGray,
+            info: Color::Rgb(255, 176, 32),        // Golden mango (#FFB020)
+            action: Color::Rgb(255, 107, 0),       // Mango skin (#FF6B00)
+            disabled: Color::Rgb(138, 125, 115),   // Warm muted (#8A7D73)
+            accent: Color::Rgb(255, 176, 32),      // Golden mango (#FFB020)
+            secondary_accent: Color::Rgb(255, 107, 0), // Mango skin (#FF6B00)
+            text_light: Color::Rgb(253, 246, 227), // Cream (#FDF6E3)
+            text_dark: Color::Rgb(26, 20, 15),     // Warm dark brown (#1A140F)
+            border: Color::Rgb(90, 78, 65),        // Warm medium brown
         }
     }
 

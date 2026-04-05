@@ -51,6 +51,12 @@ pub struct DeviceAuthDialogState {
     pub interval: u64,
 }
 
+impl Default for DeviceAuthDialogState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceAuthDialogState {
     pub fn new() -> Self {
         Self {
@@ -149,9 +155,9 @@ pub fn render_device_auth_dialog(
         return;
     }
 
-    let pink = Color::Rgb(233, 30, 99);
-    let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = Color::Rgb(30, 30, 35);
+    let pink = Color::Rgb(255, 176, 32);     // golden mango accent
+    let dim = Color::Rgb(138, 125, 115);     // warm muted
+    let dialog_bg = Color::Rgb(26, 20, 15);  // warm dark brown
     let green = Color::Rgb(80, 200, 120);
 
     // ── Darken the entire background ──

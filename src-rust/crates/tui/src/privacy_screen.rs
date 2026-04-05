@@ -140,22 +140,22 @@ pub fn render_privacy_screen(frame: &mut Frame, screen: &PrivacyScreen, area: Re
 
     frame.render_widget(Clear, dialog_area);
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    lines.push(Line::from(vec![Span::styled(
-        "  Privacy Settings",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-    )]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Use Space or Enter to toggle. Changes are saved immediately.",
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    )]));
-    lines.push(Line::from(""));
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![Span::styled(
+            "  Privacy Settings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  Use Space or Enter to toggle. Changes are saved immediately.",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )]),
+        Line::from(""),
+    ];
 
     for (i, toggle) in screen.toggles.iter().enumerate() {
         let is_selected = i == screen.selected_idx;

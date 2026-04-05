@@ -247,6 +247,12 @@ pub struct GoToLineDialog {
     pub total_lines: usize,
 }
 
+impl Default for GoToLineDialog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GoToLineDialog {
     pub fn new() -> Self {
         Self {
@@ -307,6 +313,12 @@ pub struct HistorySearch {
     pub matches: Vec<usize>,
     /// Which match is currently highlighted.
     pub selected: usize,
+}
+
+impl Default for HistorySearch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HistorySearch {
@@ -529,7 +541,7 @@ pub struct App {
 
     // ---- New overlay / notification fields --------------------------------
 
-    /// Full-screen help overlay (? / F1).
+    /// Full-screen help overlay (F1 / /help).
     pub help_overlay: HelpOverlay,
     /// Ctrl+R history search overlay.
     pub history_search_overlay: HistorySearchOverlay,
@@ -751,6 +763,11 @@ pub struct App {
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
     pub update_available: Option<String>,
+
+    // ---- Mascot image rendering -------------------------------------------
+    /// Pre-encoded inline image escape sequence for the mango mascot
+    /// (Kitty or Sixel). `None` if no inline image protocol is available.
+    pub mascot_sixel: Option<String>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1041,6 +1058,7 @@ impl App {
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
+            mascot_sixel: None,
         }
     }
 
@@ -1428,7 +1446,7 @@ impl App {
                 true
             }
             "help" => {
-                // Open the help overlay (same as pressing `?` or F1).
+                // Open the help overlay (same as pressing F1).
                 if !self.help_overlay.visible {
                     self.show_help = true;
                     self.help_overlay.toggle();
@@ -2864,10 +2882,6 @@ impl App {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
-            KeyCode::Char('?') if key.modifiers.is_empty() && !self.is_streaming => {
-                self.show_help = !self.show_help;
-                self.help_overlay.toggle();
-            }
 
             // ---- Ctrl+A: Open model picker ----
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
@@ -3667,7 +3681,6 @@ impl App {
                         // If this is the prefix-allow option ('P'), record the prefix.
                         self.maybe_record_bash_prefix();
                         self.permission_request = None;
-                        return;
                     }
                 }
             }
@@ -3758,7 +3771,7 @@ impl App {
         // For simplicity, we'll find the word based on whitespace and punctuation
         // In a full implementation, we'd map visual positions back to text offsets
         // For now, return a reasonable range around the click position
-        let start = col.saturating_sub(10).max(0);
+        let start = col.saturating_sub(10);
         let end = col.saturating_add(10);
         Some((start, end))
     }
@@ -4113,7 +4126,11 @@ impl App {
     /// Process a query event from the agentic loop.
     pub fn handle_query_event(&mut self, event: QueryEvent) {
         match event {
-            QueryEvent::Stream(stream_evt) => {
+            QueryEvent::Stream(stream_evt)
+            | QueryEvent::StreamWithParent {
+                event: stream_evt,
+                ..
+            } => {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
@@ -4156,7 +4173,12 @@ impl App {
                 }
             }
 
-            QueryEvent::ToolStart { tool_name, tool_id, input_json } => {
+            QueryEvent::ToolStart {
+                tool_name,
+                tool_id,
+                input_json,
+                ..
+            } => {
                 if !self.is_streaming && self.spinner_verb.is_none() {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
@@ -4186,6 +4208,7 @@ impl App {
                 tool_id,
                 result,
                 is_error,
+                ..
             } => {
                 // Build a multi-line preview: show up to 3 lines, truncate if more.
                 let all_lines: Vec<&str> = result.lines().collect();
@@ -4558,11 +4581,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn make_app() -> App {
         let config = Config::default();
         let cost_tracker = mangocode_core::cost::CostTracker::new();
         App::new(config, cost_tracker)
+    }
+
+    fn key_press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     #[test]
@@ -4692,6 +4725,18 @@ mod tests {
         // Second call while already open should leave it open (not toggle it off).
         assert!(app.intercept_slash_command("help"));
         assert!(app.help_overlay.visible);
+    }
+
+    #[test]
+    fn test_question_mark_in_prompt_inserts_literal_character() {
+        let mut app = make_app();
+        app.set_prompt_text("hello".to_string());
+
+        let _ = app.handle_key_event(key_press(KeyCode::Char('?'), KeyModifiers::empty()));
+
+        assert_eq!(app.prompt_input.text, "hello?");
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
     }
 
     // ---- Bash prefix allowlist ----------------------------------------------

@@ -6,7 +6,7 @@ use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
 use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
-use crate::rustle::{rustle_lines, RustlePose};
+use crate::rustle::rustle_lines_sized;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
 use crate::session_browser::render_session_browser;
@@ -60,8 +60,34 @@ const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', 
 #[cfg(not(target_os = "windows"))]
 const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
                             '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
-const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
-const WELCOME_BOX_HEIGHT: u16 = 12;
+const CLAUDE_ORANGE: Color = Color::Rgb(255, 176, 32);   // #FFB020 golden mango
+const MIN_WELCOME_BOX_HEIGHT: u16 = 10;
+const MAX_WELCOME_BOX_HEIGHT: u16 = 20;
+
+// ---------------------------------------------------------------------------
+// Inline image post-draw blit
+// ---------------------------------------------------------------------------
+// During render_welcome_box we record the blit position; after terminal.draw()
+// the event loop calls `flush_sixel_blit()` to write the inline image on top.
+thread_local! {
+    static SIXEL_BLIT: RefCell<Option<(u16, u16)>> = RefCell::new(None);
+}
+
+/// Write any pending inline mascot image to stdout.
+/// Call this **after** `terminal.draw()` so ratatui's buffer flush doesn't
+/// overwrite the image.  Pass the same `App` that was used for rendering.
+pub fn flush_sixel_blit(app: &App) {
+    SIXEL_BLIT.with(|cell| {
+        let pos = cell.borrow_mut().take();
+        if let (Some((row, col)), Some(ref image_escape)) = (pos, &app.mascot_sixel) {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            // ANSI cursor position is 1-indexed.
+            let _ = write!(stdout, "\x1b[{};{}H{}", row + 1, col + 1, image_escape);
+            let _ = stdout.flush();
+        }
+    });
+}
 
 fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
@@ -375,7 +401,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // Fill the entire frame with a black background so the terminal's default
     // color (blue on Windows) doesn't bleed through cells not covered by widgets.
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black).fg(Color::White)),
+        Block::default().style(Style::default().bg(Color::Rgb(26, 20, 15)).fg(Color::Rgb(253, 246, 227))),
         size,
     );
 
@@ -607,11 +633,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             frame,
             &app.context_viz,
             size,
-            app.context_used_tokens,
-            app.context_window_size,
-            app.rate_limit_5h_pct,
-            app.rate_limit_7day_pct,
-            app.cost_usd,
+            crate::context_viz::ContextVizMetrics {
+                context_used: app.context_used_tokens,
+                context_total: app.context_window_size,
+                rate_5h: app.rate_limit_5h_pct,
+                rate_7d: app.rate_limit_7day_pct,
+                cost_usd: app.cost_usd,
+            },
         );
     }
 
@@ -828,8 +856,26 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let notice_lines = startup_notice_lines(app, content_area.width);
-    let header_height = WELCOME_BOX_HEIGHT + notice_lines.len() as u16;
-    let show_logo_header = content_area.height >= header_height + 3 && content_area.width >= 60;
+    let notice_height = notice_lines.len() as u16;
+    let is_idle_welcome = app.messages.is_empty() && app.streaming_text.is_empty();
+    // Keep a little transcript space on first launch, but not so much that it
+    // suppresses the mascot/header on medium-height terminals.
+    let min_message_rows = if is_idle_welcome { 2 } else { 3 };
+    // Dynamic welcome height: cap by absolute max and by a screen ratio so it
+    // stays visually compact on large terminals.
+    let available_for_welcome = content_area.height.saturating_sub(notice_height + min_message_rows);
+    let proportional_cap = content_area
+        .height
+        .saturating_mul(40)
+        .saturating_div(100)
+        .max(MIN_WELCOME_BOX_HEIGHT);
+    let min_welcome_height = MIN_WELCOME_BOX_HEIGHT.min(available_for_welcome);
+    let welcome_box_height = available_for_welcome
+        .min(MAX_WELCOME_BOX_HEIGHT)
+        .min(proportional_cap)
+        .max(min_welcome_height);
+    let header_height = welcome_box_height + notice_height;
+    let show_logo_header = content_area.height >= header_height + min_message_rows && content_area.width >= 48;
     let (logo_area, notices_area, msg_area) = if show_logo_header {
         let splits = Layout::default()
             .direction(Direction::Vertical)
@@ -841,8 +887,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             let header_splits = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(WELCOME_BOX_HEIGHT),
-                    Constraint::Length(notice_lines.len() as u16),
+                    Constraint::Length(welcome_box_height),
+                    Constraint::Length(notice_height),
                 ])
                 .split(splits[0]);
             (Some(header_splits[0]), Some(header_splits[1]), splits[1])
@@ -859,7 +905,22 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.messages.is_empty() && app.streaming_text.is_empty() {
         app.last_msg_area.set(Rect::default());
         app.message_row_map.borrow_mut().clear();
-        render_welcome_box(frame, app, content_area);
+        // In compact-mode terminals, keep startup content in a bounded top slice
+        // instead of consuming the full pane height.
+        let compact_header_height = if content_area.height >= MIN_WELCOME_BOX_HEIGHT {
+            (welcome_box_height + notice_height)
+                .max(MIN_WELCOME_BOX_HEIGHT)
+                .min(content_area.height)
+        } else {
+            content_area.height
+        };
+        let compact_header_area = Rect {
+            x: content_area.x,
+            y: content_area.y,
+            width: content_area.width,
+            height: compact_header_height,
+        };
+        render_welcome_box(frame, app, compact_header_area);
         return;
     }
 
@@ -941,8 +1002,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             .viewport_content_length(visible_height as usize);
 
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .thumb_style(Style::default().fg(Color::Rgb(233, 30, 99)))  // pink thumb
-            .track_style(Style::default().fg(Color::Rgb(40, 40, 50)));  // dark track
+            .thumb_style(Style::default().fg(Color::Rgb(255, 176, 32)))  // golden mango thumb
+            .track_style(Style::default().fg(Color::Rgb(50, 42, 35)));  // warm dark track
 
         frame.render_stateful_widget(scrollbar, msg_area, &mut scrollbar_state);
     }
@@ -1032,7 +1093,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     let ann_start = raw.len();
                     render_system_annotation_lines(&mut raw, ann, width as usize);
                     message_indices.extend(
-                        std::iter::repeat(None).take(raw.len().saturating_sub(ann_start)),
+                        std::iter::repeat_n(None, raw.len().saturating_sub(ann_start)),
                     );
                 }
                 if i < total {
@@ -1043,7 +1104,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                         header_indices.insert(msg_start);
                     }
                     message_indices.extend(
-                        std::iter::repeat(Some(i)).take(raw.len().saturating_sub(msg_start)),
+                        std::iter::repeat_n(Some(i), raw.len().saturating_sub(msg_start)),
                     );
                 }
             }
@@ -1120,25 +1181,25 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // Shorten cwd: replace $USERPROFILE/$HOME prefix with ~
     let cwd = std::env::current_dir()
         .ok()
-        .and_then(|p| {
+        .map(|p| {
             let home = std::env::var("USERPROFILE")
                 .or_else(|_| std::env::var("HOME"))
                 .ok();
             if let Some(h) = home {
                 let hs = p.display().to_string();
                 if hs.starts_with(&h) {
-                    return Some(format!("~{}", &hs[h.len()..]));
+                    return format!("~{}", &hs[h.len()..]);
                 }
             }
-            Some(p.display().to_string())
+            p.display().to_string()
         })
         .unwrap_or_else(|| ".".to_string());
 
     // --- Box dimensions ---
-    // The box should be at most the full area width, and a fixed height.
-    let box_width = area.width.min(area.width);
-    let box_height: u16 = WELCOME_BOX_HEIGHT;
-    if area.height < box_height || box_width < 30 {
+    // The box fills the allocated area (height is dynamic from the caller).
+    let box_width = area.width;
+    let box_height = area.height;
+    if box_height < MIN_WELCOME_BOX_HEIGHT || box_width < 30 {
         // Too small: fall back to a single line
         let line = Line::from(vec![
             Span::styled("MangoCode ", Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD)),
@@ -1169,8 +1230,11 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Split inner into left | divider(1) | right
-    // Left width: ~28 chars or half the inner width, whichever is smaller
-    let left_w = (inner.width / 2).max(22).min(32).min(inner.width.saturating_sub(3));
+    // Left width: half of the inner width (with a floor), so the mascot can
+    // use more detail on wide terminals instead of being capped to 32 columns.
+    let left_w = (inner.width / 2)
+        .max(22)
+        .min(inner.width.saturating_sub(3));
     let right_w = inner.width.saturating_sub(left_w + 1);
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1197,24 +1261,62 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Welcome back!".to_string()
     };
-    let rustle = rustle_lines(&RustlePose::Default);
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(
         welcome_msg,
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Rgb(253, 246, 227)).add_modifier(Modifier::BOLD),
     )));
-    left_lines.push(Line::from(""));
-    // Center mascot in left column
-    let mascot_indent = left_w.saturating_sub(11) / 2;
-    let pad = " ".repeat(mascot_indent as usize);
-    for cl in &rustle {
+    let header_gap_lines: u16 = if inner.height >= 15 { 1 } else { 0 };
+    if header_gap_lines > 0 {
+        left_lines.push(Line::from(""));
+    }
+
+    // Mascot: compute available rows.
+    let show_model_line = app.has_credentials && inner.height >= 14;
+    let show_cwd_line = inner.height >= 18;
+    let spacer_after_mascot: u16 = if (show_model_line || show_cwd_line) && inner.height >= 14 { 1 } else { 0 };
+    let fixed_lines: u16 = 1 + header_gap_lines + spacer_after_mascot + (show_model_line as u16) + (show_cwd_line as u16);
+    let mascot_max_rows = inner.height.saturating_sub(fixed_lines);
+
+    // Schedule high-quality inline image rendering (Kitty/Sixel) when available.
+    // We still render text fallback below; supported terminals will overlay the
+    // inline image on top, unsupported terminals keep the fallback.
+    let inline_image_ready = app.mascot_sixel.is_some() && mascot_max_rows >= 3;
+    if inline_image_ready {
+        let mascot_y = h_chunks[0].y + 1 + header_gap_lines; // after welcome + optional gap
+        let mascot_x = h_chunks[0].x + 1;
+        // Schedule the inline image blit for after terminal.draw() flushes.
+        SIXEL_BLIT.with(|cell| {
+            *cell.borrow_mut() = Some((mascot_y, mascot_x));
+        });
+    }
+
+    // Text fallback: quadrant-block SVG rendering.
+    let rustle = rustle_lines_sized(mascot_max_rows);
+    // rustle_lines_sized() appends one blank spacer line; trim that here so
+    // we avoid double-padding beneath the mascot in compact layouts.
+    let rustle_end = rustle
+        .iter()
+        .rposition(|line| !line.spans.iter().all(|span| span.content.is_empty()))
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let rustle_view = &rustle[..rustle_end];
+
+    let mascot_w = rustle_view.first().map_or(0, |l| {
+        l.spans.iter().map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref())).sum::<usize>()
+    });
+    let mascot_indent = (left_w as usize).saturating_sub(mascot_w) / 2;
+    let pad = " ".repeat(mascot_indent);
+    for cl in rustle_view {
         let mut spans = vec![Span::raw(pad.clone())];
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
     }
-    left_lines.push(Line::from(""));
+    if spacer_after_mascot > 0 {
+        left_lines.push(Line::from(""));
+    }
     // Only show model line if credentials are configured
-    if app.has_credentials {
+    if show_model_line {
         let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
             if provider == "anthropic" {
                 model.to_string()
@@ -1229,10 +1331,12 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-    left_lines.push(Line::from(Span::styled(
-        cwd,
-        Style::default().fg(Color::DarkGray),
-    )));
+    if show_cwd_line {
+        left_lines.push(Line::from(Span::styled(
+            cwd,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     frame.render_widget(Paragraph::new(left_lines).wrap(Wrap { trim: false }), h_chunks[0]);
 
@@ -1251,7 +1355,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     for chunk in tip_text.chars().collect::<Vec<_>>().chunks(right_w_usize.max(1)) {
         right_lines.push(Line::from(chunk.iter().collect::<String>()));
     }
-    right_lines.push(Line::from(""));
+    if inner.height >= 14 {
+        right_lines.push(Line::from(""));
+    }
     right_lines.push(Line::from(Span::styled(
         "Recent activity",
         Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
@@ -1378,7 +1484,7 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error
     let (icon_color, name_color) = match block.status {
         ToolStatus::Running => {
-            let blink_on = (frame_count / 4) % 2 == 0;
+            let blink_on = (frame_count / 4).is_multiple_of(2);
             let c = if blink_on { Color::Yellow } else { Color::DarkGray };
             (c, Color::White)
         }
@@ -1496,8 +1602,8 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
             _ => "build",
         };
 
-        let pink = Color::Rgb(233, 30, 99);
-        let dim = Color::Rgb(80, 80, 80);
+        let pink = Color::Rgb(255, 107, 0);     // #FF6B00 mango skin accent
+        let dim = Color::Rgb(138, 125, 115);     // warm muted
 
         let status_line = if app.has_credentials {
             // Show model (strip provider prefix for compact display).
@@ -1544,7 +1650,7 @@ fn should_render_status_row(app: &App) -> bool {
     app.voice_recording
         || app.is_streaming
         || app.last_turn_elapsed.is_some()
-        || (!app.is_streaming && app.status_message.is_some())
+        || app.status_message.is_some()
 }
 
 fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
@@ -1639,7 +1745,7 @@ fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
 // -----------------------------------------------------------------------
 
 /// Single footer line matching the TS contract more closely:
-/// - `? for shortcuts` is suppressed once the prompt becomes non-empty
+/// - `F1 for shortcuts` is suppressed once the prompt becomes non-empty
 /// - the right side shows comprehensive status info and notifications
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
@@ -1775,7 +1881,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // During streaming show "esc to interrupt"; otherwise "? for shortcuts" when idle
+        // During streaming show "esc to interrupt"; otherwise "F1 for shortcuts" when idle
         if spans.is_empty() {
             if app.is_streaming {
                 spans.push(Span::styled(
@@ -1784,7 +1890,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ));
             } else if app.prompt_input.text.is_empty() {
                 spans.push(Span::styled(
-                    "? for shortcuts",
+                    "F1 for shortcuts",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -1987,11 +2093,33 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         .sum();
     let gap = (area.width as usize).saturating_sub(left_len + right_len);
 
-    let mut spans = left_spans;
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.extend(right_spans);
+    // Inverted mango status bar: golden #FFB020 background, dark #1A140F default text.
+    // Semantic colors (Red, Yellow, Green, etc.) are preserved for important indicators;
+    // only unstyled/DarkGray text gets the dark-on-golden treatment.
+    let bar_bg = Color::Rgb(255, 176, 32);
+    let bar_fg = Color::Rgb(26, 20, 15);
+    let bar_base = Style::default().fg(bar_fg).bg(bar_bg);
 
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+    let restyle = |span: Span<'static>| -> Span<'static> {
+        let orig = span.style;
+        // Preserve explicit semantic foreground colors (Red, Yellow, Green, etc.)
+        // Only override default/reset/DarkGray fg to the dark bar text color.
+        let fg = match orig.fg {
+            Some(Color::DarkGray) | Some(Color::Reset) | None => bar_fg,
+            Some(c) => c,
+        };
+        let mut s = Style::default().fg(fg).bg(bar_bg);
+        if orig.add_modifier.contains(Modifier::BOLD) {
+            s = s.add_modifier(Modifier::BOLD);
+        }
+        Span::styled(span.content, s)
+    };
+
+    let mut spans: Vec<Span> = left_spans.into_iter().map(restyle).collect();
+    spans.push(Span::styled(" ".repeat(gap), bar_base));
+    spans.extend(right_spans.into_iter().map(restyle));
+
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]).style(bar_base), area);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
@@ -2111,7 +2239,7 @@ fn render_simple_help_overlay(frame: &mut Frame, area: Rect) {
         kb_line("Up / Down", "Navigate input history"),
         kb_line("Ctrl+R", "Search input history"),
         kb_line("PageUp / PageDown", "Scroll messages"),
-        kb_line("F1 / ?", "Toggle this help"),
+        kb_line("F1", "Toggle this help"),
         Line::from(""),
         Line::from(vec![Span::styled(
             " Permission Dialog",
@@ -2126,7 +2254,7 @@ fn render_simple_help_overlay(frame: &mut Frame, area: Rect) {
         kb_line("Esc", "Deny (close dialog)"),
         Line::from(""),
         Line::from(vec![Span::styled(
-            " press F1 or ? to close ",
+            " press Esc, F1, or ? to close ",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -2363,7 +2491,7 @@ pub fn render_full_status_line(data: &StatusLineData, area: Rect, buf: &mut rata
 
     let line = Line::from(spans);
     Paragraph::new(line)
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(Color::Rgb(26, 20, 15)))
         .render(area, buf);
 }
 

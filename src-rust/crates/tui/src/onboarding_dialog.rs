@@ -112,8 +112,8 @@ pub fn render_onboarding_dialog(
 }
 
 fn render_provider_setup_page(frame: &mut Frame, area: Rect) {
-    // Theme pink — matches the header and mascot
-    let pink = Color::Rgb(233, 30, 99);
+    // Theme golden — matches the header and mascot
+    let pink = Color::Rgb(255, 176, 32);
     let dim = Color::Rgb(100, 100, 100);
 
     let block = Block::default()

@@ -309,7 +309,7 @@ fn write_text_windows_w(text: &str) -> bool {
     use std::io::Write;
     use std::process::Stdio;
     // PowerShell Set-Clipboard reads from stdin via pipe
-    let script = format!("[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $input | Set-Clipboard");
+    let script = "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $input | Set-Clipboard".to_string();
     let mut child = match Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
         .stdin(Stdio::piped())

@@ -3,10 +3,12 @@
 // Strategy:
 //   1. Detect which image protocol the terminal supports:
 //      - Kitty: $TERM contains "kitty" OR $TERM_PROGRAM is "WezTerm"
+//      - iTerm: $TERM_PROGRAM is "iTerm.app"
 //      - Sixel: $TERM contains xterm/screen/rxvt/mintty/iterm2
 //      - Text: fallback to human-readable description
 //   2. If base64 PNG/JPEG data is available:
 //      - Kitty: emit APC escape sequence directly
+//      - iTerm: emit OSC 1337 inline-image sequence
 //      - Sixel: decode base64 → PNG/JPEG → convert to Sixel → emit escape sequence
 //      - Text: return a placeholder string
 //   3. For URL sources: always fall back to text (no remote fetching)
@@ -34,6 +36,7 @@ const SIXEL_LINE_SIZE: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageProtocol {
     Kitty,
+    Iterm,
     Sixel,
     Text,
 }
@@ -42,9 +45,21 @@ pub enum ImageProtocol {
 ///
 /// Returns:
 /// - `ImageProtocol::Kitty` if $TERM contains "kitty" or $TERM_PROGRAM is "WezTerm"
+/// - `ImageProtocol::Iterm` if $TERM_PROGRAM is "iTerm.app"
 /// - `ImageProtocol::Sixel` if $TERM contains xterm/screen/rxvt/mintty/iterm
 /// - `ImageProtocol::Text` as fallback
 pub fn detect_image_protocol() -> ImageProtocol {
+    // Explicit override for testing/debugging protocol behavior.
+    if let Ok(force) = std::env::var("MANGOCODE_IMAGE_PROTOCOL") {
+        match force.trim().to_ascii_lowercase().as_str() {
+            "kitty" => return ImageProtocol::Kitty,
+            "iterm" | "osc1337" | "imgcat" => return ImageProtocol::Iterm,
+            "sixel" => return ImageProtocol::Sixel,
+            "text" | "none" => return ImageProtocol::Text,
+            _ => {}
+        }
+    }
+
     // Check for Kitty protocol (highest priority)
     if let Ok(term) = std::env::var("TERM") {
         if term.contains("kitty") {
@@ -56,11 +71,18 @@ pub fn detect_image_protocol() -> ImageProtocol {
         if prog.eq_ignore_ascii_case("WezTerm") {
             return ImageProtocol::Kitty;
         }
+        if prog.eq_ignore_ascii_case("iTerm.app") {
+            return ImageProtocol::Iterm;
+        }
     }
 
     // Check for Sixel protocol (medium priority)
+    // Windows Terminal (v1.22+) supports Sixel; detected via WT_SESSION env var.
+    if std::env::var("WT_SESSION").is_ok() {
+        return ImageProtocol::Sixel;
+    }
+
     if let Ok(term) = std::env::var("TERM") {
-        // xterm variants, screen/tmux, rxvt variants, mintty, iterm2
         if term.contains("xterm")
             || term.contains("screen")
             || term.contains("rxvt")
@@ -108,6 +130,10 @@ pub fn render_image(source: &ImageSource) -> Option<String> {
             ImageProtocol::Kitty => {
                 emit_kitty_apc(data, source.media_type.as_deref());
                 return None; // successfully emitted — caller skips text line
+            }
+            ImageProtocol::Iterm => {
+                emit_iterm_osc1337(data, source.media_type.as_deref());
+                return None;
             }
             ImageProtocol::Sixel => {
                 if emit_sixel(data, source.media_type.as_deref()) {
@@ -183,6 +209,33 @@ fn emit_kitty_apc(base64_data: &str, media_type: Option<&str>) {
         // Write the APC sequence: ESC _ G <params> ; <base64-chunk> ESC \
         let _ = write!(stdout, "\x1b_G{};{}\x1b\\", params, chunk);
     }
+
+    // Move to a new line so subsequent ratatui output begins cleanly.
+    let _ = write!(stdout, "\r\n");
+    let _ = stdout.flush();
+}
+
+/// Emit an iTerm OSC 1337 inline image sequence.
+///
+/// Sequence shape:
+///   ESC ] 1337 ; File=inline=1;size=<bytes>;width=auto;height=auto : <base64> BEL
+fn emit_iterm_osc1337(base64_data: &str, _media_type: Option<&str>) {
+    let mut stdout = std::io::stdout();
+
+    // Strip any whitespace/newlines that may have been inserted into the
+    // base64 string.
+    let clean: String = base64_data.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.is_empty() {
+        return;
+    }
+
+    let approx_size = clean.len() * 3 / 4;
+    let _ = write!(
+        stdout,
+        "\x1b]1337;File=inline=1;size={};width=auto;height=auto:{}\x07",
+        approx_size,
+        clean
+    );
 
     // Move to a new line so subsequent ratatui output begins cleanly.
     let _ = write!(stdout, "\r\n");
@@ -337,23 +390,15 @@ fn convert_to_sixel(img_data: &ImageData) -> Result<Vec<u8>, Box<dyn std::error:
 
 /// Emit Sixel escape sequence to stdout.
 ///
-/// The sixel_output from icy_sixel is the raw Sixel data (without delimiters).
-/// We wrap it with the proper escape sequence: ESC P ... ESC \
+/// `icy_sixel::encoder::sixel_encode` already returns the full DCS-wrapped
+/// sequence (`ESC P ... ESC \`), so we emit it verbatim.
 fn emit_sixel_sequence(sixel_data: &[u8]) {
     let mut stdout = std::io::stdout();
 
-    // Write the escape sequence introduction: ESC P q
-    let _ = write!(stdout, "\x1bPq");
-
     // Write sixel data in chunks to respect terminal line limits
     for chunk in sixel_data.chunks(SIXEL_LINE_SIZE) {
-        if let Ok(s) = std::str::from_utf8(chunk) {
-            let _ = write!(stdout, "{}", s);
-        }
+        let _ = stdout.write_all(chunk);
     }
-
-    // End sequence: ESC \
-    let _ = write!(stdout, "\x1b\\");
 
     // Move to a new line so subsequent output begins cleanly
     let _ = write!(stdout, "\r\n");

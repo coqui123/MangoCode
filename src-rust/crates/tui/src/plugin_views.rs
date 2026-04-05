@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn find_first_undismissed() {
-        let hints = vec![
+        let hints = [
             {
                 let mut b = PluginHintBanner::new("a", "msg a");
                 b.dismiss();

@@ -58,8 +58,8 @@ const MAX_USER_PROMPT_DISPLAY_CHARS: usize = 10_000;
 const TRUNCATE_USER_PROMPT_HEAD_CHARS: usize = 2_500;
 const TRUNCATE_USER_PROMPT_TAIL_CHARS: usize = 2_500;
 
-/// Claude orange: Rgb(215, 119, 87)
-const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
+/// Golden mango accent
+const CLAUDE_ORANGE: Color = Color::Rgb(255, 176, 32);
 
 const TOOL_RESULT_MAX_LINES: usize = 30;
 
@@ -330,7 +330,7 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
-    let preview_max = (width as usize).saturating_sub(prefix_len).max(20).min(120);
+    let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
     let preview: String = content.chars().take(preview_max).collect();
     let preview = if content.chars().count() > preview_max {
         format!("{preview}\u{2026}")
@@ -623,7 +623,7 @@ fn prefix_message_lines(
         Role::User => (
             "› ",
             Style::default()
-                .fg(Color::Rgb(233, 30, 99))
+                .fg(Color::Rgb(255, 107, 0))
                 .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),

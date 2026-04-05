@@ -181,11 +181,11 @@ pub fn render_dialog_select(
         return;
     }
 
-    let dim = Color::Rgb(90, 90, 90);
-    let dialog_bg = Color::Rgb(30, 30, 35);
-    let highlight_bg = Color::Rgb(233, 30, 99); // pink highlight bar
-    let highlight_fg = Color::White;
-    let category_fg = Color::Rgb(233, 30, 99); // pink category names
+    let dim = Color::Rgb(138, 125, 115);
+    let dialog_bg = Color::Rgb(26, 20, 15);
+    let highlight_bg = Color::Rgb(255, 176, 32); // golden mango highlight bar
+    let highlight_fg = Color::Rgb(26, 20, 15);  // dark text on golden bg
+    let category_fg = Color::Rgb(255, 176, 32); // golden category names
 
     // ── Darken the entire background ──
     render_dark_overlay(frame, area);
