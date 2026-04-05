@@ -526,7 +526,7 @@ fn pattern_error(px: &[(u8, u8, u8); 4], pat: u8, fg: (u8, u8, u8), bg: (u8, u8,
 /// Build a styled Span for `n` repetitions of a quadrant character.
 #[allow(dead_code)]
 fn make_span(ch: char, fg: (u8, u8, u8), bg: (u8, u8, u8), n: usize) -> Span<'static> {
-    let s: String = std::iter::repeat(ch).take(n).collect();
+    let s: String = std::iter::repeat_n(ch, n).collect();
     let style = if ch == '█' {
         Style::default().fg(Color::Rgb(fg.0, fg.1, fg.2))
     } else if ch == ' ' {
@@ -613,7 +613,7 @@ pub fn encode_svg_as_kitty_apc() -> Option<String> {
     let mut out = String::new();
 
     const KITTY_CHUNK_SIZE: usize = 4096;
-    let total = (b64.len() + KITTY_CHUNK_SIZE - 1) / KITTY_CHUNK_SIZE;
+    let total = b64.len().div_ceil(KITTY_CHUNK_SIZE);
 
     for (i, chunk) in b64.as_bytes().chunks(KITTY_CHUNK_SIZE).enumerate() {
         let more = if i + 1 == total { 0u8 } else { 1u8 };

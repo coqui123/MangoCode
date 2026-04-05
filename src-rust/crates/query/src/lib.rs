@@ -1102,12 +1102,26 @@ pub async fn run_query_loop(
 
                     // Accumulators for building the final assistant message.
                     let mut text_chunks: Vec<String> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
+                    // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
+                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
                         std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
+                    let mut stream_error: Option<String> = None;
+                    let mut received_message_stop = false;
+                    // Per-chunk timeout: how long we wait for stream.next() to
+                    // yield before giving up.  This is a hard wall-clock bound
+                    // that fires even if the underlying byte stream keeps
+                    // delivering keepalive / empty chunks internally.
+                    let stream_idle_timeout = std::time::Duration::from_secs(45);
+                    // Logical inactivity watchdog: if we've received at least
+                    // one meaningful event (text, tool, message_start) but then
+                    // nothing meaningful arrives for this duration, we assume
+                    // the turn is stuck and break out.
+                    let logical_inactivity_limit = std::time::Duration::from_secs(20);
+                    let mut last_meaningful_stream_event = tokio::time::Instant::now();
+                    let mut had_any_content = false;
 
                     use futures::StreamExt as ProviderStreamExt;
                     loop {
@@ -1115,14 +1129,56 @@ pub async fn run_query_loop(
                             _ = cancel_token.cancelled() => {
                                 return QueryOutcome::Cancelled;
                             }
-                            event = stream.next() => {
+                            // Logical inactivity watchdog: fires when we've had
+                            // content but no meaningful progress for the limit.
+                            // This works even if stream.next() is stuck because
+                            // it's a separate branch in the select!.
+                            _ = tokio::time::sleep_until(last_meaningful_stream_event + logical_inactivity_limit), if had_any_content => {
+                                warn!(
+                                    provider = %provider_id_str,
+                                    elapsed_secs = last_meaningful_stream_event.elapsed().as_secs(),
+                                    "Provider stream logical inactivity timeout — had content but no MessageStop"
+                                );
+                                stream_error = Some(format!(
+                                    "logical inactivity timeout after {}s (content received but stream did not terminate)",
+                                    last_meaningful_stream_event.elapsed().as_secs()
+                                ));
+                                break;
+                            }
+                            event = tokio::time::timeout(stream_idle_timeout, stream.next()) => {
                                 match event {
-                                    None => break,
-                                    Some(Err(e)) => {
-                                        error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                    Err(_) => {
+                                        warn!(
+                                            provider = %provider_id_str,
+                                            timeout_secs = stream_idle_timeout.as_secs(),
+                                            "Provider stream idle timeout"
+                                        );
+                                        stream_error = Some(format!(
+                                            "stream idle timeout after {}s",
+                                            stream_idle_timeout.as_secs()
+                                        ));
                                         break;
                                     }
-                                    Some(Ok(evt)) => {
+                                    Ok(None) => break,
+                                    Ok(Some(Err(e))) => {
+                                        error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        stream_error = Some(e.to_string());
+                                        break;
+                                    }
+                                    Ok(Some(Ok(evt))) => {
+                                        // Track meaningful progress for the inactivity watchdog.
+                                        match &evt {
+                                            mangocode_api::StreamEvent::MessageStart { .. }
+                                            | mangocode_api::StreamEvent::TextDelta { .. }
+                                            | mangocode_api::StreamEvent::InputJsonDelta { .. }
+                                            | mangocode_api::StreamEvent::ContentBlockStart { .. }
+                                            | mangocode_api::StreamEvent::MessageStop => {
+                                                last_meaningful_stream_event = tokio::time::Instant::now();
+                                                had_any_content = true;
+                                            }
+                                            _ => {}
+                                        }
+
                                         // Forward to TUI via AnthropicStreamEvent mapping.
                                         if let Some(ref tx) = event_tx {
                                             if let Some(ae) = map_to_anthropic_event(&evt) {
@@ -1142,14 +1198,22 @@ pub async fn run_query_loop(
                                                 index,
                                                 content_block: ContentBlock::ToolUse { id, name, .. },
                                             } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new()));
+                                                tool_call_blocks.insert(
+                                                    *index,
+                                                    (id.clone(), name.clone(), String::new(), None),
+                                                );
                                             }
                                             mangocode_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
                                             mangocode_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
+                                                if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
+                                                }
+                                            }
+                                            mangocode_api::StreamEvent::SignatureDelta { index, signature } => {
+                                                if let Some((_, _, _, sig)) = tool_call_blocks.get_mut(index) {
+                                                    *sig = Some(signature.clone());
                                                 }
                                             }
                                             mangocode_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
@@ -1161,14 +1225,65 @@ pub async fn run_query_loop(
                                                 if let Some(u) = u {
                                                     usage.output_tokens = u.output_tokens;
                                                 }
+
+                                                // Defensive fallback: some providers may emit
+                                                // a terminal MessageDelta but fail to follow
+                                                // with MessageStop. Treat a terminal delta as
+                                                // end-of-stream so the UI never hangs.
+                                                if stop_reason.is_some() {
+                                                    received_message_stop = true;
+                                                    break;
+                                                }
                                             }
-                                            mangocode_api::StreamEvent::MessageStop => break,
+                                            mangocode_api::StreamEvent::MessageStop => {
+                                                received_message_stop = true;
+                                                break;
+                                            }
                                             _ => {}
                                         }
                                     }
                                 }
                             }
                         }
+                    }
+
+                    // If the stream errored or ended prematurely (no MessageStop)
+                    // and we got no useful content, report the error so the query
+                    // loop can retry or surface it to the user.
+                    if let Some(ref err_msg) = stream_error {
+                        let has_content = !text_chunks.is_empty() || !tool_call_blocks.is_empty();
+                        if !has_content {
+                            // No partial response to salvage — report the error.
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(QueryEvent::Error(format!(
+                                    "Provider '{}' stream error: {}", provider_id_str, err_msg
+                                )));
+                            }
+                            return QueryOutcome::Error(
+                                ClaudeError::Api(format!(
+                                    "Provider '{}' stream error: {}", provider_id_str, err_msg
+                                ))
+                            );
+                        }
+                        // We have partial content — log a warning and try to use it.
+                        warn!(
+                            provider = %provider_id_str,
+                            error = %err_msg,
+                            "Stream error with partial response, attempting to use partial content"
+                        );
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "Stream interrupted — using partial response"
+                            )));
+                        }
+                    }
+
+                    // If the stream ended without MessageStop and without an error,
+                    // the connection may have been dropped. Detect tool calls in the
+                    // partial response so we can still execute them.
+                    if !received_message_stop && stream_error.is_none() && !tool_call_blocks.is_empty() {
+                        // Stream ended prematurely but we have tool calls — treat as tool_use.
+                        stop_str = "tool_use".to_string();
                     }
 
                     // Build the content blocks from accumulated stream data.
@@ -1183,9 +1298,17 @@ pub async fn run_query_loop(
                     let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
                     tc_indices.sort();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str)) = tool_call_blocks.remove(&idx) {
+                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
                             let input: serde_json::Value = serde_json::from_str(&json_str)
                                 .unwrap_or(serde_json::json!({}));
+
+                            if let Some(signature) = thought_signature {
+                                content_blocks.push(ContentBlock::Thinking {
+                                    thinking: String::new(),
+                                    signature,
+                                });
+                            }
+
                             content_blocks.push(ContentBlock::ToolUse { id, name, input });
                         }
                     }

@@ -4241,6 +4241,8 @@ impl App {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 self.spinner_verb = None;
+                self.status_message = None;
+                self.stall_start = None;
                 // Record elapsed time and pick a completion verb
                 if let Some(start) = self.turn_start.take() {
                     let secs = start.elapsed().as_secs();

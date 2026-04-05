@@ -2602,8 +2602,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             }
         }
 
-        // Drain query events — also forward relevant ones to the bridge as outbound.
-        while let Ok(evt) = event_rx.try_recv() {
+        // Drain query events in bounded batches so a misbehaving provider
+        // cannot starve input/render by flooding the queue.
+        const MAX_QUERY_EVENTS_PER_FRAME: usize = 512;
+        let mut drained_query_events = 0usize;
+        while drained_query_events < MAX_QUERY_EVENTS_PER_FRAME {
+            let Ok(evt) = event_rx.try_recv() else { break };
+            drained_query_events += 1;
+
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -2716,6 +2722,13 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 }
             }
             app.handle_query_event(evt);
+        }
+        if drained_query_events == MAX_QUERY_EVENTS_PER_FRAME {
+            // Keep responsive and continue draining on the next frame.
+            tracing::debug!(
+                limit = MAX_QUERY_EVENTS_PER_FRAME,
+                "Query event drain reached per-frame cap"
+            );
         }
 
         // Drain TUI-facing bridge events.

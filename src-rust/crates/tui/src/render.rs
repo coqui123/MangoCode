@@ -70,7 +70,7 @@ const MAX_WELCOME_BOX_HEIGHT: u16 = 20;
 // During render_welcome_box we record the blit position; after terminal.draw()
 // the event loop calls `flush_sixel_blit()` to write the inline image on top.
 thread_local! {
-    static SIXEL_BLIT: RefCell<Option<(u16, u16)>> = RefCell::new(None);
+    static SIXEL_BLIT: RefCell<Option<(u16, u16)>> = const { RefCell::new(None) };
 }
 
 /// Write any pending inline mascot image to stdout.
@@ -875,7 +875,9 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         .min(proportional_cap)
         .max(min_welcome_height);
     let header_height = welcome_box_height + notice_height;
-    let show_logo_header = content_area.height >= header_height + min_message_rows && content_area.width >= 48;
+    let show_logo_header = is_idle_welcome
+        && content_area.height >= header_height + min_message_rows
+        && content_area.width >= 48;
     let (logo_area, notices_area, msg_area) = if show_logo_header {
         let splits = Layout::default()
             .direction(Direction::Vertical)
