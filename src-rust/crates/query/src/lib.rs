@@ -1398,16 +1398,57 @@ pub async fn run_query_loop(
                                 });
                             }
 
-                            let result = execute_tool(ExecuteToolRequest {
-                                client,
-                                query_config: config,
-                                tool_id: &tool_id,
-                                name: &tool_name,
-                                input: &tool_input,
-                                tools,
-                                ctx: tool_ctx,
-                                event_tx: event_tx.as_ref(),
-                            })
+                            // Run PreToolUse hooks (same as Anthropic path)
+                            let hooks = &tool_ctx.config.hooks;
+                            let hook_ctx = mangocode_core::hooks::HookContext {
+                                event: "PreToolUse".to_string(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_input: Some(tool_input.clone()),
+                                tool_output: None,
+                                is_error: None,
+                                session_id: Some(tool_ctx.session_id.clone()),
+                            };
+                            let pre_outcome = mangocode_core::hooks::run_hooks(
+                                hooks,
+                                mangocode_core::config::HookEvent::PreToolUse,
+                                &hook_ctx,
+                                &tool_ctx.working_dir,
+                            )
+                            .await;
+
+                            // Check if hook blocked execution
+                            let result = if let mangocode_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
+                                warn!(tool = %tool_name, reason = %reason, "PreToolUse hook blocked execution");
+                                mangocode_tools::ToolResult::error(format!("Blocked by hook: {}", reason))
+                            } else {
+                                execute_tool(ExecuteToolRequest {
+                                    client,
+                                    query_config: config,
+                                    tool_id: &tool_id,
+                                    name: &tool_name,
+                                    input: &tool_input,
+                                    tools,
+                                    ctx: tool_ctx,
+                                    event_tx: event_tx.as_ref(),
+                                })
+                                .await
+                            };
+
+                            // Run PostToolUse hooks
+                            let post_ctx = mangocode_core::hooks::HookContext {
+                                event: "PostToolUse".to_string(),
+                                tool_name: Some(tool_name.clone()),
+                                tool_input: Some(tool_input.clone()),
+                                tool_output: Some(result.content.clone()),
+                                is_error: Some(result.is_error),
+                                session_id: Some(tool_ctx.session_id.clone()),
+                            };
+                            let _ = mangocode_core::hooks::run_hooks(
+                                hooks,
+                                mangocode_core::config::HookEvent::PostToolUse,
+                                &post_ctx,
+                                &tool_ctx.working_dir,
+                            )
                             .await;
 
                             if let Some(ref tx) = event_tx {
