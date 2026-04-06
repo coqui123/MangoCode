@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 
-use mangocode_core::types::{ContentBlock, Message, Role, ToolResultContent};
 use crate::kitty_image::render_image;
+use mangocode_core::types::{ContentBlock, Message, Role, ToolResultContent};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -20,8 +20,7 @@ pub use markdown::render_markdown;
 
 mod markdown_enhanced;
 pub use markdown_enhanced::{
-    detect_table, render_table, parse_inline_formatting,
-    Table, TableAlignment,
+    detect_table, parse_inline_formatting, render_table, Table, TableAlignment,
 };
 
 /// Context passed to all renderers.
@@ -145,7 +144,11 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
         "WebSearch" => truncate(str_field(input, "query"), 60),
         "Agent" => {
             let task = str_field(input, "task");
-            let task = if task.is_empty() { str_field(input, "description") } else { task };
+            let task = if task.is_empty() {
+                str_field(input, "description")
+            } else {
+                task
+            };
             truncate(task.lines().next().unwrap_or(""), 60)
         }
         _ => {
@@ -176,13 +179,12 @@ fn render_tool_use_inner(tool_name: &str, input: &serde_json::Value) -> Vec<Line
 
     // Header: • ToolName (summary)
     let mut header_spans = vec![
-        Span::styled(
-            "  \u{2022} ".to_string(),
-            Style::default().fg(Color::Green),
-        ),
+        Span::styled("  \u{2022} ".to_string(), Style::default().fg(Color::Green)),
         Span::styled(
             tool_name.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if !summary.is_empty() {
@@ -209,11 +211,15 @@ fn render_tool_use_inner(tool_name: &str, input: &serde_json::Value) -> Vec<Line
             lines.push(Line::from(vec![
                 Span::styled(
                     "    $ ".to_string(),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     display,
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
@@ -270,7 +276,9 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
         let remaining = total_lines - TOOL_RESULT_MAX_LINES;
         lines.push(Line::from(vec![Span::styled(
             format!("  ... {} more lines  (ctrl+o to expand)", remaining),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         )]));
     }
     if truncated {
@@ -286,10 +294,12 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
 pub fn render_tool_result_error(error: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     // Use orange instead of red for color-blind accessibility
-    let error_color = Color::Rgb(255, 140, 0);  // Orange
+    let error_color = Color::Rgb(255, 140, 0); // Orange
     lines.push(Line::from(vec![Span::styled(
         "✗ Error",
-        Style::default().fg(error_color).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(error_color)
+            .add_modifier(Modifier::BOLD),
     )]));
     for line in error.lines().take(10) {
         lines.push(Line::from(vec![
@@ -327,7 +337,11 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 }
 
 /// Render an attachment message (skill listing, agent listing, MCP instructions, hook results, etc.)
-pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
+pub fn render_attachment_message(
+    kind_label: &str,
+    content: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
     let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
@@ -340,20 +354,17 @@ pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) ->
     vec![Line::from(vec![
         Span::styled(
             format!("  [{kind_label}] "),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(preview, Style::default().fg(Color::White)),
     ])]
 }
 
 /// Render an advisor status line.
-pub fn render_advisor_message(
-    is_loading: bool,
-    model_name: Option<&str>,
-) -> Vec<Line<'static>> {
-    let model_suffix = model_name
-        .map(|m| format!(" ({})", m))
-        .unwrap_or_default();
+pub fn render_advisor_message(is_loading: bool, model_name: Option<&str>) -> Vec<Line<'static>> {
+    let model_suffix = model_name.map(|m| format!(" ({})", m)).unwrap_or_default();
     if is_loading {
         vec![Line::from(vec![Span::styled(
             format!("  \u{25cc} Advising\u{2026}{}", model_suffix),
@@ -364,7 +375,9 @@ pub fn render_advisor_message(
     } else {
         vec![Line::from(vec![Span::styled(
             format!("  \u{2713} Advisor reviewed{}", model_suffix),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
         )])]
     }
 }
@@ -417,11 +430,15 @@ pub fn render_bash_input_line(command: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled(
             "  $ ".to_string(),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             command.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ])]
 }
@@ -454,14 +471,13 @@ pub fn render_plan_steps(steps: &[String]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "  Plan:".to_string(),
-        Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(CLAUDE_ORANGE)
+            .add_modifier(Modifier::BOLD),
     )]));
     for (i, step) in steps.iter().enumerate() {
         lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}. ", i + 1),
-                Style::default().fg(CLAUDE_ORANGE),
-            ),
+            Span::styled(format!("  {}. ", i + 1), Style::default().fg(CLAUDE_ORANGE)),
             Span::styled(step.clone(), Style::default().fg(Color::White)),
         ]));
     }
@@ -473,7 +489,9 @@ pub fn render_plan_approval_prompt() -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled(
             "  Approve this plan? ".to_string(),
-            Style::default().fg(CLAUDE_ORANGE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(CLAUDE_ORANGE)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "[y] yes  [n] no  [e] edit".to_string(),
@@ -486,7 +504,9 @@ pub fn render_plan_approval_prompt() -> Vec<Line<'static>> {
 pub fn render_compact_boundary() -> Vec<Line<'static>> {
     vec![Line::from(vec![Span::styled(
         "----------- context compacted -----------",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )])]
 }
 
@@ -495,7 +515,9 @@ pub fn render_summary_message(text: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "Summary",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )]));
     for line in text.lines() {
         lines.push(Line::from(vec![
@@ -509,7 +531,11 @@ pub fn render_summary_message(text: &str) -> Vec<Line<'static>> {
 /// Render an unseen divider.
 pub fn render_unseen_divider(count: usize) -> Vec<Line<'static>> {
     vec![Line::from(vec![Span::styled(
-        format!("---- {} new message{} ----", count, if count == 1 { "" } else { "s" }),
+        format!(
+            "---- {} new message{} ----",
+            count,
+            if count == 1 { "" } else { "s" }
+        ),
         Style::default().fg(Color::Yellow),
     )])]
 }
@@ -533,13 +559,17 @@ pub fn render_thinking_block(text: &str, expanded: bool) -> Vec<Line<'static>> {
     if !expanded {
         return vec![Line::from(vec![Span::styled(
             "> Thinking",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )])];
     }
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "v Thinking",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
     )]));
     for line in text.lines() {
         lines.push(Line::from(vec![
@@ -556,11 +586,16 @@ pub fn render_rate_limit_banner(retry_after_secs: u64) -> Vec<Line<'static>> {
 }
 
 /// Render a rate-limit warning banner with optional upgrade hint.
-pub fn render_rate_limit_with_hint(retry_after_secs: u64, show_upgrade_hint: bool) -> Vec<Line<'static>> {
+pub fn render_rate_limit_with_hint(
+    retry_after_secs: u64,
+    show_upgrade_hint: bool,
+) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![Span::styled(
             "Rate limit exceeded",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
             format!("  Retrying in {}s...", retry_after_secs),
@@ -629,7 +664,9 @@ fn prefix_message_lines(
         ),
         Role::Assistant => (
             "◆ ",
-            Style::default().fg(Color::Rgb(0, 150, 200)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(0, 150, 200))
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::White),
         ),
     };
@@ -705,7 +742,9 @@ fn render_attachment_line(kind: &str, label: String) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled(
             format!("  {} ", kind),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(label, Style::default().fg(Color::DarkGray)),
     ])]
@@ -760,7 +799,11 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 let _ = &id;
                 lines.extend(prefix_message_lines(rendered, &msg.role, ctx.width));
             }
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let text = tool_result_text(&content);
                 let tool_name = ctx.tool_names.get(&tool_use_id).map(|s| s.as_str());
@@ -795,7 +838,12 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     ));
                 }
             }
-            ContentBlock::Document { title, context, source, .. } => {
+            ContentBlock::Document {
+                title,
+                context,
+                source,
+                ..
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let label = title
                     .or(context)
@@ -820,16 +868,29 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 lines.extend(render_user_memory_input(&key, &value));
             }
-            ContentBlock::SystemAPIError { message, retry_secs } => {
+            ContentBlock::SystemAPIError {
+                message,
+                retry_secs,
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 lines.extend(render_system_api_error(&message, retry_secs));
             }
-            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+            ContentBlock::CollapsedReadSearch {
+                tool_name,
+                paths,
+                n_hidden,
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                lines.extend(render_collapsed_read_search(&tool_name, &path_refs, n_hidden));
+                lines.extend(render_collapsed_read_search(
+                    &tool_name, &path_refs, n_hidden,
+                ));
             }
-            ContentBlock::TaskAssignment { id, subject, description } => {
+            ContentBlock::TaskAssignment {
+                id,
+                subject,
+                description,
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 lines.extend(render_task_assignment(&id, &subject, &description));
             }
@@ -882,11 +943,15 @@ pub fn render_user_command(name: &str, args: &str) -> Vec<Line<'static>> {
     vec![Line::from(vec![
         Span::styled(
             "\u{25b8} ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             name.to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ".to_string(), Style::default()),
         Span::styled(args.to_string(), Style::default().fg(Color::White)),
@@ -921,7 +986,9 @@ pub fn render_user_local_command_output(
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         format!("  !{}", command),
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
     )]));
     let total = output.lines().count();
     for line in output.lines().take(max_lines) {
@@ -946,7 +1013,9 @@ pub fn render_resource_update(server: &str, uri: &str, reason: &str) -> Vec<Line
         Span::styled("\u{21bb} ", Style::default().fg(Color::Cyan)),
         Span::styled(
             format!("{}: ", server),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(uri.to_string(), Style::default().fg(Color::White)),
         Span::styled(
@@ -966,13 +1035,12 @@ pub fn render_collapsed_read_search(
 ) -> Vec<Line<'static>> {
     let paths_str = paths.join(", ");
     let mut spans = vec![
-        Span::styled(
-            "\u{25b8} ",
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled("\u{25b8} ", Style::default().fg(Color::Yellow)),
         Span::styled(
             format!("{} ", tool_name),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(paths_str, Style::default().fg(Color::White)),
     ];
@@ -991,22 +1059,23 @@ pub fn render_task_assignment(id: &str, subject: &str, desc: &str) -> Vec<Line<'
     let mut lines = Vec::new();
     lines.push(Line::from(vec![Span::styled(
         "\u{250c}\u{2500} Task #".to_string() + id + " ",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(vec![
         Span::styled("\u{2502} ", Style::default().fg(Color::Cyan)),
         Span::styled(
             subject.to_string(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     for line in desc.lines().take(5) {
         lines.push(Line::from(vec![
             Span::styled("\u{2502} ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("  {}", line),
-                Style::default().fg(Color::Gray),
-            ),
+            Span::styled(format!("  {}", line), Style::default().fg(Color::Gray)),
         ]));
     }
     lines.push(Line::from(vec![Span::styled(
@@ -1025,11 +1094,15 @@ pub fn render_grouped_tool_use(names: &[&str], expanded: bool) -> Vec<Line<'stat
     let header = Line::from(vec![
         Span::styled(
             "\u{25b8} ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{} tool call{}", n, if n == 1 { "" } else { "s" }),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  {}", preview),
@@ -1054,7 +1127,10 @@ mod tests {
     use super::*;
 
     fn line_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|s| s.content.to_string()).collect::<String>()
+        line.spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>()
     }
 
     #[test]
@@ -1151,7 +1227,8 @@ mod tests {
 
     #[test]
     fn test_render_attachment_message() {
-        let result = render_attachment_message("skill_listing", "5 tools available: Bash, Read", 80);
+        let result =
+            render_attachment_message("skill_listing", "5 tools available: Bash, Read", 80);
         assert!(!result.is_empty());
         let text = line_text(&result[0]);
         assert!(text.contains("skill_listing"));
@@ -1164,7 +1241,10 @@ mod tests {
         let result = render_attachment_message("kind", &long, 80);
         assert!(!result.is_empty());
         let text = line_text(&result[0]);
-        assert!(text.contains('\u{2026}') || text.len() < long.len(), "expected truncation");
+        assert!(
+            text.contains('\u{2026}') || text.len() < long.len(),
+            "expected truncation"
+        );
     }
 
     #[test]
@@ -1197,7 +1277,11 @@ mod tests {
     fn test_render_shutdown_message() {
         let result = render_shutdown_message("max turns reached");
         assert!(!result.is_empty());
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("Session ended"));
         assert!(combined.contains("max turns reached"));
     }
@@ -1213,7 +1297,10 @@ mod tests {
 
     #[test]
     fn test_render_bash_output_block() {
-        let output = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = render_bash_output_block(&output, 10);
         assert!(!result.is_empty());
         // 10 content lines + 1 overflow indicator
@@ -1234,7 +1321,11 @@ mod tests {
         let steps = vec!["First step".to_string(), "Second step".to_string()];
         let result = render_plan_steps(&steps);
         assert!(!result.is_empty());
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("Plan:"));
         assert!(combined.contains("1."));
         assert!(combined.contains("First step"));
@@ -1255,7 +1346,10 @@ mod tests {
 
     #[test]
     fn test_render_tool_result_success_uses_30_lines() {
-        let output = (0..50).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let output = (0..50)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = render_tool_result_success(&output, false);
         // 30 content lines + 1 overflow indicator = 31 (no separate header line)
         assert_eq!(result.len(), 31);
@@ -1277,10 +1371,22 @@ mod tests {
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("ls -la"), "command should appear in output");
-        assert!(rendered.contains("Bash"), "tool name should appear in header");
-        assert!(!rendered.contains("* Bash"), "old generic header must not appear");
-        assert!(rendered.contains("ctrl+o"), "(ctrl+o to expand) hint should appear");
+        assert!(
+            rendered.contains("ls -la"),
+            "command should appear in output"
+        );
+        assert!(
+            rendered.contains("Bash"),
+            "tool name should appear in header"
+        );
+        assert!(
+            !rendered.contains("* Bash"),
+            "old generic header must not appear"
+        );
+        assert!(
+            rendered.contains("ctrl+o"),
+            "(ctrl+o to expand) hint should appear"
+        );
     }
 
     #[test]
@@ -1297,15 +1403,24 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Read"), "tool name should appear");
-        assert!(rendered.contains("foo.txt"), "file path summary should appear");
-        assert!(rendered.contains("ctrl+o"), "(ctrl+o to expand) hint should appear");
+        assert!(
+            rendered.contains("foo.txt"),
+            "file path summary should appear"
+        );
+        assert!(
+            rendered.contains("ctrl+o"),
+            "(ctrl+o to expand) hint should appear"
+        );
     }
 
     #[test]
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext {
+            tool_names,
+            ..Default::default()
+        };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
@@ -1319,7 +1434,10 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("hello world"), "output should appear");
         // bash_output_block does NOT prefix with "Result" (that's render_tool_result_success)
-        assert!(!rendered.contains("Result"), "bash output should NOT show generic 'Result' header");
+        assert!(
+            !rendered.contains("Result"),
+            "bash output should NOT show generic 'Result' header"
+        );
     }
 
     #[test]
@@ -1335,7 +1453,10 @@ mod tests {
             .map(|l| line_text(&l))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("file content here"), "content should appear");
+        assert!(
+            rendered.contains("file content here"),
+            "content should appear"
+        );
     }
 
     // ── New function tests ────────────────────────────────────────────────────
@@ -1344,7 +1465,11 @@ mod tests {
     fn test_render_system_api_error_short_message() {
         let result = render_system_api_error("Connection refused", None);
         assert!(!result.is_empty());
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("API Error"));
         assert!(combined.contains("Connection refused"));
         // No retry line
@@ -1354,7 +1479,11 @@ mod tests {
     #[test]
     fn test_render_system_api_error_with_retry() {
         let result = render_system_api_error("Timeout", Some(30));
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("API Error"));
         assert!(combined.contains("Timeout"));
         assert!(combined.contains("Retrying in 30s"));
@@ -1362,10 +1491,20 @@ mod tests {
 
     #[test]
     fn test_render_system_api_error_long_message_shows_expand_hint() {
-        let msg = (0..10).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let msg = (0..10)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = render_system_api_error(&msg, None);
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
-        assert!(combined.contains("[expand]"), "should show [expand] hint when more than 5 lines");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            combined.contains("[expand]"),
+            "should show [expand] hint when more than 5 lines"
+        );
         assert!(combined.contains("5 more lines"));
     }
 
@@ -1391,7 +1530,10 @@ mod tests {
 
     #[test]
     fn test_render_user_local_command_output_with_overflow() {
-        let output = (0..20).map(|i| format!("out {}", i)).collect::<Vec<_>>().join("\n");
+        let output = (0..20)
+            .map(|i| format!("out {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = render_user_local_command_output("ls", &output, 5);
         // 1 header + 5 body + 1 overflow = 7
         assert_eq!(result.len(), 7);
@@ -1431,7 +1573,10 @@ mod tests {
         assert!(text.contains('\u{25b8}'), "should have ▸ prefix");
         assert!(text.contains("Read"));
         assert!(text.contains("src/lib.rs"));
-        assert!(!text.contains("more"), "should not show 'more' when n_hidden is 0");
+        assert!(
+            !text.contains("more"),
+            "should not show 'more' when n_hidden is 0"
+        );
     }
 
     #[test]
@@ -1445,9 +1590,17 @@ mod tests {
 
     #[test]
     fn test_render_task_assignment() {
-        let result = render_task_assignment("42", "Implement feature X", "Add the new widget system\nWith multi-line support");
+        let result = render_task_assignment(
+            "42",
+            "Implement feature X",
+            "Add the new widget system\nWith multi-line support",
+        );
         assert!(!result.is_empty());
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("Task #42"));
         assert!(combined.contains("Implement feature X"));
         assert!(combined.contains("Add the new widget system"));
@@ -1455,12 +1608,22 @@ mod tests {
 
     #[test]
     fn test_render_task_assignment_truncates_desc_at_5_lines() {
-        let desc = (0..10).map(|i| format!("desc line {}", i)).collect::<Vec<_>>().join("\n");
+        let desc = (0..10)
+            .map(|i| format!("desc line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = render_task_assignment("1", "Subject", &desc);
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         // Only first 5 desc lines should appear
         assert!(combined.contains("desc line 4"));
-        assert!(!combined.contains("desc line 5"), "should truncate desc at 5 lines");
+        assert!(
+            !combined.contains("desc line 5"),
+            "should truncate desc at 5 lines"
+        );
     }
 
     #[test]
@@ -1479,18 +1642,29 @@ mod tests {
         let result = render_grouped_tool_use(&names, true);
         // 1 header + 2 tool lines
         assert_eq!(result.len(), 3);
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("2 tool calls"));
         assert!(combined.contains("Bash"));
         assert!(combined.contains("Read"));
-        assert!(combined.contains('\u{2022}'), "expanded lines should have • prefix");
+        assert!(
+            combined.contains('\u{2022}'),
+            "expanded lines should have • prefix"
+        );
     }
 
     #[test]
     fn test_render_rate_limit_with_hint_false() {
         let result = render_rate_limit_with_hint(60, false);
         assert_eq!(result.len(), 2, "without hint should have 2 lines");
-        let combined = result.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n");
+        let combined = result
+            .iter()
+            .map(|l| line_text(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(combined.contains("Rate limit exceeded"));
         assert!(combined.contains("Retrying in 60s"));
         assert!(!combined.contains("upgrade"));
@@ -1550,6 +1724,3 @@ mod tests {
         assert_eq!(a_text, b_text);
     }
 }
-
-
-

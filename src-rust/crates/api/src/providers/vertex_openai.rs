@@ -22,6 +22,8 @@ use mangocode_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
 use tracing::debug;
 
+use super::openai::OpenAiProvider;
+use super::request_options::merge_openai_compatible_options;
 use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
@@ -29,8 +31,6 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
     SystemPromptStyle,
 };
-use super::openai::OpenAiProvider;
-use super::request_options::merge_openai_compatible_options;
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -74,11 +74,11 @@ impl VertexConfig {
             return None;
         }
 
-        let location = std::env::var("VERTEX_LOCATION")
-            .unwrap_or_else(|_| "us-central1".to_string());
+        let location =
+            std::env::var("VERTEX_LOCATION").unwrap_or_else(|_| "us-central1".to_string());
 
-        let model = std::env::var("VERTEX_MODEL")
-            .unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
+        let model =
+            std::env::var("VERTEX_MODEL").unwrap_or_else(|_| "google/gemini-2.5-flash".to_string());
 
         let auth_mode = match std::env::var("VERTEX_AUTH_MODE")
             .as_deref()
@@ -127,18 +127,12 @@ pub fn vertex_openai_base_url(project_id: &str, location: &str) -> String {
 /// Fetch a Google Cloud Bearer token according to the configured auth mode.
 async fn fetch_bearer_token(config: &VertexConfig) -> Result<String, String> {
     match &config.auth_mode {
-        VertexAuthMode::AccessToken => {
-            config
-                .access_token
-                .clone()
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| {
-                    "VERTEX_ACCESS_TOKEN is not set or empty".to_string()
-                })
-        }
-        VertexAuthMode::Adc | VertexAuthMode::GcloudCommand => {
-            fetch_gcloud_token().await
-        }
+        VertexAuthMode::AccessToken => config
+            .access_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| "VERTEX_ACCESS_TOKEN is not set or empty".to_string()),
+        VertexAuthMode::Adc | VertexAuthMode::GcloudCommand => fetch_gcloud_token().await,
     }
 }
 
@@ -219,11 +213,9 @@ async fn fetch_gcloud_token() -> Result<String, String> {
 
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if token.is_empty() {
-        return Err(
-            "gcloud returned an empty access token. \
+        return Err("gcloud returned an empty access token. \
              Run `gcloud auth application-default login` to authenticate."
-                .to_string(),
-        );
+            .to_string());
     }
     Ok(token)
 }
@@ -263,7 +255,7 @@ impl VertexOpenAiProvider {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
-            .expect("failed to build reqwest client");
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
             id: ProviderId::new(ProviderId::GOOGLE_VERTEX),
@@ -470,7 +462,11 @@ fn gemini_display_name(id: &str) -> String {
     // Strip trailing "-NNN" version suffixes like "-001", "-002"
     let without_ver = {
         let parts: Vec<&str> = id.split('-').collect();
-        if parts.last().map(|p| p.chars().all(|c| c.is_ascii_digit())).unwrap_or(false) {
+        if parts
+            .last()
+            .map(|p| p.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+        {
             parts[..parts.len() - 1].join("-")
         } else {
             id.to_string()
@@ -483,13 +479,15 @@ fn gemini_display_name(id: &str) -> String {
     for part in without_ver.split('-') {
         match part {
             "gemini" => words.push("Gemini".into()),
-            "flash"  => words.push("Flash".into()),
-            "pro"    => words.push("Pro".into()),
-            "lite"   => words.push("Lite".into()),
-            "ultra"  => words.push("Ultra".into()),
-            "nano"   => words.push("Nano".into()),
-            "preview"=> { preview = true; }
-            other    => words.push(other.to_string()),
+            "flash" => words.push("Flash".into()),
+            "pro" => words.push("Pro".into()),
+            "lite" => words.push("Lite".into()),
+            "ultra" => words.push("Ultra".into()),
+            "nano" => words.push("Nano".into()),
+            "preview" => {
+                preview = true;
+            }
+            other => words.push(other.to_string()),
         }
     }
     let mut name = words.join(" ");
@@ -546,21 +544,42 @@ fn vertex_model_display_name(publisher: &str, model_id: &str) -> String {
             format!("{} (Vertex)", pretty)
         }
         "nvidia" => {
-            let pretty = model_id.split('-')
-                .map(|p| { let mut c = p.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() })
-                .collect::<Vec<_>>().join(" ");
+            let pretty = model_id
+                .split('-')
+                .map(|p| {
+                    let mut c = p.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("{} (Vertex)", pretty)
         }
         "ai21" => {
-            let pretty = model_id.split('-')
-                .map(|p| { let mut c = p.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() })
-                .collect::<Vec<_>>().join(" ");
+            let pretty = model_id
+                .split('-')
+                .map(|p| {
+                    let mut c = p.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("{} (Vertex)", pretty)
         }
         "writer" => {
-            let pretty = model_id.split('-')
-                .map(|p| { let mut c = p.chars(); c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default() })
-                .collect::<Vec<_>>().join(" ");
+            let pretty = model_id
+                .split('-')
+                .map(|p| {
+                    let mut c = p.chars();
+                    c.next()
+                        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             format!("{} (Vertex)", pretty)
         }
         _ => format!("{}/{}", publisher, model_id),
@@ -587,10 +606,34 @@ impl VertexOpenAiProvider {
     fn fallback_models(&self) -> Vec<ModelInfo> {
         let pid = self.id.clone();
         vec![
-            ModelInfo { id: ModelId::new("google/gemini-2.5-flash"),    provider_id: pid.clone(), name: "Gemini 2.5 Flash".into(), context_window: 1_000_000, max_output_tokens: 8_192 },
-            ModelInfo { id: ModelId::new("google/gemini-2.5-pro"),       provider_id: pid.clone(), name: "Gemini 2.5 Pro".into(),   context_window: 1_000_000, max_output_tokens: 8_192 },
-            ModelInfo { id: ModelId::new("google/gemini-2.0-flash-001"), provider_id: pid.clone(), name: "Gemini 2.0 Flash".into(), context_window: 1_000_000, max_output_tokens: 8_192 },
-            ModelInfo { id: ModelId::new("google/gemini-1.5-pro-002"),   provider_id: pid.clone(), name: "Gemini 1.5 Pro".into(),   context_window: 2_000_000, max_output_tokens: 8_192 },
+            ModelInfo {
+                id: ModelId::new("google/gemini-2.5-flash"),
+                provider_id: pid.clone(),
+                name: "Gemini 2.5 Flash".into(),
+                context_window: 1_000_000,
+                max_output_tokens: 8_192,
+            },
+            ModelInfo {
+                id: ModelId::new("google/gemini-2.5-pro"),
+                provider_id: pid.clone(),
+                name: "Gemini 2.5 Pro".into(),
+                context_window: 1_000_000,
+                max_output_tokens: 8_192,
+            },
+            ModelInfo {
+                id: ModelId::new("google/gemini-2.0-flash-001"),
+                provider_id: pid.clone(),
+                name: "Gemini 2.0 Flash".into(),
+                context_window: 1_000_000,
+                max_output_tokens: 8_192,
+            },
+            ModelInfo {
+                id: ModelId::new("google/gemini-1.5-pro-002"),
+                provider_id: pid.clone(),
+                name: "Gemini 1.5 Pro".into(),
+                context_window: 2_000_000,
+                max_output_tokens: 8_192,
+            },
         ]
     }
 }
@@ -849,13 +892,13 @@ impl LlmProvider for VertexOpenAiProvider {
         // Publishers with only "deploy"/"multiDeployVertex" require a custom
         // endpoint deployment and are excluded.
         let publishers = [
-            "google",       // Gemini (immediate)
-            "anthropic",    // Claude (immediate, requires Model Garden enable)
-            "mistralai",    // Mistral / Codestral (requestAccess MaaS)
-            "meta",         // Llama MaaS variants (requestAccess)
-            "ai21",         // Jamba (requestAccess)
-            "writer",       // Palmyra (requestAccess)
-            "nvidia",       // Nemotron (requestAccess)
+            "google",    // Gemini (immediate)
+            "anthropic", // Claude (immediate, requires Model Garden enable)
+            "mistralai", // Mistral / Codestral (requestAccess MaaS)
+            "meta",      // Llama MaaS variants (requestAccess)
+            "ai21",      // Jamba (requestAccess)
+            "writer",    // Palmyra (requestAccess)
+            "nvidia",    // Nemotron (requestAccess)
         ];
 
         let futures: Vec<_> = publishers
@@ -910,8 +953,12 @@ impl LlmProvider for VertexOpenAiProvider {
             let prefix = format!("publishers/{}/models/", publisher);
             if let Some(arr) = json.get("publisherModels").and_then(|v| v.as_array()) {
                 for m in arr {
-                    let Some(full_name) = m.get("name").and_then(|v| v.as_str()) else { continue };
-                    let Some(model_id) = full_name.strip_prefix(&prefix) else { continue };
+                    let Some(full_name) = m.get("name").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let Some(model_id) = full_name.strip_prefix(&prefix) else {
+                        continue;
+                    };
 
                     // Include models with either:
                     //   "openGenerationAiStudio" → works immediately
@@ -919,14 +966,15 @@ impl LlmProvider for VertexOpenAiProvider {
                     //
                     // Exclude models that only have "deploy"/"multiDeployVertex"
                     // since those require a custom endpoint, not the openapi route.
-                    let actions = m.get("supportedActions")
+                    let actions = m
+                        .get("supportedActions")
                         .and_then(|a| a.as_object())
                         .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
                         .unwrap_or_default();
 
-                    let supports_chat = actions.iter().any(|a| {
-                        a == "openGenerationAiStudio" || a == "requestAccess"
-                    });
+                    let supports_chat = actions
+                        .iter()
+                        .any(|a| a == "openGenerationAiStudio" || a == "requestAccess");
                     if !supports_chat {
                         continue;
                     }
@@ -935,8 +983,16 @@ impl LlmProvider for VertexOpenAiProvider {
                     let skip = match publisher.as_str() {
                         "google" => {
                             !model_id.starts_with("gemini")
-                            || ["embedding", "-tts", "-audio", "-image", "computer-use", "live-"]
-                                .iter().any(|s| model_id.contains(s))
+                                || [
+                                    "embedding",
+                                    "-tts",
+                                    "-audio",
+                                    "-image",
+                                    "computer-use",
+                                    "live-",
+                                ]
+                                .iter()
+                                .any(|s| model_id.contains(s))
                         }
                         "anthropic" => !model_id.starts_with("claude"),
                         "mistralai" => {
@@ -957,7 +1013,9 @@ impl LlmProvider for VertexOpenAiProvider {
                         "writer" => !model_id.contains("palmyra"),
                         _ => false,
                     };
-                    if skip { continue; }
+                    if skip {
+                        continue;
+                    }
 
                     // Format the model ID as "publisher/model-id" which is
                     // what the Vertex OpenAI-compat endpoint expects.
@@ -967,8 +1025,11 @@ impl LlmProvider for VertexOpenAiProvider {
                         "google" => gemini_context_window(model_id),
                         "anthropic" => 200_000,
                         "mistralai" => {
-                            if model_id.contains("codestral") { 256_000 }
-                            else { 128_000 }
+                            if model_id.contains("codestral") {
+                                256_000
+                            } else {
+                                128_000
+                            }
                         }
                         "meta" => 128_000,
                         "nvidia" => 128_000,
@@ -996,16 +1057,18 @@ impl LlmProvider for VertexOpenAiProvider {
         // Anthropic's v1beta1 endpoint can return 403 even when the models
         // themselves work via the openapi route), inject known static models
         // if that publisher returned nothing from the API.
-        let has_anthropic = models.iter().any(|m| m.id.to_string().starts_with("anthropic/"));
+        let has_anthropic = models
+            .iter()
+            .any(|m| m.id.to_string().starts_with("anthropic/"));
         if !has_anthropic {
             let pid = self.id.clone();
             for (id, name) in &[
-                ("anthropic/claude-opus-4-6",               "Claude Opus 4.6"),
-                ("anthropic/claude-sonnet-4-6",             "Claude Sonnet 4.6"),
-                ("anthropic/claude-haiku-4-5-20251001",     "Claude Haiku 4.5"),
-                ("anthropic/claude-3-5-sonnet-v2",          "Claude 3.5 Sonnet v2"),
-                ("anthropic/claude-3-5-haiku",              "Claude 3.5 Haiku"),
-                ("anthropic/claude-3-opus",                 "Claude 3 Opus"),
+                ("anthropic/claude-opus-4-6", "Claude Opus 4.6"),
+                ("anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6"),
+                ("anthropic/claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+                ("anthropic/claude-3-5-sonnet-v2", "Claude 3.5 Sonnet v2"),
+                ("anthropic/claude-3-5-haiku", "Claude 3.5 Haiku"),
+                ("anthropic/claude-3-opus", "Claude 3 Opus"),
             ] {
                 models.push(ModelInfo {
                     id: ModelId::new(*id),
@@ -1021,18 +1084,28 @@ impl LlmProvider for VertexOpenAiProvider {
         // descending so newer/larger models appear at the top.
         models.sort_by(|a, b| {
             let publisher_order = |id: &str| -> u8 {
-                if id.starts_with("google/")     { 0 }
-                else if id.starts_with("anthropic/") { 1 }
-                else if id.starts_with("mistralai/") { 2 }
-                else if id.starts_with("meta/")      { 3 }
-                else if id.starts_with("nvidia/")    { 4 }
-                else if id.starts_with("ai21/")      { 5 }
-                else if id.starts_with("writer/")    { 6 }
-                else { 7 }
+                if id.starts_with("google/") {
+                    0
+                } else if id.starts_with("anthropic/") {
+                    1
+                } else if id.starts_with("mistralai/") {
+                    2
+                } else if id.starts_with("meta/") {
+                    3
+                } else if id.starts_with("nvidia/") {
+                    4
+                } else if id.starts_with("ai21/") {
+                    5
+                } else if id.starts_with("writer/") {
+                    6
+                } else {
+                    7
+                }
             };
             let pa = publisher_order(&a.id.to_string());
             let pb = publisher_order(&b.id.to_string());
-            pa.cmp(&pb).then_with(|| b.id.to_string().cmp(&a.id.to_string()))
+            pa.cmp(&pb)
+                .then_with(|| b.id.to_string().cmp(&a.id.to_string()))
         });
 
         Ok(models)
@@ -1044,10 +1117,7 @@ impl LlmProvider for VertexOpenAiProvider {
             Err(msg) => Ok(ProviderStatus::Unavailable { reason: msg }),
             Ok(token) => {
                 // Make a minimal non-streaming request to verify the project/location.
-                let url = format!(
-                    "{}/chat/completions",
-                    self.base_url.trim_end_matches('/')
-                );
+                let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
                 let body = json!({
                     "model": self.config.model,
                     "max_tokens": 1,
@@ -1076,7 +1146,11 @@ impl LlmProvider for VertexOpenAiProvider {
                             })
                         } else {
                             Ok(ProviderStatus::Unavailable {
-                                reason: format!("HTTP {}: {}", status, body_text.chars().take(120).collect::<String>()),
+                                reason: format!(
+                                    "HTTP {}: {}",
+                                    status,
+                                    body_text.chars().take(120).collect::<String>()
+                                ),
                             })
                         }
                     }

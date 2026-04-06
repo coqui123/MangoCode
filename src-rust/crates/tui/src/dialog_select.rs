@@ -93,9 +93,8 @@ impl DialogSelectState {
     }
 
     pub fn page_down(&mut self) {
-        self.selected_index = (self.selected_index + 10).min(
-            self.filtered_indices.len().saturating_sub(1),
-        );
+        self.selected_index =
+            (self.selected_index + 10).min(self.filtered_indices.len().saturating_sub(1));
     }
 
     /// Get the currently selected item (if any).
@@ -172,11 +171,7 @@ impl DialogSelectState {
 
 /// Render the DialogSelect overlay — OpenCode-style: dark overlay, no border,
 /// full-width highlight bar on selected item, minimal and polished.
-pub fn render_dialog_select(
-    frame: &mut Frame,
-    state: &DialogSelectState,
-    area: Rect,
-) {
+pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: Rect) {
     if !state.visible {
         return;
     }
@@ -184,7 +179,7 @@ pub fn render_dialog_select(
     let dim = Color::Rgb(138, 125, 115);
     let dialog_bg = Color::Rgb(26, 20, 15);
     let highlight_bg = Color::Rgb(255, 176, 32); // golden mango highlight bar
-    let highlight_fg = Color::Rgb(26, 20, 15);  // dark text on golden bg
+    let highlight_fg = Color::Rgb(26, 20, 15); // dark text on golden bg
     let category_fg = Color::Rgb(255, 176, 32); // golden category names
 
     // ── Darken the entire background ──
@@ -197,9 +192,13 @@ pub fn render_dialog_select(
     let item_lines: u16 = state.filtered_indices.len() as u16;
     let category_count = if state.filter.is_empty() {
         let mut cats = std::collections::HashSet::new();
-        for &idx in &state.filtered_indices { cats.insert(&state.items[idx].category); }
+        for &idx in &state.filtered_indices {
+            cats.insert(&state.items[idx].category);
+        }
         cats.len() as u16
-    } else { 0 };
+    } else {
+        0
+    };
     let content_height = 3 + item_lines + category_count * 2; // search + blank + items + cat headers + gaps
     let height = content_height.min(max_height).max(8);
     let dialog_area = centered_rect(width, height, area);
@@ -224,7 +223,9 @@ pub fn render_dialog_select(
     lines.push(Line::from(vec![
         Span::styled(
             format!(" {}", state.title),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{:>width$}", "esc ", width = title_pad),
@@ -247,13 +248,17 @@ pub fn render_dialog_select(
     // Show cursor on first char if empty
     if state.filter.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(" S", Style::default().fg(dim).add_modifier(Modifier::UNDERLINED)),
+            Span::styled(
+                " S",
+                Style::default().fg(dim).add_modifier(Modifier::UNDERLINED),
+            ),
             Span::styled("earch", search_style),
         ]));
     } else {
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {}", search_text), search_style),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}", search_text),
+            search_style,
+        )]));
     }
 
     // ── Items ──
@@ -267,10 +272,13 @@ pub fn render_dialog_select(
 
         // Category header (only when not filtering)
         if item.category != last_category && state.filter.is_empty() {
-            lines.push(Line::from("")); current_line += 1;
+            lines.push(Line::from(""));
+            current_line += 1;
             lines.push(Line::from(vec![Span::styled(
                 format!(" {}", item.category),
-                Style::default().fg(category_fg).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(category_fg)
+                    .add_modifier(Modifier::BOLD),
             )]));
             current_line += 1;
             last_category = item.category.clone();
@@ -283,18 +291,22 @@ pub fn render_dialog_select(
             (Color::White, dialog_bg)
         };
 
-        let mut spans = vec![
-            Span::styled(
-                format!(" {}", item.title),
-                Style::default().fg(item_fg).bg(item_bg),
-            ),
-        ];
+        let mut spans = vec![Span::styled(
+            format!(" {}", item.title),
+            Style::default().fg(item_fg).bg(item_bg),
+        )];
 
         // Auth hint in parens, dimmed
         if !item.description.is_empty() {
             spans.push(Span::styled(
                 format!(" {}", item.description),
-                Style::default().fg(if is_selected { Color::Rgb(200, 200, 200) } else { dim }).bg(item_bg),
+                Style::default()
+                    .fg(if is_selected {
+                        Color::Rgb(200, 200, 200)
+                    } else {
+                        dim
+                    })
+                    .bg(item_bg),
             ));
         }
 
@@ -342,9 +354,7 @@ pub fn render_dialog_select(
         0
     };
 
-    let para = Paragraph::new(lines)
-        .bg(dialog_bg)
-        .scroll((scroll_y, 0));
+    let para = Paragraph::new(lines).bg(dialog_bg).scroll((scroll_y, 0));
     frame.render_widget(para, inner);
 }
 

@@ -68,7 +68,9 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         .borders(Borders::ALL)
         .title(Line::from(vec![Span::styled(
             " Export Conversation ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]))
         .border_style(Style::default().fg(Color::Cyan));
 
@@ -76,12 +78,16 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
     frame.render_widget(block, dialog_area);
 
     let json_style = if state.selected == ExportFormat::Json {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
     } else {
         Style::default().fg(Color::White)
     };
     let md_style = if state.selected == ExportFormat::Markdown {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
     } else {
         Style::default().fg(Color::White)
     };
@@ -107,7 +113,9 @@ pub fn render_export_dialog(frame: &mut Frame, state: &ExportDialogState, area: 
         Line::from(""),
         Line::from(vec![Span::styled(
             "  Tab/\u{2190}\u{2192} to switch  \u{b7}  Enter to export  \u{b7}  Esc to cancel",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )]),
     ];
 
@@ -203,10 +211,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         let mut state = ExportDialogState::new();
         state.open();
-        terminal.draw(|frame| {
-            render_export_dialog(frame, &state, frame.area());
-        }).unwrap();
-        let content: String = terminal.backend().buffer().clone().content().iter()
+        terminal
+            .draw(|frame| {
+                render_export_dialog(frame, &state, frame.area());
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
             .map(|c| c.symbol().chars().next().unwrap_or(' '))
             .collect();
         assert!(content.contains("Export") || content.contains("JSON"));
@@ -217,9 +232,11 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let state = ExportDialogState::new();
         let before = terminal.backend().buffer().clone();
-        terminal.draw(|frame| {
-            render_export_dialog(frame, &state, frame.area());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                render_export_dialog(frame, &state, frame.area());
+            })
+            .unwrap();
         assert_eq!(terminal.backend().buffer().content(), before.content());
     }
 }

@@ -11,9 +11,9 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
+use futures::Stream;
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::{ContentBlock, UsageInfo};
-use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -45,7 +45,7 @@ impl AzureProvider {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
-            .expect("failed to build reqwest client");
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
             id: ProviderId::new(ProviderId::AZURE),
@@ -64,8 +64,8 @@ impl AzureProvider {
     pub fn from_env() -> Option<Self> {
         let key = std::env::var("AZURE_API_KEY").ok()?;
         let resource = std::env::var("AZURE_RESOURCE_NAME").ok()?;
-        let version = std::env::var("AZURE_API_VERSION")
-            .unwrap_or_else(|_| "2024-08-01-preview".to_string());
+        let version =
+            std::env::var("AZURE_API_VERSION").unwrap_or_else(|_| "2024-08-01-preview".to_string());
         Some(Self::new(resource, key).with_api_version(version))
     }
 

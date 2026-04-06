@@ -46,9 +46,8 @@ const INLINE_TARGET_W_ITERM: u32 = 1600;
 const FALLBACK_CELL_ASPECT_X: f32 = 3.0;
 
 /// Parsed SVG tree, cached once.
-static SVG_TREE: Lazy<Option<resvg::usvg::Tree>> = Lazy::new(|| {
-    resvg::usvg::Tree::from_data(SVG_DATA, &resvg::usvg::Options::default()).ok()
-});
+static SVG_TREE: Lazy<Option<resvg::usvg::Tree>> =
+    Lazy::new(|| resvg::usvg::Tree::from_data(SVG_DATA, &resvg::usvg::Options::default()).ok());
 
 /// Cached rendered result: (max_rows, lines).
 static CACHED_RENDER: Lazy<Mutex<(u16, Vec<Line<'static>>)>> =
@@ -75,22 +74,22 @@ static SVG_CONTENT_BOUNDS: Lazy<Option<SvgCropRect>> = Lazy::new(|| {
 /// A set bit means that quadrant uses the foreground color.
 #[allow(dead_code)]
 const QUADRANT_CHARS: [char; 16] = [
-    ' ',  // 0b0000 - empty (all bg)
-    '▘',  // 0b0001 - TL
-    '▝',  // 0b0010 - TR
-    '▀',  // 0b0011 - TL+TR (upper half)
-    '▖',  // 0b0100 - BL
-    '▌',  // 0b0101 - TL+BL (left half)
-    '▞',  // 0b0110 - TR+BL (diagonal)
-    '▛',  // 0b0111 - TL+TR+BL
-    '▗',  // 0b1000 - BR
-    '▚',  // 0b1001 - TL+BR (diagonal)
-    '▐',  // 0b1010 - TR+BR (right half)
-    '▜',  // 0b1011 - TL+TR+BR
-    '▄',  // 0b1100 - BL+BR (lower half)
-    '▙',  // 0b1101 - TL+BL+BR
-    '▟',  // 0b1110 - TR+BL+BR
-    '█',  // 0b1111 - full block (all fg)
+    ' ', // 0b0000 - empty (all bg)
+    '▘', // 0b0001 - TL
+    '▝', // 0b0010 - TR
+    '▀', // 0b0011 - TL+TR (upper half)
+    '▖', // 0b0100 - BL
+    '▌', // 0b0101 - TL+BL (left half)
+    '▞', // 0b0110 - TR+BL (diagonal)
+    '▛', // 0b0111 - TL+TR+BL
+    '▗', // 0b1000 - BR
+    '▚', // 0b1001 - TL+BR (diagonal)
+    '▐', // 0b1010 - TR+BR (right half)
+    '▜', // 0b1011 - TL+TR+BR
+    '▄', // 0b1100 - BL+BR (lower half)
+    '▙', // 0b1101 - TL+BL+BR
+    '▟', // 0b1110 - TR+BL+BR
+    '█', // 0b1111 - full block (all fg)
 ];
 
 fn detect_svg_content_bounds(tree: &resvg::usvg::Tree) -> Option<SvgCropRect> {
@@ -451,7 +450,10 @@ fn render_svg_braille(max_rows: u16) -> Vec<Line<'static>> {
 #[allow(dead_code)]
 fn best_quadrant(px: [(u8, u8, u8); 4]) -> (char, (u8, u8, u8), (u8, u8, u8)) {
     // Preserve true empty background cells as spaces.
-    if px.iter().all(|&(r, g, b)| r == BG_R && g == BG_G && b == BG_B) {
+    if px
+        .iter()
+        .all(|&(r, g, b)| r == BG_R && g == BG_G && b == BG_B)
+    {
         return (' ', (BG_R, BG_G, BG_B), (BG_R, BG_G, BG_B));
     }
 
@@ -482,25 +484,45 @@ fn best_quadrant(px: [(u8, u8, u8); 4]) -> (char, (u8, u8, u8), (u8, u8, u8)) {
 /// Bit i of `pat` → pixel i is foreground; otherwise background.
 #[allow(dead_code)]
 fn avg_for_pattern(px: &[(u8, u8, u8); 4], pat: u8) -> ((u8, u8, u8), (u8, u8, u8)) {
-    let mut fg_r = 0u32; let mut fg_g = 0u32; let mut fg_b = 0u32; let mut fg_n = 0u32;
-    let mut bg_r = 0u32; let mut bg_g = 0u32; let mut bg_b = 0u32; let mut bg_n = 0u32;
+    let mut fg_r = 0u32;
+    let mut fg_g = 0u32;
+    let mut fg_b = 0u32;
+    let mut fg_n = 0u32;
+    let mut bg_r = 0u32;
+    let mut bg_g = 0u32;
+    let mut bg_b = 0u32;
+    let mut bg_n = 0u32;
 
     for i in 0..4u8 {
         let (r, g, b) = px[i as usize];
         if pat & (1 << i) != 0 {
-            fg_r += r as u32; fg_g += g as u32; fg_b += b as u32; fg_n += 1;
+            fg_r += r as u32;
+            fg_g += g as u32;
+            fg_b += b as u32;
+            fg_n += 1;
         } else {
-            bg_r += r as u32; bg_g += g as u32; bg_b += b as u32; bg_n += 1;
+            bg_r += r as u32;
+            bg_g += g as u32;
+            bg_b += b as u32;
+            bg_n += 1;
         }
     }
 
     let fg = if fg_n > 0 {
-        ((fg_r / fg_n) as u8, (fg_g / fg_n) as u8, (fg_b / fg_n) as u8)
+        (
+            (fg_r / fg_n) as u8,
+            (fg_g / fg_n) as u8,
+            (fg_b / fg_n) as u8,
+        )
     } else {
         (BG_R, BG_G, BG_B)
     };
     let bg = if bg_n > 0 {
-        ((bg_r / bg_n) as u8, (bg_g / bg_n) as u8, (bg_b / bg_n) as u8)
+        (
+            (bg_r / bg_n) as u8,
+            (bg_g / bg_n) as u8,
+            (bg_b / bg_n) as u8,
+        )
     } else {
         (BG_R, BG_G, BG_B)
     };
@@ -668,9 +690,15 @@ mod tests {
             let content_lines = lines.len().saturating_sub(1);
             eprintln!("max_rows={}: {} content lines", max_rows, content_lines);
             assert!(content_lines > 0, "No content at max_rows={}", max_rows);
-            assert!(content_lines <= max_rows as usize,
-                "Got {} lines for max_rows={}", content_lines, max_rows);
-            let width: usize = lines[0].spans.iter()
+            assert!(
+                content_lines <= max_rows as usize,
+                "Got {} lines for max_rows={}",
+                content_lines,
+                max_rows
+            );
+            let width: usize = lines[0]
+                .spans
+                .iter()
                 .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             eprintln!("  width={} cols, {} spans", width, lines[0].spans.len());

@@ -198,7 +198,7 @@ impl AgentEditorState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentsRoute {
     List,
-    Detail(usize),        // index into definitions
+    Detail(usize),         // index into definitions
     Editor(Option<usize>), // None = create new
 }
 
@@ -375,7 +375,9 @@ pub fn load_agent_definitions(project_root: &std::path::Path) -> Vec<AgentDefini
 
     for dir_opt in &dirs {
         let Some(dir) = dir_opt else { continue };
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "md") {
@@ -393,27 +395,28 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
-    let (name, model, memory, description, tools, instructions) = if let Some(stripped) = content.strip_prefix("---") {
-        let end = stripped.find("\n---")?;
-        let front = &stripped[..end];
-        let body = stripped[end + 4..].trim().to_string();
-        let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
-        let model = extract_yaml_str(front, "model");
-        let memory = extract_yaml_str(front, "memory_scope")
-            .or_else(|| extract_yaml_str(front, "memory"));
-        let desc = extract_yaml_str(front, "description").unwrap_or_default();
-        let tools = extract_yaml_list(front, "tools");
-        (name, model, memory, desc, tools, body)
-    } else {
-        (
-            stem,
-            None,
-            None,
-            content.lines().next().unwrap_or("").to_string(),
-            vec![],
-            content.trim().to_string(),
-        )
-    };
+    let (name, model, memory, description, tools, instructions) =
+        if let Some(stripped) = content.strip_prefix("---") {
+            let end = stripped.find("\n---")?;
+            let front = &stripped[..end];
+            let body = stripped[end + 4..].trim().to_string();
+            let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
+            let model = extract_yaml_str(front, "model");
+            let memory = extract_yaml_str(front, "memory_scope")
+                .or_else(|| extract_yaml_str(front, "memory"));
+            let desc = extract_yaml_str(front, "description").unwrap_or_default();
+            let tools = extract_yaml_list(front, "tools");
+            (name, model, memory, desc, tools, body)
+        } else {
+            (
+                stem,
+                None,
+                None,
+                content.lines().next().unwrap_or("").to_string(),
+                vec![],
+                content.trim().to_string(),
+            )
+        };
 
     Some(AgentDefinition {
         file_path: path.to_path_buf(),
@@ -431,12 +434,7 @@ fn parse_agent_def(path: &std::path::Path) -> Option<AgentDefinition> {
 fn extract_yaml_str(front: &str, key: &str) -> Option<String> {
     for line in front.lines() {
         if let Some(rest) = line.strip_prefix(&format!("{key}:")) {
-            return Some(
-                rest.trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            );
+            return Some(rest.trim().trim_matches('"').trim_matches('\'').to_string());
         }
     }
     None
@@ -448,12 +446,7 @@ fn extract_yaml_list(front: &str, key: &str) -> Vec<String> {
             let rest = rest.trim().trim_matches('[').trim_matches(']');
             return rest
                 .split(',')
-                .map(|s| {
-                    s.trim()
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_string()
-                })
+                .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
         }
@@ -628,7 +621,11 @@ fn render_agents_list(state: &AgentsMenuState, area: Rect, buf: &mut Buffer) {
         };
 
         let model_str = def.model.as_deref().unwrap_or("default");
-        let shadow_suffix = if def.shadowed_by.is_some() { " ⚠" } else { "" };
+        let shadow_suffix = if def.shadowed_by.is_some() {
+            " ⚠"
+        } else {
+            ""
+        };
 
         let line = Line::from(vec![
             Span::styled(prefix, base),
@@ -826,10 +823,7 @@ fn render_editor_field(label: &str, value: &str, value_style: Style) -> Line<'st
         value.to_string()
     };
     Line::from(vec![
-        Span::styled(
-            format!("{label:<11}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("{label:<11}"), Style::default().fg(Color::DarkGray)),
         Span::styled(display, value_style),
     ])
 }
@@ -872,7 +866,11 @@ pub fn render_coordinator_status(agents: &[AgentInfo], area: Rect, buf: &mut Buf
             height: 1,
         };
 
-        let prefix = if agent.is_coordinator { "● " } else { "  ○ " };
+        let prefix = if agent.is_coordinator {
+            "● "
+        } else {
+            "  ○ "
+        };
         let tool_str = agent
             .current_tool
             .as_deref()

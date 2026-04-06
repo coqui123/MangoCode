@@ -89,9 +89,7 @@ impl AuthStore {
                     }
                 }
                 StoredCredential::OAuthToken {
-                    access,
-                    refresh,
-                    ..
+                    access, refresh, ..
                 } if provider_id == "github-copilot" => {
                     if !refresh.is_empty() {
                         return Some(refresh.clone());
@@ -108,7 +106,7 @@ impl AuthStore {
         if provider_id == "google-vertex" {
             return std::env::var("VERTEX_ACCESS_TOKEN")
                 .ok()
-            .filter(|k| !k.is_empty());
+                .filter(|k| !k.is_empty());
         }
 
         // Fall back to environment variable

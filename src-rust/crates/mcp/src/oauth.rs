@@ -22,7 +22,9 @@ pub struct McpToken {
 impl McpToken {
     /// Returns `true` if the token is expired or will expire within `grace_secs`.
     pub fn is_expired(&self, grace_secs: u64) -> bool {
-        let Some(exp) = self.expires_at else { return false };
+        let Some(exp) = self.expires_at else {
+            return false;
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -45,8 +47,7 @@ pub fn store_mcp_token(token: &McpToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(token)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(token).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)
 }
 
@@ -60,7 +61,11 @@ pub fn get_mcp_token(server_name: &str) -> Option<McpToken> {
 /// Delete the stored token for a server (effectively logs out).
 pub fn remove_mcp_token(server_name: &str) -> std::io::Result<()> {
     let path = token_path(server_name);
-    if path.exists() { std::fs::remove_file(&path) } else { Ok(()) }
+    if path.exists() {
+        std::fs::remove_file(&path)
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +76,12 @@ pub fn remove_mcp_token(server_name: &str) -> std::io::Result<()> {
 pub fn pkce_verifier() -> String {
     use base64::Engine as _;
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let u1 = uuid::Uuid::new_v4();
+        let u2 = uuid::Uuid::new_v4();
+        bytes[..16].copy_from_slice(u1.as_bytes());
+        bytes[16..].copy_from_slice(u2.as_bytes());
+    }
     // base64url-encode → 43 chars (256 bits of entropy, no padding)
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -114,10 +124,7 @@ pub struct XaaLoginState {
 ///
 /// Opens the browser to the IdP authorization URL with PKCE parameters.
 /// Returns the login state needed to complete the exchange.
-pub fn initiate_xaa_login(
-    server_name: &str,
-    idp_url: &str,
-) -> std::io::Result<XaaLoginState> {
+pub fn initiate_xaa_login(server_name: &str, idp_url: &str) -> std::io::Result<XaaLoginState> {
     let port = oauth_port_alloc()?;
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
@@ -194,7 +201,10 @@ pub async fn exchange_code(
         scope: Option<String>,
     }
 
-    let tr: TokenResponse = resp.json().await.map_err(|e| anyhow::anyhow!("exchange_code: bad JSON: {}", e))?;
+    let tr: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("exchange_code: bad JSON: {}", e))?;
 
     let expires_at = tr.expires_in.map(|secs| {
         std::time::SystemTime::now()
@@ -214,7 +224,10 @@ pub async fn exchange_code(
 }
 
 /// Refresh an existing MCP token using the stored refresh token.
-pub async fn refresh_mcp_token(server_name: &str, token_endpoint: &str) -> anyhow::Result<McpToken> {
+pub async fn refresh_mcp_token(
+    server_name: &str,
+    token_endpoint: &str,
+) -> anyhow::Result<McpToken> {
     let existing = get_mcp_token(server_name)
         .ok_or_else(|| anyhow::anyhow!("No stored token for {}", server_name))?;
     let refresh = existing
@@ -224,7 +237,10 @@ pub async fn refresh_mcp_token(server_name: &str, token_endpoint: &str) -> anyho
         .to_string();
 
     let client = reqwest::Client::new();
-    let params = [("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())];
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh.as_str()),
+    ];
 
     let resp = client
         .post(token_endpoint)

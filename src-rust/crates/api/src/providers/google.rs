@@ -15,9 +15,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mangocode_core::provider_id::{ModelId, ProviderId};
-use mangocode_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::{Stream, StreamExt};
+use mangocode_core::provider_id::{ModelId, ProviderId};
+use mangocode_core::types::{
+    ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo,
+};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -52,7 +54,7 @@ impl GoogleProvider {
             .connect_timeout(std::time::Duration::from_secs(30))
             .read_timeout(std::time::Duration::from_secs(300))
             .build()
-            .expect("failed to build reqwest client");
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             id: ProviderId::new(ProviderId::GOOGLE),
             api_key,
@@ -67,7 +69,10 @@ impl GoogleProvider {
 
     /// Returns true if the model supports thinking config (Gemini 2.5+ / 3.0+).
     fn supports_thinking(model: &str) -> bool {
-        model.contains("2.5") || model.contains("3.0") || model.contains("3.1") || model.contains("gemini-3")
+        model.contains("2.5")
+            || model.contains("3.0")
+            || model.contains("3.1")
+            || model.contains("gemini-3")
     }
 
     /// Build the full generateContent URL for non-streaming.
@@ -135,7 +140,11 @@ impl GoogleProvider {
                 }
             })
             .collect();
-        let base = if sanitized.is_empty() { "tool" } else { sanitized.as_str() };
+        let base = if sanitized.is_empty() {
+            "tool"
+        } else {
+            sanitized.as_str()
+        };
         if occurrence == 0 {
             format!("call_{}", base)
         } else {
@@ -246,10 +255,16 @@ impl GoogleProvider {
             ContentBlock::SystemAPIError { message, .. } => Some(json!({
                 "text": format!("[error] {}", message)
             })),
-            ContentBlock::CollapsedReadSearch { tool_name, paths, .. } => Some(json!({
+            ContentBlock::CollapsedReadSearch {
+                tool_name, paths, ..
+            } => Some(json!({
                 "text": format!("[{}] {}", tool_name, paths.join(", "))
             })),
-            ContentBlock::TaskAssignment { id, subject, description } => Some(json!({
+            ContentBlock::TaskAssignment {
+                id,
+                subject,
+                description,
+            } => Some(json!({
                 "text": format!("[task:{}] {}: {}", id, subject, description)
             })),
 
@@ -337,11 +352,7 @@ impl GoogleProvider {
 
                         let filtered: Vec<Value> = req_arr
                             .into_iter()
-                            .filter(|v| {
-                                v.as_str()
-                                    .map(|s| prop_keys.contains(s))
-                                    .unwrap_or(false)
-                            })
+                            .filter(|v| v.as_str().map(|s| prop_keys.contains(s)).unwrap_or(false))
                             .collect();
                         map.insert("required".to_string(), Value::Array(filtered));
                     }
@@ -356,8 +367,10 @@ impl GoogleProvider {
                     if let Some(items) = map.get_mut("items") {
                         if let Value::Object(ref mut items_map) = items {
                             if !items_map.contains_key("type") {
-                                items_map
-                                    .insert("type".to_string(), Value::String("string".to_string()));
+                                items_map.insert(
+                                    "type".to_string(),
+                                    Value::String("string".to_string()),
+                                );
                             }
                             // Recurse sanitize into items.
                             let sanitized = Self::sanitize_schema(Value::Object(items_map.clone()));
@@ -511,18 +524,12 @@ impl GoogleProvider {
 
         // ---- Generation config ----
         let mut gen_config = serde_json::Map::new();
-        gen_config.insert(
-            "maxOutputTokens".to_string(),
-            json!(request.max_tokens),
-        );
+        gen_config.insert("maxOutputTokens".to_string(), json!(request.max_tokens));
         if let Some(temp) = request.temperature {
             gen_config.insert("temperature".to_string(), json!(temp));
         }
         if !request.stop_sequences.is_empty() {
-            gen_config.insert(
-                "stopSequences".to_string(),
-                json!(request.stop_sequences),
-            );
+            gen_config.insert("stopSequences".to_string(), json!(request.stop_sequences));
         }
         if let Some(top_p) = request.top_p {
             gen_config.insert("topP".to_string(), json!(top_p));
@@ -550,10 +557,7 @@ impl GoogleProvider {
         // ---- Assemble body ----
         let mut body = serde_json::Map::new();
         body.insert("contents".to_string(), Value::Array(contents));
-        body.insert(
-            "generationConfig".to_string(),
-            Value::Object(gen_config),
-        );
+        body.insert("generationConfig".to_string(), Value::Object(gen_config));
         if let Some(si) = system_instruction {
             body.insert("systemInstruction".to_string(), si);
         }
@@ -614,10 +618,7 @@ impl GoogleProvider {
                 if let Some(fc) = part.get("functionCall") {
                     saw_tool_call = true;
 
-                    if let Some(signature) = part
-                        .get("thoughtSignature")
-                        .and_then(|s| s.as_str())
-                    {
+                    if let Some(signature) = part.get("thoughtSignature").and_then(|s| s.as_str()) {
                         content_blocks.push(ContentBlock::Thinking {
                             thinking: String::new(),
                             signature: signature.to_string(),
@@ -689,7 +690,6 @@ impl GoogleProvider {
             cache_read_input_tokens: 0,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -757,10 +757,8 @@ impl LlmProvider for GoogleProvider {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         let url = self.stream_url(&request.model);
         let model = request.model.clone();
         let body = self.build_request_body(&request);
@@ -784,10 +782,10 @@ impl LlmProvider for GoogleProvider {
 
         let status = resp.status().as_u16();
         if status >= 400 {
-            let resp_body =
-                resp.text()
-                    .await
-                    .unwrap_or_else(|_| "<unreadable>".to_string());
+            let resp_body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable>".to_string());
             return Err(self.parse_error_response(status, &resp_body));
         }
 
@@ -1403,10 +1401,7 @@ impl LlmProvider for GoogleProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let url = format!(
-            "{}/v1beta/models?key={}",
-            self.base_url, self.api_key
-        );
+        let url = format!("{}/v1beta/models?key={}", self.base_url, self.api_key);
 
         let resp = self
             .http_client
@@ -1433,13 +1428,12 @@ impl LlmProvider for GoogleProvider {
             return Err(self.parse_error_response(status, &body_text));
         }
 
-        let body: Value =
-            serde_json::from_str(&body_text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models list JSON: {}", e),
-                status: Some(status),
-                body: Some(body_text.clone()),
-            })?;
+        let body: Value = serde_json::from_str(&body_text).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to parse models list JSON: {}", e),
+            status: Some(status),
+            body: Some(body_text.clone()),
+        })?;
 
         let models_array = body
             .get("models")
@@ -1492,12 +1486,10 @@ impl LlmProvider for GoogleProvider {
             Ok(_) => Ok(ProviderStatus::Degraded {
                 reason: "No Gemini models returned".to_string(),
             }),
-            Err(ProviderError::AuthFailed { message, .. }) => {
-                Err(ProviderError::AuthFailed {
-                    provider: self.id.clone(),
-                    message,
-                })
-            }
+            Err(ProviderError::AuthFailed { message, .. }) => Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message,
+            }),
             Err(e) => Ok(ProviderStatus::Unavailable {
                 reason: e.to_string(),
             }),
@@ -1607,7 +1599,10 @@ mod tests {
         assert_eq!(contents.len(), 3);
         assert_eq!(contents[0]["role"], json!("user"));
         assert_eq!(contents[0]["parts"][0]["text"], json!("before"));
-        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], json!("search"));
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            json!("search")
+        );
         assert_eq!(contents[2]["parts"][0]["text"], json!("after"));
     }
 
@@ -1713,9 +1708,14 @@ mod tests {
         ])]);
 
         let body = provider.build_request_body(&request);
-        let parts = body["contents"][0]["parts"].as_array().expect("parts array");
+        let parts = body["contents"][0]["parts"]
+            .as_array()
+            .expect("parts array");
 
-        assert_eq!(parts[0]["thoughtSignature"], json!("skip_thought_signature_validator"));
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            json!("skip_thought_signature_validator")
+        );
         assert!(parts[1].get("thoughtSignature").is_none());
     }
 
@@ -1758,8 +1758,14 @@ mod tests {
 
     #[test]
     fn sse_data_payload_accepts_both_data_prefix_forms() {
-        assert_eq!(GoogleProvider::sse_data_payload("data: {\"a\":1}"), Some("{\"a\":1}"));
-        assert_eq!(GoogleProvider::sse_data_payload("data:{\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(
+            GoogleProvider::sse_data_payload("data: {\"a\":1}"),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(
+            GoogleProvider::sse_data_payload("data:{\"a\":1}"),
+            Some("{\"a\":1}")
+        );
         assert_eq!(GoogleProvider::sse_data_payload("event: ping"), None);
     }
 
@@ -1826,9 +1832,9 @@ mod tests {
     // by building a GoogleProvider that points at a local mock HTTP server.
     // They assert that the stream always terminates and emits MessageStop.
 
+    use futures::Stream;
     use std::pin::Pin;
     use std::time::Duration;
-    use futures::Stream;
 
     /// Helper: collect all stream events from a GoogleProvider stream response.
     /// Returns the collected events or panics on timeout.
@@ -1889,11 +1895,15 @@ mod tests {
     }
 
     fn has_message_stop(events: &[Result<StreamEvent, ProviderError>]) -> bool {
-        events.iter().any(|e| matches!(e, Ok(StreamEvent::MessageStop)))
+        events
+            .iter()
+            .any(|e| matches!(e, Ok(StreamEvent::MessageStop)))
     }
 
     fn has_message_start(events: &[Result<StreamEvent, ProviderError>]) -> bool {
-        events.iter().any(|e| matches!(e, Ok(StreamEvent::MessageStart { .. })))
+        events
+            .iter()
+            .any(|e| matches!(e, Ok(StreamEvent::MessageStart { .. })))
     }
 
     /// Case A: Final content arrives, then the stream ends with no [DONE].
@@ -1910,10 +1920,12 @@ mod tests {
         assert!(has_message_start(&events), "should have MessageStart");
         assert!(has_message_stop(&events), "should have MessageStop");
         // Should have text delta with "Hello!"
-        let has_text = events.iter().any(|e| matches!(
-            e,
-            Ok(StreamEvent::TextDelta { text, .. }) if text == "Hello!"
-        ));
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                Ok(StreamEvent::TextDelta { text, .. }) if text == "Hello!"
+            )
+        });
         assert!(has_text, "should have text delta");
     }
 
@@ -1929,10 +1941,12 @@ mod tests {
         assert!(has_message_start(&events), "should have MessageStart");
         assert!(has_message_stop(&events), "should have MessageStop");
         // Should contain the block reason in a text delta.
-        let has_block_text = events.iter().any(|e| matches!(
-            e,
-            Ok(StreamEvent::TextDelta { text, .. }) if text.contains("SAFETY")
-        ));
+        let has_block_text = events.iter().any(|e| {
+            matches!(
+                e,
+                Ok(StreamEvent::TextDelta { text, .. }) if text.contains("SAFETY")
+            )
+        });
         assert!(has_block_text, "should surface block reason");
     }
 
@@ -1948,10 +1962,12 @@ mod tests {
 
         assert!(has_message_start(&events), "should have MessageStart");
         assert!(has_message_stop(&events), "should have MessageStop");
-        let has_text = events.iter().any(|e| matches!(
-            e,
-            Ok(StreamEvent::TextDelta { text, .. }) if text == "partial"
-        ));
+        let has_text = events.iter().any(|e| {
+            matches!(
+                e,
+                Ok(StreamEvent::TextDelta { text, .. }) if text == "partial"
+            )
+        });
         assert!(has_text, "should have partial text");
     }
 

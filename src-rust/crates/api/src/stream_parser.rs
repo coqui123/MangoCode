@@ -5,8 +5,8 @@
 // will be filled in during Phase 2A.
 
 use async_trait::async_trait;
-use mangocode_core::provider_id::ProviderId;
 use futures::Stream;
+use mangocode_core::provider_id::ProviderId;
 use std::pin::Pin;
 
 use crate::provider_error::ProviderError;
@@ -32,10 +32,7 @@ pub trait StreamParser: Send + Sync {
     async fn parse(
         &self,
         response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,10 +61,8 @@ impl StreamParser for SseStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),
@@ -104,10 +99,8 @@ impl StreamParser for JsonLinesStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),

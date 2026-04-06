@@ -69,9 +69,26 @@ pub(crate) fn merge_google_options(body: &mut Value, provider_options: &Value) {
     let generation_config = body_obj
         .entry("generationConfig".to_string())
         .or_insert_with(|| Value::Object(Map::new()));
-    let generation_config_obj = generation_config
-        .as_object_mut()
-        .expect("generationConfig must be an object");
+    let Some(generation_config_obj) = generation_config.as_object_mut() else {
+        *generation_config = Value::Object(Map::new());
+        let Some(obj) = generation_config.as_object_mut() else {
+            return;
+        };
+        let mut root_entries: Vec<(String, Value)> = Vec::new();
+
+        for (key, value) in options_obj {
+            if GENERATION_CONFIG_KEYS.contains(&key.as_str()) {
+                obj.insert(key.clone(), value.clone());
+            } else {
+                root_entries.push((key.clone(), value.clone()));
+            }
+        }
+
+        for (key, value) in root_entries {
+            body_obj.insert(key, value);
+        }
+        return;
+    };
     let mut root_entries: Vec<(String, Value)> = Vec::new();
 
     for (key, value) in options_obj {
@@ -97,16 +114,17 @@ pub(crate) fn merge_bedrock_options(body: &mut Value, provider_options: &Value) 
 
     for (key, value) in options_obj {
         match key.as_str() {
-            "inferenceConfig" | "toolConfig" | "reasoningConfig" | "additionalModelRequestFields" => {
-                match (body_obj.get_mut(key), value) {
-                    (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
-                        merge_maps(target_obj, source_obj);
-                    }
-                    _ => {
-                        body_obj.insert(key.clone(), value.clone());
-                    }
+            "inferenceConfig"
+            | "toolConfig"
+            | "reasoningConfig"
+            | "additionalModelRequestFields" => match (body_obj.get_mut(key), value) {
+                (Some(Value::Object(target_obj)), Value::Object(source_obj)) => {
+                    merge_maps(target_obj, source_obj);
                 }
-            }
+                _ => {
+                    body_obj.insert(key.clone(), value.clone());
+                }
+            },
             _ => {
                 body_obj.insert(key.clone(), value.clone());
             }
@@ -154,7 +172,10 @@ mod tests {
             }),
         );
 
-        assert_eq!(body["generationConfig"]["thinkingConfig"]["thinkingLevel"], json!("high"));
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            json!("high")
+        );
         assert_eq!(body["cachedContent"], json!("abc"));
     }
 

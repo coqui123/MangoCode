@@ -3,14 +3,12 @@
 use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
 use crate::dialog_select::{DialogSelectState, SelectItem};
-use crate::export_dialog::{ExportDialogState, ExportFormat};
-use crate::dialogs::PermissionRequest;
-use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
-use crate::session_browser::SessionBrowserState;
-use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
+use crate::dialogs::PermissionRequest;
+use crate::diff_viewer::{build_turn_diff, DiffViewerState};
+use crate::export_dialog::{ExportDialogState, ExportFormat};
 use crate::mcp_view::{McpServerView, McpToolView, McpViewState, McpViewStatus};
+use crate::model_picker::{EffortLevel, ModelPickerState, FAST_MODE_MODEL};
 use crate::notifications::{NotificationKind, NotificationQueue};
 use crate::overlays::{
     GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay,
@@ -20,10 +18,16 @@ use crate::plugin_views::PluginHintBanner;
 use crate::privacy_screen::PrivacyScreen;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
+use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
 use crate::stats_dialog::StatsDialogState;
+use crate::tasks_overlay::TasksOverlay;
 use crate::theme_screen::ThemeScreen;
-use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute}, diff_viewer::DiffPane};
+use crate::{
+    agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute},
+    diff_viewer::DiffPane,
+};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::file_history::FileHistory;
@@ -33,7 +37,6 @@ use mangocode_core::keybindings::{
 use mangocode_core::types::{Message, Role};
 use mangocode_query::QueryEvent;
 use mangocode_tools;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
@@ -65,8 +68,14 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
     ("init", "Initialize AGENTS.md for this project"),
-    ("insights", "Generate a session analysis report with conversation statistics"),
-    ("install-slack-app", "Install the MangoCode Slack integration"),
+    (
+        "insights",
+        "Generate a session analysis report with conversation statistics",
+    ),
+    (
+        "install-slack-app",
+        "Install the MangoCode Slack integration",
+    ),
     ("keybindings", "Show keybinding configuration"),
     ("login", "Log in to MangoCode"),
     ("logout", "Log out of MangoCode"),
@@ -87,7 +96,10 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
-    ("ultrareview", "Run an exhaustive multi-dimensional code review"),
+    (
+        "ultrareview",
+        "Run an exhaustive multi-dimensional code review",
+    ),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
@@ -174,12 +186,18 @@ fn get_url_for_provider(id: &str) -> &'static str {
 
 /// Validate basic credential shape before persisting.
 /// Returns `(category, detail)` on validation failure.
-fn validate_provider_credential(provider_id: &str, key: &str) -> Result<(), (&'static str, String)> {
+fn validate_provider_credential(
+    provider_id: &str,
+    key: &str,
+) -> Result<(), (&'static str, String)> {
     let trimmed = key.trim();
     if trimmed.is_empty() {
         return Err((
             "Configuration",
-            format!("Missing credential. Set {} or paste it here.", get_env_var_for_provider(provider_id)),
+            format!(
+                "Missing credential. Set {} or paste it here.",
+                get_env_var_for_provider(provider_id)
+            ),
         ));
     }
 
@@ -200,9 +218,7 @@ fn validate_provider_credential(provider_id: &str, key: &str) -> Result<(), (&'s
         "google" if !trimmed.starts_with("AIza") => {
             Some("Google Gemini API keys from AI Studio usually start with 'AIza'.")
         }
-        "groq" if !trimmed.starts_with("gsk_") => {
-            Some("Groq keys usually start with 'gsk_'.")
-        }
+        "groq" if !trimmed.starts_with("gsk_") => Some("Groq keys usually start with 'gsk_'."),
         _ => None,
     };
 
@@ -245,7 +261,10 @@ pub enum DisplayMessage {
     /// A real conversation turn.
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
-    System { text: String, style: SystemMessageStyle },
+    System {
+        text: String,
+        style: SystemMessageStyle,
+    },
 }
 
 /// Context menu state: position and currently selected item index.
@@ -554,20 +573,17 @@ pub struct App {
     pub cursor_pos: usize,
 
     // ---- Scrollback / auto-scroll -----------------------------------------
-
     /// When `true`, the message pane follows the latest messages automatically.
     pub auto_scroll: bool,
     /// Count of messages that arrived while the user was scrolled up.
     pub new_messages_while_scrolled: usize,
 
     // ---- Token warning tracking -------------------------------------------
-
     /// Which threshold (0 = none, 80, 95, 100) was last notified so we only
     /// show each banner once.
     pub token_warning_threshold_shown: u8,
 
     // ---- Session timing ---------------------------------------------------
-
     /// Instant the session started (used for elapsed-time in the status bar).
     pub session_start: std::time::Instant,
     /// Instant the current turn's streaming began (reset each time streaming starts).
@@ -581,7 +597,6 @@ pub struct App {
     pub transcript_version: Cell<u64>,
 
     // ---- New overlay / notification fields --------------------------------
-
     /// Full-screen help overlay (F1 / /help).
     pub help_overlay: HelpOverlay,
     /// Ctrl+R history search overlay.
@@ -612,7 +627,6 @@ pub struct App {
     pub current_turn: Option<Arc<std::sync::atomic::AtomicUsize>>,
 
     // ---- Visual mode indicators -------------------------------------------
-
     /// Plan mode — input border turns blue, [PLAN] shown in status bar.
     pub plan_mode: bool,
     /// "While you were away" summary text shown on the welcome screen.
@@ -621,7 +635,6 @@ pub struct App {
     pub stall_start: Option<std::time::Instant>,
 
     // ---- Settings / theme / privacy screens --------------------------------
-
     /// Full-screen tabbed settings screen (/config, /settings).
     pub settings_screen: SettingsScreen,
     /// Theme picker overlay (/theme).
@@ -651,7 +664,8 @@ pub struct App {
     /// Startup error dialog for malformed settings.json or AGENTS.md.
     pub invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState,
     /// Memory update notification banner.
-    pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
+    pub memory_update_notification:
+        crate::memory_update_notification::MemoryUpdateNotificationState,
     /// MCP elicitation dialog (form requested by an MCP server).
     pub elicitation: crate::elicitation_dialog::ElicitationDialogState,
     /// Model picker overlay (/model command).
@@ -719,7 +733,6 @@ pub struct App {
     pub auto_compact_threshold: u8,
 
     // ---- Voice hold-to-talk ------------------------------------------------
-
     /// The global voice recorder, Some when voice is enabled in config.
     pub voice_recorder: Option<Arc<Mutex<mangocode_core::voice::VoiceRecorder>>>,
     /// True while recording is active (Alt+V toggled on).
@@ -733,7 +746,6 @@ pub struct App {
         Option<tokio::sync::mpsc::Receiver<Result<Vec<crate::model_picker::ModelEntry>, ()>>>,
 
     // ---- Context window & rate limit info ----------------------------------
-
     /// Total context window size for the current model (tokens).
     pub context_window_size: u64,
     /// How many tokens are currently used in the context window.
@@ -812,29 +824,116 @@ pub struct App {
 }
 
 const SPINNER_VERBS: &[&str] = &[
-    "Gooning", "Pegging", "Jestermaxxing", "Aurafarming", "Chumming", "Coreposting",
-    "Vibecasting", "Dreamhoarding", "Schizoposting", "Deluluing", "Goblinizing",
-    "Realitybending", "Sigmafying", "Rizzcrafting", "Moodboarding", "Dripfarming",
-    "Rizzsummoning", "Enlightenmentgrifting", "NPCing", "Aestheticizing",
-    "Mysticposting", "Flopdetecting", "Hyperfixating", "Brainrotating", "Vibechecking",
-    "Selfgaslighting", "Frogbrooding", "Cloutweaving", "Overclocking", "Algorithmizing",
-    "Maincharactering", "Simpsummoning", "Coreblending", "Chadsplaining", "Spiritbending",
-    "Hyperlinking", "Realitymodding", "Dripmaxxing", "Uncannying", "Flopfishing",
-    "Egocharging", "Goblincore-ing", "Bitrotting", "Wifihopping", "Schizotheorizing",
-    "Neurallinking", "Situationshipping", "Moodglitching", "Rizzifying",
-    "Lorebuilding", "Quantumvibing", "Chronomelding", "Backroomsdrifting",
-    "Emojifying", "Sanitybuffering", "Clipcompiling", "Shadowbanning", "Rituallooping",
-    "Overstimulating", "Fogposting", "Gremlinhopping", "Philosomemeing",
-    "Aura-dripping", "Beefposting", "Enchantedpegging", "Vibequantizing",
-    "Dripweaving", "Schizoascending", "Maxxing", "Overthinking", "Underachieving",
-    "Dreamdissociating", "Goblinwalking", "Flopphasing", "Delulubranching",
-    "Coremitosis", "Rizzlecasting", "Existentializing", "Auraamplifying",
-    "Chungusing", "Quantumvibing", "Sleepparalyzing", "Vibe-overclocking",
-    "Etherealizing", "Memecombobulating", "Moodrebounding", "Jankifying",
-    "Liminalwalking", "Vibeosmosing", "Spiritbottling", "Psycheloading", "Finagling",
-    "Basedifying", "Chronorotating", "Galaxymapping", "Astroprojecting", "Pegposting", "FrameMogging",
-    "Vibe-huffing", "Ego-mining", "Delululooting", "Rizzrecharging", "Unrealizing", "Ejaculating",
-    "Hyperlooping", "Mindmelting", "Auracombobulating", "Dreamsplitting", "Pegpivoting", "Squirting"
+    "Gooning",
+    "Pegging",
+    "Jestermaxxing",
+    "Aurafarming",
+    "Chumming",
+    "Coreposting",
+    "Vibecasting",
+    "Dreamhoarding",
+    "Schizoposting",
+    "Deluluing",
+    "Goblinizing",
+    "Realitybending",
+    "Sigmafying",
+    "Rizzcrafting",
+    "Moodboarding",
+    "Dripfarming",
+    "Rizzsummoning",
+    "Enlightenmentgrifting",
+    "NPCing",
+    "Aestheticizing",
+    "Mysticposting",
+    "Flopdetecting",
+    "Hyperfixating",
+    "Brainrotating",
+    "Vibechecking",
+    "Selfgaslighting",
+    "Frogbrooding",
+    "Cloutweaving",
+    "Overclocking",
+    "Algorithmizing",
+    "Maincharactering",
+    "Simpsummoning",
+    "Coreblending",
+    "Chadsplaining",
+    "Spiritbending",
+    "Hyperlinking",
+    "Realitymodding",
+    "Dripmaxxing",
+    "Uncannying",
+    "Flopfishing",
+    "Egocharging",
+    "Goblincore-ing",
+    "Bitrotting",
+    "Wifihopping",
+    "Schizotheorizing",
+    "Neurallinking",
+    "Situationshipping",
+    "Moodglitching",
+    "Rizzifying",
+    "Lorebuilding",
+    "Quantumvibing",
+    "Chronomelding",
+    "Backroomsdrifting",
+    "Emojifying",
+    "Sanitybuffering",
+    "Clipcompiling",
+    "Shadowbanning",
+    "Rituallooping",
+    "Overstimulating",
+    "Fogposting",
+    "Gremlinhopping",
+    "Philosomemeing",
+    "Aura-dripping",
+    "Beefposting",
+    "Enchantedpegging",
+    "Vibequantizing",
+    "Dripweaving",
+    "Schizoascending",
+    "Maxxing",
+    "Overthinking",
+    "Underachieving",
+    "Dreamdissociating",
+    "Goblinwalking",
+    "Flopphasing",
+    "Delulubranching",
+    "Coremitosis",
+    "Rizzlecasting",
+    "Existentializing",
+    "Auraamplifying",
+    "Chungusing",
+    "Quantumvibing",
+    "Sleepparalyzing",
+    "Vibe-overclocking",
+    "Etherealizing",
+    "Memecombobulating",
+    "Moodrebounding",
+    "Jankifying",
+    "Liminalwalking",
+    "Vibeosmosing",
+    "Spiritbottling",
+    "Psycheloading",
+    "Finagling",
+    "Basedifying",
+    "Chronorotating",
+    "Galaxymapping",
+    "Astroprojecting",
+    "Pegposting",
+    "FrameMogging",
+    "Vibe-huffing",
+    "Ego-mining",
+    "Delululooting",
+    "Rizzrecharging",
+    "Unrealizing",
+    "Ejaculating",
+    "Hyperlooping",
+    "Mindmelting",
+    "Auracombobulating",
+    "Dreamsplitting",
+    "Pegpivoting",
+    "Squirting",
 ];
 
 fn sample_spinner_verb(seed: usize) -> &'static str {
@@ -844,8 +943,15 @@ fn sample_spinner_verb(seed: usize) -> &'static str {
 /// Past-tense verbs shown in the status row after a turn completes.
 /// Mirrors `TURN_COMPLETION_VERBS` from `src/constants/turnCompletionVerbs.ts`.
 const TURN_COMPLETION_VERBS: &[&str] = &[
-    "Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched",
-    "Pondered", "Processed", "Worked",
+    "Baked",
+    "Brewed",
+    "Churned",
+    "Cogitated",
+    "Cooked",
+    "Crunched",
+    "Pondered",
+    "Processed",
+    "Worked",
 ];
 
 fn sample_completion_verb(seed: usize) -> &'static str {
@@ -936,7 +1042,8 @@ impl App {
             voice_mode_notice: crate::voice_mode_notice::VoiceModeNoticeState::new(),
             desktop_upsell: crate::desktop_upsell_startup::DesktopUpsellStartupState::new(),
             invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState::new(),
-            memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState::new(),
+            memory_update_notification:
+                crate::memory_update_notification::MemoryUpdateNotificationState::new(),
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
@@ -946,7 +1053,8 @@ impl App {
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
             go_to_line_dialog: GoToLineDialog::new(),
-            bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
+            bypass_permissions_dialog:
+                crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
@@ -967,57 +1075,327 @@ impl App {
             connect_dialog: {
                 let items = vec![
                     // -- RECOMMENDED --
-                    SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "google".into(), title: "Google Gemini".into(), description: "Direct Gemini API (AI Studio)".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    SelectItem {
+                        id: "anthropic".into(),
+                        title: "Anthropic".into(),
+                        description: "".into(),
+                        category: "Recommended".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "openai".into(),
+                        title: "OpenAI".into(),
+                        description: "".into(),
+                        category: "Recommended".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "google".into(),
+                        title: "Google Gemini".into(),
+                        description: "Direct Gemini API (AI Studio)".into(),
+                        category: "Recommended".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "github-copilot".into(),
+                        title: "GitHub Copilot".into(),
+                        description: "".into(),
+                        category: "Recommended".into(),
+                        badge: None,
+                    },
                     // -- FAST & FREE --
-                    SelectItem { id: "groq".into(), title: "Groq".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
-                    SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
-                    SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
+                    SelectItem {
+                        id: "groq".into(),
+                        title: "Groq".into(),
+                        description: "".into(),
+                        category: "Fast & Free".into(),
+                        badge: Some("FREE".into()),
+                    },
+                    SelectItem {
+                        id: "cerebras".into(),
+                        title: "Cerebras".into(),
+                        description: "".into(),
+                        category: "Fast & Free".into(),
+                        badge: Some("FREE".into()),
+                    },
+                    SelectItem {
+                        id: "sambanova".into(),
+                        title: "SambaNova".into(),
+                        description: "".into(),
+                        category: "Fast & Free".into(),
+                        badge: Some("FREE".into()),
+                    },
                     // -- LOCAL (no key needed) --
-                    SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
-                    SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
-                    SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "C++ inference server".into(), category: "Local".into(), badge: Some("LOCAL".into()) },
+                    SelectItem {
+                        id: "ollama".into(),
+                        title: "Ollama".into(),
+                        description: "Run models locally".into(),
+                        category: "Local".into(),
+                        badge: Some("LOCAL".into()),
+                    },
+                    SelectItem {
+                        id: "lmstudio".into(),
+                        title: "LM Studio".into(),
+                        description: "Local model server".into(),
+                        category: "Local".into(),
+                        badge: Some("LOCAL".into()),
+                    },
+                    SelectItem {
+                        id: "llamacpp".into(),
+                        title: "llama.cpp".into(),
+                        description: "C++ inference server".into(),
+                        category: "Local".into(),
+                        badge: Some("LOCAL".into()),
+                    },
                     // -- AFFORDABLE --
-                    SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models \u{00b7} One key".into(), category: "Aggregator".into(), badge: None },
-                    SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented AI".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "xai".into(), title: "xAI".into(), description: "".into(), category: "Affordable".into(), badge: None },
-                    SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "".into(), category: "Affordable".into(), badge: None },
+                    SelectItem {
+                        id: "deepseek".into(),
+                        title: "DeepSeek".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "mistral".into(),
+                        title: "Mistral".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "openrouter".into(),
+                        title: "OpenRouter".into(),
+                        description: "100+ models \u{00b7} One key".into(),
+                        category: "Aggregator".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "togetherai".into(),
+                        title: "Together AI".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "perplexity".into(),
+                        title: "Perplexity".into(),
+                        description: "Search-augmented AI".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "cohere".into(),
+                        title: "Cohere".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "xai".into(),
+                        title: "xAI".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "deepinfra".into(),
+                        title: "DeepInfra".into(),
+                        description: "".into(),
+                        category: "Affordable".into(),
+                        badge: None,
+                    },
                     // -- ENTERPRISE --
-                    SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "google-vertex-access-token".into(), title: "Google Vertex AI (Access Token)".into(), description: "enter VERTEX_ACCESS_TOKEN".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Enterprise".into(), badge: None },
-                    SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem {
+                        id: "azure".into(),
+                        title: "Azure OpenAI".into(),
+                        description: "".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "amazon-bedrock".into(),
+                        title: "AWS Bedrock".into(),
+                        description: "".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "google-vertex".into(),
+                        title: "Google Vertex AI".into(),
+                        description: "".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "google-vertex-access-token".into(),
+                        title: "Google Vertex AI (Access Token)".into(),
+                        description: "enter VERTEX_ACCESS_TOKEN".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "sap-ai-core".into(),
+                        title: "SAP AI Core".into(),
+                        description: "Enterprise AI platform".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "gitlab".into(),
+                        title: "GitLab Duo".into(),
+                        description: "AI in GitLab".into(),
+                        category: "Enterprise".into(),
+                        badge: None,
+                    },
                     // -- CLOUD / GATEWAY --
-                    SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "AI SDK gateway".into(), category: "Gateway".into(), badge: None },
-                    SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI observability gateway".into(), category: "Gateway".into(), badge: None },
+                    SelectItem {
+                        id: "cloudflare-ai-gateway".into(),
+                        title: "Cloudflare AI Gateway".into(),
+                        description: "".into(),
+                        category: "Gateway".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "cloudflare-workers-ai".into(),
+                        title: "Cloudflare Workers AI".into(),
+                        description: "Edge AI inference".into(),
+                        category: "Gateway".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "vercel".into(),
+                        title: "Vercel AI Gateway".into(),
+                        description: "AI SDK gateway".into(),
+                        category: "Gateway".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "helicone".into(),
+                        title: "Helicone".into(),
+                        description: "AI observability gateway".into(),
+                        category: "Gateway".into(),
+                        badge: None,
+                    },
                     // -- MORE PROVIDERS --
-                    SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "nvidia".into(), title: "Nvidia".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "alibaba".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "moonshotai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "zhipuai".into(), title: "".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "novita".into(), title: "Novita".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "".into(), category: "More Providers".into(), badge: None },
-                    SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "More Providers".into(), badge: None },
+                    SelectItem {
+                        id: "huggingface".into(),
+                        title: "Hugging Face".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "nvidia".into(),
+                        title: "Nvidia".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "alibaba".into(),
+                        title: "".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "venice".into(),
+                        title: "Venice AI".into(),
+                        description: "Privacy-first AI".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "moonshotai".into(),
+                        title: "".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "zhipuai".into(),
+                        title: "".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "siliconflow".into(),
+                        title: "SiliconFlow".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "nebius".into(),
+                        title: "Nebius".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "novita".into(),
+                        title: "Novita".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "ovhcloud".into(),
+                        title: "OVHcloud".into(),
+                        description: "EU-hosted AI".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "scaleway".into(),
+                        title: "Scaleway".into(),
+                        description: "EU cloud AI".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "vultr".into(),
+                        title: "Vultr".into(),
+                        description: "Cloud inference".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "baseten".into(),
+                        title: "Baseten".into(),
+                        description: "Model serving".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "friendli".into(),
+                        title: "Friendli".into(),
+                        description: "Serverless inference".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "upstage".into(),
+                        title: "Upstage".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "stepfun".into(),
+                        title: "StepFun".into(),
+                        description: "".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
+                        id: "fireworks".into(),
+                        title: "Fireworks AI".into(),
+                        description: "Fast inference".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
                 ];
                 DialogSelectState::new("Connect a Provider", items)
             },
@@ -1052,8 +1430,8 @@ impl App {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
                     || {
-                        let path = mangocode_core::config::Settings::config_dir()
-                            .join("ui-settings.json");
+                        let path =
+                            mangocode_core::config::Settings::config_dir().join("ui-settings.json");
                         std::fs::read_to_string(&path)
                             .ok()
                             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
@@ -1349,14 +1727,22 @@ impl App {
             }
             "vim" => {
                 self.prompt_input.vim_enabled = !self.prompt_input.vim_enabled;
-                let status = if self.prompt_input.vim_enabled { "enabled" } else { "disabled" };
+                let status = if self.prompt_input.vim_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 self.status_message = Some(format!("Vim mode {}.", status));
                 self.refresh_prompt_input();
                 true
             }
             "fast" => {
                 self.fast_mode = !self.fast_mode;
-                let status = if self.fast_mode { "enabled" } else { "disabled" };
+                let status = if self.fast_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 self.status_message = Some(format!("Fast mode {}.", status));
                 true
             }
@@ -1382,7 +1768,10 @@ impl App {
             }
             "copy" => {
                 // Copy last assistant message to clipboard. Attempt arboard; fall back to notification.
-                let last = self.messages.iter().rev()
+                let last = self
+                    .messages
+                    .iter()
+                    .rev()
                     .find(|m| m.role == Role::Assistant)
                     .map(|m| m.get_all_text());
                 if let Some(text) = last {
@@ -1397,7 +1786,10 @@ impl App {
                     } else {
                         self.notifications.push(
                             NotificationKind::Info,
-                            format!("Last response: {} chars (clipboard unavailable)", text.len()),
+                            format!(
+                                "Last response: {} chars (clipboard unavailable)",
+                                text.len()
+                            ),
                             Some(5),
                         );
                     }
@@ -1448,7 +1840,8 @@ impl App {
                     }
                     self.voice_recorder = Some(recorder);
                     self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+                    self.status_message =
+                        Some("Voice mode enabled. Press Alt+V to record.".to_string());
                 }
                 true
             }
@@ -1747,8 +2140,7 @@ impl App {
             // Auto-scroll: keep offset at 0 so render shows the bottom.
             self.scroll_offset = 0;
         } else {
-            self.new_messages_while_scrolled =
-                self.new_messages_while_scrolled.saturating_add(1);
+            self.new_messages_while_scrolled = self.new_messages_while_scrolled.saturating_add(1);
         }
     }
 
@@ -1760,8 +2152,7 @@ impl App {
     /// Check current token usage and push token warning notifications as
     /// appropriate.  Call this after updating `token_count`.
     pub fn check_token_warnings(&mut self) {
-        let window =
-            mangocode_query::context_window_for_model(&self.model_name) as u32;
+        let window = mangocode_query::context_window_for_model(&self.model_name) as u32;
         if window == 0 {
             return;
         }
@@ -1812,7 +2203,8 @@ impl App {
     /// wheel) stay at the base 3-line step.
     fn scroll_step(&mut self) -> usize {
         let now = std::time::Instant::now();
-        let elapsed_ms = self.scroll_last_time
+        let elapsed_ms = self
+            .scroll_last_time
             .map(|t| now.duration_since(t).as_millis())
             .unwrap_or(u128::MAX);
         self.scroll_last_time = Some(now);
@@ -1909,7 +2301,8 @@ impl App {
                 }
             });
         }
-        self.status_message = Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
+        self.status_message =
+            Some("Recording\u{2026} release V or press Enter to transcribe".to_string());
     }
 
     /// Stop PTT recording: flip the AtomicBool inside VoiceRecorder so the
@@ -2124,9 +2517,15 @@ impl App {
                 KeyCode::Esc => {
                     self.device_auth_dialog.close();
                 }
-                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Success(_)) => {
+                _ if matches!(
+                    self.device_auth_dialog.status,
+                    crate::device_auth_dialog::DeviceAuthStatus::Success(_)
+                ) =>
+                {
                     // Any key after success -> store credential and close
-                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) = self.device_auth_dialog.status {
+                    if let crate::device_auth_dialog::DeviceAuthStatus::Success(ref token) =
+                        self.device_auth_dialog.status
+                    {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
@@ -2139,10 +2538,7 @@ impl App {
                         } else {
                             mangocode_core::StoredCredential::ApiKey { key: token }
                         };
-                        self.auth_store.set(
-                            &provider_id,
-                            credential,
-                        );
+                        self.auth_store.set(&provider_id, credential);
                         self.set_provider_default(provider_id.clone());
                         self.persist_provider_and_model();
                         self.has_credentials = true;
@@ -2153,7 +2549,11 @@ impl App {
                     }
                     self.device_auth_dialog.close();
                 }
-                _ if matches!(self.device_auth_dialog.status, crate::device_auth_dialog::DeviceAuthStatus::Error(_)) => {
+                _ if matches!(
+                    self.device_auth_dialog.status,
+                    crate::device_auth_dialog::DeviceAuthStatus::Error(_)
+                ) =>
+                {
                     // Any key after error -> close
                     self.device_auth_dialog.close();
                 }
@@ -2188,10 +2588,8 @@ impl App {
                             ));
                         }
                         Err((category, detail)) => {
-                            self.status_message = Some(format!(
-                                "Step 2/3 failed [{}]: {}",
-                                category, detail
-                            ));
+                            self.status_message =
+                                Some(format!("Step 2/3 failed [{}]: {}", category, detail));
                         }
                     }
                 }
@@ -2209,11 +2607,21 @@ impl App {
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
-                KeyCode::Esc => { self.connect_dialog.close(); }
-                KeyCode::Up => { self.connect_dialog.move_up(); }
-                KeyCode::Down => { self.connect_dialog.move_down(); }
-                KeyCode::PageUp => { self.connect_dialog.page_up(); }
-                KeyCode::PageDown => { self.connect_dialog.page_down(); }
+                KeyCode::Esc => {
+                    self.connect_dialog.close();
+                }
+                KeyCode::Up => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Down => {
+                    self.connect_dialog.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.connect_dialog.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.connect_dialog.page_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
@@ -2236,7 +2644,8 @@ impl App {
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com
                                 // (OAuth requires a registered app which MangoCode doesn't have)
-                                self.key_input_dialog.open("anthropic".into(), "Anthropic (API Key)".into());
+                                self.key_input_dialog
+                                    .open("anthropic".into(), "Anthropic (API Key)".into());
                                 self.status_message = Some(format!(
                                     "Step 2/3: enter {} from {}.",
                                     get_env_var_for_provider("anthropic"),
@@ -2245,7 +2654,8 @@ impl App {
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow with MangoCode's registered OAuth app
-                                self.device_auth_dialog.open("github-copilot".into(), "GitHub Copilot".into());
+                                self.device_auth_dialog
+                                    .open("github-copilot".into(), "GitHub Copilot".into());
                                 self.device_auth_pending = Some("github-copilot".to_string());
                                 self.status_message = Some(
                                     "Step 2/3: complete browser device login. Step 3/3 will finish automatically after token exchange."
@@ -2254,8 +2664,10 @@ impl App {
                             }
                             // AWS Bedrock — accept a bearer token via key input dialog
                             "amazon-bedrock" => {
-                                self.key_input_dialog
-                                    .open("amazon-bedrock".into(), "AWS Bedrock (Bearer Token)".into());
+                                self.key_input_dialog.open(
+                                    "amazon-bedrock".into(),
+                                    "AWS Bedrock (Bearer Token)".into(),
+                                );
                                 self.status_message = Some(format!(
                                     "Step 2/3: enter {} (or your Bedrock bearer token).",
                                     get_env_var_for_provider("amazon-bedrock")
@@ -2270,8 +2682,10 @@ impl App {
                                 );
                             }
                             "google-vertex-access-token" => {
-                                self.key_input_dialog
-                                    .open("google-vertex".into(), "Google Vertex AI (Access Token)".into());
+                                self.key_input_dialog.open(
+                                    "google-vertex".into(),
+                                    "Google Vertex AI (Access Token)".into(),
+                                );
                                 self.status_message = Some(
                                     "Step 2/3: enter VERTEX_ACCESS_TOKEN. Step 3/3: run /providers to verify connectivity."
                                         .to_string(),
@@ -2291,8 +2705,12 @@ impl App {
                         }
                     }
                 }
-                KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
-                KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                KeyCode::Backspace => {
+                    self.connect_dialog.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.connect_dialog.filter_push(c);
+                }
                 _ => {}
             }
             return false;
@@ -2301,11 +2719,21 @@ impl App {
         // Command palette (Ctrl+K)
         if self.command_palette.visible {
             match key.code {
-                KeyCode::Esc => { self.command_palette.close(); }
-                KeyCode::Up => { self.command_palette.move_up(); }
-                KeyCode::Down => { self.command_palette.move_down(); }
-                KeyCode::PageUp => { self.command_palette.page_up(); }
-                KeyCode::PageDown => { self.command_palette.page_down(); }
+                KeyCode::Esc => {
+                    self.command_palette.close();
+                }
+                KeyCode::Up => {
+                    self.command_palette.move_up();
+                }
+                KeyCode::Down => {
+                    self.command_palette.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.command_palette.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.command_palette.page_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.command_palette.selected().cloned() {
                         self.command_palette.close();
@@ -2314,8 +2742,12 @@ impl App {
                         return true; // signal to submit this as input
                     }
                 }
-                KeyCode::Backspace => { self.command_palette.filter_pop(); }
-                KeyCode::Char(c) => { self.command_palette.filter_push(c); }
+                KeyCode::Backspace => {
+                    self.command_palette.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.command_palette.filter_push(c);
+                }
                 _ => {}
             }
             return false;
@@ -2360,7 +2792,9 @@ impl App {
                         };
                         self.set_model(full_model.clone());
                         self.persist_provider_and_model();
-                        let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
+                        let effort_hint = effort
+                            .map(|e| format!(" [{}]", e.label()))
+                            .unwrap_or_default();
                         self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
                     }
                 }
@@ -2375,47 +2809,43 @@ impl App {
         if self.session_branching.visible {
             use crate::session_branching::BranchBrowserMode;
             match self.session_branching.mode {
-                BranchBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_branching.cancel(),
-                        KeyCode::Up => self.session_branching.select_prev(),
-                        KeyCode::Down => self.session_branching.select_next(),
-                        KeyCode::Char('n') => self.session_branching.start_create_new(),
-                        KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
-                        KeyCode::Enter => {
-                            if let Some(branch) = self.session_branching.selected_branch() {
-                                self.status_message = Some(format!("Switched to branch: {}", branch.name));
-                                self.session_branching.close();
-                            }
+                BranchBrowserMode::Browse => match key.code {
+                    KeyCode::Esc => self.session_branching.cancel(),
+                    KeyCode::Up => self.session_branching.select_prev(),
+                    KeyCode::Down => self.session_branching.select_next(),
+                    KeyCode::Char('n') => self.session_branching.start_create_new(),
+                    KeyCode::Char('d') => self.session_branching.start_delete_confirm(),
+                    KeyCode::Enter => {
+                        if let Some(branch) = self.session_branching.selected_branch() {
+                            self.status_message =
+                                Some(format!("Switched to branch: {}", branch.name));
+                            self.session_branching.close();
                         }
-                        _ => {}
                     }
-                }
-                BranchBrowserMode::CreateNew => {
-                    match key.code {
-                        KeyCode::Esc => self.session_branching.cancel(),
-                        KeyCode::Enter => {
-                            if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
-                                self.status_message = Some(format!("Created branch: {} at message {}", name, at_msg));
-                                self.session_branching.close();
-                            }
+                    _ => {}
+                },
+                BranchBrowserMode::CreateNew => match key.code {
+                    KeyCode::Esc => self.session_branching.cancel(),
+                    KeyCode::Enter => {
+                        if let Some((name, at_msg)) = self.session_branching.confirm_create_new() {
+                            self.status_message =
+                                Some(format!("Created branch: {} at message {}", name, at_msg));
+                            self.session_branching.close();
                         }
-                        KeyCode::Backspace => self.session_branching.pop_create_char(),
-                        KeyCode::Char(c) => self.session_branching.push_create_char(c),
-                        _ => {}
                     }
-                }
-                BranchBrowserMode::ConfirmDelete => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
-                        KeyCode::Enter | KeyCode::Char('y') => {
-                            if let Some(branch_id) = self.session_branching.confirm_delete() {
-                                self.status_message = Some(format!("Deleted branch: {}", branch_id));
-                            }
+                    KeyCode::Backspace => self.session_branching.pop_create_char(),
+                    KeyCode::Char(c) => self.session_branching.push_create_char(c),
+                    _ => {}
+                },
+                BranchBrowserMode::ConfirmDelete => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => self.session_branching.cancel(),
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        if let Some(branch_id) = self.session_branching.confirm_delete() {
+                            self.status_message = Some(format!("Deleted branch: {}", branch_id));
                         }
-                        _ => {}
                     }
-                }
+                    _ => {}
+                },
             }
             return false;
         }
@@ -2424,38 +2854,32 @@ impl App {
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
-                SessionBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
-                        KeyCode::Char('r') => self.session_browser.start_rename(),
-                        _ => {}
-                    }
-                }
-                SessionBrowserMode::Rename => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.cancel(),
-                        KeyCode::Enter => {
-                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                                self.session_title = Some(name.clone());
-                                self.status_message = Some(format!("Renamed to: {}", name));
-                            }
+                SessionBrowserMode::Browse => match key.code {
+                    KeyCode::Esc => self.session_browser.close(),
+                    KeyCode::Up => self.session_browser.select_prev(),
+                    KeyCode::Down => self.session_browser.select_next(),
+                    KeyCode::Char('r') => self.session_browser.start_rename(),
+                    _ => {}
+                },
+                SessionBrowserMode::Rename => match key.code {
+                    KeyCode::Esc => self.session_browser.cancel(),
+                    KeyCode::Enter => {
+                        if let Some((_id, name)) = self.session_browser.confirm_rename() {
+                            self.session_title = Some(name.clone());
+                            self.status_message = Some(format!("Renamed to: {}", name));
                         }
-                        KeyCode::Backspace => self.session_browser.pop_rename_char(),
-                        KeyCode::Char(c) => self.session_browser.push_rename_char(c),
-                        _ => {}
                     }
-                }
-                SessionBrowserMode::Confirm => {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
-                        KeyCode::Enter | KeyCode::Char('y') => {
-                            self.session_browser.close();
-                        }
-                        _ => {}
+                    KeyCode::Backspace => self.session_browser.pop_rename_char(),
+                    KeyCode::Char(c) => self.session_browser.push_rename_char(c),
+                    _ => {}
+                },
+                SessionBrowserMode::Confirm => match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.session_browser.close();
                     }
-                }
+                    _ => {}
+                },
             }
             return false;
         }
@@ -2467,7 +2891,9 @@ impl App {
                 KeyCode::Up => self.tasks_overlay.select_prev(),
                 KeyCode::Down => self.tasks_overlay.select_next(),
                 KeyCode::Enter => {
-                    if let Some((task_id, new_status)) = self.tasks_overlay.cycle_and_persist_status() {
+                    if let Some((task_id, new_status)) =
+                        self.tasks_overlay.cycle_and_persist_status()
+                    {
                         self.status_message = Some(format!("Task {} → {}", task_id, new_status));
                     }
                 }
@@ -2768,7 +3194,8 @@ impl App {
         }
 
         // Clear any active text selection on key press (except Ctrl+C which copies it).
-        let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_copy =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
             self.selection_anchor = None;
             self.selection_focus = None;
@@ -2867,7 +3294,8 @@ impl App {
                 } else {
                     format!("Image attached: {}", label)
                 };
-                self.notifications.push(NotificationKind::Info, msg, Some(3));
+                self.notifications
+                    .push(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text() {
                 self.prompt_input.paste(&text);
             }
@@ -2875,10 +3303,7 @@ impl App {
         }
 
         // ---- Enter while PTT recording: stop capture instead of submitting ----
-        if key.code == KeyCode::Enter
-            && self.voice_recording
-            && self.voice_recorder.is_some()
-        {
+        if key.code == KeyCode::Enter && self.voice_recording && self.voice_recorder.is_some() {
             self.handle_voice_ptt_stop();
             return false;
         }
@@ -2896,8 +3321,9 @@ impl App {
                 KeyCode::PageUp | KeyCode::PageDown => {
                     // Let these fall through to the normal scroll handling below.
                 }
-                KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                KeyCode::Char(_)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     // Printable char: switch focus to Input and process normally.
                     self.focus = FocusTarget::Input;
@@ -2917,7 +3343,11 @@ impl App {
                     self.selection_focus = None;
                     *self.selection_text.borrow_mut() = String::new();
                     if copied {
-                        self.notifications.push(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied to clipboard".to_string(),
+                            Some(2),
+                        );
                     }
                 } else if self.is_streaming {
                     self.is_streaming = false;
@@ -2962,12 +3392,16 @@ impl App {
             }
 
             // ---- Ctrl+A: Open model picker ----
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming =>
+            {
                 self.intercept_slash_command("model");
             }
 
             // ---- Ctrl+K: Command palette (or Emacs kill-line if input has text) ----
-            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('k')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming =>
+            {
                 if self.prompt_input.is_empty() {
                     self.command_palette.open();
                 } else {
@@ -2975,25 +3409,35 @@ impl App {
                     self.refresh_prompt_input();
                 }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('u')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming =>
+            {
                 self.prompt_input.kill_line_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('w')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming =>
+            {
                 self.prompt_input.kill_word_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('y')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming =>
+            {
                 self.prompt_input.yank();
                 self.refresh_prompt_input();
             }
 
             // ---- Alt/Meta key text editing operations -------------------
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('y')
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming =>
+            {
                 self.prompt_input.yank_pop();
                 self.refresh_prompt_input();
             }
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Backspace
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming =>
+            {
                 self.prompt_input.delete_word_backward();
                 self.refresh_prompt_input();
             }
@@ -3001,15 +3445,21 @@ impl App {
                 self.prompt_input.delete_word_forward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('b')
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming =>
+            {
                 self.prompt_input.move_word_backward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('f')
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming =>
+            {
                 self.prompt_input.move_word_forward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming =>
+            {
                 self.prompt_input.delete_word_at_cursor();
                 self.refresh_prompt_input();
             }
@@ -3113,7 +3563,9 @@ impl App {
 
             // ---- Input history navigation ------------------------------
             KeyCode::Up => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty()
+                    && self.prompt_input.text.starts_with('/')
+                {
                     self.prompt_input.suggestion_prev();
                 } else if !self.prompt_input.history.is_empty() {
                     self.prompt_input.history_up();
@@ -3121,7 +3573,9 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty()
+                    && self.prompt_input.text.starts_with('/')
+                {
                     self.prompt_input.suggestion_next();
                 } else if self.prompt_input.history_pos.is_some() {
                     self.prompt_input.history_down();
@@ -3789,15 +4243,17 @@ impl App {
                 self.permission_request = None;
             }
             KeyCode::Up => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option > 0 {
-                    pr.selected_option -= 1;
+                if let Some(pr) = self.permission_request.as_mut() {
+                    if pr.selected_option > 0 {
+                        pr.selected_option -= 1;
+                    }
                 }
             }
             KeyCode::Down => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option + 1 < pr.options.len() {
-                    pr.selected_option += 1;
+                if let Some(pr) = self.permission_request.as_mut() {
+                    if pr.selected_option + 1 < pr.options.len() {
+                        pr.selected_option += 1;
+                    }
                 }
             }
             KeyCode::Esc => {
@@ -3851,7 +4307,8 @@ impl App {
             (Some(last_time), Some(last_pos)) => {
                 let elapsed = now.duration_since(last_time);
                 let distance = ((current_pos.0 as i32 - last_pos.0 as i32).abs()
-                    + (current_pos.1 as i32 - last_pos.1 as i32).abs()) as u16;
+                    + (current_pos.1 as i32 - last_pos.1 as i32).abs())
+                    as u16;
                 elapsed.as_millis() < 500 && distance <= 5
             }
             _ => false,
@@ -3881,7 +4338,10 @@ impl App {
     fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
         let selectable_area = self.last_selectable_area.get();
         let line_start = selectable_area.y;
-        let line_end = selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1);
+        let line_end = selectable_area
+            .y
+            .saturating_add(selectable_area.height)
+            .saturating_sub(1);
 
         if row >= line_start && row <= line_end {
             Some((row, row))
@@ -3991,9 +4451,12 @@ impl App {
             ContextMenuItem::Fork => {
                 if let ContextMenuKind::Message { message_index } = kind {
                     let branch_point = message_index + 1;
-                    self.prompt_input.replace_text(format!("/fork {}", branch_point));
-                    self.status_message =
-                        Some(format!("Fork at message {} - press Enter to confirm", branch_point));
+                    self.prompt_input
+                        .replace_text(format!("/fork {}", branch_point));
+                    self.status_message = Some(format!(
+                        "Fork at message {} - press Enter to confirm",
+                        branch_point
+                    ));
                 }
             }
         }
@@ -4026,9 +4489,11 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
-                        self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                        self.connect_dialog
+                            .contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
-                        self.command_palette.contains(mouse_event.column, mouse_event.row)
+                        self.command_palette
+                            .contains(mouse_event.column, mouse_event.row)
                     } else {
                         // Other dialogs (model_picker, settings, export, etc.) —
                         // treat any click as "inside" to prevent accidental dismiss.
@@ -4052,12 +4517,18 @@ impl App {
                 }
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
-                    if self.connect_dialog.visible { self.connect_dialog.move_up(); }
-                    else if self.command_palette.visible { self.command_palette.move_up(); }
+                    if self.connect_dialog.visible {
+                        self.connect_dialog.move_up();
+                    } else if self.command_palette.visible {
+                        self.command_palette.move_up();
+                    }
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.connect_dialog.visible { self.connect_dialog.move_down(); }
-                    else if self.command_palette.visible { self.command_palette.move_down(); }
+                    if self.connect_dialog.visible {
+                        self.connect_dialog.move_down();
+                    } else if self.command_palette.visible {
+                        self.command_palette.move_down();
+                    }
                 }
                 _ => {}
             }
@@ -4121,13 +4592,15 @@ impl App {
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
-                let in_input = input_area.width > 0 && input_area.height > 0
+                let in_input = input_area.width > 0
+                    && input_area.height > 0
                     && mouse_event.row >= input_area.y
                     && mouse_event.row < input_area.y.saturating_add(input_area.height)
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
+                let in_selectable = selectable_area.width > 0
+                    && selectable_area.height > 0
                     && mouse_event.row >= selectable_area.y
                     && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
                     && mouse_event.column >= selectable_area.x
@@ -4160,7 +4633,9 @@ impl App {
                             self.click_count = 0; // Reset for next click sequence
                         } else {
                             // Double-click: select word
-                            if let Some((start, end)) = self.find_word_boundaries(current_pos.0, current_pos.1) {
+                            if let Some((start, end)) =
+                                self.find_word_boundaries(current_pos.0, current_pos.1)
+                            {
                                 self.selection_anchor = Some((start, current_pos.1));
                                 self.selection_focus = Some((end, current_pos.1));
                             }
@@ -4189,12 +4664,18 @@ impl App {
                 if self.selection_anchor.is_some() {
                     let selectable_area = self.last_selectable_area.get();
                     if selectable_area.width > 0 && selectable_area.height > 0 {
-                        let clamped_col = mouse_event.column
-                            .max(selectable_area.x)
-                            .min(selectable_area.x.saturating_add(selectable_area.width).saturating_sub(1));
-                        let clamped_row = mouse_event.row
-                            .max(selectable_area.y)
-                            .min(selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1));
+                        let clamped_col = mouse_event.column.max(selectable_area.x).min(
+                            selectable_area
+                                .x
+                                .saturating_add(selectable_area.width)
+                                .saturating_sub(1),
+                        );
+                        let clamped_row = mouse_event.row.max(selectable_area.y).min(
+                            selectable_area
+                                .y
+                                .saturating_add(selectable_area.height)
+                                .saturating_sub(1),
+                        );
                         self.selection_focus = Some((clamped_col, clamped_row));
                         self.click_count = 0; // Reset on drag to prevent further double-clicks
                     }
@@ -4227,8 +4708,7 @@ impl App {
         match event {
             QueryEvent::Stream(stream_evt)
             | QueryEvent::StreamWithParent {
-                event: stream_evt,
-                ..
+                event: stream_evt, ..
             } => {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
@@ -4284,9 +4764,7 @@ impl App {
                 }
                 self.is_streaming = true;
                 self.status_message = Some(format!("Running {}…", tool_name));
-                if let Some(existing) =
-                    self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
-                {
+                if let Some(existing) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
                     existing.input_json = input_json;
@@ -4317,9 +4795,7 @@ impl App {
                 if remaining > 0 {
                     preview.push_str(&format!("\n\u{2026} {} more lines", remaining));
                 }
-                if let Some(block) =
-                    self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id)
-                {
+                if let Some(block) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     block.status = if is_error {
                         ToolStatus::Error
                     } else {
@@ -4336,7 +4812,9 @@ impl App {
                 self.refresh_turn_diff_from_history();
             }
 
-            QueryEvent::TurnComplete { turn, stop_reason, .. } => {
+            QueryEvent::TurnComplete {
+                turn, stop_reason, ..
+            } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
                 self.spinner_verb = None;
@@ -4353,7 +4831,8 @@ impl App {
                     let text = std::mem::take(&mut self.streaming_text);
                     self.push_assistant_message(text);
                 }
-                self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
+                self.tool_use_blocks
+                    .retain(|b| b.status != ToolStatus::Running);
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
             }
@@ -4385,7 +4864,10 @@ impl App {
                         self.token_warning_threshold_shown = 80;
                         self.notifications.push(
                             NotificationKind::Warning,
-                            format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
+                            format!(
+                                "Context window {:.0}% full. Consider /compact.",
+                                pct_used * 100.0
+                            ),
                             Some(30),
                         );
                     }
@@ -4393,7 +4875,10 @@ impl App {
                         self.token_warning_threshold_shown = 95;
                         self.notifications.push(
                             NotificationKind::Error,
-                            format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
+                            format!(
+                                "Context window {:.0}% full! Run /compact now.",
+                                pct_used * 100.0
+                            ),
                             None,
                         );
                     }
@@ -4445,8 +4930,7 @@ impl App {
                         }
                         self.model_fetch_rx = None;
                     }
-                    Ok(Err(()))
-                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    Ok(Err(())) | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         self.model_picker.loading_models = false;
                         self.model_fetch_rx = None;
                     }
@@ -4457,7 +4941,11 @@ impl App {
             // Spawn async provider model-list fetch when requested.
             if self.model_picker_fetch_pending {
                 self.model_picker_fetch_pending = false;
-                let provider_id_str = self.config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
+                let provider_id_str = self
+                    .config
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "anthropic".to_string());
                 if let Some(ref registry) = self.provider_registry {
                     let pid = mangocode_core::ProviderId::new(&provider_id_str);
                     if let Some(provider) = registry.get(&pid) {
@@ -4507,13 +4995,13 @@ impl App {
                     match ev {
                         VoiceEvent::RecordingStarted => {
                             self.voice_recording = true;
-                            self.status_message =
-                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                            self.status_message = Some(
+                                "Recording\u{2026} press V again or Enter to stop".to_string(),
+                            );
                         }
                         VoiceEvent::RecordingStopped => {
                             self.voice_recording = false;
-                            self.status_message =
-                                Some("Transcribing\u{2026}".to_string());
+                            self.status_message = Some("Transcribing\u{2026}".to_string());
                         }
                         VoiceEvent::TranscriptReady(text) => {
                             if !text.is_empty() {
@@ -4526,9 +5014,8 @@ impl App {
                                 }
                                 self.prompt_input.paste(&text);
                                 self.refresh_prompt_input();
-                                self.status_message = Some(
-                                    format!("Transcribed: {}", &text[..text.len().min(60)])
-                                );
+                                self.status_message =
+                                    Some(format!("Transcribed: {}", &text[..text.len().min(60)]));
                             }
                             // Clear the channel once we have the result.
                             self.voice_event_rx = None;
@@ -4548,7 +5035,8 @@ impl App {
 
             // Refresh task list if the overlay is visible (every frame for live updates)
             if self.tasks_overlay.visible {
-                self.tasks_overlay.refresh_tasks(&mangocode_tools::TASK_STORE);
+                self.tasks_overlay
+                    .refresh_tasks(&mangocode_tools::TASK_STORE);
             }
 
             // Draw the frame
@@ -4633,9 +5121,9 @@ impl App {
             let content = msg.get_all_text().to_lowercase();
 
             // Check if message contains error keywords
-            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
-                content.contains(keyword)
-            });
+            let has_error = ERROR_KEYWORDS
+                .iter()
+                .any(|keyword| content.contains(keyword));
 
             if has_error && i > (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
                 // Found an error message, scroll to it
@@ -4661,9 +5149,9 @@ impl App {
             let content = msg.get_all_text().to_lowercase();
 
             // Check if message contains error keywords
-            let has_error = ERROR_KEYWORDS.iter().any(|keyword| {
-                content.contains(keyword)
-            });
+            let has_error = ERROR_KEYWORDS
+                .iter()
+                .any(|keyword| content.contains(keyword));
 
             if has_error && i < (self.messages.len().saturating_sub(self.scroll_offset / 2)) {
                 // Found an error message, scroll to it

@@ -92,18 +92,14 @@ impl KeyInputDialogState {
 
 /// Render the key input dialog overlay — OpenCode-style: dark overlay, no
 /// border, minimal and polished.
-pub fn render_key_input_dialog(
-    frame: &mut Frame,
-    state: &KeyInputDialogState,
-    area: Rect,
-) {
+pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, area: Rect) {
     if !state.visible {
         return;
     }
 
-    let pink = Color::Rgb(255, 176, 32);     // golden mango accent
-    let dim = Color::Rgb(138, 125, 115);     // warm muted
-    let dialog_bg = Color::Rgb(26, 20, 15);  // warm dark brown
+    let pink = Color::Rgb(255, 176, 32); // golden mango accent
+    let dim = Color::Rgb(138, 125, 115); // warm muted
+    let dialog_bg = Color::Rgb(26, 20, 15); // warm dark brown
 
     // ── Darken the entire background ──
     render_dark_overlay(frame, area);
@@ -157,11 +153,7 @@ pub fn render_key_input_dialog(
         if len <= 4 {
             state.input.clone()
         } else {
-            format!(
-                "{}{}",
-                "\u{2022}".repeat(len - 4),
-                &state.input[len - 4..]
-            )
+            format!("{}{}", "\u{2022}".repeat(len - 4), &state.input[len - 4..])
         }
     };
 

@@ -228,7 +228,9 @@ impl ProviderRegistry {
                     "deepseek" => Some(Arc::new(p::deepseek().with_api_key(key))),
                     "xai" => Some(Arc::new(p::xai().with_api_key(key))),
                     "openrouter" => Some(Arc::new(p::openrouter().with_api_key(key))),
-                    "togetherai" | "together-ai" => Some(Arc::new(p::together_ai().with_api_key(key))),
+                    "togetherai" | "together-ai" => {
+                        Some(Arc::new(p::together_ai().with_api_key(key)))
+                    }
                     "perplexity" => Some(Arc::new(p::perplexity().with_api_key(key))),
                     "cerebras" => Some(Arc::new(p::cerebras().with_api_key(key))),
                     "deepinfra" => Some(Arc::new(p::deepinfra().with_api_key(key))),
@@ -254,8 +256,7 @@ impl ProviderRegistry {
                     // still come from VERTEX_* env vars.
                     "google-vertex" => {
                         use crate::providers::vertex_openai::{VertexAuthMode, VertexConfig};
-                        let project_id = std::env::var("VERTEX_PROJECT_ID")
-                            .unwrap_or_default();
+                        let project_id = std::env::var("VERTEX_PROJECT_ID").unwrap_or_default();
                         if !project_id.is_empty() {
                             let location = std::env::var("VERTEX_LOCATION")
                                 .unwrap_or_else(|_| "us-central1".to_string());
@@ -304,85 +305,166 @@ impl ProviderRegistry {
         self.register(Arc::new(p::llama_cpp()));
 
         // Remote providers — only register when an API key is present.
-        if std::env::var("DEEPSEEK_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPSEEK_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepseek()));
         }
-        if std::env::var("GROQ_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("GROQ_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::groq()));
         }
-        if std::env::var("XAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("XAI_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::xai()));
         }
-        if std::env::var("OPENROUTER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OPENROUTER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::openrouter()));
         }
-        if std::env::var("TOGETHER_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("TOGETHER_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::together_ai()));
         }
-        if std::env::var("PERPLEXITY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("PERPLEXITY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::perplexity()));
         }
-        if std::env::var("CEREBRAS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("CEREBRAS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::cerebras()));
         }
-        if std::env::var("DEEPINFRA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DEEPINFRA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::deepinfra()));
         }
-        if std::env::var("VENICE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VENICE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::venice()));
         }
-        if std::env::var("DASHSCOPE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("DASHSCOPE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::qwen()));
         }
-        if std::env::var("MISTRAL_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MISTRAL_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::mistral()));
         }
-        if std::env::var("SAMBANOVA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SAMBANOVA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::sambanova()));
         }
-        if std::env::var("HF_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("HF_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::huggingface()));
         }
-        if std::env::var("NVIDIA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NVIDIA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nvidia()));
         }
-        if std::env::var("SILICONFLOW_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SILICONFLOW_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::siliconflow()));
         }
-        if std::env::var("MOONSHOT_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("MOONSHOT_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::moonshot()));
         }
-        if std::env::var("ZHIPU_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("ZHIPU_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::zhipu()));
         }
-        if std::env::var("NEBIUS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NEBIUS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::nebius()));
         }
-        if std::env::var("NOVITA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("NOVITA_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::novita()));
         }
-        if std::env::var("OVHCLOUD_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("OVHCLOUD_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::ovhcloud()));
         }
-        if std::env::var("SCALEWAY_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("SCALEWAY_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::scaleway()));
         }
-        if std::env::var("VULTR_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("VULTR_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::vultr_ai()));
         }
-        if std::env::var("BASETEN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("BASETEN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::baseten()));
         }
-        if std::env::var("FRIENDLI_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FRIENDLI_TOKEN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::friendli()));
         }
-        if std::env::var("UPSTAGE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("UPSTAGE_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::upstage()));
         }
-        if std::env::var("STEPFUN_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("STEPFUN_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::stepfun()));
         }
-        if std::env::var("FIREWORKS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+        if std::env::var("FIREWORKS_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
             self.register(Arc::new(p::fireworks()));
         }
         self

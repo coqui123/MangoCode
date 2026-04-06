@@ -365,22 +365,19 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
     // Promote `mcpServers` (TS camelCase object) → `mcp_servers` (array).
     if let Some(mcp) = obj.remove("mcpServers") {
         if mcp.is_object() {
-            let arr: Vec<serde_json::Value> = mcp
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, srv)| {
-                    let mut entry = srv.clone();
-                    if let Some(o) = entry.as_object_mut() {
-                        o.insert("name".to_string(), serde_json::Value::String(k.clone()));
-                    }
-                    entry
-                })
-                .collect();
-            obj.insert(
-                "mcp_servers".to_string(),
-                serde_json::Value::Array(arr),
-            );
+            if let Some(mcp_obj) = mcp.as_object() {
+                let arr: Vec<serde_json::Value> = mcp_obj
+                    .iter()
+                    .map(|(k, srv)| {
+                        let mut entry = srv.clone();
+                        if let Some(o) = entry.as_object_mut() {
+                            o.insert("name".to_string(), serde_json::Value::String(k.clone()));
+                        }
+                        entry
+                    })
+                    .collect();
+                obj.insert("mcp_servers".to_string(), serde_json::Value::Array(arr));
+            }
         } else if mcp.is_array() {
             obj.insert("mcp_servers".to_string(), mcp);
         }
@@ -389,22 +386,19 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
     // Promote `lspServers` (TS camelCase object) → `lsp_servers` (array).
     if let Some(lsp) = obj.remove("lspServers") {
         if lsp.is_object() {
-            let arr: Vec<serde_json::Value> = lsp
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, srv)| {
-                    let mut entry = srv.clone();
-                    if let Some(o) = entry.as_object_mut() {
-                        o.insert("name".to_string(), serde_json::Value::String(k.clone()));
-                    }
-                    entry
-                })
-                .collect();
-            obj.insert(
-                "lsp_servers".to_string(),
-                serde_json::Value::Array(arr),
-            );
+            if let Some(lsp_obj) = lsp.as_object() {
+                let arr: Vec<serde_json::Value> = lsp_obj
+                    .iter()
+                    .map(|(k, srv)| {
+                        let mut entry = srv.clone();
+                        if let Some(o) = entry.as_object_mut() {
+                            o.insert("name".to_string(), serde_json::Value::String(k.clone()));
+                        }
+                        entry
+                    })
+                    .collect();
+                obj.insert("lsp_servers".to_string(), serde_json::Value::Array(arr));
+            }
         } else if lsp.is_array() {
             obj.insert("lsp_servers".to_string(), lsp);
         }
@@ -427,11 +421,12 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
     // `commands` in TS can be a single string or array — normalise to array.
     if let Some(cmds) = obj.get("commands") {
         if cmds.is_string() {
-            let s = cmds.as_str().unwrap().to_string();
-            obj.insert(
-                "commands".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(s)]),
-            );
+            if let Some(s) = cmds.as_str() {
+                obj.insert(
+                    "commands".to_string(),
+                    serde_json::Value::Array(vec![serde_json::Value::String(s.to_string())]),
+                );
+            }
         }
     }
 
@@ -439,11 +434,12 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
     for key in &["agents", "skills", "output_styles"] {
         if let Some(val) = obj.get(*key) {
             if val.is_string() {
-                let s = val.as_str().unwrap().to_string();
-                obj.insert(
-                    key.to_string(),
-                    serde_json::Value::Array(vec![serde_json::Value::String(s)]),
-                );
+                if let Some(s) = val.as_str() {
+                    obj.insert(
+                        key.to_string(),
+                        serde_json::Value::Array(vec![serde_json::Value::String(s.to_string())]),
+                    );
+                }
             }
         }
     }

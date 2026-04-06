@@ -142,7 +142,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+r", "historySearch", KeyContext::Global),
         ("ctrl+b", "createBranch", KeyContext::Global),
         ("alt+h", "openHelp", KeyContext::Global),
-
         // ========== CHAT / INPUT CONTEXT ==========
         ("enter", "submit", KeyContext::Chat),
         ("up", "historyPrev", KeyContext::Chat),
@@ -154,7 +153,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("shift+enter", "newline", KeyContext::Chat),
         ("home", "goLineStart", KeyContext::Chat),
         ("end", "goLineEnd", KeyContext::Chat),
-
         // Text Editing (Emacs-style)
         ("ctrl+a", "goLineStart", KeyContext::Chat),
         ("ctrl+e", "goLineEnd", KeyContext::Chat),
@@ -164,7 +162,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+w", "killWord", KeyContext::Chat),
         ("alt+d", "deleteWord", KeyContext::Chat),
         ("alt+backspace", "killWord", KeyContext::Chat),
-
         // New Text Editing & Navigation
         ("ctrl+m", "sendMessage", KeyContext::Chat),
         ("ctrl+l", "clearLine", KeyContext::Chat),
@@ -174,7 +171,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+right", "nextMessage", KeyContext::Chat),
         ("ctrl+o", "historyPrev", KeyContext::Chat),
         ("ctrl+i", "historyNext", KeyContext::Chat),
-
         // Searching
         ("ctrl+f", "findInMessage", KeyContext::Chat),
         ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
@@ -183,7 +179,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+]", "findNext", KeyContext::Chat),
         ("shift+f3", "findPrev", KeyContext::Chat),
         ("ctrl+[", "findPrev", KeyContext::Chat),
-
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
         ("enter", "yes", KeyContext::Confirmation),
@@ -191,7 +186,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "no", KeyContext::Confirmation),
         ("up", "prevOption", KeyContext::Confirmation),
         ("down", "nextOption", KeyContext::Confirmation),
-
         // ========== HELP OVERLAY ==========
         ("escape", "close", KeyContext::Help),
         ("q", "close", KeyContext::Help),
@@ -199,14 +193,12 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("down", "scrollDown", KeyContext::Help),
         ("pageup", "pageUp", KeyContext::Help),
         ("pagedown", "pageDown", KeyContext::Help),
-
         // ========== HISTORY SEARCH ==========
         ("enter", "select", KeyContext::HistorySearch),
         ("escape", "cancel", KeyContext::HistorySearch),
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
-
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
         ("up", "prevMessage", KeyContext::Transcript),
         ("down", "nextMessage", KeyContext::Transcript),
@@ -216,7 +208,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("end", "goEnd", KeyContext::Transcript),
         ("enter", "selectMessage", KeyContext::Transcript),
         ("escape", "cancel", KeyContext::Transcript),
-
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
@@ -224,7 +215,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::MessageSelector),
         ("j", "nextMessage", KeyContext::MessageSelector),
         ("k", "prevMessage", KeyContext::MessageSelector),
-
         // ========== THEME & MODEL PICKERS ==========
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
@@ -234,14 +224,12 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::ThemePicker),
         ("j", "next", KeyContext::ThemePicker),
         ("k", "prev", KeyContext::ThemePicker),
-
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
         ("down", "nextTask", KeyContext::Task),
         ("enter", "selectTask", KeyContext::Task),
         ("escape", "closeTask", KeyContext::Task),
         ("x", "toggleDone", KeyContext::Task),
-
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
@@ -251,7 +239,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "rejectDiff", KeyContext::DiffDialog),
         ("r", "rejectDiff", KeyContext::DiffDialog),
         ("a", "acceptDiff", KeyContext::DiffDialog),
-
         // ========== MODAL SELECT (Generic) ==========
         ("up", "prev", KeyContext::Select),
         ("down", "next", KeyContext::Select),
@@ -262,7 +249,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("j", "next", KeyContext::Select),
         ("k", "prev", KeyContext::Select),
         ("/", "search", KeyContext::Select),
-
         // ========== PLUGIN & ATTACHMENTS ==========
         ("up", "prev", KeyContext::Plugin),
         ("down", "next", KeyContext::Plugin),
@@ -340,11 +326,14 @@ impl UserKeybindings {
             .into_iter()
             .flat_map(|block| {
                 let context = block.context;
-                block.bindings.into_iter().map(move |(chord, action)| UserBinding {
-                    chord,
-                    action,
-                    context: Some(context.clone()),
-                })
+                block
+                    .bindings
+                    .into_iter()
+                    .map(move |(chord, action)| UserBinding {
+                        chord,
+                        action,
+                        context: Some(context.clone()),
+                    })
             })
             .collect();
         Ok(Self { bindings })
@@ -413,7 +402,10 @@ impl KeybindingResolver {
 
         if !exact.is_empty() {
             // Last match wins (user overrides)
-            let binding = exact.last().unwrap();
+            let Some(binding) = exact.last() else {
+                self.pending_chord.clear();
+                return KeybindingResult::NoMatch;
+            };
             self.pending_chord.clear();
             return match &binding.action {
                 Some(action) => KeybindingResult::Action(action.clone()),
@@ -607,7 +599,10 @@ mod tests {
         assert_eq!(user.bindings.len(), 2);
         assert_eq!(user.bindings[0].context.as_deref(), Some("Chat"));
         assert_eq!(user.bindings[0].chord, "ctrl+g");
-        assert_eq!(user.bindings[0].action.as_deref(), Some("chat:externalEditor"));
+        assert_eq!(
+            user.bindings[0].action.as_deref(),
+            Some("chat:externalEditor")
+        );
         assert_eq!(user.bindings[1].chord, "space");
         assert_eq!(user.bindings[1].action, None);
     }
@@ -618,21 +613,45 @@ mod tests {
         let bindings = default_bindings();
 
         // Build list of keybinding actions
-        let actions: Vec<String> = bindings
-            .iter()
-            .filter_map(|b| b.action.clone())
-            .collect();
+        let actions: Vec<String> = bindings.iter().filter_map(|b| b.action.clone()).collect();
 
         // Check Phase 1 keybinding actions exist
-        assert!(actions.contains(&"clearLine".to_string()), "clearLine action not found");
-        assert!(actions.contains(&"sendMessage".to_string()), "sendMessage action not found");
-        assert!(actions.contains(&"jumpToNextError".to_string()), "jumpToNextError action not found");
-        assert!(actions.contains(&"jumpToPreviousError".to_string()), "jumpToPreviousError action not found");
-        assert!(actions.contains(&"previousMessage".to_string()), "previousMessage action not found");
-        assert!(actions.contains(&"nextMessage".to_string()), "nextMessage action not found");
-        assert!(actions.contains(&"openHelp".to_string()), "openHelp action not found");
-        assert!(actions.contains(&"deleteCharBefore".to_string()), "deleteCharBefore action not found");
-        assert!(actions.contains(&"reverseIndent".to_string()), "reverseIndent action not found");
+        assert!(
+            actions.contains(&"clearLine".to_string()),
+            "clearLine action not found"
+        );
+        assert!(
+            actions.contains(&"sendMessage".to_string()),
+            "sendMessage action not found"
+        );
+        assert!(
+            actions.contains(&"jumpToNextError".to_string()),
+            "jumpToNextError action not found"
+        );
+        assert!(
+            actions.contains(&"jumpToPreviousError".to_string()),
+            "jumpToPreviousError action not found"
+        );
+        assert!(
+            actions.contains(&"previousMessage".to_string()),
+            "previousMessage action not found"
+        );
+        assert!(
+            actions.contains(&"nextMessage".to_string()),
+            "nextMessage action not found"
+        );
+        assert!(
+            actions.contains(&"openHelp".to_string()),
+            "openHelp action not found"
+        );
+        assert!(
+            actions.contains(&"deleteCharBefore".to_string()),
+            "deleteCharBefore action not found"
+        );
+        assert!(
+            actions.contains(&"reverseIndent".to_string()),
+            "reverseIndent action not found"
+        );
 
         // Verify we have at least 10 new keybindings (Phase 1 requirement)
         assert!(

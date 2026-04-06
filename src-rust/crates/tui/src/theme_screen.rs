@@ -103,12 +103,7 @@ fn builtin_themes() -> Vec<ThemeOption> {
             name: "light".to_string(),
             label: "Light".to_string(),
             description: "Light background with dark text".to_string(),
-            swatch: [
-                Color::White,
-                Color::Blue,
-                Color::DarkGray,
-                Color::Black,
-            ],
+            swatch: [Color::White, Color::Blue, Color::DarkGray, Color::Black],
         },
         ThemeOption {
             name: "solarized".to_string(),
@@ -160,8 +155,8 @@ fn builtin_themes() -> Vec<ThemeOption> {
             description: "Red-green color blind friendly — blue/yellow/gray palette".to_string(),
             swatch: [
                 Color::Rgb(18, 18, 18),
-                Color::Rgb(0, 122, 204),  // Blue
-                Color::Rgb(255, 180, 0),  // Gold/Yellow
+                Color::Rgb(0, 122, 204),   // Blue
+                Color::Rgb(255, 180, 0),   // Gold/Yellow
                 Color::Rgb(200, 200, 200), // Light gray
             ],
         },
@@ -219,10 +214,7 @@ pub fn render_theme_screen(frame: &mut Frame, screen: &ThemeScreen, area: Rect) 
         row_spans.push(Span::raw(prefix));
         row_spans.extend(swatch_spans);
         row_spans.push(Span::raw("  "));
-        row_spans.push(Span::styled(
-            format!("{:<12}", theme.label),
-            name_style,
-        ));
+        row_spans.push(Span::styled(format!("{:<12}", theme.label), name_style));
         row_spans.push(Span::styled(
             theme.description.clone(),
             Style::default().fg(Color::DarkGray),

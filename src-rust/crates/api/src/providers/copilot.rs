@@ -22,9 +22,11 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use mangocode_core::provider_id::{ModelId, ProviderId};
-use mangocode_core::types::{ContentBlock, ImageSource, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::Stream;
+use mangocode_core::provider_id::{ModelId, ProviderId};
+use mangocode_core::types::{
+    ContentBlock, ImageSource, MessageContent, Role, ToolResultContent, UsageInfo,
+};
 use serde_json::{json, Value};
 use tracing::debug;
 
@@ -33,8 +35,7 @@ use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent,
-    SystemPromptStyle,
+    StreamEvent, SystemPromptStyle,
 };
 use crate::providers::openai::OpenAiProvider;
 
@@ -53,7 +54,7 @@ impl CopilotProvider {
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
-            .expect("failed to build reqwest client");
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
             id: ProviderId::new(ProviderId::GITHUB_COPILOT),
@@ -195,7 +196,10 @@ impl CopilotProvider {
         };
 
         let major: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        major.parse::<u32>().map(|value| value >= 5).unwrap_or(false)
+        major
+            .parse::<u32>()
+            .map(|value| value >= 5)
+            .unwrap_or(false)
     }
 
     fn system_prompt_to_text(request: &ProviderRequest) -> Option<String> {
@@ -298,14 +302,15 @@ impl CopilotProvider {
                 MessageContent::Blocks(blocks) => match &message.role {
                     Role::User => {
                         let mut message_parts = Vec::new();
-                        let flush_user_content = |input: &mut Vec<Value>, content: &mut Vec<Value>| {
-                            if !content.is_empty() {
-                                input.push(json!({
-                                    "role": "user",
-                                    "content": std::mem::take(content),
-                                }));
-                            }
-                        };
+                        let flush_user_content =
+                            |input: &mut Vec<Value>, content: &mut Vec<Value>| {
+                                if !content.is_empty() {
+                                    input.push(json!({
+                                        "role": "user",
+                                        "content": std::mem::take(content),
+                                    }));
+                                }
+                            };
                         for (index, block) in blocks.iter().enumerate() {
                             if let Some(part) = Self::user_block_to_responses_part(block, index) {
                                 message_parts.push(part);
@@ -430,17 +435,83 @@ impl CopilotProvider {
     /// unreachable or returns empty data.
     fn hardcoded_models(provider_id: &ProviderId) -> Vec<ModelInfo> {
         vec![
-            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000 },
+            ModelInfo {
+                id: ModelId::new("claude-sonnet-4.6"),
+                provider_id: provider_id.clone(),
+                name: "Claude Sonnet 4.6 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+            },
+            ModelInfo {
+                id: ModelId::new("claude-sonnet-4.5"),
+                provider_id: provider_id.clone(),
+                name: "Claude Sonnet 4.5 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+            },
+            ModelInfo {
+                id: ModelId::new("claude-haiku-4.5"),
+                provider_id: provider_id.clone(),
+                name: "Claude Haiku 4.5 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 32_000,
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4.1"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4.1 (Copilot)".into(),
+                context_window: 64_000,
+                max_output_tokens: 16_384,
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4o"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4o (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-4o-mini"),
+                provider_id: provider_id.clone(),
+                name: "GPT-4o Mini (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-5.4"),
+                provider_id: provider_id.clone(),
+                name: "GPT-5.4 (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 128_000,
+            },
+            ModelInfo {
+                id: ModelId::new("gpt-5-mini"),
+                provider_id: provider_id.clone(),
+                name: "GPT-5 Mini (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 128_000,
+            },
+            ModelInfo {
+                id: ModelId::new("o3-mini"),
+                provider_id: provider_id.clone(),
+                name: "o3-mini (Copilot)".into(),
+                context_window: 200_000,
+                max_output_tokens: 100_000,
+            },
+            ModelInfo {
+                id: ModelId::new("o4-mini"),
+                provider_id: provider_id.clone(),
+                name: "o4-mini (Copilot)".into(),
+                context_window: 200_000,
+                max_output_tokens: 100_000,
+            },
+            ModelInfo {
+                id: ModelId::new("gemini-3-flash-preview"),
+                provider_id: provider_id.clone(),
+                name: "Gemini 3 Flash (Copilot)".into(),
+                context_window: 128_000,
+                max_output_tokens: 64_000,
+            },
         ]
     }
 
@@ -478,7 +549,9 @@ impl CopilotProvider {
                         for part in parts {
                             match part.get("type").and_then(|value| value.as_str()) {
                                 Some("output_text") | Some("text") => {
-                                    if let Some(text) = part.get("text").and_then(|value| value.as_str()) {
+                                    if let Some(text) =
+                                        part.get("text").and_then(|value| value.as_str())
+                                    {
                                         if !text.is_empty() {
                                             content.push(ContentBlock::Text {
                                                 text: text.to_string(),
@@ -1068,7 +1141,8 @@ impl LlmProvider for CopilotProvider {
         // Try to fetch the live model list from the Copilot API.
         let url = format!("{}/models", Self::base_url());
         let builder = self.http_client.get(&url);
-        let builder = self.copilot_headers(builder)
+        let builder = self
+            .copilot_headers(builder)
             .header("Accept", "application/json");
 
         let resp = builder.send().await;
@@ -1081,12 +1155,13 @@ impl LlmProvider for CopilotProvider {
                     status: None,
                     body: None,
                 })?;
-                let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                    provider: self.id.clone(),
-                    message: format!("Failed to parse models JSON: {}", e),
-                    status: None,
-                    body: Some(text.clone()),
-                })?;
+                let json: Value =
+                    serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("Failed to parse models JSON: {}", e),
+                        status: None,
+                        body: Some(text.clone()),
+                    })?;
 
                 let mut models = Vec::new();
 
@@ -1099,10 +1174,7 @@ impl LlmProvider for CopilotProvider {
 
                 if let Some(arr) = items {
                     for item in arr {
-                        if item
-                            .get("model_picker_enabled")
-                            .and_then(|v| v.as_bool())
-                            == Some(false)
+                        if item.get("model_picker_enabled").and_then(|v| v.as_bool()) == Some(false)
                         {
                             continue;
                         }
@@ -1123,19 +1195,29 @@ impl LlmProvider for CopilotProvider {
                             }
                         }
                         if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                            let name = item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or(id);
+                            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or(id);
                             let ctx = item
                                 .get("context_window")
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_context_window_tokens"))))
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_prompt_tokens"))))
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits")
+                                            .and_then(|l| l.get("max_context_window_tokens"))
+                                    })
+                                })
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits").and_then(|l| l.get("max_prompt_tokens"))
+                                    })
+                                })
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(128_000) as u32;
                             let max_out = item
                                 .get("max_output_tokens")
-                                .or_else(|| item.get("capabilities").and_then(|c| c.get("limits").and_then(|l| l.get("max_output_tokens"))))
+                                .or_else(|| {
+                                    item.get("capabilities").and_then(|c| {
+                                        c.get("limits").and_then(|l| l.get("max_output_tokens"))
+                                    })
+                                })
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(16_384) as u32;
                             models.push(ModelInfo {

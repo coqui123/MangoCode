@@ -16,11 +16,11 @@
 //     Use poll_background_agent() to check completion status.
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use mangocode_api::client::ClientConfig;
 use mangocode_api::AnthropicClient;
 use mangocode_core::types::Message;
 use mangocode_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -306,10 +306,8 @@ impl Tool for AgentTool {
                             let p = entry.path();
                             if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
-                                    let name = p
-                                        .file_stem()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("agent");
+                                    let name =
+                                        p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
                                     agent_defs.push_str(&format!(
                                         "\n\n## Agent: {}\n{}",
                                         name,
@@ -433,25 +431,21 @@ impl Tool for AgentTool {
                 );
                 ToolResult::success(text)
             }
-            QueryOutcome::MaxTokens { partial_message, .. } => {
+            QueryOutcome::MaxTokens {
+                partial_message, ..
+            } => {
                 let text = partial_message.get_all_text();
-                ToolResult::success(format!(
-                    "{}\n\n[Note: Agent hit max_tokens limit]",
-                    text
-                ))
+                ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text))
             }
-            QueryOutcome::Cancelled => {
-                ToolResult::error("Sub-agent was cancelled".to_string())
-            }
-            QueryOutcome::Error(e) => {
-                ToolResult::error(format!("Sub-agent error: {}", e))
-            }
-            QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                ToolResult::error(format!(
-                    "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
-                    cost_usd, limit_usd
-                ))
-            }
+            QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
+            QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
+            QueryOutcome::BudgetExceeded {
+                cost_usd,
+                limit_usd,
+            } => ToolResult::error(format!(
+                "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
+                cost_usd, limit_usd
+            )),
         }
     }
 }
@@ -584,10 +578,8 @@ pub async fn execute_with_runtime(
                         let p = entry.path();
                         if p.extension().is_some_and(|e| e == "md") {
                             if let Ok(content) = std::fs::read_to_string(&p) {
-                                let name = p
-                                    .file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("agent");
+                                let name =
+                                    p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
                                 agent_defs.push_str(&format!(
                                     "\n\n## Agent: {}\n{}",
                                     name,
@@ -737,16 +729,18 @@ pub async fn execute_with_runtime(
             );
             ToolResult::success(text)
         }
-        QueryOutcome::MaxTokens { partial_message, .. } => {
+        QueryOutcome::MaxTokens {
+            partial_message, ..
+        } => {
             let text = partial_message.get_all_text();
-            ToolResult::success(format!(
-                "{}\n\n[Note: Agent hit max_tokens limit]",
-                text
-            ))
+            ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text))
         }
         QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
         QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
-        QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => ToolResult::error(format!(
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => ToolResult::error(format!(
             "Sub-agent stopped: budget ${:.4} exceeded (limit ${:.4})",
             cost_usd, limit_usd
         )),
@@ -808,13 +802,18 @@ fn attach_parent_to_event(
 fn format_outcome(outcome: QueryOutcome) -> String {
     match outcome {
         QueryOutcome::EndTurn { message, .. } => message.get_all_text(),
-        QueryOutcome::MaxTokens { partial_message, .. } => format!(
+        QueryOutcome::MaxTokens {
+            partial_message, ..
+        } => format!(
             "{}\n\n[Note: Agent hit max_tokens limit]",
             partial_message.get_all_text()
         ),
         QueryOutcome::Cancelled => "[Agent was cancelled]".to_string(),
         QueryOutcome::Error(e) => format!("[Agent error: {}]", e),
-        QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => format!(
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => format!(
             "[Agent stopped: budget ${:.4} exceeded (limit ${:.4})]",
             cost_usd, limit_usd
         ),
@@ -852,20 +851,21 @@ pub fn init_team_swarm_runner() {
                     .await
                     .unwrap_or_else(|| (String::new(), false));
 
-                let client = match mangocode_api::AnthropicClient::new(mangocode_api::client::ClientConfig {
-                    api_key: credential.clone(),
-                    api_base: ctx.config.resolve_api_base(),
-                    use_bearer_auth,
-                    ..Default::default()
-                }) {
-                    Ok(c) => Arc::new(c),
-                    Err(e) => {
-                        return format!(
-                            "[Agent '{}' failed to create client: {}]",
-                            description, e
-                        )
-                    }
-                };
+                let client =
+                    match mangocode_api::AnthropicClient::new(mangocode_api::client::ClientConfig {
+                        api_key: credential.clone(),
+                        api_base: ctx.config.resolve_api_base(),
+                        use_bearer_auth,
+                        ..Default::default()
+                    }) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            return format!(
+                                "[Agent '{}' failed to create client: {}]",
+                                description, e
+                            )
+                        }
+                    };
 
                 let (provider_registry, model_registry) =
                     build_provider_and_model_registries(&ctx, credential, use_bearer_auth);
@@ -933,18 +933,18 @@ mod tests {
 
     #[test]
     fn attaches_parent_to_plain_stream_events() {
-        let evt = crate::QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
-            index: 0,
-            delta: mangocode_api::streaming::ContentDelta::TextDelta {
-                text: "hello".to_string(),
-            },
-        });
+        let evt =
+            crate::QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: mangocode_api::streaming::ContentDelta::TextDelta {
+                    text: "hello".to_string(),
+                },
+            });
 
         let out = attach_parent_to_event(evt, "parent-1");
         match out {
             crate::QueryEvent::StreamWithParent {
-                parent_tool_use_id,
-                ..
+                parent_tool_use_id, ..
             } => assert_eq!(parent_tool_use_id, "parent-1"),
             _ => panic!("expected StreamWithParent"),
         }
@@ -962,8 +962,7 @@ mod tests {
         let out = attach_parent_to_event(evt, "fallback-parent");
         match out {
             crate::QueryEvent::ToolStart {
-                parent_tool_use_id,
-                ..
+                parent_tool_use_id, ..
             } => assert_eq!(parent_tool_use_id.as_deref(), Some("existing-parent")),
             _ => panic!("expected ToolStart"),
         }
@@ -982,8 +981,7 @@ mod tests {
         let out = attach_parent_to_event(evt, "fallback-parent");
         match out {
             crate::QueryEvent::ToolEnd {
-                parent_tool_use_id,
-                ..
+                parent_tool_use_id, ..
             } => assert_eq!(parent_tool_use_id.as_deref(), Some("fallback-parent")),
             _ => panic!("expected ToolEnd"),
         }

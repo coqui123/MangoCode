@@ -156,7 +156,10 @@ pub fn save_collapse_state(_session_id: &str, state: &CollapseState) -> anyhow::
         .join(".mangocode")
         .join("context_collapse_state.json");
 
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Collapse state path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)?;
     let json = serde_json::to_string(state)?;
     std::fs::write(&path, json)?;
     Ok(())

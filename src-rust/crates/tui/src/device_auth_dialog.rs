@@ -146,18 +146,14 @@ pub enum DeviceAuthEvent {
 
 /// Render the device auth dialog overlay — OpenCode-style: dark overlay, no
 /// border, minimal and polished.
-pub fn render_device_auth_dialog(
-    frame: &mut Frame,
-    state: &DeviceAuthDialogState,
-    area: Rect,
-) {
+pub fn render_device_auth_dialog(frame: &mut Frame, state: &DeviceAuthDialogState, area: Rect) {
     if !state.visible {
         return;
     }
 
-    let pink = Color::Rgb(255, 176, 32);     // golden mango accent
-    let dim = Color::Rgb(138, 125, 115);     // warm muted
-    let dialog_bg = Color::Rgb(26, 20, 15);  // warm dark brown
+    let pink = Color::Rgb(255, 176, 32); // golden mango accent
+    let dim = Color::Rgb(138, 125, 115); // warm muted
+    let dialog_bg = Color::Rgb(26, 20, 15); // warm dark brown
     let green = Color::Rgb(80, 200, 120);
 
     // ── Darken the entire background ──
@@ -227,9 +223,7 @@ pub fn render_device_auth_dialog(
                 Span::styled(" at ", Style::default().fg(dim)),
                 Span::styled(
                     state.verification_uri.clone(),
-                    Style::default()
-                        .fg(pink)
-                        .add_modifier(Modifier::UNDERLINED),
+                    Style::default().fg(pink).add_modifier(Modifier::UNDERLINED),
                 ),
             ]));
             lines.push(Line::from(""));
@@ -258,9 +252,7 @@ pub fn render_device_auth_dialog(
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 " \u{2714} Connected successfully!",
-                Style::default()
-                    .fg(green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(green).add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

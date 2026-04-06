@@ -18,25 +18,25 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod session_memory;
 pub mod skill_prefetch;
-pub use agent_tool::{AgentTool, init_team_swarm_runner};
-pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
-pub use cron_scheduler::start_cron_scheduler;
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
-};
+pub use agent_tool::{init_team_swarm_runner, AgentTool};
+pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
 pub use compact::{
-    AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
     compact_conversation, context_collapse, context_window_for_model, format_compact_summary,
-    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed,
-    reactive_compact, should_auto_compact, should_compact, should_context_collapse, snip_compact,
+    get_compact_prompt, group_messages_for_compact, micro_compact_if_needed, reactive_compact,
+    should_auto_compact, should_compact, should_context_collapse, snip_compact, AutoCompactState,
+    CompactResult, CompactTrigger, MessageGroup, MicroCompactConfig, TokenWarningState,
 };
+pub use cron_scheduler::start_cron_scheduler;
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
+pub use skill_prefetch::{
+    format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
+};
 
 use mangocode_api::{
-    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
+    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use mangocode_core::config::Config;
@@ -59,7 +59,10 @@ pub enum QueryOutcome {
     /// The model finished its turn (end_turn stop reason).
     EndTurn { message: Message, usage: UsageInfo },
     /// The model hit max_tokens.
-    MaxTokens { partial_message: Message, usage: UsageInfo },
+    MaxTokens {
+        partial_message: Message,
+        usage: UsageInfo,
+    },
     /// The conversation was cancelled by the user.
     Cancelled,
     /// An unrecoverable error occurred.
@@ -157,10 +160,7 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             ..Default::default()
         }
     }
@@ -169,7 +169,10 @@ impl QueryConfig {
     ///
     /// Prefers the best model for the configured provider (from models.dev data)
     /// over the hardcoded defaults.
-    pub fn from_config_with_registry(cfg: &Config, registry: &mangocode_api::ModelRegistry) -> Self {
+    pub fn from_config_with_registry(
+        cfg: &Config,
+        registry: &mangocode_api::ModelRegistry,
+    ) -> Self {
         // We can't move the Arc here, but we need a clone for the query loop.
         // Callers typically wrap the registry in an Arc already.
         Self {
@@ -177,18 +180,13 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             ..Default::default()
         }
     }
 }
 
-fn reasoning_effort_for_level(
-    effort_level: mangocode_core::effort::EffortLevel,
-) -> &'static str {
+fn reasoning_effort_for_level(effort_level: mangocode_core::effort::EffortLevel) -> &'static str {
     match effort_level {
         mangocode_core::effort::EffortLevel::Low => "low",
         mangocode_core::effort::EffortLevel::Medium => "medium",
@@ -283,10 +281,7 @@ fn build_provider_options(
                 "reasoningEffort".to_string(),
                 serde_json::json!(reasoning_effort),
             );
-            options.insert(
-                "reasoningSummary".to_string(),
-                serde_json::json!("auto"),
-            );
+            options.insert("reasoningSummary".to_string(), serde_json::json!("auto"));
             options.insert(
                 "include".to_string(),
                 serde_json::json!(["reasoning.encrypted_content"]),
@@ -296,10 +291,7 @@ fn build_provider_options(
                 && !model_id.contains("codex")
                 && !model_id.contains("-chat")
             {
-                options.insert(
-                    "textVerbosity".to_string(),
-                    serde_json::json!("low"),
-                );
+                options.insert("textVerbosity".to_string(), serde_json::json!("low"));
             }
         }
     }
@@ -363,10 +355,7 @@ fn build_provider_options(
             && !model_id.contains("-chat")
             && provider_id != "azure"
         {
-            options.insert(
-                "textVerbosity".to_string(),
-                serde_json::json!("low"),
-            );
+            options.insert("textVerbosity".to_string(), serde_json::json!("low"));
         }
     }
 
@@ -380,9 +369,7 @@ fn build_provider_options(
         }
     }
 
-    if provider_id == "qwen"
-        && thinking_budget.is_some()
-        && !model_id.contains("kimi-k2-thinking")
+    if provider_id == "qwen" && thinking_budget.is_some() && !model_id.contains("kimi-k2-thinking")
     {
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }
@@ -430,7 +417,11 @@ pub enum QueryEvent {
         parent_tool_use_id: Option<String>,
     },
     /// The model finished a turn.
-    TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
+    TurnComplete {
+        turn: u32,
+        stop_reason: String,
+        usage: Option<UsageInfo>,
+    },
     /// An informational status message.
     Status(String),
     /// An error.
@@ -438,7 +429,10 @@ pub enum QueryEvent {
     /// Token usage has crossed a warning threshold.
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
-    TokenWarning { state: TokenWarningState, pct_used: f64 },
+    TokenWarning {
+        state: TokenWarningState,
+        pct_used: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +496,11 @@ pub fn fire_post_sampling_hooks(
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let body = if !stderr.trim().is_empty() { stderr } else { stdout };
+        let body = if !stderr.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
 
         tracing::warn!(
             command = %entry.command,
@@ -585,9 +583,16 @@ fn total_tool_result_chars(messages: &[Message]) -> usize {
             if let ContentBlock::ToolResult { content, .. } = b {
                 Some(match content {
                     ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(blocks) => blocks.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
+                    ToolResultContent::Blocks(blocks) => blocks
+                        .iter()
+                        .map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                text.len()
+                            } else {
+                                0
+                            }
+                        })
+                        .sum(),
                 })
             } else {
                 None
@@ -627,16 +632,22 @@ fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Messa
             if let ContentBlock::ToolResult { content, .. } = block {
                 let size = match &*content {
                     ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(inner) => inner.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
+                    ToolResultContent::Blocks(inner) => inner
+                        .iter()
+                        .map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                text.len()
+                            } else {
+                                0
+                            }
+                        })
+                        .sum(),
                 };
                 if size == 0 {
                     continue;
                 }
-                *content = ToolResultContent::Text(
-                    "[tool result truncated to save context]".to_string(),
-                );
+                *content =
+                    ToolResultContent::Text("[tool result truncated to save context]".to_string());
                 truncated += 1;
                 if size > to_shed {
                     break 'outer;
@@ -700,7 +711,8 @@ pub async fn run_query_loop(
     let mut used_fallback = false;
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
+    let effective_max_turns = config
+        .agent_definition
         .as_ref()
         .and_then(|a| a.max_turns)
         .unwrap_or(config.max_turns);
@@ -843,15 +855,16 @@ pub async fn run_query_loop(
 
         // Apply temperature: explicit config value takes precedence, then agent override,
         // then effort-level override.
-        let effective_temperature = config.temperature
+        let effective_temperature = config
+            .temperature
             .or_else(|| {
-                config.agent_definition.as_ref()
+                config
+                    .agent_definition
+                    .as_ref()
                     .and_then(|a| a.temperature)
                     .map(|t| t as f32)
             })
-            .or_else(|| {
-                config.effort_level.and_then(|el| el.temperature())
-            });
+            .or_else(|| config.effort_level.and_then(|el| el.temperature()));
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
@@ -875,7 +888,12 @@ pub async fn run_query_loop(
         //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
         //   4. Default to "anthropic"
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
+            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx
+                .config
+                .provider
+                .as_deref()
+                .filter(|p| *p != "anthropic")
+            {
                 // Explicit non-Anthropic provider in config — use it.
                 // If the stored model is in canonical "provider/model" form,
                 // strip the top-level provider prefix before sending it to the
@@ -892,19 +910,39 @@ pub async fn run_query_loop(
                 // Check whether `p` is a known provider or just a model
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
-                    "anthropic", "openai", "google", "groq", "mistral",
-                    "deepseek", "xai", "cohere", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "ollama", "lmstudio",
-                    "llamacpp", "azure", "amazon-bedrock", "huggingface",
-                    "nvidia", "fireworks", "sambanova",
+                    "anthropic",
+                    "openai",
+                    "google",
+                    "groq",
+                    "mistral",
+                    "deepseek",
+                    "xai",
+                    "cohere",
+                    "perplexity",
+                    "cerebras",
+                    "openrouter",
+                    "togetherai",
+                    "together-ai",
+                    "deepinfra",
+                    "venice",
+                    "github-copilot",
+                    "ollama",
+                    "lmstudio",
+                    "llamacpp",
+                    "azure",
+                    "amazon-bedrock",
+                    "huggingface",
+                    "nvidia",
+                    "fireworks",
+                    "sambanova",
                 ];
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
                 } else {
                     // Treat the whole string as the model ID, fall through
                     // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                    let fallback_provider =
+                        tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
                     (fallback_provider.to_string(), effective_model.clone())
                 }
             } else {
@@ -913,7 +951,9 @@ pub async fn run_query_loop(
                 // Use the shared model registry from QueryConfig if available;
                 // otherwise construct a temporary one.
                 let temp_reg;
-                let model_reg: &mangocode_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
+                let model_reg: &mangocode_api::ModelRegistry = if let Some(ref shared) =
+                    config.model_registry
+                {
                     shared
                 } else {
                     temp_reg = {
@@ -945,70 +985,132 @@ pub async fn run_query_loop(
                 // Try registry first; if not found, build provider dynamically
                 // from auth_store (handles keys added at runtime via /connect).
                 let registry_provider = registry.get(&pid).cloned();
-                let dynamic_provider: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> = if registry_provider.is_none() {
-                    let auth_store = mangocode_core::AuthStore::load();
-                    if let Some(key) = auth_store.api_key_for(&provider_id_str) {
-                        if !key.is_empty() {
-                            match provider_id_str.as_str() {
-                                "openai" => Some(std::sync::Arc::new(mangocode_api::OpenAiProvider::new(key))),
-                                "google" => Some(std::sync::Arc::new(mangocode_api::GoogleProvider::new(key))),
-                                "github-copilot" => Some(std::sync::Arc::new(mangocode_api::CopilotProvider::new(key))),
-                                "cohere" => {
-                                    if let Some(p) = mangocode_api::CohereProvider::from_env() {
-                                        Some(std::sync::Arc::new(p))
-                                    } else {
-                                        None
+                let dynamic_provider: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> =
+                    if registry_provider.is_none() {
+                        let auth_store = mangocode_core::AuthStore::load();
+                        if let Some(key) = auth_store.api_key_for(&provider_id_str) {
+                            if !key.is_empty() {
+                                match provider_id_str.as_str() {
+                                    "openai" => Some(std::sync::Arc::new(
+                                        mangocode_api::OpenAiProvider::new(key),
+                                    )),
+                                    "google" => Some(std::sync::Arc::new(
+                                        mangocode_api::GoogleProvider::new(key),
+                                    )),
+                                    "github-copilot" => Some(std::sync::Arc::new(
+                                        mangocode_api::CopilotProvider::new(key),
+                                    )),
+                                    "cohere" => {
+                                        if let Some(p) = mangocode_api::CohereProvider::from_env() {
+                                            Some(std::sync::Arc::new(p))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => {
+                                        // Use the factory functions that include correct provider quirks
+                                        // (e.g. Mistral tool_id_max_len=9, DeepSeek reasoning_field).
+                                        // The factory reads an env var for the key, but .with_api_key()
+                                        // below replaces it with the runtime-provided key.
+                                        use mangocode_api::providers::openai_compat_providers;
+                                        let provider =
+                                            match provider_id_str.as_str() {
+                                                "groq" => openai_compat_providers::groq()
+                                                    .with_api_key(key),
+                                                "mistral" => openai_compat_providers::mistral()
+                                                    .with_api_key(key),
+                                                "deepseek" => openai_compat_providers::deepseek()
+                                                    .with_api_key(key),
+                                                "xai" => {
+                                                    openai_compat_providers::xai().with_api_key(key)
+                                                }
+                                                "openrouter" => {
+                                                    openai_compat_providers::openrouter()
+                                                        .with_api_key(key)
+                                                }
+                                                "togetherai" | "together-ai" => {
+                                                    openai_compat_providers::together_ai()
+                                                        .with_api_key(key)
+                                                }
+                                                "perplexity" => {
+                                                    openai_compat_providers::perplexity()
+                                                        .with_api_key(key)
+                                                }
+                                                "cerebras" => openai_compat_providers::cerebras()
+                                                    .with_api_key(key),
+                                                "deepinfra" => openai_compat_providers::deepinfra()
+                                                    .with_api_key(key),
+                                                "venice" => openai_compat_providers::venice()
+                                                    .with_api_key(key),
+                                                "huggingface" => {
+                                                    openai_compat_providers::huggingface()
+                                                        .with_api_key(key)
+                                                }
+                                                "nvidia" => openai_compat_providers::nvidia()
+                                                    .with_api_key(key),
+                                                "siliconflow" => {
+                                                    openai_compat_providers::siliconflow()
+                                                        .with_api_key(key)
+                                                }
+                                                "sambanova" => openai_compat_providers::sambanova()
+                                                    .with_api_key(key),
+                                                "moonshot" => openai_compat_providers::moonshot()
+                                                    .with_api_key(key),
+                                                "zhipu" => openai_compat_providers::zhipu()
+                                                    .with_api_key(key),
+                                                "qwen" => openai_compat_providers::qwen()
+                                                    .with_api_key(key),
+                                                "nebius" => openai_compat_providers::nebius()
+                                                    .with_api_key(key),
+                                                "novita" => openai_compat_providers::novita()
+                                                    .with_api_key(key),
+                                                "ovhcloud" => openai_compat_providers::ovhcloud()
+                                                    .with_api_key(key),
+                                                "scaleway" => openai_compat_providers::scaleway()
+                                                    .with_api_key(key),
+                                                "vultr" | "vultr-ai" => {
+                                                    openai_compat_providers::vultr_ai()
+                                                        .with_api_key(key)
+                                                }
+                                                "baseten" => openai_compat_providers::baseten()
+                                                    .with_api_key(key),
+                                                "friendli" => openai_compat_providers::friendli()
+                                                    .with_api_key(key),
+                                                "upstage" => openai_compat_providers::upstage()
+                                                    .with_api_key(key),
+                                                "stepfun" => openai_compat_providers::stepfun()
+                                                    .with_api_key(key),
+                                                "fireworks" => openai_compat_providers::fireworks()
+                                                    .with_api_key(key),
+                                                "ollama" => openai_compat_providers::ollama(),
+                                                "lmstudio" | "lm-studio" => {
+                                                    openai_compat_providers::lm_studio()
+                                                }
+                                                "llamacpp" | "llama-cpp" => {
+                                                    openai_compat_providers::llama_cpp()
+                                                }
+                                                _ => {
+                                                    // True fallback: unknown provider, generic OpenAI-compatible
+                                                    mangocode_api::OpenAiCompatProvider::new(
+                                                        &provider_id_str,
+                                                        &provider_id_str,
+                                                        "https://api.openai.com/v1",
+                                                    )
+                                                    .with_api_key(key)
+                                                }
+                                            };
+                                        Some(std::sync::Arc::new(provider))
                                     }
                                 }
-                                _ => {
-                                    // Use the factory functions that include correct provider quirks
-                                    // (e.g. Mistral tool_id_max_len=9, DeepSeek reasoning_field).
-                                    // The factory reads an env var for the key, but .with_api_key()
-                                    // below replaces it with the runtime-provided key.
-                                    use mangocode_api::providers::openai_compat_providers;
-                                    let provider = match provider_id_str.as_str() {
-                                        "groq" => openai_compat_providers::groq().with_api_key(key),
-                                        "mistral" => openai_compat_providers::mistral().with_api_key(key),
-                                        "deepseek" => openai_compat_providers::deepseek().with_api_key(key),
-                                        "xai" => openai_compat_providers::xai().with_api_key(key),
-                                        "openrouter" => openai_compat_providers::openrouter().with_api_key(key),
-                                        "togetherai" | "together-ai" => openai_compat_providers::together_ai().with_api_key(key),
-                                        "perplexity" => openai_compat_providers::perplexity().with_api_key(key),
-                                        "cerebras" => openai_compat_providers::cerebras().with_api_key(key),
-                                        "deepinfra" => openai_compat_providers::deepinfra().with_api_key(key),
-                                        "venice" => openai_compat_providers::venice().with_api_key(key),
-                                        "huggingface" => openai_compat_providers::huggingface().with_api_key(key),
-                                        "nvidia" => openai_compat_providers::nvidia().with_api_key(key),
-                                        "siliconflow" => openai_compat_providers::siliconflow().with_api_key(key),
-                                        "sambanova" => openai_compat_providers::sambanova().with_api_key(key),
-                                        "moonshot" => openai_compat_providers::moonshot().with_api_key(key),
-                                        "zhipu" => openai_compat_providers::zhipu().with_api_key(key),
-                                        "qwen" => openai_compat_providers::qwen().with_api_key(key),
-                                        "nebius" => openai_compat_providers::nebius().with_api_key(key),
-                                        "novita" => openai_compat_providers::novita().with_api_key(key),
-                                        "ovhcloud" => openai_compat_providers::ovhcloud().with_api_key(key),
-                                        "scaleway" => openai_compat_providers::scaleway().with_api_key(key),
-                                        "vultr" | "vultr-ai" => openai_compat_providers::vultr_ai().with_api_key(key),
-                                        "baseten" => openai_compat_providers::baseten().with_api_key(key),
-                                        "friendli" => openai_compat_providers::friendli().with_api_key(key),
-                                        "upstage" => openai_compat_providers::upstage().with_api_key(key),
-                                        "stepfun" => openai_compat_providers::stepfun().with_api_key(key),
-                                        "fireworks" => openai_compat_providers::fireworks().with_api_key(key),
-                                        "ollama" => openai_compat_providers::ollama(),
-                                        "lmstudio" | "lm-studio" => openai_compat_providers::lm_studio(),
-                                        "llamacpp" | "llama-cpp" => openai_compat_providers::llama_cpp(),
-                                        _ => {
-                                            // True fallback: unknown provider, generic OpenAI-compatible
-                                            mangocode_api::OpenAiCompatProvider::new(&provider_id_str, &provider_id_str, "https://api.openai.com/v1")
-                                                .with_api_key(key)
-                                        }
-                                    };
-                                    Some(std::sync::Arc::new(provider))
-                                }
+                            } else {
+                                None
                             }
-                        } else { None }
-                    } else { None }
-                } else { None };
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                 let provider = registry_provider.or(dynamic_provider);
                 if let Some(provider) = provider {
@@ -1016,7 +1118,11 @@ pub async fn run_query_loop(
 
                     // Notify TUI that we're calling the provider
                     if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!("Calling {} ({})…", provider.name(), model_id_str)));
+                        let _ = tx.send(QueryEvent::Status(format!(
+                            "Calling {} ({})…",
+                            provider.name(),
+                            model_id_str
+                        )));
                     }
 
                     // Build ProviderRequest from the already-assembled request data.
@@ -1025,35 +1131,44 @@ pub async fn run_query_loop(
                     // with placeholder text when the provider doesn't support them,
                     // preventing crashes on text-only models.
                     let mut caps = provider.capabilities();
-                    if let Some(model_entry) = config
-                        .model_registry
-                        .as_ref()
-                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
+                    if let Some(model_entry) =
+                        config.model_registry.as_ref().and_then(|model_registry| {
+                            model_registry.get(&provider_id_str, &model_id_str)
+                        })
                     {
                         caps.image_input = model_entry.vision;
                         caps.tool_calling = model_entry.tool_calling;
                         caps.thinking = model_entry.reasoning;
                     }
-                    let provider_tools: Vec<mangocode_core::types::ToolDefinition> = if caps.tool_calling {
-                        tools.iter().map(|t| t.to_definition()).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let provider_tools: Vec<mangocode_core::types::ToolDefinition> =
+                        if caps.tool_calling {
+                            tools.iter().map(|t| t.to_definition()).collect()
+                        } else {
+                            Vec::new()
+                        };
                     let provider_messages: Vec<mangocode_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
-                            if let mangocode_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                            if let mangocode_core::types::MessageContent::Blocks(ref mut blocks) =
+                                msg.content
+                            {
                                 for block in blocks.iter_mut() {
                                     match block {
-                                        mangocode_core::types::ContentBlock::Image { .. } if !caps.image_input => {
+                                        mangocode_core::types::ContentBlock::Image { .. }
+                                            if !caps.image_input =>
+                                        {
                                             *block = mangocode_core::types::ContentBlock::Text {
-                                                text: "[Image not supported by this model]".to_string(),
+                                                text: "[Image not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
-                                        mangocode_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
+                                        mangocode_core::types::ContentBlock::Document {
+                                            ..
+                                        } if !caps.pdf_input => {
                                             *block = mangocode_core::types::ContentBlock::Text {
-                                                text: "[PDF not supported by this model]".to_string(),
+                                                text: "[PDF not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
                                         _ => {}
@@ -1075,8 +1190,7 @@ pub async fn run_query_loop(
                         top_k: None,
                         stop_sequences: vec![],
                         thinking: if caps.thinking {
-                            effective_thinking_budget
-                                .map(mangocode_api::ThinkingConfig::enabled)
+                            effective_thinking_budget.map(mangocode_api::ThinkingConfig::enabled)
                         } else {
                             None
                         },
@@ -1094,9 +1208,9 @@ pub async fn run_query_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(
-                                mangocode_core::error::ClaudeError::Api(e.to_string())
-                            );
+                            return QueryOutcome::Error(mangocode_core::error::ClaudeError::Api(
+                                e.to_string(),
+                            ));
                         }
                     };
 
@@ -1113,8 +1227,10 @@ pub async fn run_query_loop(
 
                     let mut text_chunks: Vec<String> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
-                        std::collections::HashMap::new();
+                    let mut tool_call_blocks: std::collections::HashMap<
+                        usize,
+                        (String, String, String, Option<String>),
+                    > = std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1281,14 +1397,14 @@ pub async fn run_query_loop(
                             // No partial response to salvage — report the error.
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::Error(format!(
-                                    "Provider '{}' stream error: {}", provider_id_str, err_msg
+                                    "Provider '{}' stream error: {}",
+                                    provider_id_str, err_msg
                                 )));
                             }
-                            return QueryOutcome::Error(
-                                ClaudeError::Api(format!(
-                                    "Provider '{}' stream error: {}", provider_id_str, err_msg
-                                ))
-                            );
+                            return QueryOutcome::Error(ClaudeError::Api(format!(
+                                "Provider '{}' stream error: {}",
+                                provider_id_str, err_msg
+                            )));
                         }
                         // We have partial content — log a warning and try to use it.
                         warn!(
@@ -1314,7 +1430,8 @@ pub async fn run_query_loop(
                     // only salvage already-buffered partial output.
                     if !received_message_stop && stream_error.is_none() {
                         turn_state = ProviderTurnState::Failed;
-                        stream_error = Some("stream_lifecycle_violation:missing_message_stop".to_string());
+                        stream_error =
+                            Some("stream_lifecycle_violation:missing_message_stop".to_string());
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::Status(
                                 "Stream ended unexpectedly — using partial response".to_string(),
@@ -1330,7 +1447,7 @@ pub async fn run_query_loop(
                         && tool_call_blocks.is_empty()
                     {
                         return QueryOutcome::Error(ClaudeError::Api(
-                            stream_error.unwrap_or_else(|| "provider_stream_failed".to_string())
+                            stream_error.unwrap_or_else(|| "provider_stream_failed".to_string()),
                         ));
                     }
 
@@ -1339,16 +1456,20 @@ pub async fn run_query_loop(
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text });
+                        content_blocks.push(ContentBlock::Text {
+                            text: combined_text,
+                        });
                     }
 
                     // Reconstruct tool-use blocks (sorted by index for determinism).
                     let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
                     tc_indices.sort();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
-                            let input: serde_json::Value = serde_json::from_str(&json_str)
-                                .unwrap_or(serde_json::json!({}));
+                        if let Some((id, name, json_str, thought_signature)) =
+                            tool_call_blocks.remove(&idx)
+                        {
+                            let input: serde_json::Value =
+                                serde_json::from_str(&json_str).unwrap_or(serde_json::json!({}));
 
                             if let Some(signature) = thought_signature {
                                 content_blocks.push(ContentBlock::Thinking {
@@ -1363,7 +1484,9 @@ pub async fn run_query_loop(
 
                     let assistant_msg = Message {
                         role: mangocode_core::types::Role::Assistant,
-                        content: mangocode_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        content: mangocode_core::types::MessageContent::Blocks(
+                            content_blocks.clone(),
+                        ),
                         uuid: Some(msg_id),
                         cost: None,
                     };
@@ -1378,13 +1501,16 @@ pub async fn run_query_loop(
                     messages.push(assistant_msg.clone());
 
                     // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input } = b {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let tool_use_blocks: Vec<_> = content_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse { id, name, input } = b {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
                     if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
                         let mut tool_results = Vec::new();
@@ -1417,9 +1543,15 @@ pub async fn run_query_loop(
                             .await;
 
                             // Check if hook blocked execution
-                            let result = if let mangocode_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
+                            let result = if let mangocode_core::hooks::HookOutcome::Blocked(
+                                reason,
+                            ) = pre_outcome
+                            {
                                 warn!(tool = %tool_name, reason = %reason, "PreToolUse hook blocked execution");
-                                mangocode_tools::ToolResult::error(format!("Blocked by hook: {}", reason))
+                                mangocode_tools::ToolResult::error(format!(
+                                    "Blocked by hook: {}",
+                                    reason
+                                ))
                             } else {
                                 execute_tool(ExecuteToolRequest {
                                     client,
@@ -1463,7 +1595,9 @@ pub async fn run_query_loop(
 
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: mangocode_core::types::ToolResultContent::Text(result.content),
+                                content: mangocode_core::types::ToolResultContent::Text(
+                                    result.content,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -1509,12 +1643,10 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
-                    return QueryOutcome::Error(
-                        ClaudeError::Api(format!(
-                            "No API key for provider '{}' (model '{}'). {}",
-                            provider_id_str, model_id_str, hint
-                        ))
-                    );
+                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                        "No API key for provider '{}' (model '{}'). {}",
+                        provider_id_str, model_id_str, hint
+                    )));
                 }
             }
         }
@@ -1527,7 +1659,9 @@ pub async fn run_query_loop(
                 // On overloaded/rate-limit errors, attempt one switch to the fallback model.
                 let err_str = e.to_string().to_lowercase();
                 if !used_fallback
-                    && (err_str.contains("overloaded") || err_str.contains("529") || err_str.contains("rate_limit"))
+                    && (err_str.contains("overloaded")
+                        || err_str.contains("529")
+                        || err_str.contains("rate_limit"))
                 {
                     if let Some(ref fb) = config.fallback_model {
                         warn!(
@@ -1683,13 +1817,7 @@ pub async fn run_query_loop(
                         "Compacting context... (emergency collapse)".to_string(),
                     ));
                 }
-                match compact::context_collapse(
-                    std::mem::take(messages),
-                    client,
-                    config,
-                )
-                .await
-                {
+                match compact::context_collapse(std::mem::take(messages), client, config).await {
                     Ok(result) => {
                         *messages = result.messages;
                         info!(
@@ -2004,22 +2132,26 @@ pub async fn run_query_loop(
                         let plugin_pre_outcome =
                             mangocode_plugins::run_global_pre_tool_hook(&name, &input);
 
-                        let blocked_result =
-                            if let mangocode_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(mangocode_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let mangocode_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(mangocode_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                None
-                            };
+                        let blocked_result = if let mangocode_core::hooks::HookOutcome::Blocked(
+                            reason,
+                        ) = pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                            Some(mangocode_tools::ToolResult::error(format!(
+                                "Blocked by hook: {}",
+                                reason
+                            )))
+                        } else if let mangocode_plugins::HookOutcome::Deny(reason) =
+                            plugin_pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                            Some(mangocode_tools::ToolResult::error(format!(
+                                "Blocked by plugin hook: {}",
+                                reason
+                            )))
+                        } else {
+                            None
+                        };
 
                         prepared.push(PreparedTool {
                             id,
@@ -2038,8 +2170,7 @@ pub async fn run_query_loop(
                     .iter()
                     .map(|p| {
                         let event_tx_for_exec = event_tx.clone();
-                        if p.blocked_result.is_some() {
-                            let r = p.blocked_result.clone().unwrap();
+                        if let Some(r) = p.blocked_result.clone() {
                             futures::future::Either::Left(async move { r })
                         } else {
                             let id = p.id.clone();
@@ -2063,12 +2194,10 @@ pub async fn run_query_loop(
                     .collect();
 
                 // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<ToolResult> =
-                    futures::future::join_all(exec_futures).await;
+                let exec_results: Vec<ToolResult> = futures::future::join_all(exec_futures).await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
-                let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len());
+                let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                 for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
                     let hooks = &tool_ctx.config.hooks;
                     let post_ctx = mangocode_core::hooks::HookContext {
@@ -2130,7 +2259,10 @@ pub async fn run_query_loop(
                 };
             }
             other => {
-                warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
+                warn!(
+                    stop_reason = other,
+                    "Unknown stop reason, treating as end_turn"
+                );
                 fire_stop_hook!(assistant_msg);
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
@@ -2256,40 +2388,48 @@ fn map_to_anthropic_event(
                 usage: usage.clone(),
             })
         }
-        StreamEvent::ContentBlockStart { index, content_block } => {
-            Some(AnthropicStreamEvent::ContentBlockStart {
-                index: *index,
-                content_block: content_block.clone(),
-            })
-        }
-        StreamEvent::TextDelta { index, text } => {
-            Some(AnthropicStreamEvent::ContentBlockDelta {
-                index: *index,
-                delta: ContentDelta::TextDelta { text: text.clone() },
-            })
-        }
+        StreamEvent::ContentBlockStart {
+            index,
+            content_block,
+        } => Some(AnthropicStreamEvent::ContentBlockStart {
+            index: *index,
+            content_block: content_block.clone(),
+        }),
+        StreamEvent::TextDelta { index, text } => Some(AnthropicStreamEvent::ContentBlockDelta {
+            index: *index,
+            delta: ContentDelta::TextDelta { text: text.clone() },
+        }),
         StreamEvent::ThinkingDelta { index, thinking } => {
             Some(AnthropicStreamEvent::ContentBlockDelta {
                 index: *index,
-                delta: ContentDelta::ThinkingDelta { thinking: thinking.clone() },
+                delta: ContentDelta::ThinkingDelta {
+                    thinking: thinking.clone(),
+                },
             })
         }
         StreamEvent::ReasoningDelta { index, reasoning } => {
             Some(AnthropicStreamEvent::ContentBlockDelta {
                 index: *index,
-                delta: ContentDelta::ThinkingDelta { thinking: reasoning.clone() },
+                delta: ContentDelta::ThinkingDelta {
+                    thinking: reasoning.clone(),
+                },
             })
         }
-        StreamEvent::InputJsonDelta { index, partial_json } => {
-            Some(AnthropicStreamEvent::ContentBlockDelta {
-                index: *index,
-                delta: ContentDelta::InputJsonDelta { partial_json: partial_json.clone() },
-            })
-        }
+        StreamEvent::InputJsonDelta {
+            index,
+            partial_json,
+        } => Some(AnthropicStreamEvent::ContentBlockDelta {
+            index: *index,
+            delta: ContentDelta::InputJsonDelta {
+                partial_json: partial_json.clone(),
+            },
+        }),
         StreamEvent::SignatureDelta { index, signature } => {
             Some(AnthropicStreamEvent::ContentBlockDelta {
                 index: *index,
-                delta: ContentDelta::SignatureDelta { signature: signature.clone() },
+                delta: ContentDelta::SignatureDelta {
+                    signature: signature.clone(),
+                },
             })
         }
         StreamEvent::ContentBlockStop { index } => {
@@ -2301,9 +2441,13 @@ fn map_to_anthropic_event(
             let stop_reason_str = stop_reason.as_ref().map(|r| match r {
                 mangocode_api::provider_types::StopReason::ToolUse => "tool_use".to_string(),
                 mangocode_api::provider_types::StopReason::MaxTokens => "max_tokens".to_string(),
-                mangocode_api::provider_types::StopReason::StopSequence => "stop_sequence".to_string(),
+                mangocode_api::provider_types::StopReason::StopSequence => {
+                    "stop_sequence".to_string()
+                }
                 mangocode_api::provider_types::StopReason::EndTurn => "end_turn".to_string(),
-                mangocode_api::provider_types::StopReason::ContentFiltered => "content_filtered".to_string(),
+                mangocode_api::provider_types::StopReason::ContentFiltered => {
+                    "content_filtered".to_string()
+                }
                 mangocode_api::provider_types::StopReason::Other(s) => s.clone(),
             });
             Some(AnthropicStreamEvent::MessageDelta {
@@ -2312,12 +2456,13 @@ fn map_to_anthropic_event(
             })
         }
         StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
-        StreamEvent::Error { error_type, message } => {
-            Some(AnthropicStreamEvent::Error {
-                error_type: error_type.clone(),
-                message: message.clone(),
-            })
-        }
+        StreamEvent::Error {
+            error_type,
+            message,
+        } => Some(AnthropicStreamEvent::Error {
+            error_type: error_type.clone(),
+            message: message.clone(),
+        }),
     }
 }
 

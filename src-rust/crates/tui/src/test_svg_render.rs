@@ -3,7 +3,7 @@ fn test_mango_svg_renders() {
     let svg_data = include_bytes!("../../../mangoMan.svg");
     let tree = resvg::usvg::Tree::from_data(svg_data, &resvg::usvg::Options::default());
     assert!(tree.is_ok(), "SVG parsing failed: {:?}", tree.err());
-    let tree = tree.unwrap();
+    let tree = tree.expect("embedded rustle SVG literal should parse");
     let size = tree.size();
     eprintln!("SVG size: {}x{}", size.width(), size.height());
     
@@ -14,7 +14,7 @@ fn test_mango_svg_renders() {
     
     let pixmap = resvg::tiny_skia::Pixmap::new(target_w, target_h);
     assert!(pixmap.is_some(), "Failed to create pixmap");
-    let mut pixmap = pixmap.unwrap();
+    let mut pixmap = pixmap.expect("pixmap allocation for SVG render should succeed");
     
     let bg = resvg::tiny_skia::Color::from_rgba8(26, 20, 15, 255);
     pixmap.fill(bg);

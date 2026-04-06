@@ -45,8 +45,7 @@ type SharedReplSession = Arc<Mutex<ReplSession>>;
 type ReplSessionMap = DashMap<ReplSessionKey, SharedReplSession>;
 
 /// Key: (session_id, language)
-static REPL_SESSIONS: Lazy<Arc<ReplSessionMap>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+static REPL_SESSIONS: Lazy<Arc<ReplSessionMap>> = Lazy::new(|| Arc::new(DashMap::new()));
 
 // ---------------------------------------------------------------------------
 // Sentinel values
@@ -103,8 +102,8 @@ async fn get_or_spawn_session(
     }
 
     // Spawn a new interpreter
-    let (cmd, args) = interpreter_for(language)
-        .ok_or_else(|| format!("Unsupported language: {}", language))?;
+    let (cmd, args) =
+        interpreter_for(language).ok_or_else(|| format!("Unsupported language: {}", language))?;
 
     let mut child = tokio::process::Command::new(cmd)
         .args(&args)
@@ -236,11 +235,7 @@ impl Tool for ReplTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let language = params
-            .language
-            .as_deref()
-            .unwrap_or("bash")
-            .to_lowercase();
+        let language = params.language.as_deref().unwrap_or("bash").to_lowercase();
 
         debug!(
             session = %ctx.session_id,

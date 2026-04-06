@@ -110,13 +110,23 @@ impl CommandQueue {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let mut heap = self.0.lock().unwrap();
-        heap.push(QueueEntry { command, priority, timestamp: ts });
+        let mut heap = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        heap.push(QueueEntry {
+            command,
+            priority,
+            timestamp: ts,
+        });
     }
 
     /// Drain all pending commands in priority order (highest first).
     pub fn drain(&self) -> Vec<QueuedCommand> {
-        let mut heap = self.0.lock().unwrap();
+        let mut heap = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut out = Vec::with_capacity(heap.len());
         while let Some(entry) = heap.pop() {
             out.push(entry.command);
@@ -125,7 +135,10 @@ impl CommandQueue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.lock().unwrap().is_empty()
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
     }
 }
 

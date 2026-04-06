@@ -14,8 +14,7 @@ use ratatui::Frame;
 
 /// Distinguishes what kind of action the permission dialog is for.
 /// This drives how many options are shown and what the command block looks like.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum PermissionDialogKind {
     /// Generic four-option dialog (the previous default).
     #[default]
@@ -31,7 +30,6 @@ pub enum PermissionDialogKind {
     /// File write — four options: once / session / project / deny.
     FileWrite { path: String },
 }
-
 
 // ---------------------------------------------------------------------------
 // Permission dialog types
@@ -148,12 +146,7 @@ impl PermissionRequest {
     }
 
     /// Build a FileRead-specific dialog (3 options: once / session / deny).
-    pub fn file_read(
-        tool_use_id: String,
-        tool_name: String,
-        reason: String,
-        path: String,
-    ) -> Self {
+    pub fn file_read(tool_use_id: String, tool_name: String, reason: String, path: String) -> Self {
         let (description, danger_explanation) = if let Some(nl) = reason.find('\n') {
             (reason[..nl].to_string(), reason[nl + 1..].to_string())
         } else {
@@ -210,10 +203,22 @@ impl PermissionRequest {
     /// The four canonical options (matches TS interactive permission dialog).
     pub fn default_options() -> Vec<PermissionOption> {
         vec![
-            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
-            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "Yes, always allow (persistent)".to_string(), key: 'p' },
-            PermissionOption { label: "No, deny".to_string(), key: 'n' },
+            PermissionOption {
+                label: "Yes, allow once".to_string(),
+                key: 'y',
+            },
+            PermissionOption {
+                label: "Yes, allow this session".to_string(),
+                key: 'Y',
+            },
+            PermissionOption {
+                label: "Yes, always allow (persistent)".to_string(),
+                key: 'p',
+            },
+            PermissionOption {
+                label: "No, deny".to_string(),
+                key: 'n',
+            },
         ]
     }
 
@@ -222,7 +227,9 @@ impl PermissionRequest {
         let mut opts = Self::default_options();
         if let Some(prefix) = suggested_prefix {
             // Insert before the deny option (last item).
-            let deny = opts.pop().unwrap();
+            let Some(deny) = opts.pop() else {
+                return opts;
+            };
             opts.push(PermissionOption {
                 label: format!("Allow commands matching {}*", prefix),
                 key: 'P',
@@ -235,19 +242,40 @@ impl PermissionRequest {
     /// FileRead options (3): once / session / deny.
     pub fn file_read_options() -> Vec<PermissionOption> {
         vec![
-            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
-            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "No, deny".to_string(), key: 'n' },
+            PermissionOption {
+                label: "Yes, allow once".to_string(),
+                key: 'y',
+            },
+            PermissionOption {
+                label: "Yes, allow this session".to_string(),
+                key: 'Y',
+            },
+            PermissionOption {
+                label: "No, deny".to_string(),
+                key: 'n',
+            },
         ]
     }
 
     /// FileWrite options (4): once / session / project / deny.
     pub fn file_write_options() -> Vec<PermissionOption> {
         vec![
-            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
-            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "Yes, always allow for this project".to_string(), key: 'p' },
-            PermissionOption { label: "No, deny".to_string(), key: 'n' },
+            PermissionOption {
+                label: "Yes, allow once".to_string(),
+                key: 'y',
+            },
+            PermissionOption {
+                label: "Yes, allow this session".to_string(),
+                key: 'Y',
+            },
+            PermissionOption {
+                label: "Yes, always allow for this project".to_string(),
+                key: 'p',
+            },
+            PermissionOption {
+                label: "No, deny".to_string(),
+                key: 'n',
+            },
         ]
     }
 }
@@ -373,7 +401,11 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     let preview_line_count: u16 = match &pr.kind {
         PermissionDialogKind::Bash { .. } => 0, // rendered separately as bash_command_lines
         _ => {
-            if pr.input_preview.is_some() { 3 } else { 0 }
+            if pr.input_preview.is_some() {
+                3
+            } else {
+                0
+            }
         }
     };
 
@@ -426,7 +458,9 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
             lines.push(Line::from(vec![
                 Span::styled(
                     "  \u{276F} ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     preview.clone(),
@@ -452,10 +486,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         for expl_line in &expl_lines {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    expl_line.clone(),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(expl_line.clone(), Style::default().fg(Color::Yellow)),
             ]));
         }
         lines.push(Line::from(""));
@@ -577,17 +608,30 @@ pub enum ToolPermissionKind {
     /// File edit: show diff of proposed changes.
     FileEdit { path: String, diff: String },
     /// File write: show new file content.
-    FileWrite { path: String, content_preview: String },
+    FileWrite {
+        path: String,
+        content_preview: String,
+    },
     /// File read: show path + line range.
-    FileRead { path: String, line_range: Option<(u32, u32)> },
+    FileRead {
+        path: String,
+        line_range: Option<(u32, u32)>,
+    },
     /// Web fetch: show URL + domain risk.
     WebFetch { url: String, is_high_risk: bool },
     /// PowerShell script execution.
     PowerShell { script: String },
     /// Ask user a question (from AskUserQuestion tool).
-    AskUser { question: String, choices: Vec<String> },
+    AskUser {
+        question: String,
+        choices: Vec<String>,
+    },
     /// MCP server elicitation (schema-driven form).
-    Elicitation { server: String, title: String, fields: Vec<ElicitationField> },
+    Elicitation {
+        server: String,
+        title: String,
+        fields: Vec<ElicitationField>,
+    },
 }
 
 /// A single field in an elicitation form.
@@ -624,7 +668,12 @@ pub struct ToolPermissionDialog {
 
 impl ToolPermissionDialog {
     pub fn new(kind: ToolPermissionKind) -> Self {
-        Self { kind, focused_button: 0, scroll: 0, focused_field: 0 }
+        Self {
+            kind,
+            focused_button: 0,
+            scroll: 0,
+            focused_field: 0,
+        }
     }
 
     /// Move focus to next button.
@@ -683,31 +732,25 @@ fn build_dialog_content(dialog: &ToolPermissionDialog) -> (&'static str, Vec<Str
     match &dialog.kind {
         ToolPermissionKind::Bash { command } => (
             "Allow Bash Command?",
-            vec![
-                "Command:".to_string(),
-                format!("  $ {}", command),
-            ],
+            vec!["Command:".to_string(), format!("  $ {}", command)],
         ),
-        ToolPermissionKind::FileEdit { path, diff } => (
-            "Allow File Edit?",
-            {
-                let mut lines = vec![format!("File: {}", path), String::new()];
-                for line in diff.lines().take(30) {
-                    lines.push(line.to_string());
-                }
-                lines
-            },
-        ),
-        ToolPermissionKind::FileWrite { path, content_preview } => (
-            "Allow File Write?",
-            {
-                let mut lines = vec![format!("File: {}", path), String::new()];
-                for line in content_preview.lines().take(20) {
-                    lines.push(format!("  {}", line));
-                }
-                lines
-            },
-        ),
+        ToolPermissionKind::FileEdit { path, diff } => ("Allow File Edit?", {
+            let mut lines = vec![format!("File: {}", path), String::new()];
+            for line in diff.lines().take(30) {
+                lines.push(line.to_string());
+            }
+            lines
+        }),
+        ToolPermissionKind::FileWrite {
+            path,
+            content_preview,
+        } => ("Allow File Write?", {
+            let mut lines = vec![format!("File: {}", path), String::new()];
+            for line in content_preview.lines().take(20) {
+                lines.push(format!("  {}", line));
+            }
+            lines
+        }),
         ToolPermissionKind::FileRead { path, line_range } => (
             "Allow File Read?",
             vec![
@@ -729,44 +772,44 @@ fn build_dialog_content(dialog: &ToolPermissionDialog) -> (&'static str, Vec<Str
                 },
             ],
         ),
-        ToolPermissionKind::PowerShell { script } => (
-            "Allow PowerShell?",
-            {
-                let mut lines = vec!["Script:".to_string()];
-                for line in script.lines().take(20) {
-                    lines.push(format!("  {}", line));
+        ToolPermissionKind::PowerShell { script } => ("Allow PowerShell?", {
+            let mut lines = vec!["Script:".to_string()];
+            for line in script.lines().take(20) {
+                lines.push(format!("  {}", line));
+            }
+            lines
+        }),
+        ToolPermissionKind::AskUser { question, choices } => ("Agent Question", {
+            let mut lines = vec![question.clone()];
+            if !choices.is_empty() {
+                lines.push(String::new());
+                lines.push("Options:".to_string());
+                for (i, c) in choices.iter().enumerate() {
+                    lines.push(format!("  {}. {}", i + 1, c));
                 }
-                lines
-            },
-        ),
-        ToolPermissionKind::AskUser { question, choices } => (
-            "Agent Question",
-            {
-                let mut lines = vec![question.clone()];
-                if !choices.is_empty() {
-                    lines.push(String::new());
-                    lines.push("Options:".to_string());
-                    for (i, c) in choices.iter().enumerate() {
-                        lines.push(format!("  {}. {}", i + 1, c));
-                    }
-                }
-                lines
-            },
-        ),
-        ToolPermissionKind::Elicitation { server, title, fields } => (
-            "Server Input Request",
-            {
-                let mut lines = vec![
-                    format!("Server: {}", server),
-                    format!("Request: {}", title),
-                    String::new(),
-                ];
-                for f in fields {
-                    lines.push(format!("  {} {}: {}", if f.required { "*" } else { " " }, f.name, f.value));
-                }
-                lines
-            },
-        ),
+            }
+            lines
+        }),
+        ToolPermissionKind::Elicitation {
+            server,
+            title,
+            fields,
+        } => ("Server Input Request", {
+            let mut lines = vec![
+                format!("Server: {}", server),
+                format!("Request: {}", title),
+                String::new(),
+            ];
+            for f in fields {
+                lines.push(format!(
+                    "  {} {}: {}",
+                    if f.required { "*" } else { " " },
+                    f.name,
+                    f.value
+                ));
+            }
+            lines
+        }),
     }
 }
 
@@ -783,7 +826,9 @@ fn render_permission_buttons(focused: usize, area: Rect, frame: &mut Frame) {
 
     for (i, (label, chunk)) in buttons.iter().zip(chunks.iter()).enumerate() {
         let style = if i == focused {
-            Style::default().fg(Color::Black).bg(if i == 2 { Color::Red } else { Color::Green })
+            Style::default()
+                .fg(Color::Black)
+                .bg(if i == 2 { Color::Red } else { Color::Green })
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
@@ -833,7 +878,11 @@ pub enum McpApprovalChoice {
 
 impl McpApprovalChoice {
     fn all() -> &'static [McpApprovalChoice] {
-        &[McpApprovalChoice::AllowSession, McpApprovalChoice::AllowAlways, McpApprovalChoice::Deny]
+        &[
+            McpApprovalChoice::AllowSession,
+            McpApprovalChoice::AllowAlways,
+            McpApprovalChoice::Deny,
+        ]
     }
 
     fn index(&self) -> usize {
@@ -955,11 +1004,7 @@ impl Default for McpApprovalDialogState {
 /// │    [2] Always allow                               │
 /// │    [3] Deny                                       │
 /// └───────────────────────────────────────────────────┘
-pub fn render_mcp_approval_dialog(
-    state: &McpApprovalDialogState,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+pub fn render_mcp_approval_dialog(state: &McpApprovalDialogState, area: Rect, buf: &mut Buffer) {
     if !state.visible {
         return;
     }
@@ -992,12 +1037,17 @@ pub fn render_mcp_approval_dialog(
     lines.push(Line::from(""));
 
     // Server name.
-    let server_label = format!("  Server:  {}", truncate_str(&state.server_name, text_width.saturating_sub(10)));
+    let server_label = format!(
+        "  Server:  {}",
+        truncate_str(&state.server_name, text_width.saturating_sub(10))
+    );
     lines.push(Line::from(vec![
         Span::styled("  Server:  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             truncate_str(&state.server_name, text_width.saturating_sub(10)),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     let _ = server_label; // suppress unused warning
@@ -1026,17 +1076,19 @@ pub fn render_mcp_approval_dialog(
     // Tools list.
     if has_tools {
         let extra = state.tool_names.len().saturating_sub(5);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "  Exposes {} tool{}{}:",
-                    state.tool_names.len(),
-                    if state.tool_names.len() == 1 { "" } else { "s" },
-                    if extra > 0 { format!(" (showing first 5 of {})", state.tool_names.len()) } else { String::new() },
-                ),
-                Style::default().fg(Color::DarkGray),
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  Exposes {} tool{}{}:",
+                state.tool_names.len(),
+                if state.tool_names.len() == 1 { "" } else { "s" },
+                if extra > 0 {
+                    format!(" (showing first 5 of {})", state.tool_names.len())
+                } else {
+                    String::new()
+                },
             ),
-        ]));
+            Style::default().fg(Color::DarkGray),
+        )]));
         for name in state.tool_names.iter().take(5) {
             lines.push(Line::from(vec![
                 Span::styled("    \u{2022} ", Style::default().fg(Color::DarkGray)),
@@ -1055,7 +1107,9 @@ pub fn render_mcp_approval_dialog(
         let prefix = if is_selected { "  \u{25BA} " } else { "    " };
         let num = choice.index() + 1;
         let key_style = if is_selected {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1119,9 +1173,7 @@ pub fn handle_mcp_approval_key(
             state.select_next();
             None
         }
-        KeyCode::Enter => {
-            Some(state.confirm())
-        }
+        KeyCode::Enter => Some(state.confirm()),
         KeyCode::Char('1') => {
             state.selected = McpApprovalChoice::AllowSession;
             Some(state.confirm())
@@ -1248,10 +1300,13 @@ mod tests {
             None,
         );
         assert_eq!(pr.options.len(), 4);
-        assert_eq!(pr.kind, PermissionDialogKind::Bash {
-            command: "ls -la".to_string(),
-            suggested_prefix: None,
-        });
+        assert_eq!(
+            pr.kind,
+            PermissionDialogKind::Bash {
+                command: "ls -la".to_string(),
+                suggested_prefix: None,
+            }
+        );
         // input_preview is set to the command
         assert_eq!(pr.input_preview.as_deref(), Some("ls -la"));
     }
@@ -1267,8 +1322,16 @@ mod tests {
         );
         assert_eq!(pr.options.len(), 5);
         // 5th option (index 3 before deny) carries the prefix label
-        assert!(pr.options[3].label.contains("git "), "Expected prefix in label: {:?}", pr.options[3].label);
-        assert!(pr.options[3].label.ends_with('*'), "Expected * suffix: {:?}", pr.options[3].label);
+        assert!(
+            pr.options[3].label.contains("git "),
+            "Expected prefix in label: {:?}",
+            pr.options[3].label
+        );
+        assert!(
+            pr.options[3].label.ends_with('*'),
+            "Expected * suffix: {:?}",
+            pr.options[3].label
+        );
         // Deny is still the last option
         assert_eq!(pr.options[4].key, 'n');
     }
@@ -1304,11 +1367,8 @@ mod tests {
 
     #[test]
     fn permission_key_digit_selects_and_confirms() {
-        let mut pr = PermissionRequest::standard(
-            "id".to_string(),
-            "Bash".to_string(),
-            "desc".to_string(),
-        );
+        let mut pr =
+            PermissionRequest::standard("id".to_string(), "Bash".to_string(), "desc".to_string());
         // Press '1' → selects option 0 (allow once) and confirms.
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('1')));
         assert!(confirmed);
@@ -1350,11 +1410,8 @@ mod tests {
 
     #[test]
     fn permission_key_char_shortcut_confirms() {
-        let mut pr = PermissionRequest::standard(
-            "id".to_string(),
-            "Bash".to_string(),
-            "desc".to_string(),
-        );
+        let mut pr =
+            PermissionRequest::standard("id".to_string(), "Bash".to_string(), "desc".to_string());
         // Press 'n' → deny (index 3).
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('n')));
         assert!(confirmed);
@@ -1363,11 +1420,8 @@ mod tests {
 
     #[test]
     fn permission_key_esc_selects_deny() {
-        let mut pr = PermissionRequest::standard(
-            "id".to_string(),
-            "Bash".to_string(),
-            "desc".to_string(),
-        );
+        let mut pr =
+            PermissionRequest::standard("id".to_string(), "Bash".to_string(), "desc".to_string());
         pr.selected_option = 0;
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Esc));
         assert!(confirmed);
@@ -1376,11 +1430,8 @@ mod tests {
 
     #[test]
     fn permission_key_up_down_navigation() {
-        let mut pr = PermissionRequest::standard(
-            "id".to_string(),
-            "Bash".to_string(),
-            "desc".to_string(),
-        );
+        let mut pr =
+            PermissionRequest::standard("id".to_string(), "Bash".to_string(), "desc".to_string());
         pr.selected_option = 1;
         // Down.
         handle_permission_key(&mut pr, key(KeyCode::Down));
