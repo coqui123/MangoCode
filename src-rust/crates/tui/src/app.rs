@@ -884,6 +884,8 @@ pub struct App {
     pub paste_burst_last_printable_at: Option<std::time::Instant>,
     /// If set and not expired, Enter inserts newline instead of submitting.
     pub paste_burst_until: Option<std::time::Instant>,
+    /// Cursor position when the current paste burst started (for collapse).
+    pub paste_burst_start_cursor: Option<usize>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1547,6 +1549,7 @@ impl App {
             paste_burst_printable_streak: 0,
             paste_burst_last_printable_at: None,
             paste_burst_until: None,
+            paste_burst_start_cursor: None,
         }
     }
 
@@ -1667,6 +1670,7 @@ impl App {
             self.paste_burst_until = None;
             self.paste_burst_printable_streak = 0;
             self.paste_burst_last_printable_at = None;
+            self.paste_burst_start_cursor = None;
         }
     }
 
@@ -1698,12 +1702,43 @@ impl App {
             }
             _ => {
                 self.paste_burst_printable_streak = 1;
+                // New burst — record where the prompt cursor is now
+                self.paste_burst_start_cursor = Some(self.prompt_input.cursor);
             }
         }
         self.paste_burst_last_printable_at = Some(now);
 
         if self.paste_burst_printable_streak >= PASTE_BURST_MIN_STREAK {
             self.activate_paste_burst(now);
+
+            // If we've accumulated a lot of rapid input, collapse it into
+            // [Pasted text #N (+X lines)] like Claude Code does.
+            if let Some(start) = self.paste_burst_start_cursor {
+                let burst_len = self.prompt_input.cursor.saturating_sub(start);
+                if burst_len > 1024 {
+                    // Extract the burst text, collapse it
+                    let burst_text: String = self.prompt_input.text[start..self.prompt_input.cursor].to_string();
+                    let line_count = burst_text.lines().count();
+                    self.prompt_input.paste_counter += 1;
+                    let placeholder = if line_count > 1 {
+                        format!("[Pasted text #{} (+{} lines)]", self.prompt_input.paste_counter, line_count)
+                    } else {
+                        format!("[Pasted text #{}]", self.prompt_input.paste_counter)
+                    };
+                    // Store the original content for when the message is submitted
+                    self.prompt_input.paste_contents.insert(
+                        self.prompt_input.paste_counter,
+                        burst_text,
+                    );
+                    // Replace the burst text with the placeholder
+                    self.prompt_input.text.replace_range(start..self.prompt_input.cursor, &placeholder);
+                    self.prompt_input.cursor = start + placeholder.len();
+                    self.prompt_input.update_token_estimate();
+                    // Reset burst tracking for the next paste
+                    self.paste_burst_start_cursor = None;
+                    self.paste_burst_printable_streak = 0;
+                }
+            }
         }
     }
 
