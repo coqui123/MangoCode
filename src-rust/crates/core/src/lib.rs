@@ -2514,13 +2514,83 @@ pub mod history {
         crate::config::Settings::config_dir().join("sessions")
     }
 
-    /// Save a session to `~/.mangocode/sessions/<id>.json`.
+    /// Save a session to `~/.mangocode/sessions/<id>.json` and also write
+    /// a JSONL transcript to `~/.claude/projects/` for CloudCLI/Conducctor
+    /// session discovery compatibility.
     pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
+        // Write the internal JSON session (MangoCode's native format)
         let dir = sessions_dir();
         tokio::fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{}.json", session.id));
         let content = serde_json::to_string_pretty(session)?;
         tokio::fs::write(&path, content).await?;
+
+        // Also write a JSONL transcript at ~/.claude/projects/ for CC compatibility.
+        // This allows CloudCLI-based UIs to discover MangoCode sessions.
+        let project_root = session.working_dir.as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let transcript_path = crate::session_storage::transcript_path(project_root, &session.id);
+        if let Some(parent) = transcript_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
+        // Build JSONL entries from messages with CC-compatible metadata
+        let mut lines = String::new();
+        let cwd_str = session.working_dir.as_deref().unwrap_or(".");
+        let session_id = &session.id;
+
+        for msg in &session.messages {
+            let entry_type = match msg.role {
+                crate::types::Role::User => "user",
+                crate::types::Role::Assistant => "assistant",
+            };
+            let uuid_val = msg.uuid.clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let entry = serde_json::json!({
+                "type": entry_type,
+                "message": {
+                    "role": entry_type,
+                    "content": msg.content,
+                },
+                "uuid": uuid_val,
+                "timestamp": session.updated_at.to_rfc3339(),
+                "sessionId": session_id,
+                "cwd": cwd_str,
+            });
+            lines.push_str(&serde_json::to_string(&entry).unwrap_or_default());
+            lines.push('\n');
+        }
+        // Add summary for sidebar display (uses first user message as fallback)
+        let summary = session.title.clone().or_else(|| {
+            session.messages.iter().find(|m| matches!(m.role, crate::types::Role::User)).and_then(|m| {
+                match &m.content {
+                    crate::types::MessageContent::Text(t) => Some(t.chars().take(50).collect()),
+                    crate::types::MessageContent::Blocks(blocks) => {
+                        blocks.iter().find_map(|b| {
+                            if let crate::types::ContentBlock::Text { text } = b {
+                                Some(text.chars().take(50).collect())
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                }
+            })
+        });
+        if let Some(ref s) = summary {
+            let summary_entry = serde_json::json!({
+                "type": "summary",
+                "summary": s,
+                "sessionId": session_id,
+            });
+            lines.push_str(&serde_json::to_string(&summary_entry).unwrap_or_default());
+            lines.push('\n');
+        }
+        if let Err(e) = tokio::fs::write(&transcript_path, &lines).await {
+            eprintln!("Warning: failed to write JSONL transcript to {:?}: {}", transcript_path, e);
+        }
+
         Ok(())
     }
 

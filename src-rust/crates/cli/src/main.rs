@@ -1360,6 +1360,7 @@ async fn run_headless(
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let cancel = CancellationToken::new();
     let stream_session_id = tool_ctx.session_id.clone();
+    let mut brief_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let event_task = tokio::spawn(async move {
         let mut full_text = String::new();
         while let Some(event) = event_rx.recv().await {
@@ -1374,13 +1375,16 @@ async fn run_headless(
                         use std::io::Write;
                         let _ = std::io::stdout().flush();
                     } else if is_stream_json {
+                        // Emit CC-compatible content_block_delta + content_block_stop
+                        // instead of wrapping in an assistant message, so orchestration
+                        // UIs can use the standard Claude streaming adapter.
                         emit_ndjson(serde_json::json!({
-                            "type": "assistant",
-                            "message": {
-                                "role": "assistant",
-                                "content": [{ "type": "text", "text": text }]
-                            },
-                            "parent_tool_use_id": serde_json::Value::Null,
+                            "type": "content_block_delta",
+                            "delta": { "text": text },
+                            "session_id": stream_session_id,
+                        }));
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_stop",
                             "session_id": stream_session_id,
                         }));
                     }
@@ -1400,12 +1404,12 @@ async fn run_headless(
                         let _ = std::io::stdout().flush();
                     } else if is_stream_json {
                         emit_ndjson(serde_json::json!({
-                            "type": "assistant",
-                            "message": {
-                                "role": "assistant",
-                                "content": [{ "type": "text", "text": text }]
-                            },
-                            "parent_tool_use_id": parent_tool_use_id,
+                            "type": "content_block_delta",
+                            "delta": { "text": text },
+                            "session_id": stream_session_id,
+                        }));
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_stop",
                             "session_id": stream_session_id,
                         }));
                     }
@@ -1493,6 +1497,14 @@ async fn run_headless(
                     } else if is_stream_json {
                         let parsed_input = serde_json::from_str::<serde_json::Value>(&input_json)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input_json }));
+                        // In stream-json mode, suppress Brief tool_use events entirely.
+                        // Brief is an internal display wrapper — the model also emits
+                        // a separate assistant text event with the same content, so
+                        // emitting Brief as tool_use would cause duplicate messages
+                        // in orchestration UIs like Conducctor.
+                        if tool_name == "Brief" {
+                            brief_tool_ids.insert(tool_id.clone());
+                        } else {
                         emit_ndjson(serde_json::json!({
                             "type": "assistant",
                             "message": {
@@ -1509,6 +1521,7 @@ async fn run_headless(
                                 .unwrap_or(serde_json::Value::Null),
                             "session_id": stream_session_id,
                         }));
+                        }
                     } else {
                         emit_ndjson(serde_json::json!({ "type": "tool_start", "tool": tool_name }));
                     }
@@ -1520,6 +1533,10 @@ async fn run_headless(
                     ..
                 } => {
                     if is_stream_json {
+                        // Skip tool_result for Brief (already emitted as text)
+                        if brief_tool_ids.remove(&tool_id) {
+                            continue;
+                        }
                         emit_ndjson(serde_json::json!({
                             "type": "user",
                             "message": {
