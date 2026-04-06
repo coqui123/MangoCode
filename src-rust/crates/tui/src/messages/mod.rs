@@ -174,10 +174,10 @@ fn render_tool_use_inner(tool_name: &str, input: &serde_json::Value) -> Vec<Line
     let summary = extract_tool_summary(tool_name, input);
     let mut lines = Vec::new();
 
-    // Header: ● ToolName (summary)
+    // Header: • ToolName (summary)
     let mut header_spans = vec![
         Span::styled(
-            "  \u{25cf} ".to_string(),
+            "  \u{2022} ".to_string(),
             Style::default().fg(Color::Green),
         ),
         Span::styled(

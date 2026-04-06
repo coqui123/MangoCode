@@ -1,6 +1,6 @@
 // session_storage.rs — JSONL transcript persistence for MangoCode.
 //
-// File layout:  ~/.mangocode/projects/{base64url(project_root)}/{session_id}.jsonl
+// File layout:  ~/.claude/projects/{sanitized(project_root)}/{session_id}.jsonl
 //
 // Each line is a JSON object ("entry") whose `type` field is the discriminant.
 // The schema is kept compatible with the TypeScript `Entry` union in
@@ -13,8 +13,6 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -661,18 +659,16 @@ mod tests {
     }
 
     #[test]
-    fn transcript_path_encoding_is_reversible() {
+    fn transcript_path_uses_compat_sanitized_project_dir() {
         let root = Path::new("/Users/alice/my-project");
+        let dir = transcript_dir(root);
+        let encoded_dir = dir.file_name().unwrap().to_str().unwrap();
+
+        // Must match Claude Code path compatibility encoding.
+        assert_eq!(encoded_dir, "-Users-alice-my-project");
+
         let path = transcript_path(root, "test-session");
-        // The directory component after "projects/" should decode back to the root.
-        let encoded_dir = path
-            .parent()
-            .unwrap()
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap();
-        let decoded = URL_SAFE_NO_PAD.decode(encoded_dir).unwrap();
-        assert_eq!(String::from_utf8(decoded).unwrap(), root.to_str().unwrap());
+        assert!(path.starts_with(projects_dir()));
+        assert!(path.ends_with(Path::new("test-session.jsonl")));
     }
 }

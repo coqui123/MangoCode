@@ -11,6 +11,7 @@
 // - list_models via GET /v1beta/models
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -40,6 +41,9 @@ pub struct GoogleProvider {
     base_url: String,
     http_client: reqwest::Client,
 }
+
+const GOOGLE_STREAM_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const GOOGLE_STREAM_LOGICAL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl GoogleProvider {
     pub fn new(api_key: String) -> Self {
@@ -699,7 +703,7 @@ impl LlmProvider for GoogleProvider {
     }
 
     fn name(&self) -> &str {
-        "Google"
+        "Google Gemini"
     }
 
     async fn create_message(
@@ -805,56 +809,66 @@ impl LlmProvider for GoogleProvider {
             let mut line_buf = String::new();
             let mut tool_name_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            let mut had_stream_error = false;
+            let mut terminal_stream_error: Option<String> = None;
 
             // Logical inactivity watchdog: track when we last received a
             // *meaningful* event (candidate parsed, text delta, tool delta,
             // finish reason, promptFeedback).  If the message has started
             // and we go N seconds without meaningful progress, we synthesise
-            // terminal events and close the stream so the UI never hangs.
-            let inactivity_limit = std::time::Duration::from_secs(20);
-            let chunk_read_timeout = std::time::Duration::from_secs(60);
+            // a terminal stream error so callers can decide whether partial
+            // output should be surfaced.
             let mut last_meaningful_event = tokio::time::Instant::now();
 
             // Helper closure extracted as a macro-like block below since
             // async_stream! doesn't support closures that yield.
 
             loop {
-                // Read the next byte chunk with a hard timeout so that we
-                // don't block forever when the server keeps the connection
-                // open but sends nothing at all.
+                // Logical watchdog: bytes may still arrive but only as keepalives
+                // or wrapper envelopes. Require meaningful stream progress.
+                if emitted_message_start
+                    && !emitted_message_stop
+                    && last_meaningful_event.elapsed() >= GOOGLE_STREAM_LOGICAL_INACTIVITY_TIMEOUT
+                {
+                    let elapsed = last_meaningful_event.elapsed().as_secs();
+                    terminal_stream_error = Some(format!(
+                        "stream_timeout:logical_inactivity:{}s_without_meaningful_event",
+                        elapsed
+                    ));
+                    warn!(
+                        "Google SSE: logical inactivity timeout after {}s without meaningful progress",
+                        elapsed
+                    );
+                    break;
+                }
+
+                // Transport watchdog: bound time between byte chunks. This catches
+                // hung TCP streams that never close and never produce more data.
                 let chunk_result = match tokio::time::timeout(
-                    chunk_read_timeout,
+                    GOOGLE_STREAM_TRANSPORT_IDLE_TIMEOUT,
                     byte_stream.next(),
-                ).await {
+                )
+                .await
+                {
                     Ok(Some(result)) => result,
-                    Ok(None) => break,  // stream exhausted
+                    Ok(None) => break, // stream exhausted
                     Err(_) => {
-                        // Hard timeout — no bytes at all for chunk_read_timeout.
-                        warn!("Google SSE: chunk read timeout ({}s)", chunk_read_timeout.as_secs());
-                        had_stream_error = true;
+                        terminal_stream_error = Some(format!(
+                            "stream_timeout:transport_idle:{}s_without_bytes",
+                            GOOGLE_STREAM_TRANSPORT_IDLE_TIMEOUT.as_secs()
+                        ));
+                        warn!(
+                            "Google SSE: transport idle timeout after {}s",
+                            GOOGLE_STREAM_TRANSPORT_IDLE_TIMEOUT.as_secs()
+                        );
                         break;
                     }
                 };
 
-                // Check logical inactivity watchdog *before* processing the chunk.
-                // If we started a message but haven't had meaningful progress,
-                // break out so the cleanup code below emits MessageStop.
-                if emitted_message_start
-                    && !emitted_message_stop
-                    && last_meaningful_event.elapsed() >= inactivity_limit
-                {
-                    warn!(
-                        "Google SSE: logical inactivity timeout ({}s with no meaningful event)",
-                        inactivity_limit.as_secs()
-                    );
-                    break;
-                }
                 let chunk: Bytes = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
                         warn!("Google SSE: byte stream error: {}", e);
-                        had_stream_error = true;
+                        terminal_stream_error = Some(format!("stream_read_error:{}", e));
                         break;
                     }
                 };
@@ -1322,12 +1336,37 @@ impl LlmProvider for GoogleProvider {
                 }
             }
 
+            // Explicit terminal stream error (timeout/read failure). Emit
+            // close markers for open blocks, then surface a structured error.
+            if let Some(err_message) = terminal_stream_error.take() {
+                if emitted_message_start && !emitted_message_stop {
+                    if emitted_text_block_start {
+                        yield Ok(StreamEvent::ContentBlockStop {
+                            index: text_block_index,
+                        });
+                    }
+
+                    let mut tool_indices: Vec<usize> =
+                        open_tool_calls.values().map(|(idx, _, _)| *idx).collect();
+                    tool_indices.sort_unstable();
+                    for idx in tool_indices {
+                        yield Ok(StreamEvent::ContentBlockStop { index: idx });
+                    }
+                }
+
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id_for_stream.clone(),
+                    message: err_message,
+                    partial_response: None,
+                });
+                return;
+            }
+
             // Final safety net: if we started a message but never emitted
             // MessageStop (connection dropped, malformed response, etc.),
-            // close all open blocks and emit MessageStop so the query loop
-            // can proceed instead of hanging.
+            // close open blocks and return an explicit stream error.
             if emitted_message_start && !emitted_message_stop {
-                warn!("Google SSE: stream ended without finishReason — forcing MessageStop");
+                warn!("Google SSE: stream ended without terminal lifecycle event");
 
                 if emitted_text_block_start {
                     yield Ok(StreamEvent::ContentBlockStop {
@@ -1342,36 +1381,21 @@ impl LlmProvider for GoogleProvider {
                     yield Ok(StreamEvent::ContentBlockStop { index: idx });
                 }
 
-                // Determine stop reason: if we have open tool calls, treat
-                // as tool_use so the query loop still executes them.
-                let stop_reason = if !open_tool_calls.is_empty() {
-                    Some(StopReason::ToolUse)
-                } else {
-                    Some(StopReason::EndTurn)
-                };
-
-                yield Ok(StreamEvent::MessageDelta {
-                    stop_reason,
-                    usage: Some(UsageInfo::default()),
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id_for_stream.clone(),
+                    message: "stream_eof_without_terminal_event".to_string(),
+                    partial_response: None,
                 });
-                yield Ok(StreamEvent::MessageStop);
+                return;
             }
 
             // If we never even started (no data received), emit an error.
             if !emitted_message_start {
-                if had_stream_error {
-                    yield Err(ProviderError::StreamError {
-                        provider: provider_id_for_stream.clone(),
-                        message: "Stream failed before any data was received".to_string(),
-                        partial_response: None,
-                    });
-                } else {
-                    yield Err(ProviderError::StreamError {
-                        provider: provider_id_for_stream.clone(),
-                        message: "Stream ended without any data".to_string(),
-                        partial_response: None,
-                    });
-                }
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id_for_stream.clone(),
+                    message: "stream_eof_without_any_data".to_string(),
+                    partial_response: None,
+                });
             }
         };
 
@@ -1929,5 +1953,25 @@ mod tests {
             Ok(StreamEvent::TextDelta { text, .. }) if text == "partial"
         ));
         assert!(has_text, "should have partial text");
+    }
+
+    /// Case D: stream EOF without finishReason or [DONE].
+    /// Adapter should emit a terminal stream error instead of forcing MessageStop.
+    #[tokio::test]
+    async fn stream_errors_on_eof_without_terminal_event() {
+        let body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}],",
+            "\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n\n",
+        );
+        let events = collect_stream_events(body, Duration::from_secs(5)).await;
+
+        assert!(has_message_start(&events), "should have MessageStart");
+        assert!(!has_message_stop(&events), "should not force MessageStop");
+
+        let has_terminal_error = events.iter().any(|e| matches!(
+            e,
+            Err(ProviderError::StreamError { message, .. }) if message.contains("stream_eof_without_terminal_event")
+        ));
+        assert!(has_terminal_error, "should emit stream lifecycle error");
     }
 }

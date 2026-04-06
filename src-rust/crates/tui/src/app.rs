@@ -172,6 +172,47 @@ fn get_url_for_provider(id: &str) -> &'static str {
     }
 }
 
+/// Validate basic credential shape before persisting.
+/// Returns `(category, detail)` on validation failure.
+fn validate_provider_credential(provider_id: &str, key: &str) -> Result<(), (&'static str, String)> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err((
+            "Configuration",
+            format!("Missing credential. Set {} or paste it here.", get_env_var_for_provider(provider_id)),
+        ));
+    }
+
+    if trimmed.len() < 10 {
+        return Err((
+            "Authentication",
+            "Credential looks too short to be valid.".to_string(),
+        ));
+    }
+
+    let prefix_hint = match provider_id {
+        "anthropic" if !trimmed.starts_with("sk-ant-") => {
+            Some("Anthropic keys usually start with 'sk-ant-'.")
+        }
+        "openai" if !(trimmed.starts_with("sk-") || trimmed.starts_with("sess-")) => {
+            Some("OpenAI keys usually start with 'sk-' or 'sess-'.")
+        }
+        "google" if !trimmed.starts_with("AIza") => {
+            Some("Google Gemini API keys from AI Studio usually start with 'AIza'.")
+        }
+        "groq" if !trimmed.starts_with("gsk_") => {
+            Some("Groq keys usually start with 'gsk_'.")
+        }
+        _ => None,
+    };
+
+    if let Some(hint) = prefix_hint {
+        return Err(("Authentication", hint.to_string()));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
@@ -928,7 +969,7 @@ impl App {
                     // -- RECOMMENDED --
                     SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "".into(), category: "Recommended".into(), badge: None },
                     SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "".into(), category: "Recommended".into(), badge: None },
-                    SelectItem { id: "google".into(), title: "Google".into(), description: "".into(), category: "Recommended".into(), badge: None },
+                    SelectItem { id: "google".into(), title: "Google Gemini".into(), description: "Direct Gemini API (AI Studio)".into(), category: "Recommended".into(), badge: None },
                     SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "".into(), category: "Recommended".into(), badge: None },
                     // -- FAST & FREE --
                     SelectItem { id: "groq".into(), title: "Groq".into(), description: "".into(), category: "Fast & Free".into(), badge: Some("FREE".into()) },
@@ -951,6 +992,7 @@ impl App {
                     SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
                     SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "".into(), category: "Enterprise".into(), badge: None },
                     SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "".into(), category: "Enterprise".into(), badge: None },
+                    SelectItem { id: "google-vertex-access-token".into(), title: "Google Vertex AI (Access Token)".into(), description: "enter VERTEX_ACCESS_TOKEN".into(), category: "Enterprise".into(), badge: None },
                     SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Enterprise".into(), badge: None },
                     SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Enterprise".into(), badge: None },
                     // -- CLOUD / GATEWAY --
@@ -2127,21 +2169,30 @@ impl App {
                     self.key_input_dialog.close();
                 }
                 KeyCode::Enter => {
-                    let api_key = self.key_input_dialog.take_key();
                     let provider_id = self.key_input_dialog.provider_id.clone();
                     let provider_name = self.key_input_dialog.provider_name.clone();
-                    if !api_key.is_empty() {
-                        self.auth_store.set(
-                            &provider_id,
-                            mangocode_core::StoredCredential::ApiKey { key: api_key },
-                        );
-                        self.set_provider_default(provider_id.clone());
-                        self.persist_provider_and_model();
-                        self.has_credentials = true;
-                        self.status_message = Some(format!(
-                            "Connected to {}! Use /model to pick a model.",
-                            provider_name
-                        ));
+                    let pending_key = self.key_input_dialog.input.clone();
+                    match validate_provider_credential(&provider_id, &pending_key) {
+                        Ok(()) => {
+                            let api_key = self.key_input_dialog.take_key();
+                            self.auth_store.set(
+                                &provider_id,
+                                mangocode_core::StoredCredential::ApiKey { key: api_key },
+                            );
+                            self.set_provider_default(provider_id.clone());
+                            self.persist_provider_and_model();
+                            self.has_credentials = true;
+                            self.status_message = Some(format!(
+                                "Step 3/3 complete: connected to {}. Run /providers to verify live health, then /model to choose a model.",
+                                provider_name
+                            ));
+                        }
+                        Err((category, detail)) => {
+                            self.status_message = Some(format!(
+                                "Step 2/3 failed [{}]: {}",
+                                category, detail
+                            ));
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -2166,6 +2217,10 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
+                        self.status_message = Some(format!(
+                            "Step 1/3 complete: selected {}. Configure authentication next.",
+                            selected.title
+                        ));
 
                         match selected.id.as_str() {
                             // Local providers — activate immediately, no key needed
@@ -2174,7 +2229,7 @@ impl App {
                                 self.persist_provider_and_model();
                                 self.has_credentials = true;
                                 self.status_message = Some(format!(
-                                    "Switched to {}! Use /model to pick a model.",
+                                    "Step 3/3 complete: switched to {} (local). Use /model to pick a model.",
                                     selected.title
                                 ));
                             }
@@ -2182,26 +2237,43 @@ impl App {
                                 // Anthropic: use API key from console.anthropic.com
                                 // (OAuth requires a registered app which MangoCode doesn't have)
                                 self.key_input_dialog.open("anthropic".into(), "Anthropic (API Key)".into());
+                                self.status_message = Some(format!(
+                                    "Step 2/3: enter {} from {}.",
+                                    get_env_var_for_provider("anthropic"),
+                                    get_url_for_provider("anthropic")
+                                ));
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow with MangoCode's registered OAuth app
                                 self.device_auth_dialog.open("github-copilot".into(), "GitHub Copilot".into());
                                 self.device_auth_pending = Some("github-copilot".to_string());
+                                self.status_message = Some(
+                                    "Step 2/3: complete browser device login. Step 3/3 will finish automatically after token exchange."
+                                        .to_string(),
+                                );
                             }
                             // AWS Bedrock — accept a bearer token via key input dialog
                             "amazon-bedrock" => {
                                 self.key_input_dialog
                                     .open("amazon-bedrock".into(), "AWS Bedrock (Bearer Token)".into());
+                                self.status_message = Some(format!(
+                                    "Step 2/3: enter {} (or your Bedrock bearer token).",
+                                    get_env_var_for_provider("amazon-bedrock")
+                                ));
                             }
-                            // Google Vertex AI — auth comes from gcloud ADC, not a stored key.
+                            // Google Vertex AI — auth comes from gcloud ADC.
                             // Show setup instructions and let the user configure env vars.
                             "google-vertex" => {
                                 self.status_message = Some(
-                                    "Vertex AI setup: (1) set VERTEX_ENABLED=true  \
-                                     (2) set VERTEX_PROJECT_ID=<your-gcp-project>  \
-                                     (3) set VERTEX_LOCATION=us-central1 (optional)  \
-                                     (4) run: gcloud auth application-default login  \
-                                     then restart MangoCode."
+                                    "Step 2/3 (Vertex AI auth): set VERTEX_ENABLED=true, VERTEX_PROJECT_ID=<your-gcp-project>, optional VERTEX_LOCATION=us-central1, then run `gcloud auth application-default login` and restart MangoCode.\n\nStep 3/3: run /providers to verify connectivity. Or choose Google Vertex AI (Access Token) in /connect to enter VERTEX_ACCESS_TOKEN directly."
+                                        .to_string(),
+                                );
+                            }
+                            "google-vertex-access-token" => {
+                                self.key_input_dialog
+                                    .open("google-vertex".into(), "Google Vertex AI (Access Token)".into());
+                                self.status_message = Some(
+                                    "Step 2/3: enter VERTEX_ACCESS_TOKEN. Step 3/3: run /providers to verify connectivity."
                                         .to_string(),
                                 );
                             }
@@ -2209,6 +2281,12 @@ impl App {
                             _ => {
                                 self.key_input_dialog
                                     .open(selected.id.clone(), selected.title.clone());
+                                self.status_message = Some(format!(
+                                    "Step 2/3: enter {} for {} ({}).",
+                                    get_env_var_for_provider(&selected.id),
+                                    selected.title,
+                                    get_url_for_provider(&selected.id)
+                                ));
                             }
                         }
                     }
@@ -3420,6 +3498,18 @@ impl App {
                 false
             }
             "submit" => !self.is_streaming,
+            "indent" => {
+                if !self.is_streaming {
+                    if !self.prompt_input.suggestions.is_empty() {
+                        if self.prompt_input.suggestion_index.is_none() {
+                            self.prompt_input.suggestion_index = Some(0);
+                        }
+                        self.prompt_input.accept_suggestion();
+                        self.refresh_prompt_input();
+                    }
+                }
+                false
+            }
             "historyPrev" => {
                 // Slash-command suggestions take priority over history.
                 if !self.prompt_input.suggestions.is_empty()
@@ -3599,6 +3689,15 @@ impl App {
             }
             "sendMessage" => {
                 // Ctrl+M: Send message (alternative to Enter)
+                // Keep slash-command suggestion behavior aligned with Enter.
+                if !self.prompt_input.suggestions.is_empty()
+                    && self.prompt_input.suggestion_index.is_some()
+                    && self.prompt_input.text.starts_with('/')
+                {
+                    self.prompt_input.accept_suggestion();
+                    self.refresh_prompt_input();
+                    return false;
+                }
                 !self.is_streaming
             }
             _ => false,

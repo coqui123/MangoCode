@@ -305,6 +305,11 @@ working_dir: String
 - `list_sessions() -> Result<Vec<ConversationSession>>` — reads all `.json` files in `~/.claude/conversations/`, sorts by `updated_at` descending
 - `delete_session(id: &str) -> Result<()>` — removes the file
 
+**Session transcript storage:**
+- `session_storage.rs` writes transcript JSONL files under `~/.claude/projects/<encoded_project_root>/`.
+- `transcript_dir(project_root)` sanitizes the absolute path by replacing `/`, `\`, `:`, ` `, `~`, and `_` with `-`, producing portable directory names like `-Users-alice-my-project`.
+- This is compatible with the existing Claude Code project/session discovery layout and avoids requiring base64 decoding in the Rust port.
+
 ### Module: `cost`
 
 **`ModelPricing` struct:** `{ input_per_mtok: f64, output_per_mtok: f64, cache_creation_per_mtok: f64, cache_read_per_mtok: f64 }`
@@ -461,6 +466,15 @@ Internal `PartialBlock` enum during accumulation:
 4. Background task reads response body line by line via `SseLineParser`
 5. Calls `frame_to_event()` to parse each frame
 6. Sends to channel + calls `handler.on_event()`
+
+**Google provider streaming guardrails (`providers/google.rs`):**
+- Provider display name is `Google Gemini`.
+- Uses dual watchdogs for long-lived streams:
+   - transport idle timeout: 45s without bytes (`stream_timeout:transport_idle:*`)
+   - logical inactivity timeout: 60s without meaningful events after message start (`stream_timeout:logical_inactivity:*`)
+- Logical inactivity is refreshed only by meaningful progress events (text/tool deltas and terminal lifecycle events), not generic envelopes.
+- On timeout/read failure, the adapter closes open content blocks and returns `ProviderError::StreamError` rather than forcing `MessageStop`.
+- EOF without a terminal lifecycle event returns explicit `stream_eof_without_terminal_event`; EOF without any data returns `stream_eof_without_any_data`.
 
 **`send_with_retry(request_fn) -> Result<reqwest::Response>`** — exponential backoff:
 - Max 5 retries
@@ -896,15 +910,22 @@ Main agentic loop:
 5. Builds `CreateMessageRequest` (with thinking config if `budget` provided)
 6. Creates `ChannelStreamHandler` or `NullStreamHandler`
 7. Calls `client.create_message_stream()`, receives `mpsc::Receiver<StreamEvent>`
-8. Inner loop: `tokio::select!` on cancellation or stream events; feeds `StreamAccumulator`
-9. On `MessageStop` or channel close: calls `accumulator.finish()`
-10. Tracks costs via `cost_tracker.add_usage()`
+8. Inner loop: `tokio::select!` on cancellation or stream events; forwards stream events to UI and accumulates text/tool-call buffers
+9. Enforces provider stream lifecycle ordering (`MessageStart` before deltas, terminal `MessageStop` at end)
+10. Builds assistant message content from accumulated buffers; tracks costs via `cost_tracker.add_usage()`
 11. Appends assistant message to `messages`
 12. Calls `auto_compact_if_needed()` if stop reason is `end_turn` or `tool_use`
 13. Dispatches on `stop_reason`:
     - `"end_turn"` / `"stop_sequence"` / unknown → fires `Stop` hook → returns `EndTurn`
     - `"max_tokens"` → returns `MaxTokens`
     - `"tool_use"` → executes all tool_use blocks (see below), appends results, `continue`
+
+**Provider turn lifecycle enforcement (`query/src/lib.rs`):**
+- Per-turn stream state is tracked with `ProviderTurnState` (`AwaitingStart`, `StreamingText`, `StreamingToolCall`, `Completing`, `Completed`, `Failed`).
+- Invalid ordering (`event_before_message_start`, `duplicate_message_start`, `message_stop_before_message_start`) is promoted to `stream_lifecycle_violation:*` and marks the turn failed.
+- A clean turn must end with `MessageStop`; missing stop is recorded as `stream_lifecycle_violation:missing_message_stop`.
+- If interruption happens after partial content was buffered, partial output is salvaged (including `tool_use` continuation when tool-call blocks exist).
+- If interruption happens before any usable content, the loop returns `QueryOutcome::Error`.
 
 **Tool execution in `tool_use` turn:**
 1. For each `ContentBlock::ToolUse { id, name, input }`:
@@ -1015,6 +1036,48 @@ Input schema: `{ description: string, prompt: string, tools: optional Array<stri
 
 Terminal UI built on `ratatui` + `crossterm`. Replaces the TypeScript `ink`/React rendering layer.
 
+### TUI source file map
+
+- `Cargo.toml` — crate manifest, TUI feature flags, and dependencies (`ratatui`, `crossterm`, `syntect`, `icy_sixel`, `reqwest`, `image`).
+- `src/lib.rs` — public crate API, terminal init/restore helpers, mascot setup, and module exports.
+- `src/app.rs` — app state and main event loop; input history, message buffer, streaming state, status messages, and query event handling.
+- `src/render.rs` — ratatui rendering pipeline for the main screen; splits layout into messages, prompt, and status areas.
+- `src/input.rs` — keyboard input helpers and slash-command parsing.
+- `src/prompt_input.rs` — prompt editor widget, history/typeahead, Vim mode, and paste handling.
+- `src/overlays.rs` — help/history search/message selector/rewind overlays and modal management.
+- `src/dialogs.rs` — permission dialogs, confirmation modals, and dialog rendering helpers.
+- `src/notifications.rs` — notification banners and transient status updates.
+- `src/bridge_state.rs` — bridge connection state and TUI-facing bridge events.
+- `src/settings_screen.rs` — full-screen settings UI.
+- `src/theme_colors.rs` / `src/theme_screen.rs` — color palettes, theme definitions, and theme picker.
+- `src/messages/` — message renderers and helper modules for assistant/user/tool messages.
+- `src/kitty_image.rs` — inline Kitty/OSC image rendering support.
+- `src/image_paste.rs` — clipboard image and text paste handling.
+- `src/voice_capture.rs` — push-to-talk voice capture overlay.
+- `src/device_auth_dialog.rs` — browser/device auth UI.
+- `src/mcp_view.rs` — MCP server management overlay.
+- `src/session_browser.rs` / `src/session_branching.rs` — session browsing and branch switching overlays.
+- `src/desktop_upsell_startup.rs` — desktop upsell startup modal.
+- `src/feedback_survey.rs` — session feedback survey overlay.
+- `src/diff_viewer.rs` — diff viewer for file changes.
+- `src/agents_view.rs` — agent definitions and coordinator status.
+- `src/memory_file_selector.rs` — memory file chooser.
+- `src/hook_config_menu.rs` — hooks configuration browser.
+- `src/overage_upsell.rs` — credit/overage upsell banner.
+- `src/privacy_screen.rs` — privacy settings screen.
+- `src/bypass_permissions_dialog.rs` — bypass-permissions confirm dialog.
+- `src/elicitation_dialog.rs` — MCP elicitation dialog.
+- `src/export_dialog.rs` — export format picker.
+- `src/plugin_views.rs` — plugin hint and recommendation panels.
+- `src/message_copy.rs` — message copy/export utilities.
+- `src/figures.rs` — terminal figures and icon constants.
+- `src/rustle.rs` — mascot SVG/image encoding support.
+- `src/context_viz.rs` — context window visualization overlay.
+- `src/dialog_select.rs` — reusable fuzzy-select dialog widget.
+- `src/key_input_dialog.rs` — masked text input overlay.
+- `src/virtual_list.rs` — virtualized scrolling list for message history.
+- `src/test_svg_render.rs` — SVG rendering test helper.
+
 ### `App` struct
 
 ```
@@ -1043,6 +1106,11 @@ show_help: bool
 - `Up`/`Down`: navigates `input_history`
 - `PageUp`/`PageDown`: adjusts `scroll_offset`
 - `F1` / `?`: toggles help overlay
+- Action `indent` (Tab mapping): accepts slash-command suggestion when suggestions are visible.
+- Action `sendMessage` (Ctrl+M mapping): mirrors Enter behavior, including slash-suggestion acceptance before submit.
+- `/connect` flow emits staged `Step 1/3` → `Step 2/3` → `Step 3/3` status messages with provider-specific guidance.
+- API-key submission runs `validate_provider_credential()` and reports categorized failures (`missing`, `too_short`, `format_hint`) in status text.
+- Onboarding defaults to `Welcome`; provider-setup onboarding is entered explicitly via `show_provider_setup()`.
 
 **`handle_query_event(&mut self, event: QueryEvent)`:**
 - `Stream(ContentBlockDelta::TextDelta)` → appends to `streaming_text`
@@ -1068,6 +1136,15 @@ show_help: bool
 - **Messages:** renders each `(role, text)` pair — `Role::User` in Cyan, `Role::Assistant` in Green. If streaming, appends partial `streaming_text` in Yellow italic
 - **Input area:** bordered `Block` titled "Input"; shows `self.input` with cursor `_` appended
 - **Status bar:** shows `{model} | {cost_summary}` in Dark Gray
+- Header visibility keeps the logo/welcome block after first message when terminal height/width permit, instead of hiding it solely because history exists.
+- Streaming status spinner turns red when stream data stalls for more than 3 seconds.
+
+### Module: `messages`
+
+**`render_tool_use(tool_name, input_json)`**:
+- Header format: bullet + tool name + optional summary (`ToolName (summary)`).
+- Bash/PowerShell tool-use bodies render short command previews.
+- Includes transcript hint `(ctrl+o to expand)`.
 
 ### Module: `widgets`
 
@@ -1423,6 +1500,9 @@ Binary entry point. Produces the `claude` executable. Wires all crates together.
 Implements `Tool` for tools provided by MCP servers:
 - `permission_level()` → `Execute`
 - `execute()` strips server prefix from tool name, calls `McpManager::call_tool()`, converts result via `mcp_result_to_string()`
+
+**Stream-json parent linkage:**
+- The CLI `--output-format StreamJson` path preserves `parent_tool_use_id` on `StreamWithParent` content block delta events so orchestration consumers can maintain tool-call parentage.
 
 ### `main()` Function
 

@@ -1406,6 +1406,7 @@ async fn run_headless(
                         emit_ndjson(serde_json::json!({
                             "type": "content_block_delta",
                             "delta": { "text": text },
+                            "parent_tool_use_id": parent_tool_use_id,
                             "session_id": stream_session_id,
                         }));
                         emit_ndjson(serde_json::json!({

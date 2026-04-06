@@ -1101,6 +1101,16 @@ pub async fn run_query_loop(
                     };
 
                     // Accumulators for building the final assistant message.
+                    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+                    enum ProviderTurnState {
+                        AwaitingStart,
+                        StreamingText,
+                        StreamingToolCall,
+                        Completing,
+                        Completed,
+                        Failed,
+                    }
+
                     let mut text_chunks: Vec<String> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
@@ -1109,19 +1119,9 @@ pub async fn run_query_loop(
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
                     let mut stream_error: Option<String> = None;
+                    let mut turn_state = ProviderTurnState::AwaitingStart;
+                    let mut received_message_start = false;
                     let mut received_message_stop = false;
-                    // Per-chunk timeout: how long we wait for stream.next() to
-                    // yield before giving up.  This is a hard wall-clock bound
-                    // that fires even if the underlying byte stream keeps
-                    // delivering keepalive / empty chunks internally.
-                    let stream_idle_timeout = std::time::Duration::from_secs(45);
-                    // Logical inactivity watchdog: if we've received at least
-                    // one meaningful event (text, tool, message_start) but then
-                    // nothing meaningful arrives for this duration, we assume
-                    // the turn is stuck and break out.
-                    let logical_inactivity_limit = std::time::Duration::from_secs(20);
-                    let mut last_meaningful_stream_event = tokio::time::Instant::now();
-                    let mut had_any_content = false;
 
                     use futures::StreamExt as ProviderStreamExt;
                     loop {
@@ -1129,54 +1129,73 @@ pub async fn run_query_loop(
                             _ = cancel_token.cancelled() => {
                                 return QueryOutcome::Cancelled;
                             }
-                            // Logical inactivity watchdog: fires when we've had
-                            // content but no meaningful progress for the limit.
-                            // This works even if stream.next() is stuck because
-                            // it's a separate branch in the select!.
-                            _ = tokio::time::sleep_until(last_meaningful_stream_event + logical_inactivity_limit), if had_any_content => {
-                                warn!(
-                                    provider = %provider_id_str,
-                                    elapsed_secs = last_meaningful_stream_event.elapsed().as_secs(),
-                                    "Provider stream logical inactivity timeout — had content but no MessageStop"
-                                );
-                                stream_error = Some(format!(
-                                    "logical inactivity timeout after {}s (content received but stream did not terminate)",
-                                    last_meaningful_stream_event.elapsed().as_secs()
-                                ));
-                                break;
-                            }
-                            event = tokio::time::timeout(stream_idle_timeout, stream.next()) => {
+                            // Disabled the logical inactivity watchdog and hard
+                            // stream chunk timeout for slow provider responses.
+                            // _ = tokio::time::sleep_until(last_meaningful_stream_event + logical_inactivity_limit), if had_any_content => {
+                            //     warn!(
+                            //         provider = %provider_id_str,
+                            //         elapsed_secs = last_meaningful_stream_event.elapsed().as_secs(),
+                            //         "Provider stream logical inactivity timeout — had content but no MessageStop"
+                            //     );
+                            //     stream_error = Some(format!(
+                            //         "logical inactivity timeout after {}s (content received but stream did not terminate)",
+                            //         last_meaningful_stream_event.elapsed().as_secs()
+                            //     ));
+                            //     break;
+                            // }
+                            event = stream.next() => {
                                 match event {
-                                    Err(_) => {
-                                        warn!(
-                                            provider = %provider_id_str,
-                                            timeout_secs = stream_idle_timeout.as_secs(),
-                                            "Provider stream idle timeout"
-                                        );
-                                        stream_error = Some(format!(
-                                            "stream idle timeout after {}s",
-                                            stream_idle_timeout.as_secs()
-                                        ));
-                                        break;
-                                    }
-                                    Ok(None) => break,
-                                    Ok(Some(Err(e))) => {
+                                    None => break,
+                                    Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
+                                        turn_state = ProviderTurnState::Failed;
                                         stream_error = Some(e.to_string());
                                         break;
                                     }
-                                    Ok(Some(Ok(evt))) => {
-                                        // Track meaningful progress for the inactivity watchdog.
-                                        match &evt {
-                                            mangocode_api::StreamEvent::MessageStart { .. }
+                                    Some(Ok(evt)) => {
+                                        // Enforce stream lifecycle ordering per turn.
+                                        let lifecycle_error = match &evt {
+                                            mangocode_api::StreamEvent::MessageStart { .. } => {
+                                                if received_message_start {
+                                                    Some("duplicate_message_start".to_string())
+                                                } else {
+                                                    received_message_start = true;
+                                                    turn_state = ProviderTurnState::StreamingText;
+                                                    None
+                                                }
+                                            }
+                                            mangocode_api::StreamEvent::MessageStop => {
+                                                if !received_message_start {
+                                                    Some("message_stop_before_message_start".to_string())
+                                                } else {
+                                                    turn_state = ProviderTurnState::Completed;
+                                                    None
+                                                }
+                                            }
+                                            mangocode_api::StreamEvent::MessageDelta { .. }
+                                            | mangocode_api::StreamEvent::ContentBlockStart { .. }
+                                            | mangocode_api::StreamEvent::ContentBlockStop { .. }
                                             | mangocode_api::StreamEvent::TextDelta { .. }
                                             | mangocode_api::StreamEvent::InputJsonDelta { .. }
-                                            | mangocode_api::StreamEvent::ContentBlockStart { .. }
-                                            | mangocode_api::StreamEvent::MessageStop => {
-                                                last_meaningful_stream_event = tokio::time::Instant::now();
-                                                had_any_content = true;
+                                            | mangocode_api::StreamEvent::SignatureDelta { .. }
+                                            | mangocode_api::StreamEvent::ThinkingDelta { .. }
+                                            | mangocode_api::StreamEvent::ReasoningDelta { .. }
+                                            | mangocode_api::StreamEvent::Error { .. } => {
+                                                if !received_message_start {
+                                                    Some("event_before_message_start".to_string())
+                                                } else {
+                                                    None
+                                                }
                                             }
-                                            _ => {}
+                                        };
+
+                                        if let Some(err) = lifecycle_error {
+                                            turn_state = ProviderTurnState::Failed;
+                                            stream_error = Some(format!(
+                                                "stream_lifecycle_violation:{}",
+                                                err
+                                            ));
+                                            break;
                                         }
 
                                         // Forward to TUI via AnthropicStreamEvent mapping.
@@ -1198,25 +1217,30 @@ pub async fn run_query_loop(
                                                 index,
                                                 content_block: ContentBlock::ToolUse { id, name, .. },
                                             } => {
+                                                turn_state = ProviderTurnState::StreamingToolCall;
                                                 tool_call_blocks.insert(
                                                     *index,
                                                     (id.clone(), name.clone(), String::new(), None),
                                                 );
                                             }
                                             mangocode_api::StreamEvent::TextDelta { text, .. } => {
+                                                turn_state = ProviderTurnState::StreamingText;
                                                 text_chunks.push(text.clone());
                                             }
                                             mangocode_api::StreamEvent::InputJsonDelta { index, partial_json } => {
+                                                turn_state = ProviderTurnState::StreamingToolCall;
                                                 if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
                                                 }
                                             }
                                             mangocode_api::StreamEvent::SignatureDelta { index, signature } => {
+                                                turn_state = ProviderTurnState::StreamingToolCall;
                                                 if let Some((_, _, _, sig)) = tool_call_blocks.get_mut(index) {
                                                     *sig = Some(signature.clone());
                                                 }
                                             }
                                             mangocode_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
+                                                turn_state = ProviderTurnState::Completing;
                                                 stop_str = match stop_reason {
                                                     Some(mangocode_api::provider_types::StopReason::ToolUse) => "tool_use",
                                                     Some(mangocode_api::provider_types::StopReason::MaxTokens) => "max_tokens",
@@ -1225,18 +1249,19 @@ pub async fn run_query_loop(
                                                 if let Some(u) = u {
                                                     usage.output_tokens = u.output_tokens;
                                                 }
-
-                                                // Defensive fallback: some providers may emit
-                                                // a terminal MessageDelta but fail to follow
-                                                // with MessageStop. Treat a terminal delta as
-                                                // end-of-stream so the UI never hangs.
-                                                if stop_reason.is_some() {
-                                                    received_message_stop = true;
-                                                    break;
-                                                }
                                             }
                                             mangocode_api::StreamEvent::MessageStop => {
                                                 received_message_stop = true;
+                                                turn_state = ProviderTurnState::Completed;
+                                                break;
+                                            }
+                                            mangocode_api::StreamEvent::Error { error_type, message } => {
+                                                turn_state = ProviderTurnState::Failed;
+                                                stream_error = Some(format!(
+                                                    "provider_stream_error:{}:{}",
+                                                    error_type,
+                                                    message
+                                                ));
                                                 break;
                                             }
                                             _ => {}
@@ -1276,14 +1301,37 @@ pub async fn run_query_loop(
                                 "Stream interrupted — using partial response".to_string(),
                             ));
                         }
+
+                        // If the interrupted partial response contains tool calls,
+                        // preserve tool-use continuation semantics.
+                        if !tool_call_blocks.is_empty() && stop_str == "end_turn" {
+                            stop_str = "tool_use".to_string();
+                        }
                     }
 
-                    // If the stream ended without MessageStop and without an error,
-                    // the connection may have been dropped. Detect tool calls in the
-                    // partial response so we can still execute them.
-                    if !received_message_stop && stream_error.is_none() && !tool_call_blocks.is_empty() {
-                        // Stream ended prematurely but we have tool calls — treat as tool_use.
-                        stop_str = "tool_use".to_string();
+                    // A clean turn must end with MessageStop. If the stream ended
+                    // without a terminal event, mark it as a lifecycle failure and
+                    // only salvage already-buffered partial output.
+                    if !received_message_stop && stream_error.is_none() {
+                        turn_state = ProviderTurnState::Failed;
+                        stream_error = Some("stream_lifecycle_violation:missing_message_stop".to_string());
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::Status(
+                                "Stream ended unexpectedly — using partial response".to_string(),
+                            ));
+                        }
+                        if !tool_call_blocks.is_empty() {
+                            stop_str = "tool_use".to_string();
+                        }
+                    }
+
+                    if turn_state == ProviderTurnState::Failed
+                        && text_chunks.is_empty()
+                        && tool_call_blocks.is_empty()
+                    {
+                        return QueryOutcome::Error(ClaudeError::Api(
+                            stream_error.unwrap_or_else(|| "provider_stream_failed".to_string())
+                        ));
                     }
 
                     // Build the content blocks from accumulated stream data.

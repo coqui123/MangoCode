@@ -171,6 +171,18 @@ fn truncate_end(text: &str, max_width: usize) -> String {
     out
 }
 
+fn provider_status_name(provider_id: &str) -> &'static str {
+    match provider_id {
+        "anthropic" => "Anthropic",
+        "openai" => "OpenAI",
+        "google" => "Google Gemini",
+        "google-vertex" => "Google Vertex AI",
+        "github-copilot" => "GitHub Copilot",
+        "openrouter" => "OpenRouter",
+        _ => "Provider",
+    }
+}
+
 fn truncate_middle(text: &str, max_width: usize) -> String {
     if max_width == 0 {
         return String::new();
@@ -875,8 +887,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         .min(proportional_cap)
         .max(min_welcome_height);
     let header_height = welcome_box_height + notice_height;
-    let show_logo_header = is_idle_welcome
-        && content_area.height >= header_height + min_message_rows
+    let show_logo_header = content_area.height >= header_height + min_message_rows
         && content_area.width >= 48;
     let (logo_area, notices_area, msg_area) = if show_logo_header {
         let splits = Layout::default()
@@ -1904,6 +1915,45 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     // Right side: status metrics and lightweight badges.
     let right_spans: Vec<Span> = {
         let mut parts: Vec<Span> = Vec::new();
+
+        // Streaming health: provider/model/auth source/phase/last token age.
+        if app.is_streaming {
+            let provider_id = app.config.provider.as_deref().unwrap_or("anthropic");
+            let provider_name = provider_status_name(provider_id);
+            let model_short = app
+                .model_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(app.model_name.as_str());
+            let auth_source = if app.auth_store.get(provider_id).is_some() {
+                "stored"
+            } else {
+                "env"
+            };
+            let phase = if app
+                .tool_use_blocks
+                .iter()
+                .any(|b| matches!(b.status, ToolStatus::Running))
+            {
+                "tool"
+            } else if !app.streaming_text.is_empty() {
+                "text"
+            } else {
+                "awaiting"
+            };
+            let since_last_token_secs = app
+                .stall_start
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+
+            parts.push(Span::styled(
+                format!(
+                    "{} / {} auth:{} phase:{} t+{}s",
+                    provider_name, model_short, auth_source, phase, since_last_token_secs
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
 
         // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning
         if app.context_window_size > 0 {
