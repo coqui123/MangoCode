@@ -171,6 +171,12 @@ pub struct StatsDialogState {
     pub current_streak_days: u32,
     /// The longest streak ever recorded.
     pub longest_streak_days: u32,
+    /// Latest input handling duration in microseconds.
+    pub perf_input_us: u64,
+    /// Latest render duration in microseconds.
+    pub perf_render_us: u64,
+    /// Latest frame cadence duration in milliseconds.
+    pub perf_frame_ms: f64,
 }
 
 impl StatsDialogState {
@@ -184,6 +190,9 @@ impl StatsDialogState {
             model_breakdown: Vec::new(),
             current_streak_days: 0,
             longest_streak_days: 0,
+            perf_input_us: 0,
+            perf_render_us: 0,
+            perf_frame_ms: 0.0,
         }
     }
 
@@ -248,6 +257,23 @@ impl StatsDialogState {
                 output_tokens: output,
                 cost_usd: cost,
             });
+        }
+    }
+
+    pub fn update_perf_metrics(
+        &mut self,
+        input_us: Option<u64>,
+        render_us: Option<u64>,
+        frame_ms: Option<f64>,
+    ) {
+        if let Some(v) = input_us {
+            self.perf_input_us = v;
+        }
+        if let Some(v) = render_us {
+            self.perf_render_us = v;
+        }
+        if let Some(v) = frame_ms {
+            self.perf_frame_ms = v;
         }
     }
 }
@@ -551,6 +577,20 @@ fn render_overview(data: &AggregatedStats, state: &StatsDialogState, area: Rect,
             ]));
         }
     }
+
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("Perf input: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{}us", state.perf_input_us)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Perf render: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{}us", state.perf_render_us)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Perf frame: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{:.2}ms", state.perf_frame_ms)),
+    ]));
 
     Paragraph::new(lines).render(area, buf);
 }
@@ -1002,6 +1042,30 @@ mod tests {
         let (current, longest) = compute_streaks(&agg);
         assert_eq!(current, 2);
         assert_eq!(longest, 3);
+    }
+
+    #[test]
+    fn test_update_perf_metrics_sets_values() {
+        let mut state = StatsDialogState::new();
+        state.update_perf_metrics(Some(123), Some(456), Some(7.5));
+
+        assert_eq!(state.perf_input_us, 123);
+        assert_eq!(state.perf_render_us, 456);
+        assert!((state.perf_frame_ms - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_perf_metrics_none_is_noop() {
+        let mut state = StatsDialogState::new();
+        state.perf_input_us = 11;
+        state.perf_render_us = 22;
+        state.perf_frame_ms = 3.3;
+
+        state.update_perf_metrics(None, None, None);
+
+        assert_eq!(state.perf_input_us, 11);
+        assert_eq!(state.perf_render_us, 22);
+        assert!((state.perf_frame_ms - 3.3).abs() < f64::EPSILON);
     }
 
     #[test]

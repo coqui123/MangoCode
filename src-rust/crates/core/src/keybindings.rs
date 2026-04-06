@@ -660,4 +660,58 @@ mod tests {
             actions.len()
         );
     }
+
+    #[test]
+    fn test_critical_parity_bindings_exist() {
+        let bindings = default_bindings();
+        let required: &[(&str, &str, KeyContext)] = &[
+            ("enter", "submit", KeyContext::Chat),
+            ("shift+enter", "newline", KeyContext::Chat),
+            ("ctrl+f", "findInMessage", KeyContext::Chat),
+            ("f3", "findNext", KeyContext::Chat),
+            ("shift+f3", "findPrev", KeyContext::Chat),
+            ("ctrl+r", "historySearch", KeyContext::Global),
+            ("ctrl+c", "interrupt", KeyContext::Global),
+            ("ctrl+d", "exit", KeyContext::Global),
+        ];
+
+        for (chord_str, action, ctx) in required {
+            let chord = parse_chord(chord_str).expect("required chord should parse");
+            let found = bindings.iter().any(|b| {
+                b.context == *ctx
+                    && b.action.as_deref() == Some(*action)
+                    && b.chord == chord
+            });
+            assert!(found, "Missing critical binding: {} -> {} in {:?}", chord_str, action, ctx);
+        }
+    }
+
+    #[test]
+    fn test_critical_bindings_have_no_context_conflicts() {
+        let bindings = default_bindings();
+        let critical: &[(&str, KeyContext)] = &[
+            ("enter", KeyContext::Chat),
+            ("shift+enter", KeyContext::Chat),
+            ("ctrl+f", KeyContext::Chat),
+            ("f3", KeyContext::Chat),
+            ("shift+f3", KeyContext::Chat),
+            ("ctrl+r", KeyContext::Global),
+        ];
+
+        for (chord_str, ctx) in critical {
+            let chord = parse_chord(chord_str).expect("critical chord should parse");
+            let matches: Vec<&ParsedBinding> = bindings
+                .iter()
+                .filter(|b| b.context == *ctx && b.chord == chord)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "Conflict: {} in {:?} has {} mappings",
+                chord_str,
+                ctx,
+                matches.len()
+            );
+        }
+    }
 }

@@ -109,42 +109,7 @@ fn spinner_color(app: &App) -> Color {
 }
 
 fn is_modal_open(app: &App) -> bool {
-    app.permission_request.is_some()
-        || app.rewind_flow.visible
-        || app.tasks_overlay.visible
-        || app.help_overlay.visible
-        || app.show_help
-        || app.history_search_overlay.visible
-        || app.history_search.is_some()
-        || app.settings_screen.visible
-        || app.theme_screen.visible
-        || app.privacy_screen.visible
-        || app.stats_dialog.open
-        || app.mcp_view.open
-        || app.agents_menu.open
-        || app.diff_viewer.open
-        || app.global_search.open
-        || app.feedback_survey.visible
-        || app.memory_file_selector.visible
-        || app.hooks_config_menu.visible
-        || app.overage_upsell.visible
-        || app.voice_mode_notice.visible
-        || app.memory_update_notification.visible
-        || app.desktop_upsell.visible
-        || app.invalid_config_dialog.visible
-        || app.bypass_permissions_dialog.visible
-        || app.onboarding_dialog.visible
-        || app.connect_dialog.visible
-        || app.key_input_dialog.visible
-        || app.device_auth_dialog.visible
-        || app.command_palette.visible
-        || app.elicitation.visible
-        || app.model_picker.visible
-        || app.session_browser.visible
-        || app.session_branching.visible
-        || app.export_dialog.visible
-        || app.context_viz.visible
-        || app.mcp_approval.visible
+    app.active_modal_owner().is_some()
 }
 
 // -----------------------------------------------------------------------
@@ -776,10 +741,8 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
                 } else {
                     &sym
                 });
-                // Highlight: white background, black foreground
-                let new_style = Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(200, 200, 200));
+                // Preserve original text style (fg/modifiers), only transform background.
+                let new_style = selection_overlay_style(cell.style());
                 cell.set_style(new_style);
             }
         }
@@ -795,6 +758,10 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         text.pop();
     }
     *app.selection_text.borrow_mut() = text;
+}
+
+fn selection_overlay_style(orig: Style) -> Style {
+    orig.bg(Color::Rgb(200, 200, 200))
 }
 
 /// Render a right-click context menu at the specified position.
@@ -898,6 +865,36 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_overlay_preserves_foreground_and_modifiers() {
+        let original = Style::default()
+            .fg(Color::Rgb(12, 34, 56))
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::ITALIC);
+        let selected = selection_overlay_style(original);
+
+        assert_eq!(selected.fg, original.fg);
+        assert_eq!(selected.add_modifier, original.add_modifier);
+        assert_eq!(selected.sub_modifier, original.sub_modifier);
+        assert_eq!(selected.bg, Some(Color::Rgb(200, 200, 200)));
+    }
+
+    #[test]
+    fn spinner_color_turns_red_after_stall_timeout() {
+        let mut app = App::new(
+            mangocode_core::config::Config::default(),
+            mangocode_core::cost::CostTracker::new(),
+        );
+        app.stall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+
+        assert_eq!(spinner_color(&app), Color::Red);
     }
 }
 
@@ -1005,30 +1002,85 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = render_message_items(app, msg_area.width);
 
-    // Highlight search matches in transcript when global search is active
-    let lines = if app.global_search.open && !app.global_search.query.is_empty() {
-        let query_lc = app.global_search.query.to_lowercase();
+    // Highlight transcript search matches (all + current match)
+    let lines = if !app.transcript_search.query.is_empty() {
+        let query_lc = app.transcript_search.query.to_lowercase();
+        let current_match = app.transcript_search.current_match;
+        let mut match_cursor = 0usize;
         lines
             .into_iter()
             .map(|mut item| {
                 if item.search_text.to_lowercase().contains(query_lc.as_str()) {
-                    // Re-render the line with yellow highlight on matching spans
+                    // Re-render the line with highlight on matching spans.
                     let highlighted_spans: Vec<Span<'static>> = item
                         .line
                         .spans
                         .into_iter()
-                        .map(|span| {
-                            if span.content.to_lowercase().contains(query_lc.as_str()) {
-                                Span::styled(
-                                    span.content,
-                                    span.style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow),
-                                )
-                            } else {
-                                span
+                        .flat_map(|span| {
+                            let original_style = span.style;
+                            let span_lc = span.content.to_lowercase();
+                            if !span_lc.contains(query_lc.as_str()) {
+                                return vec![span];
                             }
+
+                            let text = span.content.to_string();
+                            let mut result: Vec<Span<'static>> = Vec::new();
+                            let mut cursor = 0usize;
+                            while let Some(rel) = span_lc[cursor..].find(query_lc.as_str()) {
+                                let abs = cursor + rel;
+                                if abs > cursor {
+                                    result.push(Span::styled(text[cursor..abs].to_string(), original_style));
+                                }
+
+                                let is_current = current_match.is_some_and(|idx| idx == match_cursor);
+                                let style = if is_current {
+                                    original_style
+                                        .bg(Color::Rgb(255, 176, 32))
+                                        .fg(Color::Black)
+                                        .add_modifier(ratatui::style::Modifier::BOLD)
+                                } else {
+                                    original_style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow)
+                                };
+                                let end = abs + query_lc.len();
+                                result.push(Span::styled(text[abs..end].to_string(), style));
+                                match_cursor += 1;
+                                cursor = end;
+                            }
+
+                            if cursor < text.len() {
+                                result.push(Span::styled(text[cursor..].to_string(), original_style));
+                            }
+                            result
                         })
                         .collect();
                     item.line = ratatui::text::Line::from(highlighted_spans);
+                }
+                item
+            })
+            .collect()
+    } else {
+        lines
+    };
+
+    let lines = if let Some(hovered_idx) = app.hovered_message_index {
+        lines
+            .into_iter()
+            .map(|mut item| {
+                if item.message_index == Some(hovered_idx) {
+                    item.line = Line::from(
+                        item.line
+                            .spans
+                            .into_iter()
+                            .map(|span| {
+                                let style = if span.style.bg.is_none() {
+                                    span.style.bg(Color::Rgb(28, 34, 46))
+                                } else {
+                                    span.style
+                                };
+                                Span::styled(span.content, style)
+                            })
+                            .collect::<Vec<_>>(),
+                    );
                 }
                 item
             })

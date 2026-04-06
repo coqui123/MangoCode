@@ -42,6 +42,7 @@ use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
 use std::io::Stdout;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::debug;
 
 const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -103,6 +104,10 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
+
+const PASTE_BURST_PRINTABLE_GAP: Duration = Duration::from_millis(120);
+const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
+const PASTE_BURST_MIN_STREAK: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Provider connection helpers
@@ -375,6 +380,13 @@ pub struct HistorySearch {
     pub selected: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptSearchState {
+    pub query: String,
+    pub total_matches: usize,
+    pub current_match: Option<usize>,
+}
+
 impl Default for HistorySearch {
     fn default() -> Self {
         Self::new()
@@ -518,6 +530,46 @@ pub enum FocusTarget {
     Transcript,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalOwner {
+    PermissionRequest,
+    Settings,
+    Theme,
+    Privacy,
+    Stats,
+    McpView,
+    AgentsMenu,
+    DiffViewer,
+    BypassPermissions,
+    Onboarding,
+    DeviceAuth,
+    KeyInput,
+    Connect,
+    InvalidConfig,
+    DesktopUpsell,
+    MemoryUpdateNotification,
+    VoiceModeNotice,
+    OverageUpsell,
+    HooksConfig,
+    MemoryFileSelector,
+    FeedbackSurvey,
+    GoToLineDialog,
+    McpApproval,
+    ContextViz,
+    ExportDialog,
+    SessionBranching,
+    SessionBrowser,
+    ModelPicker,
+    Elicitation,
+    CommandPalette,
+    DeviceAuthPending,
+    GlobalSearch,
+    HistorySearch,
+    Help,
+    Tasks,
+    Rewind,
+}
+
 // ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
@@ -567,6 +619,7 @@ pub struct App {
     pub agent_mode: Option<String>,
     pub agent_status: Vec<(String, String)>,
     pub history_search: Option<HistorySearch>,
+    pub transcript_search: TranscriptSearchState,
     pub keybindings: KeybindingResolver,
 
     // Cursor position within input (byte offset)
@@ -776,6 +829,8 @@ pub struct App {
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
     /// Maps screen row → transcript message index for right-click hit testing.
     pub message_row_map: RefCell<std::collections::HashMap<u16, usize>>,
+    /// Hovered transcript message index from latest mouse-move event.
+    pub hovered_message_index: Option<usize>,
     /// Total message lines from the last render (used for virtual row mapping).
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
@@ -821,6 +876,14 @@ pub struct App {
     /// Pre-encoded inline image escape sequence for the mango mascot
     /// (Kitty or Sixel). `None` if no inline image protocol is available.
     pub mascot_sixel: Option<String>,
+
+    // ---- Paste burst guard -------------------------------------------------
+    /// Number of printable characters received in a tight timing burst.
+    pub paste_burst_printable_streak: usize,
+    /// Timestamp of the last printable character used for burst detection.
+    pub paste_burst_last_printable_at: Option<std::time::Instant>,
+    /// If set and not expired, Enter inserts newline instead of submitting.
+    pub paste_burst_until: Option<std::time::Instant>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1001,6 +1064,7 @@ impl App {
             agent_mode: None,
             agent_status: Vec::new(),
             history_search: None,
+            transcript_search: TranscriptSearchState::default(),
             keybindings: KeybindingResolver::new(&user_keybindings),
             cursor_pos: 0,
             auto_scroll: true,
@@ -1465,6 +1529,7 @@ impl App {
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
+            hovered_message_index: None,
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
             selection_anchor: None,
@@ -1479,6 +1544,174 @@ impl App {
             bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
             mascot_sixel: None,
+            paste_burst_printable_streak: 0,
+            paste_burst_last_printable_at: None,
+            paste_burst_until: None,
+        }
+    }
+
+    pub fn active_modal_owner(&self) -> Option<ModalOwner> {
+        if self.permission_request.is_some() {
+            return Some(ModalOwner::PermissionRequest);
+        }
+        if self.settings_screen.visible {
+            return Some(ModalOwner::Settings);
+        }
+        if self.theme_screen.visible {
+            return Some(ModalOwner::Theme);
+        }
+        if self.privacy_screen.visible {
+            return Some(ModalOwner::Privacy);
+        }
+        if self.stats_dialog.open {
+            return Some(ModalOwner::Stats);
+        }
+        if self.mcp_view.open {
+            return Some(ModalOwner::McpView);
+        }
+        if self.agents_menu.open {
+            return Some(ModalOwner::AgentsMenu);
+        }
+        if self.diff_viewer.open {
+            return Some(ModalOwner::DiffViewer);
+        }
+        if self.bypass_permissions_dialog.visible {
+            return Some(ModalOwner::BypassPermissions);
+        }
+        if self.onboarding_dialog.visible {
+            return Some(ModalOwner::Onboarding);
+        }
+        if self.device_auth_dialog.visible {
+            return Some(ModalOwner::DeviceAuth);
+        }
+        if self.key_input_dialog.visible {
+            return Some(ModalOwner::KeyInput);
+        }
+        if self.connect_dialog.visible {
+            return Some(ModalOwner::Connect);
+        }
+        if self.invalid_config_dialog.visible {
+            return Some(ModalOwner::InvalidConfig);
+        }
+        if self.desktop_upsell.visible {
+            return Some(ModalOwner::DesktopUpsell);
+        }
+        if self.memory_update_notification.visible {
+            return Some(ModalOwner::MemoryUpdateNotification);
+        }
+        if self.voice_mode_notice.visible {
+            return Some(ModalOwner::VoiceModeNotice);
+        }
+        if self.overage_upsell.visible {
+            return Some(ModalOwner::OverageUpsell);
+        }
+        if self.hooks_config_menu.visible {
+            return Some(ModalOwner::HooksConfig);
+        }
+        if self.memory_file_selector.visible {
+            return Some(ModalOwner::MemoryFileSelector);
+        }
+        if self.feedback_survey.visible {
+            return Some(ModalOwner::FeedbackSurvey);
+        }
+        if self.go_to_line_dialog.active {
+            return Some(ModalOwner::GoToLineDialog);
+        }
+        if self.mcp_approval.visible {
+            return Some(ModalOwner::McpApproval);
+        }
+        if self.context_viz.visible {
+            return Some(ModalOwner::ContextViz);
+        }
+        if self.export_dialog.visible {
+            return Some(ModalOwner::ExportDialog);
+        }
+        if self.session_branching.visible {
+            return Some(ModalOwner::SessionBranching);
+        }
+        if self.session_browser.visible {
+            return Some(ModalOwner::SessionBrowser);
+        }
+        if self.model_picker.visible {
+            return Some(ModalOwner::ModelPicker);
+        }
+        if self.elicitation.visible {
+            return Some(ModalOwner::Elicitation);
+        }
+        if self.command_palette.visible {
+            return Some(ModalOwner::CommandPalette);
+        }
+        if self.global_search.open {
+            return Some(ModalOwner::GlobalSearch);
+        }
+        if self.history_search_overlay.visible || self.history_search.is_some() {
+            return Some(ModalOwner::HistorySearch);
+        }
+        if self.help_overlay.visible || self.show_help {
+            return Some(ModalOwner::Help);
+        }
+        if self.tasks_overlay.visible {
+            return Some(ModalOwner::Tasks);
+        }
+        if self.rewind_flow.visible {
+            return Some(ModalOwner::Rewind);
+        }
+        None
+    }
+
+    fn expire_paste_burst_if_idle(&mut self, now: std::time::Instant) {
+        if self
+            .paste_burst_until
+            .is_some_and(|until| now >= until)
+        {
+            self.paste_burst_until = None;
+            self.paste_burst_printable_streak = 0;
+            self.paste_burst_last_printable_at = None;
+        }
+    }
+
+    fn is_in_paste_burst(&self, now: std::time::Instant) -> bool {
+        self.paste_burst_until
+            .is_some_and(|until| now < until)
+    }
+
+    fn activate_paste_burst(&mut self, now: std::time::Instant) {
+        self.paste_burst_until = Some(now + PASTE_BURST_IDLE_TIMEOUT);
+    }
+
+    fn register_printable_keystroke_for_paste_burst(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) {
+        // Ignore control/meta chords from burst scoring.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SUPER)
+        {
+            return;
+        }
+
+        match self.paste_burst_last_printable_at {
+            Some(prev) if now.duration_since(prev) <= PASTE_BURST_PRINTABLE_GAP => {
+                self.paste_burst_printable_streak += 1;
+            }
+            _ => {
+                self.paste_burst_printable_streak = 1;
+            }
+        }
+        self.paste_burst_last_printable_at = Some(now);
+
+        if self.paste_burst_printable_streak >= PASTE_BURST_MIN_STREAK {
+            self.activate_paste_burst(now);
+        }
+    }
+
+    fn handle_prompt_paste(&mut self, data: &str, now: std::time::Instant) {
+        self.prompt_input.paste(data);
+        self.refresh_prompt_input();
+        if data.contains('\n') || data.contains('\r') {
+            self.activate_paste_burst(now);
         }
     }
 
@@ -1949,6 +2182,79 @@ impl App {
     fn refresh_global_search(&mut self) {
         let root = self.project_root();
         self.global_search.run_search(&root);
+        self.sync_transcript_search_from_global();
+    }
+
+    fn transcript_search_haystack(&self) -> String {
+        let mut parts: Vec<String> = self.messages.iter().map(Message::get_all_text).collect();
+        parts.extend(self.system_annotations.iter().map(|ann| ann.text.clone()));
+        parts.join("\n")
+    }
+
+    fn count_case_insensitive_occurrences(haystack: &str, needle: &str) -> usize {
+        if needle.is_empty() {
+            return 0;
+        }
+        let hay = haystack.to_lowercase();
+        let need = needle.to_lowercase();
+        let mut count = 0usize;
+        let mut start = 0usize;
+        while let Some(pos) = hay[start..].find(&need) {
+            count += 1;
+            start += pos + need.len();
+        }
+        count
+    }
+
+    pub(crate) fn recompute_transcript_search(&mut self) {
+        if self.transcript_search.query.is_empty() {
+            self.transcript_search.total_matches = 0;
+            self.transcript_search.current_match = None;
+            return;
+        }
+
+        self.invalidate_transcript();
+        let haystack = self.transcript_search_haystack();
+        let total = Self::count_case_insensitive_occurrences(&haystack, &self.transcript_search.query);
+        self.transcript_search.total_matches = total;
+        self.transcript_search.current_match = if total == 0 {
+            None
+        } else {
+            Some(self.transcript_search.current_match.unwrap_or(0).min(total - 1))
+        };
+    }
+
+    fn sync_transcript_search_from_global(&mut self) {
+        let next_query = self.global_search.query.trim().to_string();
+        if self.transcript_search.query != next_query {
+            self.transcript_search.query = next_query;
+            self.transcript_search.current_match = if self.transcript_search.query.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
+        self.recompute_transcript_search();
+    }
+
+    fn transcript_search_step(&mut self, next: bool) {
+        self.recompute_transcript_search();
+        if self.transcript_search.total_matches == 0 {
+            self.status_message = Some("Find: 0/0".to_string());
+            return;
+        }
+
+        let total = self.transcript_search.total_matches;
+        let cur = self.transcript_search.current_match.unwrap_or(0);
+        let new_cur = if next {
+            (cur + 1) % total
+        } else if cur == 0 {
+            total - 1
+        } else {
+            cur - 1
+        };
+        self.transcript_search.current_match = Some(new_cur);
+        self.status_message = Some(format!("Find: {}/{}", new_cur + 1, total));
     }
 
     fn load_mcp_servers(&self) -> Vec<McpServerView> {
@@ -2109,17 +2415,20 @@ impl App {
         self.messages.push(msg);
         self.invalidate_transcript();
         self.on_new_message();
+        self.recompute_transcript_search();
     }
 
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
         self.invalidate_transcript();
+        self.recompute_transcript_search();
     }
 
     pub fn push_message(&mut self, message: Message) {
         self.messages.push(message);
         self.invalidate_transcript();
         self.on_new_message();
+        self.recompute_transcript_search();
     }
 
     /// Push a synthetic system annotation into the conversation pane.
@@ -2441,6 +2750,9 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        let now = std::time::Instant::now();
+        self.expire_paste_burst_if_idle(now);
+
         if self.global_search.open {
             return self.handle_global_search_key(key);
         }
@@ -3177,6 +3489,17 @@ impl App {
             }
         }
 
+        // Shift+Enter and active paste-burst must never route through submit keybindings.
+        if key.code == KeyCode::Enter
+            && !self.is_streaming
+            && (key.modifiers.contains(KeyModifiers::SHIFT) || self.is_in_paste_burst(now))
+        {
+            self.prompt_input.insert_newline();
+            self.refresh_prompt_input();
+            self.activate_paste_burst(now);
+            return false;
+        }
+
         // ---- Keybinding processor (runs AFTER all dialog checks) ----------
         let key_context = self.current_key_context();
         if let Some(keystroke) = key_event_to_keystroke(&key) {
@@ -3297,7 +3620,7 @@ impl App {
                 self.notifications
                     .push(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text() {
-                self.prompt_input.paste(&text);
+                self.handle_prompt_paste(&text, now);
             }
             return false;
         }
@@ -3470,6 +3793,7 @@ impl App {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
                     self.prompt_input.insert_char(c);
+                    self.register_printable_keystroke_for_paste_burst(key, now);
                 }
                 self.refresh_prompt_input();
             }
@@ -3529,6 +3853,13 @@ impl App {
 
             // ---- Submit ------------------------------------------------
             KeyCode::Enter if !self.is_streaming => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) || self.is_in_paste_burst(now) {
+                    self.prompt_input.insert_newline();
+                    self.refresh_prompt_input();
+                    self.activate_paste_burst(now);
+                    return false;
+                }
+
                 // If a slash-command suggestion is selected, accept it instead of submitting.
                 if !self.prompt_input.suggestions.is_empty()
                     && self.prompt_input.suggestion_index.is_some()
@@ -3920,6 +4251,22 @@ impl App {
     fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
             "interrupt" => {
+                let sel_text = self.selection_text.borrow().clone();
+                if self.selection_anchor.is_some() && !sel_text.is_empty() {
+                    let copied = crate::image_paste::write_clipboard_text(&sel_text);
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                    *self.selection_text.borrow_mut() = String::new();
+                    if copied {
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            "Copied to clipboard".to_string(),
+                            Some(2),
+                        );
+                    }
+                    return false;
+                }
+
                 if self.is_streaming {
                     self.is_streaming = false;
                     self.spinner_verb = None;
@@ -3949,6 +4296,32 @@ impl App {
             "openSearch" => {
                 self.global_search.open();
                 self.refresh_global_search();
+                false
+            }
+            "globalSearch" => {
+                self.global_search.open();
+                self.refresh_global_search();
+                false
+            }
+            "findInMessage" => {
+                self.global_search.open();
+                self.refresh_global_search();
+                if self.transcript_search.total_matches > 0 {
+                    let cur = self.transcript_search.current_match.unwrap_or(0);
+                    self.status_message = Some(format!(
+                        "Find: {}/{}",
+                        cur + 1,
+                        self.transcript_search.total_matches
+                    ));
+                }
+                false
+            }
+            "findNext" => {
+                self.transcript_search_step(true);
+                false
+            }
+            "findPrev" => {
+                self.transcript_search_step(false);
                 false
             }
             "submit" => !self.is_streaming,
@@ -4466,9 +4839,17 @@ impl App {
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
 
-        // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
-        // need hover tracking. Only process clicks, scroll, and drag.
         if matches!(mouse_event.kind, MouseEventKind::Moved) {
+            let msg_area = self.last_msg_area.get();
+            let in_msg_area = mouse_event.column >= msg_area.x
+                && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
+                && mouse_event.row >= msg_area.y
+                && mouse_event.row < msg_area.y.saturating_add(msg_area.height);
+            self.hovered_message_index = if in_msg_area {
+                self.message_index_at_row(mouse_event.row)
+            } else {
+                None
+            };
             return;
         }
 
@@ -4902,6 +5283,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> anyhow::Result<Option<String>> {
         loop {
+            let frame_loop_start = std::time::Instant::now();
             self.frame_count = self.frame_count.wrapping_add(1);
 
             // Sync cost/token counters from the shared tracker
@@ -5040,10 +5422,14 @@ impl App {
             }
 
             // Draw the frame
+            let render_start = std::time::Instant::now();
             terminal.draw(|f| render::render_app(f, self))?;
+            self.stats_dialog
+                .update_perf_metrics(None, Some(render_start.elapsed().as_micros() as u64), None);
 
             // Poll for events with a short timeout so we can redraw for animation
             if event::poll(std::time::Duration::from_millis(50))? {
+                let input_start = std::time::Instant::now();
                 match event::read()? {
                     Event::Key(key) => {
                         // On Windows crossterm fires both Press and Release events.
@@ -5096,15 +5482,22 @@ impl App {
                             && !self.history_search_overlay.visible
                             && self.history_search.is_none() =>
                     {
-                        self.prompt_input.paste(&data);
-                        self.refresh_prompt_input();
+                        self.handle_prompt_paste(&data, std::time::Instant::now());
                     }
                     Event::Mouse(mouse_event) => {
                         self.handle_mouse_event(mouse_event);
                     }
                     _ => {}
                 }
+                self.stats_dialog
+                    .update_perf_metrics(Some(input_start.elapsed().as_micros() as u64), None, None);
             }
+
+            self.stats_dialog.update_perf_metrics(
+                None,
+                None,
+                Some(frame_loop_start.elapsed().as_secs_f64() * 1000.0),
+            );
         }
     }
 
@@ -5293,6 +5686,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_mouse_hover_sets_and_clears_hovered_message_index() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.message_row_map.borrow_mut().insert(4, 7);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.hovered_message_index, Some(7));
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 120,
+            row: 40,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.hovered_message_index, None);
+    }
+
     // ---- Help overlay -------------------------------------------------------
 
     #[test]
@@ -5428,5 +5851,85 @@ mod tests {
 
         assert!(app.permission_request.is_none());
         assert!(!app.bash_command_allowed_by_prefix("npm test"));
+    }
+
+    #[test]
+    fn test_bracketed_multiline_paste_does_not_auto_submit() {
+        let mut app = make_app();
+        app.handle_prompt_paste("line 1\nline 2\nline 3", std::time::Instant::now());
+
+        let submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!submit);
+        assert_eq!(app.prompt_input.text, "line 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn test_rapid_printable_stream_with_enter_inserts_newline_not_submit() {
+        let mut app = make_app();
+        for ch in ['a', 'b', 'c', 'd', 'e'] {
+            let _ = app.handle_key_event(key_press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        let submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!submit);
+        assert_eq!(app.prompt_input.text, "abcde\n");
+    }
+
+    #[test]
+    fn test_normal_typing_then_enter_still_submits() {
+        let mut app = make_app();
+        let _ = app.handle_key_event(key_press(KeyCode::Char('h'), KeyModifiers::NONE));
+        let _ = app.handle_key_event(key_press(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        let submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(submit);
+        assert_eq!(app.prompt_input.text, "hi");
+    }
+
+    #[test]
+    fn test_transcript_search_counts_multiline_matches_case_insensitive() {
+        let mut app = make_app();
+        app.add_message(Role::User, "Hello\nworld hello".to_string());
+        app.add_message(Role::Assistant, "HELLO again".to_string());
+        app.transcript_search.query = "hello".to_string();
+        app.recompute_transcript_search();
+
+        assert_eq!(app.transcript_search.total_matches, 3);
+        assert_eq!(app.transcript_search.current_match, Some(0));
+    }
+
+    #[test]
+    fn test_transcript_search_next_prev_wrap() {
+        let mut app = make_app();
+        app.add_message(Role::User, "foo foo foo".to_string());
+        app.transcript_search.query = "foo".to_string();
+        app.recompute_transcript_search();
+        app.transcript_search.current_match = Some(2);
+
+        app.transcript_search_step(true);
+        assert_eq!(app.transcript_search.current_match, Some(0));
+
+        app.transcript_search_step(false);
+        assert_eq!(app.transcript_search.current_match, Some(2));
+    }
+
+    #[test]
+    fn test_modal_owner_priority_is_deterministic() {
+        let mut app = make_app();
+        app.model_picker.visible = true;
+        app.onboarding_dialog.visible = true;
+
+        assert_eq!(app.active_modal_owner(), Some(ModalOwner::Onboarding));
+    }
+
+    #[test]
+    fn test_modal_active_prevents_chat_submit_leak() {
+        let mut app = make_app();
+        app.model_picker.visible = true;
+        app.set_prompt_text("hello".to_string());
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "hello");
     }
 }

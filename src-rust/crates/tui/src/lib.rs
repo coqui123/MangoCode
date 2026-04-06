@@ -230,7 +230,7 @@ mod tests {
     use mangocode_core::file_history::FileHistory;
     use mangocode_core::types::{ContentBlock, Role, ToolResultContent};
     use notifications::NotificationKind;
-    use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -454,6 +454,21 @@ mod tests {
         assert!(!app.is_streaming);
         assert!(!app.should_quit);
         assert!(app.streaming_text.is_empty());
+    }
+
+    #[test]
+    fn test_ctrl_c_copies_selection_instead_of_quit() {
+        let mut app = make_app();
+        app.selection_anchor = Some((1, 1));
+        app.selection_focus = Some((3, 1));
+        *app.selection_text.borrow_mut() = "selected text".to_string();
+
+        app.handle_key_event(ctrl(KeyCode::Char('c')));
+
+        assert!(!app.should_quit);
+        assert!(app.selection_anchor.is_none());
+        assert!(app.selection_focus.is_none());
+        assert!(app.selection_text.borrow().is_empty());
     }
 
     #[test]
@@ -696,6 +711,37 @@ mod tests {
             .join("");
 
         assert!(!rendered.contains("? for shortcuts"));
+    }
+
+    #[test]
+    fn test_render_transcript_search_highlights_current_distinctly() {
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = make_app();
+        app.push_message(mangocode_core::types::Message::assistant(
+            "foo alpha foo beta".to_string(),
+        ));
+        app.transcript_search.query = "foo".to_string();
+        app.recompute_transcript_search();
+        app.transcript_search.current_match = Some(1);
+
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+
+        let mut has_regular_match_bg = false;
+        let mut has_current_match_bg = false;
+        for cell in &terminal.backend().buffer().content {
+            if cell.style().bg == Some(Color::Rgb(60, 50, 0)) {
+                has_regular_match_bg = true;
+            }
+            if cell.style().bg == Some(Color::Rgb(255, 176, 32)) {
+                has_current_match_bg = true;
+            }
+        }
+
+        assert!(has_regular_match_bg);
+        assert!(has_current_match_bg);
     }
 
     #[test]
