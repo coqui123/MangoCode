@@ -209,18 +209,33 @@ pub struct SessionSummary {
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the base projects directory: `~/.mangocode/projects/`.
+/// Returns the base projects directory: `~/.claude/projects/`.
+///
+/// Uses the same path as Claude Code so that orchestration platforms
+/// (like Conducctor) and CloudCLI-based UIs can discover MangoCode
+/// sessions alongside Claude sessions.
 pub fn projects_dir() -> PathBuf {
-    crate::config::Settings::config_dir().join("projects")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects")
 }
 
 /// Returns the per-project transcript directory.
 ///
-/// The project root path is encoded using **URL-safe base64 without padding**
-/// to produce a stable, platform-safe directory name that is fully reversible
-/// (unlike the TS `sanitizePath` which just replaces chars with hyphens).
+/// Uses the same path encoding as Claude Code's TypeScript CLI:
+/// the absolute project path with `/`, `\`, `:`, ` `, `~`, `_` replaced
+/// by `-`.  This produces directory names like `-home-ethan-myproject`
+/// that are compatible with CloudCLI session discovery.
 pub fn transcript_dir(project_root: &Path) -> PathBuf {
-    let encoded = URL_SAFE_NO_PAD.encode(project_root.to_string_lossy().as_bytes());
+    let path_str = project_root.to_string_lossy();
+    let encoded: String = path_str
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | ' ' | '~' | '_' => '-',
+            _ => c,
+        })
+        .collect();
     projects_dir().join(encoded)
 }
 
