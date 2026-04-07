@@ -2692,6 +2692,7 @@ pub mod history {
                 "type": "summary",
                 "summary": s,
                 "sessionId": session_id,
+                "provider": "mangocode",
             });
             lines.push_str(&serde_json::to_string(&summary_entry).unwrap_or_default());
             lines.push('\n');
