@@ -1,0 +1,15 @@
+[package]
+name = "mangocode-buddy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mangocode-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
