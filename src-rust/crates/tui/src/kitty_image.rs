@@ -76,19 +76,23 @@ pub fn detect_image_protocol() -> ImageProtocol {
         }
     }
 
+    // SSH sessions: fall back to text — most SSH terminals don't support
+    // inline image protocols, and sixel data will appear as garbage.
+    if std::env::var("SSH_CONNECTION").is_ok() || std::env::var("SSH_TTY").is_ok() {
+        return ImageProtocol::Text;
+    }
+
     // Check for Sixel protocol (medium priority)
     // Windows Terminal (v1.22+) supports Sixel; detected via WT_SESSION env var.
     if std::env::var("WT_SESSION").is_ok() {
         return ImageProtocol::Sixel;
     }
 
+    // Only enable sixel for terminals known to support it.
+    // Plain "xterm-256color" does NOT imply sixel — most terminal emulators
+    // set TERM=xterm-256color but don't support sixel at all.
     if let Ok(term) = std::env::var("TERM") {
-        if term.contains("xterm")
-            || term.contains("screen")
-            || term.contains("rxvt")
-            || term.contains("mintty")
-            || term.contains("iterm")
-        {
+        if term.contains("mintty") || term.contains("mlterm") || term.contains("foot") {
             return ImageProtocol::Sixel;
         }
     }

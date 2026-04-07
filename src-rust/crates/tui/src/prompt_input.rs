@@ -2950,7 +2950,7 @@ impl PromptInputState {
     }
 
     /// Rough token estimate: ~4 chars per token.
-    fn update_token_estimate(&mut self) {
+    pub fn update_token_estimate(&mut self) {
         self.token_estimate = self.text.len().div_ceil(4);
     }
 
