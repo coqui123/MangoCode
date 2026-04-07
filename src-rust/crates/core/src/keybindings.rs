@@ -136,20 +136,20 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 pub fn default_bindings() -> Vec<ParsedBinding> {
     let defaults: &[(&str, &str, KeyContext)] = &[
         // ========== GLOBAL CONTROL ==========
-        ("ctrl+c", "interrupt", KeyContext::Global),
-        ("ctrl+d", "exit", KeyContext::Global),
-        ("ctrl+l", "redraw", KeyContext::Global),
-        ("ctrl+r", "historySearch", KeyContext::Global),
+        ("ctrl+c", "session.abort", KeyContext::Global),
+        ("ctrl+d", "session.close", KeyContext::Global),
+        ("ctrl+l", "view.repaint", KeyContext::Global),
+        ("ctrl+r", "history.overlay.open", KeyContext::Global),
         ("ctrl+b", "createBranch", KeyContext::Global),
         ("alt+h", "openHelp", KeyContext::Global),
         // ========== CHAT / INPUT CONTEXT ==========
-        ("enter", "submit", KeyContext::Chat),
-        ("up", "historyPrev", KeyContext::Chat),
-        ("down", "historyNext", KeyContext::Chat),
-        ("shift+tab", "reverseIndent", KeyContext::Chat),
-        ("pageup", "scrollUp", KeyContext::Chat),
-        ("pagedown", "scrollDown", KeyContext::Chat),
-        ("tab", "indent", KeyContext::Chat),
+        ("enter", "chat.submit", KeyContext::Chat),
+        ("up", "history.entry.prev", KeyContext::Chat),
+        ("down", "history.entry.next", KeyContext::Chat),
+        ("shift+tab", "mode.cycle", KeyContext::Chat),
+        ("pageup", "transcript.scroll.up", KeyContext::Chat),
+        ("pagedown", "transcript.scroll.down", KeyContext::Chat),
+        ("tab", "suggestion.accept", KeyContext::Chat),
         ("shift+enter", "newline", KeyContext::Chat),
         ("home", "goLineStart", KeyContext::Chat),
         ("end", "goLineEnd", KeyContext::Chat),
@@ -163,41 +163,41 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+d", "deleteWord", KeyContext::Chat),
         ("alt+backspace", "killWord", KeyContext::Chat),
         // New Text Editing & Navigation
-        ("ctrl+m", "sendMessage", KeyContext::Chat),
-        ("ctrl+l", "clearLine", KeyContext::Chat),
-        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
-        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
-        ("alt+left", "previousMessage", KeyContext::Chat),
-        ("alt+right", "nextMessage", KeyContext::Chat),
-        ("ctrl+o", "historyPrev", KeyContext::Chat),
-        ("ctrl+i", "historyNext", KeyContext::Chat),
+        ("ctrl+m", "chat.submit.alt", KeyContext::Chat),
+        ("ctrl+l", "input.clear", KeyContext::Chat),
+        ("ctrl+.", "transcript.issue.next", KeyContext::Chat),
+        ("ctrl+shift+.", "transcript.issue.prev", KeyContext::Chat),
+        ("alt+left", "transcript.jump.prev", KeyContext::Chat),
+        ("alt+right", "transcript.jump.next", KeyContext::Chat),
+        ("ctrl+o", "history.entry.prev", KeyContext::Chat),
+        ("ctrl+i", "history.entry.next", KeyContext::Chat),
         // Searching
-        ("ctrl+f", "findInMessage", KeyContext::Chat),
-        ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
+        ("ctrl+f", "search.transcript.open", KeyContext::Chat),
+        ("ctrl+shift+f", "search.global.open", KeyContext::Chat),
         ("ctrl+g", "goToLine", KeyContext::Chat),
-        ("f3", "findNext", KeyContext::Chat),
-        ("ctrl+]", "findNext", KeyContext::Chat),
-        ("shift+f3", "findPrev", KeyContext::Chat),
-        ("ctrl+[", "findPrev", KeyContext::Chat),
+        ("f3", "search.transcript.next", KeyContext::Chat),
+        ("ctrl+]", "search.transcript.next", KeyContext::Chat),
+        ("shift+f3", "search.transcript.prev", KeyContext::Chat),
+        ("ctrl+[", "search.transcript.prev", KeyContext::Chat),
         // ========== CONFIRMATION DIALOGS ==========
-        ("y", "yes", KeyContext::Confirmation),
-        ("enter", "yes", KeyContext::Confirmation),
-        ("n", "no", KeyContext::Confirmation),
-        ("escape", "no", KeyContext::Confirmation),
-        ("up", "prevOption", KeyContext::Confirmation),
-        ("down", "nextOption", KeyContext::Confirmation),
+        ("y", "confirm.accept", KeyContext::Confirmation),
+        ("enter", "confirm.accept", KeyContext::Confirmation),
+        ("n", "confirm.reject", KeyContext::Confirmation),
+        ("escape", "confirm.reject", KeyContext::Confirmation),
+        ("up", "confirm.prev", KeyContext::Confirmation),
+        ("down", "confirm.next", KeyContext::Confirmation),
         // ========== HELP OVERLAY ==========
-        ("escape", "close", KeyContext::Help),
-        ("q", "close", KeyContext::Help),
+        ("escape", "overlay.dismiss", KeyContext::Help),
+        ("q", "overlay.dismiss", KeyContext::Help),
         ("up", "scrollUp", KeyContext::Help),
         ("down", "scrollDown", KeyContext::Help),
         ("pageup", "pageUp", KeyContext::Help),
         ("pagedown", "pageDown", KeyContext::Help),
         // ========== HISTORY SEARCH ==========
-        ("enter", "select", KeyContext::HistorySearch),
-        ("escape", "cancel", KeyContext::HistorySearch),
-        ("up", "prevResult", KeyContext::HistorySearch),
-        ("down", "nextResult", KeyContext::HistorySearch),
+        ("enter", "history.result.select", KeyContext::HistorySearch),
+        ("escape", "history.result.cancel", KeyContext::HistorySearch),
+        ("up", "history.result.prev", KeyContext::HistorySearch),
+        ("down", "history.result.next", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
         ("up", "prevMessage", KeyContext::Transcript),
@@ -532,7 +532,7 @@ mod tests {
                 && b.context == KeyContext::Global
         });
         assert!(ctrl_c.is_some());
-        assert_eq!(ctrl_c.unwrap().action.as_deref(), Some("interrupt"));
+        assert_eq!(ctrl_c.unwrap().action.as_deref(), Some("session.abort"));
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
         let mut resolver = KeybindingResolver::new(&user);
         let ks = parse_keystroke("ctrl+c").unwrap();
         let result = resolver.process(ks, &KeyContext::Global);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "interrupt"));
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "session.abort"));
     }
 
     #[test]
@@ -558,11 +558,11 @@ mod tests {
     fn test_resolver_context_match_global_from_chat() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        // ctrl+l in Chat context maps to "clearLine" (newly added Phase 1 keybinding)
+        // ctrl+l in Chat context maps to input.clear
         // Global context is checked after context-specific bindings
         let ks = parse_keystroke("ctrl+l").unwrap();
         let result = resolver.process(ks, &KeyContext::Chat);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "clearLine"));
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "input.clear"));
     }
 
     #[test]
@@ -617,40 +617,40 @@ mod tests {
 
         // Check Phase 1 keybinding actions exist
         assert!(
-            actions.contains(&"clearLine".to_string()),
-            "clearLine action not found"
+            actions.contains(&"input.clear".to_string()),
+            "input.clear action not found"
         );
         assert!(
-            actions.contains(&"sendMessage".to_string()),
-            "sendMessage action not found"
+            actions.contains(&"chat.submit.alt".to_string()),
+            "chat.submit.alt action not found"
         );
         assert!(
-            actions.contains(&"jumpToNextError".to_string()),
-            "jumpToNextError action not found"
+            actions.contains(&"transcript.issue.next".to_string()),
+            "transcript.issue.next action not found"
         );
         assert!(
-            actions.contains(&"jumpToPreviousError".to_string()),
-            "jumpToPreviousError action not found"
+            actions.contains(&"transcript.issue.prev".to_string()),
+            "transcript.issue.prev action not found"
         );
         assert!(
-            actions.contains(&"previousMessage".to_string()),
-            "previousMessage action not found"
+            actions.contains(&"transcript.jump.prev".to_string()),
+            "transcript.jump.prev action not found"
         );
         assert!(
-            actions.contains(&"nextMessage".to_string()),
-            "nextMessage action not found"
+            actions.contains(&"transcript.jump.next".to_string()),
+            "transcript.jump.next action not found"
         );
         assert!(
-            actions.contains(&"openHelp".to_string()),
-            "openHelp action not found"
+            actions.contains(&"openHelp".to_string()) || actions.contains(&"help.toggle".to_string()),
+            "help toggle action not found"
         );
         assert!(
-            actions.contains(&"deleteCharBefore".to_string()),
-            "deleteCharBefore action not found"
+            actions.contains(&"deleteCharBefore".to_string()) || actions.contains(&"input.backspace".to_string()),
+            "backspace action not found"
         );
         assert!(
-            actions.contains(&"reverseIndent".to_string()),
-            "reverseIndent action not found"
+            actions.contains(&"mode.cycle".to_string()),
+            "mode.cycle action not found"
         );
 
         // Verify we have at least 10 new keybindings (Phase 1 requirement)
@@ -665,14 +665,14 @@ mod tests {
     fn test_critical_parity_bindings_exist() {
         let bindings = default_bindings();
         let required: &[(&str, &str, KeyContext)] = &[
-            ("enter", "submit", KeyContext::Chat),
+            ("enter", "chat.submit", KeyContext::Chat),
             ("shift+enter", "newline", KeyContext::Chat),
-            ("ctrl+f", "findInMessage", KeyContext::Chat),
-            ("f3", "findNext", KeyContext::Chat),
-            ("shift+f3", "findPrev", KeyContext::Chat),
-            ("ctrl+r", "historySearch", KeyContext::Global),
-            ("ctrl+c", "interrupt", KeyContext::Global),
-            ("ctrl+d", "exit", KeyContext::Global),
+            ("ctrl+f", "search.transcript.open", KeyContext::Chat),
+            ("f3", "search.transcript.next", KeyContext::Chat),
+            ("shift+f3", "search.transcript.prev", KeyContext::Chat),
+            ("ctrl+r", "history.overlay.open", KeyContext::Global),
+            ("ctrl+c", "session.abort", KeyContext::Global),
+            ("ctrl+d", "session.close", KeyContext::Global),
         ];
 
         for (chord_str, action, ctx) in required {

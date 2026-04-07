@@ -51,18 +51,17 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-// Spinner frames matching the TypeScript SpinnerGlyph: platform-specific base
-// characters mirrored (forward + reverse) for a smooth pulse effect.
-// Windows uses '*' instead of '✳'/'✽' for better font coverage.
+// Streaming spinner glyphs tuned for terminal font coverage.
+// Sequence is intentionally asymmetric; `spinner_char` below uses a stepped
+// index progression so motion is less pendulum-like than a mirrored list.
 #[cfg(target_os = "windows")]
 const SPINNER: &[char] = &[
-    '\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
-    '\u{2736}', '*', '\u{2722}', '\u{00b7}',
+    '.', '*', '+', 'x', 'o', '*', 'x', '+', 'o', '*',
 ];
 #[cfg(not(target_os = "windows"))]
 const SPINNER: &[char] = &[
-    '\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}', '\u{273d}', '\u{273b}',
-    '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}',
+    '\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}', '\u{2736}', '\u{2733}',
+    '\u{2722}', '\u{00b7}',
 ];
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 176, 32); // #FFB020 golden mango
 const MIN_WELCOME_BOX_HEIGHT: u16 = 10;
@@ -94,7 +93,9 @@ pub fn flush_sixel_blit(app: &App) {
 }
 
 fn spinner_char(frame_count: u64) -> char {
-    SPINNER[(frame_count as usize) % SPINNER.len()]
+    let len = SPINNER.len() as u64;
+    let stepped = frame_count.saturating_mul(5).saturating_add(frame_count / 3);
+    SPINNER[(stepped % len) as usize]
 }
 
 /// Returns the colour to use for the streaming spinner.

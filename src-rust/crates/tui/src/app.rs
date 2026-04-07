@@ -44,66 +44,7 @@ use std::io::Stdout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
-
-const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("advisor", "Set or unset the server-side advisor model"),
-    ("agent", "List available agents or show agent details"),
-    ("agents", "Browse agent definitions and active agents"),
-    ("changes", "Inspect changes from the current session"),
-    ("clear", "Clear the conversation transcript"),
-    ("compact", "Compact the conversation context"),
-    ("config", "Open settings"),
-    ("connect", "Connect an AI provider"),
-    ("context", "Show context window and rate limit usage"),
-    ("copy", "Copy the last assistant response to clipboard"),
-    ("cost", "Show cost breakdown"),
-    ("diff", "Inspect the current git diff"),
-    ("doctor", "Run diagnostics"),
-    ("effort", "Set effort level (low/medium/high/max)"),
-    ("exit", "Quit MangoCode"),
-    ("export", "Export conversation"),
-    ("fast", "Toggle fast mode"),
-    ("feedback", "Open session feedback survey"),
-    ("fork", "Fork session into a new branch"),
-    ("heapdump", "Show process memory and diagnostic information"),
-    ("help", "Show help"),
-    ("hooks", "Browse configured hooks (read-only)"),
-    ("init", "Initialize AGENTS.md for this project"),
-    (
-        "insights",
-        "Generate a session analysis report with conversation statistics",
-    ),
-    (
-        "install-slack-app",
-        "Install the MangoCode Slack integration",
-    ),
-    ("keybindings", "Show keybinding configuration"),
-    ("login", "Log in to MangoCode"),
-    ("logout", "Log out of MangoCode"),
-    ("mcp", "Browse configured MCP servers"),
-    ("memory", "Browse and open AGENTS.md memory files"),
-    ("model", "Change the AI model"),
-    ("output-style", "Toggle output style (auto/stream/verbose)"),
-    ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
-    ("privacy", "Open privacy settings"),
-    ("providers", "List available AI providers and their status"),
-    ("quit", "Quit MangoCode"),
-    ("rename", "Rename this session"),
-    ("resume", "Resume a previous session"),
-    ("review", "Review changes (git diff)"),
-    ("rewind", "Rewind to an earlier turn"),
-    ("session", "Browse and manage sessions"),
-    ("settings", "Open settings"),
-    ("stats", "Open token and cost stats"),
-    ("survey", "Open session feedback survey"),
-    ("theme", "Open the theme picker"),
-    (
-        "ultrareview",
-        "Run an exhaustive multi-dimensional code review",
-    ),
-    ("vim", "Toggle vim keybindings"),
-    ("voice", "Toggle voice input mode"),
-];
+use crate::slash_commands::PROMPT_SLASH_COMMANDS;
 
 const PASTE_BURST_PRINTABLE_GAP: Duration = Duration::from_millis(120);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -1468,11 +1409,11 @@ impl App {
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
-                    .map(|(name, desc)| SelectItem {
-                        id: format!("/{}", name),
-                        title: format!("/{}", name),
-                        description: desc.to_string(),
-                        category: "Commands".to_string(),
+                    .map(|cmd| SelectItem {
+                        id: format!("/{}", cmd.name),
+                        title: format!("/{}", cmd.name),
+                        description: cmd.description.to_string(),
+                        category: cmd.group.to_string(),
                         badge: None,
                     })
                     .collect();
@@ -1553,113 +1494,64 @@ impl App {
         }
     }
 
+    fn modal_stack(&self) -> Vec<ModalOwner> {
+        let mut stack = Vec::new();
+
+        macro_rules! push_if {
+            ($cond:expr, $owner:expr) => {
+                if $cond {
+                    stack.push($owner);
+                }
+            };
+        }
+
+        push_if!(self.permission_request.is_some(), ModalOwner::PermissionRequest);
+        push_if!(self.settings_screen.visible, ModalOwner::Settings);
+        push_if!(self.theme_screen.visible, ModalOwner::Theme);
+        push_if!(self.privacy_screen.visible, ModalOwner::Privacy);
+        push_if!(self.stats_dialog.open, ModalOwner::Stats);
+        push_if!(self.mcp_view.open, ModalOwner::McpView);
+        push_if!(self.agents_menu.open, ModalOwner::AgentsMenu);
+        push_if!(self.diff_viewer.open, ModalOwner::DiffViewer);
+        push_if!(self.bypass_permissions_dialog.visible, ModalOwner::BypassPermissions);
+        push_if!(self.onboarding_dialog.visible, ModalOwner::Onboarding);
+        push_if!(self.device_auth_dialog.visible, ModalOwner::DeviceAuth);
+        push_if!(self.key_input_dialog.visible, ModalOwner::KeyInput);
+        push_if!(self.connect_dialog.visible, ModalOwner::Connect);
+        push_if!(self.invalid_config_dialog.visible, ModalOwner::InvalidConfig);
+        push_if!(self.desktop_upsell.visible, ModalOwner::DesktopUpsell);
+        push_if!(
+            self.memory_update_notification.visible,
+            ModalOwner::MemoryUpdateNotification
+        );
+        push_if!(self.voice_mode_notice.visible, ModalOwner::VoiceModeNotice);
+        push_if!(self.overage_upsell.visible, ModalOwner::OverageUpsell);
+        push_if!(self.hooks_config_menu.visible, ModalOwner::HooksConfig);
+        push_if!(self.memory_file_selector.visible, ModalOwner::MemoryFileSelector);
+        push_if!(self.feedback_survey.visible, ModalOwner::FeedbackSurvey);
+        push_if!(self.go_to_line_dialog.active, ModalOwner::GoToLineDialog);
+        push_if!(self.mcp_approval.visible, ModalOwner::McpApproval);
+        push_if!(self.context_viz.visible, ModalOwner::ContextViz);
+        push_if!(self.export_dialog.visible, ModalOwner::ExportDialog);
+        push_if!(self.session_branching.visible, ModalOwner::SessionBranching);
+        push_if!(self.session_browser.visible, ModalOwner::SessionBrowser);
+        push_if!(self.model_picker.visible, ModalOwner::ModelPicker);
+        push_if!(self.elicitation.visible, ModalOwner::Elicitation);
+        push_if!(self.command_palette.visible, ModalOwner::CommandPalette);
+        push_if!(self.global_search.open, ModalOwner::GlobalSearch);
+        push_if!(
+            self.history_search_overlay.visible || self.history_search.is_some(),
+            ModalOwner::HistorySearch
+        );
+        push_if!(self.help_overlay.visible || self.show_help, ModalOwner::Help);
+        push_if!(self.tasks_overlay.visible, ModalOwner::Tasks);
+        push_if!(self.rewind_flow.visible, ModalOwner::Rewind);
+
+        stack
+    }
+
     pub fn active_modal_owner(&self) -> Option<ModalOwner> {
-        if self.permission_request.is_some() {
-            return Some(ModalOwner::PermissionRequest);
-        }
-        if self.settings_screen.visible {
-            return Some(ModalOwner::Settings);
-        }
-        if self.theme_screen.visible {
-            return Some(ModalOwner::Theme);
-        }
-        if self.privacy_screen.visible {
-            return Some(ModalOwner::Privacy);
-        }
-        if self.stats_dialog.open {
-            return Some(ModalOwner::Stats);
-        }
-        if self.mcp_view.open {
-            return Some(ModalOwner::McpView);
-        }
-        if self.agents_menu.open {
-            return Some(ModalOwner::AgentsMenu);
-        }
-        if self.diff_viewer.open {
-            return Some(ModalOwner::DiffViewer);
-        }
-        if self.bypass_permissions_dialog.visible {
-            return Some(ModalOwner::BypassPermissions);
-        }
-        if self.onboarding_dialog.visible {
-            return Some(ModalOwner::Onboarding);
-        }
-        if self.device_auth_dialog.visible {
-            return Some(ModalOwner::DeviceAuth);
-        }
-        if self.key_input_dialog.visible {
-            return Some(ModalOwner::KeyInput);
-        }
-        if self.connect_dialog.visible {
-            return Some(ModalOwner::Connect);
-        }
-        if self.invalid_config_dialog.visible {
-            return Some(ModalOwner::InvalidConfig);
-        }
-        if self.desktop_upsell.visible {
-            return Some(ModalOwner::DesktopUpsell);
-        }
-        if self.memory_update_notification.visible {
-            return Some(ModalOwner::MemoryUpdateNotification);
-        }
-        if self.voice_mode_notice.visible {
-            return Some(ModalOwner::VoiceModeNotice);
-        }
-        if self.overage_upsell.visible {
-            return Some(ModalOwner::OverageUpsell);
-        }
-        if self.hooks_config_menu.visible {
-            return Some(ModalOwner::HooksConfig);
-        }
-        if self.memory_file_selector.visible {
-            return Some(ModalOwner::MemoryFileSelector);
-        }
-        if self.feedback_survey.visible {
-            return Some(ModalOwner::FeedbackSurvey);
-        }
-        if self.go_to_line_dialog.active {
-            return Some(ModalOwner::GoToLineDialog);
-        }
-        if self.mcp_approval.visible {
-            return Some(ModalOwner::McpApproval);
-        }
-        if self.context_viz.visible {
-            return Some(ModalOwner::ContextViz);
-        }
-        if self.export_dialog.visible {
-            return Some(ModalOwner::ExportDialog);
-        }
-        if self.session_branching.visible {
-            return Some(ModalOwner::SessionBranching);
-        }
-        if self.session_browser.visible {
-            return Some(ModalOwner::SessionBrowser);
-        }
-        if self.model_picker.visible {
-            return Some(ModalOwner::ModelPicker);
-        }
-        if self.elicitation.visible {
-            return Some(ModalOwner::Elicitation);
-        }
-        if self.command_palette.visible {
-            return Some(ModalOwner::CommandPalette);
-        }
-        if self.global_search.open {
-            return Some(ModalOwner::GlobalSearch);
-        }
-        if self.history_search_overlay.visible || self.history_search.is_some() {
-            return Some(ModalOwner::HistorySearch);
-        }
-        if self.help_overlay.visible || self.show_help {
-            return Some(ModalOwner::Help);
-        }
-        if self.tasks_overlay.visible {
-            return Some(ModalOwner::Tasks);
-        }
-        if self.rewind_flow.visible {
-            return Some(ModalOwner::Rewind);
-        }
-        None
+        self.modal_stack().into_iter().next()
     }
 
     fn expire_paste_burst_if_idle(&mut self, now: std::time::Instant) {
@@ -1711,8 +1603,8 @@ impl App {
         if self.paste_burst_printable_streak >= PASTE_BURST_MIN_STREAK {
             self.activate_paste_burst(now);
 
-            // If we've accumulated a lot of rapid input, collapse it into
-            // [Pasted text #N (+X lines)] like Claude Code does.
+            // If we've accumulated a lot of rapid input, collapse it into a
+            // neutral placeholder token while preserving full pasted content.
             if let Some(start) = self.paste_burst_start_cursor {
                 let burst_len = self.prompt_input.cursor.saturating_sub(start);
                 if burst_len > 1024 {
@@ -1721,9 +1613,9 @@ impl App {
                     let line_count = burst_text.lines().count();
                     self.prompt_input.paste_counter += 1;
                     let placeholder = if line_count > 1 {
-                        format!("[Pasted text #{} (+{} lines)]", self.prompt_input.paste_counter, line_count)
+                        format!("[Blob:{} lines={}]", self.prompt_input.paste_counter, line_count)
                     } else {
-                        format!("[Pasted text #{}]", self.prompt_input.paste_counter)
+                        format!("[Blob:{}]", self.prompt_input.paste_counter)
                     };
                     // Store the original content for when the message is submitted
                     self.prompt_input.paste_contents.insert(
@@ -2529,7 +2421,7 @@ impl App {
 
     /// Take the current input buffer, push it to history, and return it.
     pub fn take_input(&mut self) -> String {
-        let input = self.prompt_input.take();
+        let input = self.prompt_input.take_expanded();
         if !input.is_empty() {
             self.prompt_input.history.push(input.clone());
             self.prompt_input.history_pos = None;
@@ -4283,7 +4175,45 @@ impl App {
         false
     }
 
+    fn canonical_key_action(action: &str) -> &str {
+        match action {
+            // New namespaced vocabulary
+            "session.abort" => "interrupt",
+            "session.close" => "exit",
+            "view.repaint" => "redraw",
+            "history.overlay.open" => "historySearch",
+            "chat.submit" => "submit",
+            "history.entry.prev" => "historyPrev",
+            "history.entry.next" => "historyNext",
+            "transcript.scroll.up" => "scrollUp",
+            "transcript.scroll.down" => "scrollDown",
+            "suggestion.accept" => "indent",
+            "search.global.open" => "globalSearch",
+            "search.transcript.open" => "findInMessage",
+            "search.transcript.next" => "findNext",
+            "search.transcript.prev" => "findPrev",
+            "confirm.accept" => "yes",
+            "confirm.reject" => "no",
+            "confirm.prev" => "prevOption",
+            "confirm.next" => "nextOption",
+            "overlay.dismiss" => "close",
+            "history.result.select" => "select",
+            "history.result.cancel" => "cancel",
+            "history.result.prev" => "prevResult",
+            "history.result.next" => "nextResult",
+            "input.clear" => "clearLine",
+            "transcript.issue.next" => "jumpToNextError",
+            "transcript.issue.prev" => "jumpToPreviousError",
+            "transcript.jump.prev" => "previousMessage",
+            "transcript.jump.next" => "nextMessage",
+            "mode.cycle" => "reverseIndent",
+            "chat.submit.alt" => "sendMessage",
+            _ => action,
+        }
+    }
+
     fn handle_keybinding_action(&mut self, action: &str) -> bool {
+        let action = Self::canonical_key_action(action);
         match action {
             "interrupt" => {
                 let sel_text = self.selection_text.borrow().clone();

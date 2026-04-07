@@ -16,6 +16,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use crate::slash_commands::SlashCommandSpec;
 
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 107, 0); // #FF6B00 mango skin prompt accent
 const PROMPT_POINTER: &str = "\u{276f}";
@@ -1503,16 +1504,19 @@ pub struct TypeaheadSuggestion {
 }
 
 /// Compute typeahead suggestions for the current input.
-pub fn compute_typeahead(input: &str, slash_commands: &[(&str, &str)]) -> Vec<TypeaheadSuggestion> {
+pub fn compute_typeahead(
+    input: &str,
+    slash_commands: &[SlashCommandSpec],
+) -> Vec<TypeaheadSuggestion> {
     let mut suggestions = Vec::new();
 
     if let Some(cmd_prefix) = input.strip_prefix('/') {
         let prefix_lower = cmd_prefix.to_lowercase();
-        for (name, desc) in slash_commands {
-            if name.to_lowercase().starts_with(&prefix_lower) {
+        for cmd in slash_commands {
+            if cmd.name.to_lowercase().starts_with(&prefix_lower) {
                 suggestions.push(TypeaheadSuggestion {
-                    text: format!("/{}", name),
-                    description: desc.to_string(),
+                    text: format!("/{}", cmd.name),
+                    description: cmd.description.to_string(),
                     source: TypeaheadSource::SlashCommand,
                 });
             }
@@ -1526,8 +1530,8 @@ pub fn compute_typeahead(input: &str, slash_commands: &[(&str, &str)]) -> Vec<Ty
 // Paste handling
 // ---------------------------------------------------------------------------
 
-/// Handle a paste event. If the content is > 1024 bytes, returns a placeholder
-/// string `[Pasted text #N (+X lines)]` and the original content (for storage).
+/// Handle a paste event. If the content is > 1024 bytes, returns a neutral
+/// placeholder token and the original content (for storage).
 pub fn handle_paste(content: &str, paste_counter: &mut u32) -> (String, Option<String>) {
     if content.len() <= 1024 {
         return (content.to_string(), None);
@@ -1535,9 +1539,9 @@ pub fn handle_paste(content: &str, paste_counter: &mut u32) -> (String, Option<S
     *paste_counter += 1;
     let line_count = content.lines().count();
     let placeholder = if line_count > 1 {
-        format!("[Pasted text #{} (+{} lines)]", paste_counter, line_count)
+        format!("[Blob:{} lines={}]", paste_counter, line_count)
     } else {
-        format!("[Pasted text #{}]", paste_counter)
+        format!("[Blob:{}]", paste_counter)
     };
     (placeholder, Some(content.to_string()))
 }
@@ -2864,6 +2868,7 @@ impl PromptInputState {
         self.suggestion_index = None;
         self.history_pos = None;
         self.token_estimate = 0;
+        self.paste_contents.clear();
         self.vim_pending = VimPendingState::None;
         self.visual_anchor = None;
         self.vim_command_buf.clear();
@@ -2877,8 +2882,39 @@ impl PromptInputState {
         text
     }
 
+    /// Take current text with any generated paste placeholders expanded.
+    pub fn take_expanded(&mut self) -> String {
+        let mut text = self.text.clone();
+
+        // Expand in descending id order so nested/repeated markers remain stable.
+        let mut ids: Vec<u32> = self.paste_contents.keys().copied().collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+
+        for id in ids {
+            let Some(content) = self.paste_contents.get(&id) else {
+                continue;
+            };
+            let line_count = content.lines().count();
+
+            let blob_single = format!("[Blob:{}]", id);
+            let blob_multi = format!("[Blob:{} lines={}]", id, line_count);
+            let legacy_single = format!("[Pasted text #{}]", id);
+            let legacy_multi = format!("[Pasted text #{} +{} lines]", id, line_count);
+            let legacy_multi_paren = format!("[Pasted text #{} (+{} lines)]", id, line_count);
+
+            text = text.replace(&blob_single, content);
+            text = text.replace(&blob_multi, content);
+            text = text.replace(&legacy_single, content);
+            text = text.replace(&legacy_multi, content);
+            text = text.replace(&legacy_multi_paren, content);
+        }
+
+        self.clear();
+        text
+    }
+
     /// Update typeahead suggestions for the current text.
-    pub fn update_suggestions(&mut self, slash_commands: &[(&str, &str)]) {
+    pub fn update_suggestions(&mut self, slash_commands: &[SlashCommandSpec]) {
         self.suggestions = compute_typeahead(&self.text, slash_commands);
         if self.suggestions.is_empty() {
             self.suggestion_index = None;
@@ -3493,6 +3529,31 @@ mod tests {
     }
 
     #[test]
+    fn take_expanded_replaces_blob_refs() {
+        let mut s = PromptInputState::new();
+        s.text = "before [Blob:3] after".to_string();
+        s.cursor = s.text.len();
+        s.paste_contents.insert(3, "PASTED".to_string());
+
+        let taken = s.take_expanded();
+        assert_eq!(taken, "before PASTED after");
+        assert!(s.text.is_empty());
+        assert!(s.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn take_expanded_supports_legacy_paste_refs() {
+        let mut s = PromptInputState::new();
+        s.text = "[Pasted text #2 (+3 lines)]".to_string();
+        s.cursor = s.text.len();
+        s.paste_contents
+            .insert(2, "a\nb\nc".to_string());
+
+        let taken = s.take_expanded();
+        assert_eq!(taken, "a\nb\nc");
+    }
+
+    #[test]
     fn is_empty_trims_whitespace() {
         let mut s = PromptInputState::new();
         s.text = "   \n  ".to_string();
@@ -3517,7 +3578,7 @@ mod tests {
         let mut counter = 0u32;
         let big = "x".repeat(2000);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted text #1"));
+        assert_eq!(result, "[Blob:1]");
         assert!(stored.is_some());
         assert_eq!(counter, 1);
     }
@@ -3527,7 +3588,7 @@ mod tests {
         let mut counter = 0u32;
         let big = "line\n".repeat(300); // 1500 bytes, >1024
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.contains("+300 lines") || result.contains("lines"));
+        assert_eq!(result, "[Blob:1 lines=300]");
         assert!(stored.is_some());
     }
 
@@ -3545,9 +3606,9 @@ mod tests {
     #[test]
     fn typeahead_slash_prefix_matches() {
         let cmds = [
-            ("help", "Show help"),
-            ("history", "Show history"),
-            ("compact", "Compact"),
+            SlashCommandSpec { name: "help", description: "Show help", group: "test" },
+            SlashCommandSpec { name: "history", description: "Show history", group: "test" },
+            SlashCommandSpec { name: "compact", description: "Compact", group: "test" },
         ];
         let suggestions = compute_typeahead("/h", &cmds);
         assert_eq!(suggestions.len(), 2);
@@ -3557,14 +3618,14 @@ mod tests {
 
     #[test]
     fn typeahead_no_slash_returns_empty() {
-        let cmds = [("help", "Show help")];
+        let cmds = [SlashCommandSpec { name: "help", description: "Show help", group: "test" }];
         let suggestions = compute_typeahead("hello", &cmds);
         assert!(suggestions.is_empty());
     }
 
     #[test]
     fn typeahead_full_match() {
-        let cmds = [("compact", "Compact conversation")];
+        let cmds = [SlashCommandSpec { name: "compact", description: "Compact conversation", group: "test" }];
         let suggestions = compute_typeahead("/compact", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/compact");
@@ -3573,7 +3634,7 @@ mod tests {
 
     #[test]
     fn typeahead_case_insensitive() {
-        let cmds = [("Help", "Show help")];
+        let cmds = [SlashCommandSpec { name: "Help", description: "Show help", group: "test" }];
         let suggestions = compute_typeahead("/H", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/Help");
@@ -3585,9 +3646,9 @@ mod tests {
     fn suggestion_next_cycles() {
         let mut s = PromptInputState::new();
         let cmds = [
-            ("help", "Help"),
-            ("history", "History"),
-            ("compact", "Compact"),
+            SlashCommandSpec { name: "help", description: "Help", group: "test" },
+            SlashCommandSpec { name: "history", description: "History", group: "test" },
+            SlashCommandSpec { name: "compact", description: "Compact", group: "test" },
         ];
         s.text = "/h".to_string();
         s.update_suggestions(&cmds);
@@ -3602,7 +3663,7 @@ mod tests {
     #[test]
     fn accept_suggestion_fills_text() {
         let mut s = PromptInputState::new();
-        let cmds = [("help", "Show help")];
+        let cmds = [SlashCommandSpec { name: "help", description: "Show help", group: "test" }];
         s.text = "/he".to_string();
         s.update_suggestions(&cmds);
         s.suggestion_next();
