@@ -4,6 +4,8 @@ MangoCode is a Rust-powered terminal coding agent built for real-world developme
 
 This repo began from the Claurst clean-room effort and has since been heavily modified with substantial runtime, provider, UX, and architecture changes.
 
+<img width="2132" height="1124" alt="image" src="https://github.com/user-attachments/assets/27aec059-6f1c-4427-a727-1d4466c71e47" />
+
 ## Highlights
 
 - Provider flexibility without lock-in: use cloud and local models with one CLI (`/connect`, `/model`, `--provider`, `--model`).
