@@ -182,16 +182,48 @@ pub use voice_mode_notice::{render_voice_mode_notice, VoiceModeNoticeState};
 /// Initialize the mango mascot Sixel data for high-quality rendering.
 /// Uses the highest-fidelity inline image protocol available:
 /// Kitty (best) -> iTerm -> Sixel -> text fallback.
+fn suggested_mascot_inline_width() -> u32 {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((100, 30));
+
+    // Approximate the welcome-box left pane and keep mascot size bounded.
+    let left_cols = cols.saturating_div(2).clamp(16, 34);
+    let max_rows = rows.saturating_sub(10).clamp(4, 10);
+
+    let (cell_px_w, cell_px_h) = crossterm::terminal::window_size()
+        .ok()
+        .and_then(|ws| {
+            if ws.columns == 0 || ws.rows == 0 || ws.width == 0 || ws.height == 0 {
+                None
+            } else {
+                Some((
+                    ws.width as f32 / ws.columns as f32,
+                    ws.height as f32 / ws.rows as f32,
+                ))
+            }
+        })
+        .unwrap_or((8.0, 16.0));
+
+    // The embedded SVG viewBox is 282x339; use this to fit the mascot by rows.
+    let mascot_aspect = 339.0_f32 / 282.0_f32;
+    let width_from_cols = left_cols as f32 * cell_px_w * 0.80;
+    let width_from_rows = max_rows as f32 * cell_px_h / mascot_aspect * 0.72;
+
+    width_from_cols
+        .min(width_from_rows)
+        .round()
+        .clamp(120.0, 190.0) as u32
+}
+
 pub fn init_mascot(app: &mut App) {
     use crate::kitty_image::{detect_image_protocol, ImageProtocol};
+    let target_w = suggested_mascot_inline_width();
     app.mascot_sixel = match detect_image_protocol() {
-        ImageProtocol::Kitty => crate::rustle::encode_svg_as_kitty_apc()
-            .or_else(crate::rustle::encode_svg_as_iterm_osc1337)
-            .or_else(crate::rustle::encode_svg_as_sixel),
-        ImageProtocol::Iterm => {
-            crate::rustle::encode_svg_as_iterm_osc1337().or_else(crate::rustle::encode_svg_as_sixel)
-        }
-        ImageProtocol::Sixel => crate::rustle::encode_svg_as_sixel(),
+        ImageProtocol::Kitty => crate::rustle::encode_svg_as_kitty_apc_with_width(target_w)
+            .or_else(|| crate::rustle::encode_svg_as_iterm_osc1337_with_width(target_w))
+            .or_else(|| crate::rustle::encode_svg_as_sixel_with_width(target_w)),
+        ImageProtocol::Iterm => crate::rustle::encode_svg_as_iterm_osc1337_with_width(target_w)
+            .or_else(|| crate::rustle::encode_svg_as_sixel_with_width(target_w)),
+        ImageProtocol::Sixel => crate::rustle::encode_svg_as_sixel_with_width(target_w),
         ImageProtocol::Text => None,
     };
 }

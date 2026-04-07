@@ -35,9 +35,9 @@ const BRAILLE_FG_THRESHOLD_SQ: i32 = 64;
 
 /// Default raster target widths for inline-image protocols.
 /// Higher widths preserve more SVG detail at the cost of larger escape payloads.
-const INLINE_TARGET_W_SIXEL: u32 = 960;
-const INLINE_TARGET_W_KITTY: u32 = 1600;
-const INLINE_TARGET_W_ITERM: u32 = 1600;
+const INLINE_TARGET_W_SIXEL: u32 = 220;
+const INLINE_TARGET_W_KITTY: u32 = 260;
+const INLINE_TARGET_W_ITERM: u32 = 260;
 
 /// Horizontal stretch factor used for text-cell rendering fallback.
 /// Many Windows terminal fonts are effectively taller than the ideal 2:1 cell
@@ -158,9 +158,12 @@ fn render_svg_cropped_to_pixmap(
     crop: SvgCropRect,
     target_w: u32,
     target_h: u32,
+    fill_bg: bool,
 ) -> Option<resvg::tiny_skia::Pixmap> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(target_w, target_h)?;
-    pixmap.fill(resvg::tiny_skia::Color::from_rgba8(BG_R, BG_G, BG_B, 255));
+    if fill_bg {
+        pixmap.fill(resvg::tiny_skia::Color::from_rgba8(BG_R, BG_G, BG_B, 255));
+    }
 
     let sx = target_w as f32 / crop.w;
     let sy = target_h as f32 / crop.h;
@@ -188,7 +191,9 @@ fn rasterize_svg_rgba_for_inline(target_w: u32) -> Option<(Vec<u8>, u32, u32)> {
     let aspect = crop.h / crop.w;
     let target_h = (target_w as f32 * aspect).round() as u32;
 
-    let pixmap = render_svg_cropped_to_pixmap(tree, crop, target_w, target_h)?;
+    // Keep inline protocols transparent so mascot overlays don't paint a full
+    // opaque rectangle over the TUI during resize/redraw.
+    let pixmap = render_svg_cropped_to_pixmap(tree, crop, target_w, target_h, false)?;
     Some((pixmap.take(), target_w, target_h))
 }
 
@@ -196,7 +201,7 @@ fn inline_target_width(default_w: u32) -> u32 {
     std::env::var("MANGOCODE_MASCOT_INLINE_WIDTH")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .map(|w| w.clamp(128, 4096))
+        .map(|w| w.clamp(96, 2048))
         .unwrap_or(default_w)
 }
 
@@ -260,7 +265,7 @@ fn render_svg_quadrants(max_rows: u16) -> Vec<Line<'static>> {
     let pixel_w = pixel_w.max(4) & !1; // ensure even
     let pixel_h = pixel_h.max(4) & !1;
 
-    let pixmap = match render_svg_cropped_to_pixmap(tree, crop, pixel_w, pixel_h) {
+    let pixmap = match render_svg_cropped_to_pixmap(tree, crop, pixel_w, pixel_h, true) {
         Some(p) => p,
         None => return fallback_lines(),
     };
@@ -369,7 +374,7 @@ fn render_svg_braille(max_rows: u16) -> Vec<Line<'static>> {
     let pixel_h = (content_rows * 4).max(8);
     let pixel_w = ((pixel_h as f32 / aspect).round() as u32).max(4) & !1;
 
-    let pixmap = match render_svg_cropped_to_pixmap(tree, crop, pixel_w, pixel_h) {
+    let pixmap = match render_svg_cropped_to_pixmap(tree, crop, pixel_w, pixel_h, true) {
         Some(p) => p,
         None => return fallback_lines(),
     };
@@ -587,10 +592,15 @@ fn pixel_rgb(data: &[u8], width: u32, x: u32, y: u32) -> (u8, u8, u8) {
 /// Encode the SVG as a Sixel string for high-quality terminal rendering.
 /// Returns `None` if the SVG fails to parse/rasterize or Sixel encoding fails.
 pub fn encode_svg_as_sixel() -> Option<String> {
+    encode_svg_as_sixel_with_width(INLINE_TARGET_W_SIXEL)
+}
+
+/// Encode the SVG as a Sixel string using an explicit raster width.
+pub fn encode_svg_as_sixel_with_width(target_w: u32) -> Option<String> {
     use icy_sixel::{BackgroundMode, EncodeOptions, PixelAspectRatio, QuantizeMethod, SixelImage};
 
     // Render at a higher base resolution so the mascot keeps edge detail.
-    let target_w = inline_target_width(INLINE_TARGET_W_SIXEL);
+    let target_w = inline_target_width(target_w.clamp(96, 1024));
     let (rgba, target_w, target_h) = rasterize_svg_rgba_for_inline(target_w)?;
 
     // For flat-color SVG art, disabling diffusion keeps edges much crisper.
@@ -602,7 +612,7 @@ pub fn encode_svg_as_sixel() -> Option<String> {
 
     let sixel_image = SixelImage::from_rgba(rgba, target_w as usize, target_h as usize)
         .with_aspect_ratio(PixelAspectRatio::Square)
-        .with_background_mode(BackgroundMode::Opaque);
+        .with_background_mode(BackgroundMode::Transparent);
 
     // icy_sixel already returns the full DCS-wrapped SIXEL sequence.
     sixel_image.encode_with(&sixel_opts).ok()
@@ -629,8 +639,13 @@ fn encode_svg_png_base64(target_w: u32) -> Option<(String, usize)> {
 /// Encode the SVG as a Kitty graphics APC sequence for highest-resolution
 /// terminals that support the Kitty protocol.
 pub fn encode_svg_as_kitty_apc() -> Option<String> {
+    encode_svg_as_kitty_apc_with_width(INLINE_TARGET_W_KITTY)
+}
+
+/// Encode the SVG as a Kitty graphics APC sequence using an explicit raster width.
+pub fn encode_svg_as_kitty_apc_with_width(target_w: u32) -> Option<String> {
     // Kitty can comfortably handle a larger raster than Sixel.
-    let target_w = inline_target_width(INLINE_TARGET_W_KITTY);
+    let target_w = inline_target_width(target_w.clamp(128, 2048));
     let (b64, _) = encode_svg_png_base64(target_w)?;
     let mut out = String::new();
 
@@ -659,7 +674,12 @@ pub fn encode_svg_as_kitty_apc() -> Option<String> {
 /// Some terminals (and xterm-compatible emulators with image addons) support
 /// this protocol even when Kitty/Sixel are unavailable.
 pub fn encode_svg_as_iterm_osc1337() -> Option<String> {
-    let target_w = inline_target_width(INLINE_TARGET_W_ITERM);
+    encode_svg_as_iterm_osc1337_with_width(INLINE_TARGET_W_ITERM)
+}
+
+/// Encode the SVG as an iTerm/OSC 1337 inline image sequence using an explicit raster width.
+pub fn encode_svg_as_iterm_osc1337_with_width(target_w: u32) -> Option<String> {
+    let target_w = inline_target_width(target_w.clamp(128, 2048));
     let (b64, png_len) = encode_svg_png_base64(target_w)?;
 
     Some(format!(

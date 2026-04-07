@@ -1477,28 +1477,34 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Text fallback: quadrant-block SVG rendering.
+    // When the inline image is active, keep the same vertical reservation but
+    // do not draw the ASCII mascot underneath it.
     let rustle = rustle_lines_sized(mascot_max_rows);
-    // rustle_lines_sized() appends one blank spacer line; trim that here so
-    // we avoid double-padding beneath the mascot in compact layouts.
     let rustle_end = rustle
         .iter()
         .rposition(|line| !line.spans.iter().all(|span| span.content.is_empty()))
         .map(|idx| idx + 1)
         .unwrap_or(0);
-    let rustle_view = &rustle[..rustle_end];
 
-    let mascot_w = rustle_view.first().map_or(0, |l| {
-        l.spans
-            .iter()
-            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-            .sum::<usize>()
-    });
-    let mascot_indent = (left_w as usize).saturating_sub(mascot_w) / 2;
-    let pad = " ".repeat(mascot_indent);
-    for cl in rustle_view {
-        let mut spans = vec![Span::raw(pad.clone())];
-        spans.extend(cl.spans.iter().cloned());
-        left_lines.push(Line::from(spans));
+    if inline_image_ready {
+        for _ in 0..rustle_end {
+            left_lines.push(Line::from(""));
+        }
+    } else {
+        let rustle_view = &rustle[..rustle_end];
+        let mascot_w = rustle_view.first().map_or(0, |l| {
+            l.spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum::<usize>()
+        });
+        let mascot_indent = (left_w as usize).saturating_sub(mascot_w) / 2;
+        let pad = " ".repeat(mascot_indent);
+        for cl in rustle_view {
+            let mut spans = vec![Span::raw(pad.clone())];
+            spans.extend(cl.spans.iter().cloned());
+            left_lines.push(Line::from(spans));
+        }
     }
     if spacer_after_mascot > 0 {
         left_lines.push(Line::from(""));

@@ -2659,7 +2659,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     app.handle_mouse_event(mouse);
                 }
                 Event::Resize(_, _) => {
-                    // Terminal resize - will be handled on next draw
+                    let _ = terminal.clear();
+                    // Regenerate the mascot image at a bounded size for the new viewport.
+                    init_mascot(&mut app);
                 }
                 _ => {}
             }
