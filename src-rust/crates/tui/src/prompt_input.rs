@@ -3602,9 +3602,9 @@ mod tests {
     #[test]
     fn typeahead_slash_prefix_matches() {
         let cmds = [
-            SlashCommandSpec { name: "help", description: "Show help", group: "test" },
-            SlashCommandSpec { name: "history", description: "Show history", group: "test" },
-            SlashCommandSpec { name: "compact", description: "Compact", group: "test" },
+            SlashCommandSpec { name: "help".to_string(), description: "Show help".to_string(), group: "test".to_string() },
+            SlashCommandSpec { name: "history".to_string(), description: "Show history".to_string(), group: "test".to_string() },
+            SlashCommandSpec { name: "compact".to_string(), description: "Compact".to_string(), group: "test".to_string() },
         ];
         let suggestions = compute_typeahead("/h", &cmds);
         assert_eq!(suggestions.len(), 2);
@@ -3614,14 +3614,14 @@ mod tests {
 
     #[test]
     fn typeahead_no_slash_returns_empty() {
-        let cmds = [SlashCommandSpec { name: "help", description: "Show help", group: "test" }];
+        let cmds = [SlashCommandSpec { name: "help".to_string(), description: "Show help".to_string(), group: "test".to_string() }];
         let suggestions = compute_typeahead("hello", &cmds);
         assert!(suggestions.is_empty());
     }
 
     #[test]
     fn typeahead_full_match() {
-        let cmds = [SlashCommandSpec { name: "compact", description: "Compact conversation", group: "test" }];
+        let cmds = [SlashCommandSpec { name: "compact".to_string(), description: "Compact conversation".to_string(), group: "test".to_string() }];
         let suggestions = compute_typeahead("/compact", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/compact");
@@ -3630,7 +3630,7 @@ mod tests {
 
     #[test]
     fn typeahead_case_insensitive() {
-        let cmds = [SlashCommandSpec { name: "Help", description: "Show help", group: "test" }];
+        let cmds = [SlashCommandSpec { name: "Help".to_string(), description: "Show help".to_string(), group: "test".to_string() }];
         let suggestions = compute_typeahead("/H", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/Help");
@@ -3642,9 +3642,9 @@ mod tests {
     fn suggestion_next_cycles() {
         let mut s = PromptInputState::new();
         let cmds = [
-            SlashCommandSpec { name: "help", description: "Help", group: "test" },
-            SlashCommandSpec { name: "history", description: "History", group: "test" },
-            SlashCommandSpec { name: "compact", description: "Compact", group: "test" },
+            SlashCommandSpec { name: "help".to_string(), description: "Help".to_string(), group: "test".to_string() },
+            SlashCommandSpec { name: "history".to_string(), description: "History".to_string(), group: "test".to_string() },
+            SlashCommandSpec { name: "compact".to_string(), description: "Compact".to_string(), group: "test".to_string() },
         ];
         s.text = "/h".to_string();
         s.update_suggestions(&cmds);
@@ -3659,7 +3659,7 @@ mod tests {
     #[test]
     fn accept_suggestion_fills_text() {
         let mut s = PromptInputState::new();
-        let cmds = [SlashCommandSpec { name: "help", description: "Show help", group: "test" }];
+        let cmds = [SlashCommandSpec { name: "help".to_string(), description: "Show help".to_string(), group: "test".to_string() }];
         s.text = "/he".to_string();
         s.update_suggestions(&cmds);
         s.suggestion_next();

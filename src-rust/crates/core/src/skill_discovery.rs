@@ -2,9 +2,9 @@
 //! on disk and (optionally) from git URLs.
 //!
 //! Search priority (first match wins for a given skill name):
-//!   1. Project `.mangocode/skills/` — walk up from `cwd`
-//!   2. Project `.agents/skills/`  — walk up from `cwd`
-//!   3. Global `~/.mangocode/skills/`
+//!   1. Project `.mangocode/skills/` and `.mangocode/commands/` — walk up from `cwd`
+//!   2. Project `.agents/skills/` and `.agents/commands/` — walk up from `cwd`
+//!   3. Global `~/.mangocode/skills/` and `~/.mangocode/commands/`
 //!   4. Configured extra paths from `SkillsConfig.paths`
 //!   5. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
 
@@ -141,6 +141,7 @@ pub fn discover_skills(
 ) -> HashMap<String, DiscoveredSkill> {
     let mut all: HashMap<String, DiscoveredSkill> = HashMap::new();
     let mut warn_duplicates: Vec<String> = Vec::new();
+    let mut scanned_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     // Inline closure: insert a batch, warning on duplicates.
     let mut add = |skills: Vec<DiscoveredSkill>| {
@@ -158,12 +159,20 @@ pub fn discover_skills(
         }
     };
 
+    let mut scan_once = |path: PathBuf| {
+        if scanned_dirs.insert(path.clone()) {
+            add(scan_dir(&path));
+        }
+    };
+
     // ---- 1. Project skills: walk up from cwd --------------------------------
     {
         let mut dir: &Path = cwd;
         loop {
-            add(scan_dir(&dir.join(".mangocode").join("skills")));
-            add(scan_dir(&dir.join(".agents").join("skills")));
+            scan_once(dir.join(".mangocode").join("skills"));
+            scan_once(dir.join(".mangocode").join("commands"));
+            scan_once(dir.join(".agents").join("skills"));
+            scan_once(dir.join(".agents").join("commands"));
             match dir.parent() {
                 Some(parent) if parent != dir => dir = parent,
                 _ => break,
@@ -171,9 +180,10 @@ pub fn discover_skills(
         }
     }
 
-    // ---- 2. Global skills: ~/.mangocode/skills/ --------------------------------
+    // ---- 2. Global skills: ~/.mangocode/skills/ and commands/ ------------------
     if let Some(home) = dirs::home_dir() {
-        add(scan_dir(&home.join(".mangocode").join("skills")));
+        scan_once(home.join(".mangocode").join("skills"));
+        scan_once(home.join(".mangocode").join("commands"));
     }
 
     // ---- 3. Configured extra paths ------------------------------------------
@@ -184,7 +194,7 @@ pub fn discover_skills(
         } else {
             cwd.join(path)
         };
-        add(scan_dir(&path));
+        scan_once(path);
     }
 
     // ---- 4. Git URL skills (cached) -----------------------------------------
@@ -374,6 +384,23 @@ mod tests {
         let discovered = discover_skills(tmp.path(), &config);
         assert!(discovered.contains_key("myskill"));
         assert_eq!(discovered["myskill"].description, "Test");
+    }
+
+    #[test]
+    fn test_discover_from_project_commands_dir() {
+        let tmp = make_temp_dir();
+        let commands_dir = tmp.path().join(".mangocode").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        write_file(
+            &commands_dir,
+            "presentation.md",
+            "---\nname: presentation\ndescription: Deck skill\n---\nMake slides.",
+        );
+
+        let config = crate::config::SkillsConfig::default();
+        let discovered = discover_skills(tmp.path(), &config);
+        assert!(discovered.contains_key("presentation"));
+        assert_eq!(discovered["presentation"].description, "Deck skill");
     }
 
     #[test]

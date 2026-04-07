@@ -44,7 +44,7 @@ use std::io::Stdout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
-use crate::slash_commands::PROMPT_SLASH_COMMANDS;
+use crate::slash_commands::{prompt_slash_commands, SlashCommandSpec};
 
 const PASTE_BURST_PRINTABLE_GAP: Duration = Duration::from_millis(120);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -704,6 +704,8 @@ pub struct App {
     pub connect_dialog: DialogSelectState,
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
+    /// Slash-command metadata used by prompt typeahead and the command palette.
+    pub prompt_slash_commands: Vec<SlashCommandSpec>,
     /// Whether MangoCode was launched from the user's home directory.
     /// Shown as a startup notice: "Note: You have launched claude in your home directory…"
     pub home_dir_warning: bool,
@@ -977,6 +979,12 @@ impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        let project_root = config
+            .project_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let prompt_slash_commands = prompt_slash_commands(&project_root, &config.skills);
         Self {
             config,
             cost_tracker,
@@ -1407,18 +1415,19 @@ impl App {
                 DialogSelectState::new("Connect a Provider", items)
             },
             command_palette: {
-                let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
+                let items: Vec<SelectItem> = prompt_slash_commands
                     .iter()
                     .map(|cmd| SelectItem {
                         id: format!("/{}", cmd.name),
                         title: format!("/{}", cmd.name),
-                        description: cmd.description.to_string(),
-                        category: cmd.group.to_string(),
+                        description: cmd.description.clone(),
+                        category: cmd.group.clone(),
                         badge: None,
                     })
                     .collect();
                 DialogSelectState::new("Command Palette", items)
             },
+            prompt_slash_commands,
             home_dir_warning: false,
             output_style: "auto".to_string(),
             pr_number: None,
@@ -2504,7 +2513,7 @@ impl App {
 
     fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS);
+        self.prompt_input.update_suggestions(&self.prompt_slash_commands);
         self.sync_legacy_prompt_fields();
     }
 
