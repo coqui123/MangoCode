@@ -1530,19 +1530,18 @@ pub fn compute_typeahead(
 // Paste handling
 // ---------------------------------------------------------------------------
 
-/// Handle a paste event. If the content is > 1024 bytes, returns a neutral
-/// placeholder token and the original content (for storage).
+/// Handle a paste event. Multi-line pastes are collapsed into a placeholder
+/// `[Pasted text #N +X lines]`; single-line pastes are inserted inline.
 pub fn handle_paste(content: &str, paste_counter: &mut u32) -> (String, Option<String>) {
-    if content.len() <= 1024 {
+    // In raw terminal mode, newlines may arrive as \r, \r\n, or \n.
+    let line_count = content.split(|c: char| c == '\n' || c == '\r')
+        .filter(|s| !s.is_empty())
+        .count();
+    if line_count <= 1 {
         return (content.to_string(), None);
     }
     *paste_counter += 1;
-    let line_count = content.lines().count();
-    let placeholder = if line_count > 1 {
-        format!("[Blob:{} lines={}]", paste_counter, line_count)
-    } else {
-        format!("[Blob:{}]", paste_counter)
-    };
+    let placeholder = format!("[Pasted text #{} +{} lines]", paste_counter, line_count);
     (placeholder, Some(content.to_string()))
 }
 
@@ -3565,7 +3564,7 @@ mod tests {
     // ---- handle_paste ---------------------------------------------------
 
     #[test]
-    fn paste_small_content_inline() {
+    fn paste_single_line_inline() {
         let mut counter = 0u32;
         let (result, stored) = handle_paste("short text", &mut counter);
         assert_eq!(result, "short text");
@@ -3574,30 +3573,27 @@ mod tests {
     }
 
     #[test]
-    fn paste_large_content_placeholder() {
+    fn paste_multiline_placeholder() {
         let mut counter = 0u32;
-        let big = "x".repeat(2000);
-        let (result, stored) = handle_paste(&big, &mut counter);
-        assert_eq!(result, "[Blob:1]");
+        let (result, stored) = handle_paste("line1\nline2\nline3", &mut counter);
+        assert_eq!(result, "[Pasted text #1 +3 lines]");
         assert!(stored.is_some());
         assert_eq!(counter, 1);
     }
 
     #[test]
-    fn paste_large_multiline_placeholder() {
+    fn paste_cr_line_endings() {
         let mut counter = 0u32;
-        let big = "line\n".repeat(300); // 1500 bytes, >1024
-        let (result, stored) = handle_paste(&big, &mut counter);
-        assert_eq!(result, "[Blob:1 lines=300]");
+        let (result, stored) = handle_paste("line1\rline2\rline3", &mut counter);
+        assert_eq!(result, "[Pasted text #1 +3 lines]");
         assert!(stored.is_some());
     }
 
     #[test]
     fn paste_counter_increments() {
         let mut counter = 0u32;
-        let big = "x".repeat(2000);
-        handle_paste(&big, &mut counter);
-        handle_paste(&big, &mut counter);
+        handle_paste("a\nb", &mut counter);
+        handle_paste("c\nd", &mut counter);
         assert_eq!(counter, 2);
     }
 

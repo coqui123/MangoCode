@@ -5825,7 +5825,8 @@ mod tests {
 
         let submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!submit);
-        assert_eq!(app.prompt_input.text, "line 1\nline 2\nline 3\n");
+        // Multi-line paste is collapsed into a placeholder.
+        assert_eq!(app.prompt_input.text, "[Pasted text #1 +3 lines]\n");
     }
 
     #[test]
