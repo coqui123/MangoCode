@@ -1,4 +1,4 @@
-# Claude Code — Services, Context, State & Screens
+# MangoCode — Services, Context, State & Screens
 
 This document exhaustively covers all files in `src/services/`, `src/context/`, `src/bootstrap/state.ts`, `src/coordinator/`, `src/server/`, and `src/screens/`. Every exported symbol is listed with its full signature, key logic, configuration, and dependencies.
 
@@ -98,7 +98,7 @@ This document exhaustively covers all files in `src/services/`, `src/context/`, 
 
 **Path:** `src/bootstrap/state.ts`
 
-**Purpose:** The single global session state singleton for the entire Claude Code process. Acts as the authoritative source of truth for all per-session metrics, model configuration, telemetry handles, and feature flags. Designed as a strict leaf in the import DAG — imports nothing from `src/utils/` except via explicit safe indirection.
+**Purpose:** The single global session state singleton for the entire MangoCode process. Acts as the authoritative source of truth for all per-session metrics, model configuration, telemetry handles, and feature flags. Designed as a strict leaf in the import DAG — imports nothing from `src/utils/` except via explicit safe indirection.
 
 **Key Types Exported:**
 
@@ -249,7 +249,7 @@ export function setMainLoopModelOverride(model: ModelSetting | undefined): void
 
 **Path:** `src/coordinator/coordinatorMode.ts`
 
-**Purpose:** Implements multi-worker "coordinator mode" where Claude Code orchestrates multiple parallel subagents. Provides the system prompt, user context injection, mode detection, and session-resume alignment logic.
+**Purpose:** Implements multi-worker "coordinator mode" where MangoCode orchestrates multiple parallel subagents. Provides the system prompt, user context injection, mode detection, and session-resume alignment logic.
 
 **Exports:**
 
@@ -295,7 +295,7 @@ const INTERNAL_WORKER_TOOLS = new Set([
 
 **Path:** `src/server/types.ts`
 
-**Purpose:** Shared type definitions for the Claude Code server (direct-connect mode). Provides the Zod validation schema for session creation responses.
+**Purpose:** Shared type definitions for the MangoCode server (direct-connect mode). Provides the Zod validation schema for session creation responses.
 
 **Exports:**
 
@@ -342,7 +342,7 @@ export type SessionIndex = Record<string, SessionIndexEntry>
 
 **Path:** `src/server/createDirectConnectSession.ts`
 
-**Purpose:** Creates a session on a remote direct-connect Claude Code server. Posts to `/sessions`, validates response, returns a `DirectConnectConfig` ready for use by the REPL or headless runner.
+**Purpose:** Creates a session on a remote direct-connect MangoCode server. Posts to `/sessions`, validates response, returns a `DirectConnectConfig` ready for use by the REPL or headless runner.
 
 **Exports:**
 
@@ -378,7 +378,7 @@ export async function createDirectConnectSession(opts: {
 
 **Path:** `src/server/directConnectManager.ts`
 
-**Purpose:** WebSocket client for communicating with a remote direct-connect Claude Code server. Handles message routing, permission request/response, interrupt signals, and connection lifecycle.
+**Purpose:** WebSocket client for communicating with a remote direct-connect MangoCode server. Handles message routing, permission request/response, interrupt signals, and connection lifecycle.
 
 **Exports:**
 
@@ -685,12 +685,12 @@ export function isSinkKilled(sink: SinkName): boolean
 
 **Path:** `src/services/analytics/datadog.ts`
 
-**Purpose:** Datadog metrics and event logging integration for Claude Code analytics.
+**Purpose:** Datadog metrics and event logging integration for MangoCode analytics.
 
 **Key Logic:**
 - Sends events via `@datadog/datadog-ci` or direct HTTP to Datadog API
 - Disabled when `isAnalyticsDisabled()` returns true
-- Event namespace: `tengu_*` prefix for all Claude Code events
+- Event namespace: `tengu_*` prefix for all MangoCode events
 - Tags include version, platform, user type, session metadata
 
 ---
@@ -1014,7 +1014,7 @@ export async function listFilesCreatedAfter(
 
 **Path:** `src/services/api/firstTokenDate.ts`
 
-**Purpose:** Fetches and stores the date when the user first made a Claude Code API call.
+**Purpose:** Fetches and stores the date when the user first made a MangoCode API call.
 
 **Exports:**
 
@@ -1233,7 +1233,7 @@ export function resetPromptCacheBreakDetection(): void
 
 **Path:** `src/services/api/referral.ts`
 
-**Purpose:** Manages referral program eligibility, redemptions, and guest passes for Claude Code subscribers.
+**Purpose:** Manages referral program eligibility, redemptions, and guest passes for MangoCode subscribers.
 
 **Constants:**
 - `CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000` (24 hours)
@@ -1340,7 +1340,7 @@ export async function fetchUltrareviewQuota(): Promise<UltrareviewQuotaResponse 
 
 **Path:** `src/services/api/usage.ts`
 
-**Purpose:** Fetches usage statistics for the current user/organization from the Claude Code API.
+**Purpose:** Fetches usage statistics for the current user/organization from the MangoCode API.
 
 **Exports:**
 
@@ -1836,7 +1836,7 @@ export function getTimeBasedMCConfig(): TimeBasedMCConfig
 
 **Path:** `src/services/diagnosticTracking.ts`
 
-**Purpose:** Tracks file diagnostics (lint errors, type errors) before and after file edits to detect regressions introduced by Claude Code.
+**Purpose:** Tracks file diagnostics (lint errors, type errors) before and after file edits to detect regressions introduced by MangoCode.
 
 **Constants:**
 - `MAX_DIAGNOSTICS_SUMMARY_CHARS = 4000`
@@ -1902,7 +1902,7 @@ export async function logPermissionContextForAnts(
 
 **Path:** `src/services/MagicDocs/magicDocs.ts`
 
-**Purpose:** Auto-maintained markdown documentation files that stay in sync with code changes made by Claude Code.
+**Purpose:** Auto-maintained markdown documentation files that stay in sync with code changes made by MangoCode.
 
 **Key Logic:**
 - Monitors file edits and regenerates associated markdown docs
@@ -2006,7 +2006,7 @@ export function checkMockFastModeRateLimit(isFastModeActive?: boolean): MockHead
 
 **Path:** `src/services/preventSleep.ts`
 
-**Purpose:** Prevents system sleep while Claude Code tasks are running.
+**Purpose:** Prevents system sleep while MangoCode tasks are running.
 
 **Key Logic:**
 - Uses platform-specific APIs (caffeinate on macOS, systemd-inhibit on Linux)
@@ -2559,7 +2559,7 @@ type VersionLockInfo = {
 
 **Path:** `src/screens/REPL.tsx`
 
-**Purpose:** The main interactive REPL screen — the primary conversational UI that orchestrates the entire Claude Code interactive session.
+**Purpose:** The main interactive REPL screen — the primary conversational UI that orchestrates the entire MangoCode interactive session.
 
 **Key Logic:**
 - Manages the full conversation lifecycle: user input → API query → tool execution → response display

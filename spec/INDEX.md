@@ -1,4 +1,4 @@
-# Claude Code — Spec Index
+# MangoCode — Spec Index
 
 > Quick-reference index across all spec documents.
 > Total spec coverage: ~990 KB across 15 markdown files.
@@ -115,8 +115,8 @@
 
 ## Architecture in One Paragraph
 
-Claude Code is a terminal AI coding assistant built as a React application running in a custom terminal UI framework (Ink, a React reconciler targeting terminal output with Yoga flexbox layout). The main loop (`query.ts` + `QueryEngine.ts`) streams responses from the Claude API, executes tools with user permission, and manages a 200K-token context window with automatic compaction. It has 100+ slash commands, 40+ tools (file I/O, shell, web, agents, MCP), a multi-agent system for parallel task execution, a memory system for long-term context, voice input, IDE integration via a bridge protocol (WebSocket/SSE), and a plugin/skills marketplace. The codebase is being rewritten in Rust (`claude-code-rust/`) as a complete standalone reimplementation.
+MangoCode is a terminal AI coding assistant built as a React application running in a custom terminal UI framework (Ink, a React reconciler targeting terminal output with Yoga flexbox layout). The main loop (`query.ts` + `QueryEngine.ts`) streams responses from the Claude API, executes tools with user permission, and manages a 200K-token context window with automatic compaction. It has 100+ slash commands, 40+ tools (file I/O, shell, web, agents, MCP), a multi-agent system for parallel task execution, a memory system for long-term context, voice input, IDE integration via a bridge protocol (WebSocket/SSE), and a plugin/skills marketplace. The codebase is being rewritten in Rust (`claude-code-rust/`) as a complete standalone reimplementation.
 
 ---
 
-*Generated 2026-03-31 from Claude Code source analysis.*
+*Generated 2026-03-31 from MangoCode source analysis.*

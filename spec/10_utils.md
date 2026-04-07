@@ -1,4 +1,4 @@
-# Claude Code — Utilities
+# MangoCode — Utilities
 
 This document covers the entire `src/utils/` directory (564 files across 36 subdirectories) plus `src/interactiveHelpers.tsx` and `src/ink.ts`.
 
@@ -814,7 +814,7 @@ export function isIgnoredByGitignore(path: string, cwd: string): boolean
 Git diff parsing and formatting utilities.
 
 ### `gitSettings.ts`
-Git configuration utilities for Claude Code settings.
+Git configuration utilities for MangoCode settings.
 
 ### `ghPrStatus.ts`
 GitHub PR status checking via `gh` CLI.
@@ -841,7 +841,7 @@ Git worktree management utilities.
 Feature flag check for worktree mode.
 
 ### `commitAttribution.ts`
-Adds Claude Code attribution to git commits.
+Adds MangoCode attribution to git commits.
 
 ---
 
@@ -910,7 +910,7 @@ Search within session transcripts.
 Handles resuming sessions across different project directories.
 
 ### `concurrentSessions.ts`
-Manages multiple concurrent Claude Code sessions.
+Manages multiple concurrent MangoCode sessions.
 
 ### `cwd.ts`
 ```typescript
@@ -1623,7 +1623,7 @@ export async function teleportToRemote(
   options: TeleportOptions,
   root: Root
 ): Promise<TeleportResult>
-// Launches a remote Claude Code session via CCR
+// Launches a remote MangoCode session via CCR
 ```
 
 ---
@@ -1715,7 +1715,7 @@ Type-safe tagged ID types (prevents mixing SessionId, AgentId, etc.).
 Native binary installation utilities.
 
 ### `localInstaller.ts`
-Installs Claude Code to local paths.
+Installs MangoCode to local paths.
 
 ### `autoUpdater.ts`
 Auto-update checking and installation.
@@ -1958,7 +1958,7 @@ export async function exitWithMessage(
 
 ## 33. `ink.ts` (Top-Level Module)
 
-The public API for the Ink terminal rendering framework used throughout Claude Code.
+The public API for the Ink terminal rendering framework used throughout MangoCode.
 
 **Purpose:** Wraps the internal `ink/root.ts` with a `ThemeProvider` so every render is automatically themed.
 

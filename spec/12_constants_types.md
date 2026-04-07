@@ -1,6 +1,6 @@
-# Claude Code — Constants, Types & Configuration
+# MangoCode — Constants, Types & Configuration
 
-This document exhaustively catalogs every constant, type, interface, and configuration value defined across the `constants/` directory, key root-level files (`Tool.ts`, `Task.ts`), and the `types/` directory of the Claude Code CLI codebase.
+This document exhaustively catalogs every constant, type, interface, and configuration value defined across the `constants/` directory, key root-level files (`Tool.ts`, `Task.ts`), and the `types/` directory of the MangoCode CLI codebase.
 
 ---
 
@@ -82,7 +82,7 @@ This document exhaustively catalogs every constant, type, interface, and configu
 
 | Constant | Value | Description |
 |---|---|---|
-| `CLAUDE_CODE_20250219_BETA_HEADER` | `'claude-code-20250219'` | Core Claude Code beta header. |
+| `CLAUDE_CODE_20250219_BETA_HEADER` | `'claude-code-20250219'` | Core MangoCode beta header. |
 | `INTERLEAVED_THINKING_BETA_HEADER` | `'interleaved-thinking-2025-05-14'` | Enables interleaved thinking (extended reasoning within tool use). |
 | `CONTEXT_1M_BETA_HEADER` | `'context-1m-2025-08-07'` | Enables 1M token context window. |
 | `CONTEXT_MANAGEMENT_BETA_HEADER` | `'context-management-2025-06-27'` | Context management features. |
@@ -290,13 +290,13 @@ Detects binary content by inspecting up to 8192 bytes (`BINARY_CHECK_SIZE`):
 
 | Constant | Value | Description |
 |---|---|---|
-| `PR_TITLE` | `'Add Claude Code GitHub Workflow'` | Title of the PR created when installing the GitHub app workflow. |
+| `PR_TITLE` | `'Add MangoCode GitHub Workflow'` | Title of the PR created when installing the GitHub app workflow. |
 | `GITHUB_ACTION_SETUP_DOCS_URL` | `'https://github.com/anthropics/claude-code-action/blob/main/docs/setup.md'` | Link to setup documentation. |
 
 ### Template Constants
 
 **`WORKFLOW_CONTENT`** — `string`
-A complete GitHub Actions YAML workflow file (`name: Claude Code`) that:
+A complete GitHub Actions YAML workflow file (`name: MangoCode`) that:
 - Triggers on: `issue_comment` (created), `pull_request_review_comment` (created), `issues` (opened, assigned), `pull_request_review` (submitted).
 - Condition: Only runs when `@claude` is mentioned in the relevant event body.
 - Runs on: `ubuntu-latest`.
@@ -304,10 +304,10 @@ A complete GitHub Actions YAML workflow file (`name: Claude Code`) that:
 - Steps: `actions/checkout@v4` (depth 1), then `anthropics/claude-code-action@v1` with `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
 
 **`PR_BODY`** — `string`
-Markdown body for the installation PR. Explains what Claude Code is, how the workflow functions, security considerations (API key as secret, write-access restriction, Actions run history), and how to configure additional allowed tools.
+Markdown body for the installation PR. Explains what MangoCode is, how the workflow functions, security considerations (API key as secret, write-access restriction, Actions run history), and how to configure additional allowed tools.
 
 **`CODE_REVIEW_PLUGIN_WORKFLOW_CONTENT`** — `string`
-A GitHub Actions YAML workflow for automated code review (`name: Claude Code Review`):
+A GitHub Actions YAML workflow for automated code review (`name: MangoCode Review`):
 - Triggers on: `pull_request` events (opened, synchronize, ready_for_review, reopened).
 - Uses `anthropics/claude-code-action@v1` with the `code-review@claude-code-plugins` plugin from the `https://github.com/anthropics/claude-code.git` marketplace.
 - Runs the `/code-review:code-review` command on the PR.
@@ -492,7 +492,7 @@ type OutputStyles = {
 
 ### Built-In Output Styles (`OUTPUT_STYLE_CONFIG`)
 
-**`default`:** `null` — No customization; standard Claude Code behavior.
+**`default`:** `null` — No customization; standard MangoCode behavior.
 
 **`Explanatory`:**
 - Source: `'built-in'`
@@ -554,13 +554,13 @@ Returns the full URL to view a remote session at `${baseUrl}/code/${compatId}`. 
 ## 14. System Prompts
 
 **File:** `constants/prompts.ts`
-**Purpose:** Core system prompt generation for all Claude Code session types.
+**Purpose:** Core system prompt generation for all MangoCode session types.
 
 ### URL Constants
 
 | Constant | Value | Description |
 |---|---|---|
-| `CLAUDE_CODE_DOCS_MAP_URL` | `'https://code.claude.com/docs/en/claude_code_docs_map.md'` | URL for Claude Code documentation map. |
+| `CLAUDE_CODE_DOCS_MAP_URL` | `'https://code.claude.com/docs/en/claude_code_docs_map.md'` | URL for MangoCode documentation map. |
 | `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` | `'__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__'` | Boundary marker separating static (cross-org cacheable) content from dynamic content. Everything BEFORE this in the system prompt array can use `scope: 'global'`. |
 
 ### Model Configuration (Internal)
@@ -589,8 +589,8 @@ These are internal constants used within the prompts but not exported:
 
 ```typescript
 type CLISyspromptPrefix =
-  | "You are Claude Code, Anthropic's official CLI for Claude."
-  | "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+  | "You are MangoCode, Anthropic's official CLI for Claude."
+  | "You are MangoCode, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
   | "You are a Claude agent, built on Anthropic's Claude Agent SDK."
 ```
 
@@ -607,7 +607,7 @@ type CLISyspromptPrefix =
 **`DEFAULT_AGENT_PROMPT`** — `string`
 
 ```
-You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's
+You are an agent for MangoCode, Anthropic's official CLI for Claude. Given the user's
 message, you should use the tools available to complete the task. Complete the task fully—
 don't gold-plate, but don't leave it half-done. When you complete the task, respond with
 a concise report covering what was done and any key findings — the caller will relay this
@@ -678,13 +678,13 @@ later in your response, as the original tool result may be cleared later.
 ### Key Functions
 
 **`getSystemPrompt(tools, model, additionalWorkingDirectories?, mcpClients?): Promise<string[]>`**
-Main entry point for system prompt generation. Returns `['You are Claude Code...\nCWD: ...\nDate: ...']` when `CLAUDE_CODE_SIMPLE=1`.
+Main entry point for system prompt generation. Returns `['You are MangoCode...\nCWD: ...\nDate: ...']` when `CLAUDE_CODE_SIMPLE=1`.
 
 **`computeEnvInfo(modelId, additionalWorkingDirectories?): Promise<string>`**
 Generates the `<env>` block in legacy format for subagent system prompts.
 
 **`computeSimpleEnvInfo(modelId, additionalWorkingDirectories?): Promise<string>`**
-Generates the `# Environment` section for main system prompts (includes worktree warning, model IDs reference, Claude Code availability info, Fast Mode note).
+Generates the `# Environment` section for main system prompts (includes worktree warning, model IDs reference, MangoCode availability info, Fast Mode note).
 
 **`enhanceSystemPromptWithEnvDetails(existingSystemPrompt, model, ...): Promise<string[]>`**
 Enhances an existing system prompt (from `--system-prompt`) with notes and environment info for subagents. Notes include:
@@ -732,8 +732,8 @@ Returns spinner verbs respecting user configuration from settings:
 
 Three possible prefix values (exported via `CLI_SYSPROMPT_PREFIXES` set):
 
-1. `DEFAULT_PREFIX`: `"You are Claude Code, Anthropic's official CLI for Claude."` — Used for interactive sessions and Vertex AI.
-2. `AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX`: `"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."` — Non-interactive with `appendSystemPrompt`.
+1. `DEFAULT_PREFIX`: `"You are MangoCode, Anthropic's official CLI for Claude."` — Used for interactive sessions and Vertex AI.
+2. `AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX`: `"You are MangoCode, Anthropic's official CLI for Claude, running within the Claude Agent SDK."` — Non-interactive with `appendSystemPrompt`.
 3. `AGENT_SDK_PREFIX`: `"You are a Claude agent, built on Anthropic's Claude Agent SDK."` — Non-interactive without `appendSystemPrompt`.
 
 ### Attribution Header

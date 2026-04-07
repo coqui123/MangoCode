@@ -1,4 +1,4 @@
-# Claude Code — React Hooks
+# MangoCode — React Hooks
 
 This document covers every hook in `src/hooks/`, `src/hooks/toolPermission/`, and `src/hooks/notifs/`. For each hook the entry covers: purpose, parameters/props, return value, key logic and side effects, and dependencies.
 
@@ -1284,7 +1284,7 @@ This document covers every hook in `src/hooks/`, `src/hooks/toolPermission/`, an
 
 **File:** `hooks/useRemoteSession.ts`
 
-**Purpose:** Full CCR (Claude Code Remote) WebSocket session management. Handles bidirectional message conversion, streaming tool uses, permission request/response flow, response timeout detection, session title updates, and subagent task counting.
+**Purpose:** Full CCR (MangoCode Remote) WebSocket session management. Handles bidirectional message conversion, streaming tool uses, permission request/response flow, response timeout detection, session title updates, and subagent task counting.
 
 **Parameters:** Large props object including:
 - `config: AppConfig`
@@ -1898,7 +1898,7 @@ All hooks in `notifs/` use `useNotifications()` from `context/notifications.js` 
 
 **File:** `hooks/notifs/useNpmDeprecationNotification.tsx`
 
-**Purpose:** Shows a 15-second warning notification when Claude Code is running via an npm install (deprecated) rather than the native installer.
+**Purpose:** Shows a 15-second warning notification when MangoCode is running via an npm install (deprecated) rather than the native installer.
 
 **Key Logic:**
 - Skips if `isInBundledMode()` or `DISABLE_INSTALLATION_CHECKS` env var is set.

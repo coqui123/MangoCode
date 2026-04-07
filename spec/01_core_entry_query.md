@@ -1,4 +1,4 @@
-# Claude Code — Core Entry Points & Query System
+# MangoCode — Core Entry Points & Query System
 
 ## Table of Contents
 
@@ -366,7 +366,7 @@ Internal: `doInitializeTelemetry()` → `setMeterState()` → `initializeTelemet
 
 ### Purpose
 
-Starts Claude Code as an MCP (Model Context Protocol) server, exposing Claude's built-in tools over the `stdio` transport. Server name: `claude/tengu`.
+Starts MangoCode as an MCP (Model Context Protocol) server, exposing Claude's built-in tools over the `stdio` transport. Server name: `claude/tengu`.
 
 ### Exports
 
@@ -418,7 +418,7 @@ For each tool:
 
 ### Purpose
 
-The main entrypoint for Claude Code Agent SDK types. Re-exports all public SDK types and declares stub functions that throw `'not implemented'` — actual implementations are provided by the real SDK runtime (the CLI process). This file is the type-only interface for SDK consumers.
+The main entrypoint for MangoCode Agent SDK types. Re-exports all public SDK types and declares stub functions that throw `'not implemented'` — actual implementations are provided by the real SDK runtime (the CLI process). This file is the type-only interface for SDK consumers.
 
 ### Exports
 
@@ -1569,7 +1569,7 @@ Short-circuits on `hasCompletedProjectOnboarding: true` in cached config (avoids
 
 ### Purpose
 
-The single module-level state singleton for a Claude Code process. **DO NOT ADD MORE STATE HERE** (documented with triple comment emphasis). Contains all session-scoped values including costs, tokens, model configuration, telemetry, agent state, and session identity.
+The single module-level state singleton for a MangoCode process. **DO NOT ADD MORE STATE HERE** (documented with triple comment emphasis). Contains all session-scoped values including costs, tokens, model configuration, telemetry, agent state, and session identity.
 
 ### State Structure
 

@@ -1,4 +1,4 @@
-# Claude Code — Bridge Protocol, CLI Framework & Remote Systems
+# MangoCode — Bridge Protocol, CLI Framework & Remote Systems
 
 ## Table of Contents
 
@@ -33,7 +33,7 @@
 
 ## 1. Bridge System Overview
 
-The "Bridge" (Remote Control) system allows a local Claude Code CLI session to be driven from the claude.ai web application. It creates a bidirectional communication channel between the running CLI process and the cloud backend (CCR — Cloud Code Runner).
+The "Bridge" (Remote Control) system allows a local MangoCode CLI session to be driven from the claude.ai web application. It creates a bidirectional communication channel between the running CLI process and the cloud backend (CCR — Cloud Code Runner).
 
 ### Architecture: Two Bridge Variants
 
@@ -1486,7 +1486,7 @@ enrollTrustedDevice(): Promise<void>
 
 **Token precedence:** `CLAUDE_TRUSTED_DEVICE_TOKEN` env var > keychain.
 
-**Enrollment:** `POST /api/auth/trusted_devices` with display name `"Claude Code on {hostname()} · {platform}"`. Must be called within 10 minutes of login. Best-effort — never throws. On success, persists to keychain and clears memo cache.
+**Enrollment:** `POST /api/auth/trusted_devices` with display name `"MangoCode on {hostname()} · {platform}"`. Must be called within 10 minutes of login. Best-effort — never throws. On success, persists to keychain and clears memo cache.
 
 ### codeSessionApi.ts
 
@@ -2109,7 +2109,7 @@ Enroll device for elevated security sessions.
 
 **Request:**
 ```json
-{ "display_name": "Claude Code on hostname · darwin" }
+{ "display_name": "MangoCode on hostname · darwin" }
 ```
 
 **Response:**
@@ -2230,4 +2230,4 @@ All NDJSON-format messages (used in child process stdio) must escape `U+2028` an
 
 ---
 
-*Document generated from source analysis of Claude Code codebase, 2026-03-31.*
+*Document generated from source analysis of MangoCode codebase, 2026-03-31.*

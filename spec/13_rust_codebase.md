@@ -1,8 +1,8 @@
-# Claude Code — Rust Codebase
+# MangoCode — Rust Codebase
 
 ## Overview
 
-The Rust codebase at `claude-code-rust/` is a **complete standalone rewrite** of the TypeScript Claude Code CLI in async Rust. It is not an FFI binding layer, not a partial port, and shares no runtime code with the TypeScript implementation. It re-implements the same tool names and semantics, permission model, CLAUDE.md discovery, auto-compact logic, MCP (Model Context Protocol) client, bridge protocol, and cron scheduler — all in async Rust using the Tokio runtime.
+The Rust codebase at `claude-code-rust/` is a **complete standalone rewrite** of the TypeScript MangoCode CLI in async Rust. It is not an FFI binding layer, not a partial port, and shares no runtime code with the TypeScript implementation. It re-implements the same tool names and semantics, permission model, CLAUDE.md discovery, auto-compact logic, MCP (Model Context Protocol) client, bridge protocol, and cron scheduler — all in async Rust using the Tokio runtime.
 
 ### Architecture
 
@@ -308,7 +308,7 @@ working_dir: String
 **Session transcript storage:**
 - `session_storage.rs` writes transcript JSONL files under `~/.claude/projects/<encoded_project_root>/`.
 - `transcript_dir(project_root)` sanitizes the absolute path by replacing `/`, `\`, `:`, ` `, `~`, and `_` with `-`, producing portable directory names like `-Users-alice-my-project`.
-- This is compatible with the existing Claude Code project/session discovery layout and avoids requiring base64 decoding in the Rust port.
+- This is compatible with the existing MangoCode project/session discovery layout and avoids requiring base64 decoding in the Rust port.
 
 ### Module: `cost`
 
@@ -1386,7 +1386,7 @@ Manages multiple named MCP server connections.
 
 **Path:** `crates/bridge/src/lib.rs`
 
-Implements the bridge protocol connecting the local Claude Code CLI to the claude.ai web UI. Enables remote control of the CLI from a browser session.
+Implements the bridge protocol connecting the local MangoCode CLI to the claude.ai web UI. Enables remote control of the CLI from a browser session.
 
 ### Configuration
 
@@ -1556,7 +1556,7 @@ Interactive TUI REPL:
 ### System Prompt (`system_prompt.txt`)
 
 Embedded in binary at compile time. Content:
-> You are Claude Code, an AI coding assistant by Anthropic.
+> You are MangoCode, an AI coding assistant by Anthropic.
 
 Guidelines:
 - Read files before editing them

@@ -1,8 +1,8 @@
-# Claude Code — Ink Terminal Rendering System
+# MangoCode — Ink Terminal Rendering System
 
 ## Overview
 
-The ink directory contains a complete, custom terminal UI framework built on top of React. It is a heavily modified and extended fork of the open-source Ink library, tuned for Claude Code's requirements: fullscreen alternate-screen rendering, hardware-accelerated scroll, text selection, search highlighting, mouse tracking, bidirectional text, and fine-grained performance instrumentation.
+The ink directory contains a complete, custom terminal UI framework built on top of React. It is a heavily modified and extended fork of the open-source Ink library, tuned for MangoCode's requirements: fullscreen alternate-screen rendering, hardware-accelerated scroll, text selection, search highlighting, mouse tracking, bidirectional text, and fine-grained performance instrumentation.
 
 The system can be summarized as a pipeline:
 
@@ -863,7 +863,7 @@ Utility functions: `defaultStyle()`, `stylesEqual(a, b)`, `colorsEqual(a, b)`.
 - `getClipboardPath()` — `'native' | 'tmux-buffer' | 'osc52'` without side effects
 - `tmuxLoadBuffer(text)` — async: runs `tmux load-buffer [-w] -`
 - `tabStatus({indicator, status, statusColor})` / `CLEAR_TAB_STATUS` — OSC 21337 tab chrome
-- `supportsTabStatus()` — detects iTerm2 / Claude Code terminal from env
+- `supportsTabStatus()` — detects iTerm2 / MangoCode terminal from env
 - `CLEAR_ITERM2_PROGRESS` — clears iTerm2 progress bar
 
 **Clipboard path decision:**

@@ -1,4 +1,4 @@
-# Claude Code — Components: Agents, Permissions, Design System & Feature Modules
+# MangoCode — Components: Agents, Permissions, Design System & Feature Modules
 
 This document provides an exhaustive spec for all components in the `src/components/` subdirectories covering agents management, permission UIs, the design system primitives, and the many feature-specific modules (MCP, memory, tasks, teams, diff, grove, hooks, HelpV2, TrustDialog, ManagedSettingsSecurityDialog, ClaudeCodeHint, HighlightedCode, LogoV2, DesktopUpsell, FeedbackSurvey, LspRecommendation, Passes, Spinner, PromptInput, CustomSelect, Settings, sandbox, shell, skills, ui, wizard).
 
@@ -1522,7 +1522,7 @@ Background task and remote session monitoring UI.
 | `BackgroundTasksDialog.tsx` | Full dialog listing all background tasks |
 | `DreamDetailDialog.tsx` | Detail for a "dream" (autoDream background consolidation) task |
 | `InProcessTeammateDetailDialog.tsx` | Detail for an in-process swarm teammate |
-| `RemoteSessionDetailDialog.tsx` | Detail for a remote Claude Code session |
+| `RemoteSessionDetailDialog.tsx` | Detail for a remote MangoCode session |
 | `RemoteSessionProgress.tsx` | Progress display for remote session activity |
 | `ShellDetailDialog.tsx` | Detail for a shell background task |
 | `ShellProgress.tsx` | Progress line for shell commands |

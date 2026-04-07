@@ -1,4 +1,4 @@
-# Claude Code — Components: Core & Messages
+# MangoCode — Components: Core & Messages
 
 This document covers every component in `src/components/` (top-level files) and `src/components/messages/` (including `UserToolResultMessage/` sub-directory).
 
@@ -151,7 +151,7 @@ Global state is accessed via `useAppState`, `useSetAppState`, `useAppStateStore`
 
 **Key state:** `useNativeInstaller: boolean | null`, `isPackageManager: boolean | null`
 
-**Key behavior:** Renders `PackageManagerAutoUpdater`, `NativeAutoUpdater`, or `AutoUpdater` depending on how Claude Code was installed.
+**Key behavior:** Renders `PackageManagerAutoUpdater`, `NativeAutoUpdater`, or `AutoUpdater` depending on how MangoCode was installed.
 
 ---
 
@@ -1248,7 +1248,7 @@ Global state is accessed via `useAppState`, `useSetAppState`, `useAppStateStore`
 
 ### PackageManagerAutoUpdater.tsx
 
-**Purpose:** Notifies users about available updates when Claude Code was installed via a package manager (brew, pip, etc.).
+**Purpose:** Notifies users about available updates when MangoCode was installed via a package manager (brew, pip, etc.).
 
 **Exports:** `PackageManagerAutoUpdater`
 
@@ -1340,7 +1340,7 @@ Global state is accessed via `useAppState`, `useSetAppState`, `useAppStateStore`
 
 ### ResumeTask.tsx
 
-**Purpose:** Lists remote Claude Code sessions (from Sessions API) for resuming. Filters by current git repository.
+**Purpose:** Lists remote MangoCode sessions (from Sessions API) for resuming. Filters by current git repository.
 
 **Exports:** `ResumeTask`
 
@@ -1791,7 +1791,7 @@ Global state is accessed via `useAppState`, `useSetAppState`, `useAppStateStore`
 | `onSubmit` | `(selectedWorkflows: Workflow[]) => void` | yes | Called with selected workflows |
 | `defaultSelections` | `Workflow[]` | yes | Initially selected workflows |
 
-**Workflows:** `claude` (@Claude Code tag), `claude-review` (automated PR review)
+**Workflows:** `claude` (@MangoCode tag), `claude-review` (automated PR review)
 
 ---
 

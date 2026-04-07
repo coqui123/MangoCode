@@ -1,4 +1,4 @@
-# Claude Code — Special Systems: Buddy, Memory, Keybindings, Skills, Voice, Plugins & More
+# MangoCode — Special Systems: Buddy, Memory, Keybindings, Skills, Voice, Plugins & More
 
 ---
 
@@ -452,7 +452,7 @@ Formats headers as text manifest for the selector prompt:
 
 **System prompt used for selection:**
 ```
-You are selecting memories that will be useful to Claude Code as it processes a user's query.
+You are selecting memories that will be useful to MangoCode as it processes a user's query.
 Return a list of filenames for the memories that will clearly be useful (up to 5).
 Only include memories you are certain will be helpful. Be selective and discerning.
 - If unsure, do not include it.
@@ -640,7 +640,7 @@ All exports used in system prompt construction:
 
 ### 3.1 System Overview
 
-The keybindings system provides a fully configurable keyboard shortcut layer for Claude Code. Users can customize bindings via `~/.claude/keybindings.json` (gated on `tengu_keybinding_customization_release` GrowthBook feature). The system supports:
+The keybindings system provides a fully configurable keyboard shortcut layer for MangoCode. Users can customize bindings via `~/.claude/keybindings.json` (gated on `tengu_keybinding_customization_release` GrowthBook feature). The system supports:
 - Single-keystroke bindings
 - Multi-keystroke chords (e.g., `ctrl+x ctrl+k`)
 - Context-scoped bindings (Chat, Global, Confirmation, etc.)
@@ -948,7 +948,7 @@ type KeybindingWarning = {
 **`MACOS_RESERVED`** (macOS only, all errors):
 - `cmd+c/v/x/q/w/tab/space`
 
-Note: `ctrl+s` (XOFF) and `ctrl+q` (XON) are intentionally NOT in reserved list — modern terminals disable flow control and Claude Code uses `ctrl+s` for stash.
+Note: `ctrl+s` (XOFF) and `ctrl+q` (XON) are intentionally NOT in reserved list — modern terminals disable flow control and MangoCode uses `ctrl+s` for stash.
 
 ---
 
@@ -1049,7 +1049,7 @@ type BundledSkillDefinition = {
 
 | Skill | Feature Gate | Description |
 |-------|-------------|-------------|
-| `updateConfig` | — | Update Claude Code configuration |
+| `updateConfig` | — | Update MangoCode configuration |
 | `keybindings` | — | Manage keyboard shortcuts |
 | `verify` | — | Verify work / run checks |
 | `debug` | — | Debug assistance |
@@ -1098,7 +1098,7 @@ The loader handles:
 
 ### 5.1 System Overview
 
-Voice mode enables hold-to-talk interaction with Claude Code using a push-to-talk model. Voice requires:
+Voice mode enables hold-to-talk interaction with MangoCode using a push-to-talk model. Voice requires:
 1. OAuth authentication (uses `voice_stream` endpoint on claude.ai)
 2. GrowthBook feature flag `VOICE_MODE`
 3. Kill-switch gate: `tengu_amber_quartz_disabled` (negative flag)
@@ -1135,7 +1135,7 @@ Voice mode enables hold-to-talk interaction with Claude Code using a push-to-tal
 
 ### 6.1 System Overview
 
-Plugins extend Claude Code with additional skills, hooks, MCP servers, LSP servers, and output styles. There are two plugin categories:
+Plugins extend MangoCode with additional skills, hooks, MCP servers, LSP servers, and output styles. There are two plugin categories:
 1. **Built-in plugins** — ship with the CLI, appear in `/plugin` UI, user-toggleable
 2. **Marketplace plugins** — installed from GitHub repos via `/plugin install`
 
@@ -1731,7 +1731,7 @@ See Section 6.4 for `LoadedPlugin`, `BuiltinPluginDefinition`, `PluginError`, an
 
 ### 13.1 System Overview
 
-The remote session system manages multi-user and remote-connected Claude Code sessions, bridging between the local CLI process and remote session infrastructure.
+The remote session system manages multi-user and remote-connected MangoCode sessions, bridging between the local CLI process and remote session infrastructure.
 
 **Source:** `src/remote/`
 

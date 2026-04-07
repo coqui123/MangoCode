@@ -1,4 +1,4 @@
-# Claude Code — Tools System
+# MangoCode — Tools System
 
 ## Table of Contents
 
