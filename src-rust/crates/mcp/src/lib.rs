@@ -584,7 +584,6 @@ pub mod client {
         pub instructions: Option<String>,
         transport: Arc<dyn transport::McpTransport>,
         next_id: AtomicU64,
-        #[allow(dead_code)]
         pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
     }
 
@@ -791,7 +790,6 @@ pub mod client {
         ///   to the matching sender in `resource_subscriptions`.
         /// - `notifications/tools/list_changed` — logged at info level.
         /// - anything else — logged at debug level.
-        #[allow(dead_code)]
         pub(crate) async fn poll_notifications(
             &self,
             resource_subscriptions: &dashmap::DashMap<
@@ -799,10 +797,11 @@ pub mod client {
                 tokio::sync::mpsc::Sender<ResourceChangedEvent>,
             >,
         ) {
-            loop {
-                let raw = match self.transport.try_receive_raw().await {
-                    Ok(Some(v)) => v,
-                    Ok(None) => break,
+            let mut notification_stream = self.transport.subscribe_to_notifications();
+
+            while let Some(result) = notification_stream.next().await {
+                let raw = match result {
+                    Ok(v) => v,
                     Err(e) => {
                         debug!(
                             server = %self.server_name,
@@ -813,56 +812,33 @@ pub mod client {
                     }
                 };
 
-                // Only process server-initiated notifications (have "method", no non-null "id")
-                let has_method = raw.get("method").is_some();
                 let has_id = raw.get("id").map(|v| !v.is_null()).unwrap_or(false);
-                if !has_method || has_id {
-                    // This is an RPC response, not a notification — skip it.
-                    // (In practice this should not occur because call() drains
-                    //  responses synchronously before poll_notifications runs.)
-                    debug!(
-                        server = %self.server_name,
-                        "poll_notifications: skipping non-notification message"
-                    );
+                if has_id {
+                    if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
+                        if let Some(sender) = self.pending.lock().await.remove(&id) {
+                            match serde_json::from_value::<JsonRpcResponse>(raw.clone()) {
+                                Ok(response) => {
+                                    let _ = sender.send(response);
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        server = %self.server_name,
+                                        error = %e,
+                                        response_id = id,
+                                        "poll_notifications: failed to parse RPC response"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
-                let method = raw["method"].as_str().unwrap_or("");
-                match method {
-                    "notifications/resources/updated" => {
-                        let uri = raw["params"]["uri"].as_str().unwrap_or("").to_string();
-                        let key = (self.server_name.clone(), uri.clone());
-                        if let Some(tx) = resource_subscriptions.get(&key) {
-                            let event = ResourceChangedEvent {
-                                server_name: self.server_name.clone(),
-                                uri,
-                            };
-                            if let Err(e) = tx.send(event).await {
-                                debug!(
-                                    server = %self.server_name,
-                                    error = %e,
-                                    "poll_notifications: resource subscription receiver dropped"
-                                );
-                            }
-                        } else {
-                            debug!(
-                                server = %self.server_name,
-                                uri = %raw["params"]["uri"],
-                                "poll_notifications: no subscriber for resource update"
-                            );
-                        }
-                    }
-                    "notifications/tools/list_changed" => {
-                        info!(server = %self.server_name, "MCP tools list changed");
-                    }
-                    other => {
-                        debug!(
-                            server = %self.server_name,
-                            method = %other,
-                            "Unhandled MCP notification"
-                        );
-                    }
+                if raw.get("method").is_none() {
+                    continue;
                 }
+
+                self.process_notification(raw, resource_subscriptions).await;
             }
         }
 
@@ -934,47 +910,40 @@ pub mod client {
             method: &str,
             params: Option<Value>,
         ) -> anyhow::Result<T> {
+            let (_id, resp_rx) = self.send_request(method, params).await?;
+            let resp = resp_rx.await.map_err(|_| {
+                anyhow::anyhow!("MCP transport closed while waiting for response to '{}'", method)
+            })?;
+
+            if let Some(err) = resp.error {
+                return Err(anyhow::anyhow!(
+                    "MCP error {} from '{}': {}",
+                    err.code,
+                    method,
+                    err.message
+                ));
+            }
+
+            let result = resp
+                .result
+                .ok_or_else(|| anyhow::anyhow!("No result in MCP response for '{}'", method))?;
+            Ok(serde_json::from_value(result)?)
+        }
+
+        async fn send_request(
+            &self,
+            method: &str,
+            params: Option<Value>,
+        ) -> anyhow::Result<(u64, oneshot::Receiver<JsonRpcResponse>)> {
             let id = self.next_id.fetch_add(1, Ordering::SeqCst);
             let req = JsonRpcRequest::new(id, method, params);
-
-            // We use a simple request/response loop here (no concurrent requests).
-            // For production use, proper demultiplexing by id would be needed.
-            self.transport.send(&req).await?;
-
-            loop {
-                let resp = self.transport.recv().await?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MCP transport closed while waiting for response to '{}'",
-                        method
-                    )
-                })?;
-
-                // Check if this response matches our request id
-                let resp_id = resp.id.as_ref().and_then(|v| v.as_u64()).unwrap_or(0);
-                if resp_id != id {
-                    // Might be a server-initiated notification; skip
-                    debug!(
-                        got_id = resp_id,
-                        want_id = id,
-                        "Skipping non-matching response"
-                    );
-                    continue;
-                }
-
-                if let Some(err) = resp.error {
-                    return Err(anyhow::anyhow!(
-                        "MCP error {} from '{}': {}",
-                        err.code,
-                        method,
-                        err.message
-                    ));
-                }
-
-                let result = resp
-                    .result
-                    .ok_or_else(|| anyhow::anyhow!("No result in MCP response for '{}'", method))?;
-                return Ok(serde_json::from_value(result)?);
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().await.insert(id, tx);
+            if let Err(e) = self.transport.send(&req).await {
+                let _ = self.pending.lock().await.remove(&id);
+                return Err(e);
             }
+            Ok((id, rx))
         }
 
         /// Test-only constructor: build an `McpClient` backed by an arbitrary
@@ -1517,33 +1486,14 @@ impl McpManager {
             let manager_weak = Arc::downgrade(&self);
 
             tokio::spawn(async move {
-                // Subscribe to the transport's notification stream
-                let mut notification_stream = client_clone.transport().subscribe_to_notifications();
+                let manager = match manager_weak.upgrade() {
+                    Some(m) => m,
+                    None => return,
+                };
 
-                // Process notifications from the stream
-                while let Some(result) = notification_stream.next().await {
-                    // Check if the manager is still alive
-                    let manager = match manager_weak.upgrade() {
-                        Some(m) => m,
-                        None => break, // Manager dropped — shut down
-                    };
-
-                    match result {
-                        Ok(raw) => {
-                            client_clone
-                                .process_notification(raw, &manager.resource_subscriptions)
-                                .await;
-                        }
-                        Err(e) => {
-                            debug!(
-                                server = %client_clone.server_name,
-                                error = %e,
-                                "notification stream error"
-                            );
-                            break;
-                        }
-                    }
-                }
+                client_clone
+                    .poll_notifications(&manager.resource_subscriptions)
+                    .await;
             });
         }
     }
@@ -1939,13 +1889,12 @@ mod notification_tests {
         fn subscribe_to_notifications(
             &self,
         ) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
-            let queue = Arc::new(tokio::sync::Mutex::new(
-                self.queue
-                    .blocking_lock()
-                    .iter()
-                    .cloned()
-                    .collect::<std::collections::VecDeque<_>>(),
-            ));
+            let snapshot = self
+                .queue
+                .try_lock()
+                .map(|q| q.iter().cloned().collect::<std::collections::VecDeque<_>>())
+                .unwrap_or_default();
+            let queue = Arc::new(tokio::sync::Mutex::new(snapshot));
 
             let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<serde_json::Value>>(100);
 

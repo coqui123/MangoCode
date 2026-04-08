@@ -380,11 +380,7 @@ fn reactive_compact_local(
         return (snipped, snip_count, CollapseStrategy::SnipCompact);
     }
 
-    let (microed, micro_count) = if FeatureFlags::is_enabled("cached_microcompact") {
-        micro_compact(snipped, max_tokens)
-    } else {
-        (snipped, 0)
-    };
+    let (microed, micro_count) = micro_compact(snipped, max_tokens);
     if estimate_message_tokens(&microed) <= max_tokens {
         return (microed, micro_count, CollapseStrategy::MicroCompact);
     }

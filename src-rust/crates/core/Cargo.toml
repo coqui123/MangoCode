@@ -9,6 +9,14 @@ edition.workspace = true
 # returns an error instead of accessing hardware.
 voice = ["dep:cpal"]
 
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
+
 # Experimental/feature-flagged capabilities
 default = ["voice", "ultraplan", "cached_microcompact"]
 
@@ -103,6 +111,12 @@ futures = { workspace = true }
 rusqlite = { workspace = true }
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
+opentelemetry = { version = "0.24", optional = true }
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.17", optional = true }
+tracing-opentelemetry = { version = "0.25", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tiktoken-rs = "0.6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

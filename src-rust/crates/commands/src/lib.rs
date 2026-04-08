@@ -5,6 +5,7 @@
 // Each command is a struct implementing the `SlashCommand` trait.
 
 use async_trait::async_trait;
+use mangocode_core::analytics::SessionMetrics;
 use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
@@ -23,6 +24,7 @@ use std::sync::Arc;
 pub struct CommandContext {
     pub config: Config,
     pub cost_tracker: Arc<CostTracker>,
+    pub session_metrics: Option<Arc<SessionMetrics>>,
     pub messages: Vec<Message>,
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
@@ -101,6 +103,7 @@ pub struct HelpCommand;
 pub struct ClearCommand;
 pub struct CompactCommand;
 pub struct CostCommand;
+pub struct AnalyticsCommand;
 pub struct ExitCommand;
 pub struct ModelCommand;
 pub struct ConfigCommand;
@@ -356,6 +359,36 @@ fn split_command_args(args: &str) -> Vec<String> {
     out
 }
 
+fn format_compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    format!("{:.1}s", ms as f64 / 1000.0)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn analytics_events_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".mangocode").join("analytics").join("events.jsonl"))
+}
+
 fn execute_named_command_from_slash(
     target_name: &str,
     args: &str,
@@ -384,7 +417,7 @@ fn command_category(name: &str) -> &'static str {
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
         | "statusline" | "output-style" | "keybindings" | "privacy-settings" | "flags"
         | "rate-limit-options" | "sandbox-toggle" => "Settings",
-        "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
+        "cost" | "analytics" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "upgrade" | "release-notes" => {
             "System"
         }
@@ -637,6 +670,75 @@ impl SlashCommand for CostCommand {
             total = total,
             cost = cost,
             savings = savings,
+        ))
+    }
+}
+
+// ---- /analytics ----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for AnalyticsCommand {
+    fn name(&self) -> &str {
+        "analytics"
+    }
+    fn description(&self) -> &str {
+        "Show session analytics metrics or export event log info"
+    }
+    fn help(&self) -> &str {
+        "Usage: /analytics [export]\n\n\
+         /analytics shows session analytics counters (tokens, API/tool time,\n\
+         tool calls, lines changed, commits, PRs).\n\
+         /analytics export prints the local events.jsonl file path and size."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+        if args.eq_ignore_ascii_case("export") {
+            let Some(path) = analytics_events_path() else {
+                return CommandResult::Error("Could not resolve home directory.".to_string());
+            };
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let status = if path.exists() { "present" } else { "not found" };
+            return CommandResult::Message(format!(
+                "Analytics Export\n\
+                 Path: {}\n\
+                 Size: {} ({})",
+                path.display(),
+                format_bytes(size),
+                status,
+            ));
+        }
+
+        if !args.is_empty() {
+            return CommandResult::Error("Usage: /analytics [export]".to_string());
+        }
+
+        let Some(metrics) = &ctx.session_metrics else {
+            return CommandResult::Message("Session analytics unavailable.".to_string());
+        };
+
+        let summary = metrics.summary();
+        CommandResult::Message(format!(
+            "📊 Session Analytics\n\
+             Cost: {}\n\
+             Tokens: {} ({} in / {} out)\n\
+             API time: {}\n\
+             Tool time: {}\n\
+             Tool calls: {}\n\
+             Lines changed: +{} / -{}\n\
+             Commits: {}\n\
+             PRs: {}",
+            summary.format_cost(),
+            summary.format_tokens(),
+            format_compact_token_count(summary.input_tokens),
+            format_compact_token_count(summary.output_tokens),
+            format_duration_ms(summary.api_duration_ms),
+            format_duration_ms(summary.tool_duration_ms),
+            summary.tool_uses,
+            summary.lines_added,
+            summary.lines_removed,
+            summary.commits,
+            summary.prs,
         ))
     }
 }
@@ -5431,7 +5533,6 @@ mod chrome_cdp {
     // Global session state
     // -----------------------------------------------------------------------
 
-    #[allow(dead_code)]
     pub struct ChromeSession {
         pub ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
         pub port: u16,
@@ -5565,9 +5666,11 @@ mod chrome_cdp {
     /// Disconnect the current session.
     pub fn disconnect() -> String {
         let mut guard = SESSION.lock();
-        if guard.is_some() {
-            *guard = None;
-            "Disconnected from Chrome.".to_string()
+        if let Some(session) = guard.take() {
+            format!(
+                "Disconnected from Chrome on port {} (tab: {}).",
+                session.port, session.tab_url
+            )
         } else {
             "No active Chrome session.".to_string()
         }
@@ -7270,7 +7373,6 @@ mod teleport_bundle {
     }
 
     impl TeleportPermissions {
-        #[allow(dead_code)]
         pub fn from_rules(rules: &[SerializedPermissionRule]) -> Self {
             let mut allowed = Vec::new();
             let mut denied = Vec::new();
@@ -7423,11 +7525,7 @@ impl SlashCommand for TeleportCommand {
                             action: PermissionAction::Deny,
                         });
                     }
-                    TeleportPermissions {
-                        allowed,
-                        denied,
-                        rules,
-                    }
+                    TeleportPermissions::from_rules(&rules)
                 };
 
                 // ---- build bundle -----------------------------------------
@@ -7591,11 +7689,7 @@ impl SlashCommand for TeleportCommand {
                             action: PermissionAction::Deny,
                         });
                     }
-                    TeleportPermissions {
-                        allowed,
-                        denied,
-                        rules,
-                    }
+                    TeleportPermissions::from_rules(&rules)
                 };
 
                 let bundle = TeleportBundle {
@@ -8481,6 +8575,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ClearCommand),
         Box::new(CompactCommand),
         Box::new(CostCommand),
+        Box::new(AnalyticsCommand),
         Box::new(ExitCommand),
         Box::new(ModelCommand),
         Box::new(ConfigCommand),
@@ -8854,6 +8949,7 @@ mod tests {
         CommandContext {
             config: mangocode_core::config::Config::default(),
             cost_tracker: CostTracker::new(),
+            session_metrics: None,
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),
             session_id: "test-session".to_string(),
@@ -8925,6 +9021,7 @@ mod tests {
             "clear",
             "compact",
             "cost",
+            "analytics",
             "exit",
             "model",
             "config",

@@ -38,7 +38,40 @@ pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// The free/OSS build does not fetch server-pushed security overlays or
 /// enterprise-managed settings from Anthropic's API.
 pub async fn fetch_remote_managed_settings() -> Value {
-    serde_json::json!({})
+    let config = RemoteSettingsConfig::from_env();
+    if !RemoteSettingsManager::is_eligible(config.api_key.as_deref()) {
+        return serde_json::json!({});
+    }
+
+    let manager = RemoteSettingsManager::new(config);
+
+    // Try network fetch first
+    match manager.fetch_with_retry(None).await {
+        Ok(Some(settings)) => {
+            // Cache the result
+            let cache = RemoteSettingsCache {
+                settings: Some(settings.clone()),
+                checksum: None,
+                fetched_at: Some(chrono::Utc::now()),
+            };
+            let _ = manager.save_cache(&cache).await;
+            settings
+        }
+        Ok(None) => {
+            // 304 Not Modified — use cache
+            manager
+                .load_cached()
+                .await
+                .unwrap_or_else(|| serde_json::json!({}))
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Remote settings fetch failed, using cache");
+            manager
+                .load_cached()
+                .await
+                .unwrap_or_else(|| serde_json::json!({}))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -56,6 +89,23 @@ pub struct RemoteSettingsConfig {
     pub base_url: String,
     /// How often to poll for new settings in the background.
     pub polling_interval: Duration,
+}
+
+impl RemoteSettingsConfig {
+    /// Build config from environment variables.
+    pub fn from_env() -> Self {
+        Self {
+            api_key: std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            oauth_token: std::env::var("MANGOCODE_OAUTH_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            base_url: std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+            polling_interval: DEFAULT_POLLING_INTERVAL,
+        }
+    }
 }
 
 impl Default for RemoteSettingsConfig {
@@ -84,7 +134,6 @@ pub struct RemoteSettingsCache {
 #[derive(Debug, Deserialize)]
 struct RemoteSettingsResponse {
     /// Settings UUID (informational only).
-    #[allow(dead_code)]
     uuid: Option<String>,
     /// Server-computed checksum.
     checksum: Option<String>,
@@ -225,6 +274,9 @@ impl RemoteSettingsManager {
         // accept raw settings object if the wrapper is missing.
         let (settings, _checksum) =
             if let Ok(parsed) = serde_json::from_value::<RemoteSettingsResponse>(body.clone()) {
+                if let Some(ref uuid) = parsed.uuid {
+                    debug!(uuid = %uuid, "Remote settings: received settings object");
+                }
                 (parsed.settings, parsed.checksum)
             } else if body.is_object() {
                 (body, None)

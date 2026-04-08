@@ -1,5 +1,8 @@
 //! Analytics and telemetry (OpenTelemetry-compatible counters)
 
+use chrono::Utc;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -186,21 +189,87 @@ impl Analytics {
     }
 }
 
-/// No-op analytics stub. The OSS/free build intentionally ships without
-/// product telemetry. All call sites compile unchanged; all data is discarded.
-pub fn log_event(_event_name: &str, _metadata: &[(&str, &str)]) {}
+/// Log an analytics event to the local event file.
+/// Privacy-respecting: no PII, no network calls. Data stays on disk.
+pub fn log_event(event_name: &str, metadata: &[(&str, &str)]) {
+    if !is_telemetry_enabled() {
+        return;
+    }
 
-pub async fn log_event_async(_event_name: &str, _metadata: &[(&str, &str)]) {}
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "event".into(),
+        serde_json::Value::String(event_name.to_string()),
+    );
+    entry.insert(
+        "timestamp".into(),
+        serde_json::Value::String(Utc::now().to_rfc3339()),
+    );
+    for (k, v) in metadata {
+        entry.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
 
-/// No-op. The Rust port does not initialize OpenTelemetry exporters.
-pub fn initialize_telemetry() {}
+    let line = serde_json::to_string(&serde_json::Value::Object(entry)).unwrap_or_default();
 
-/// No-op. Nothing to flush.
-pub async fn flush_telemetry() {}
+    // Best-effort write — never block or crash on analytics failure.
+    if let Some(dir) = analytics_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+}
+
+pub async fn log_event_async(event_name: &str, metadata: &[(&str, &str)]) {
+    // Delegate to sync version — file I/O is fast enough for append.
+    log_event(event_name, metadata);
+}
+
+/// Initialize the local analytics system.
+/// Creates the analytics directory and writes a session-start marker.
+pub fn initialize_telemetry() {
+    #[cfg(feature = "otel")]
+    {
+        crate::session_tracing::otel_impl::init_provider();
+    }
+
+    if !is_telemetry_enabled() {
+        return;
+    }
+    if let Some(dir) = analytics_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    log_event("telemetry_initialized", &[]);
+}
+
+/// Flush any buffered analytics data.
+/// With JSONL append, there's nothing to flush, but we write a session-end marker.
+pub async fn flush_telemetry() {
+    #[cfg(feature = "otel")]
+    {
+        if let Some(provider) = crate::session_tracing::otel_impl::PROVIDER.get() {
+            let _ = provider.force_flush();
+        }
+    }
+
+    if !is_telemetry_enabled() {
+        return;
+    }
+    log_event("telemetry_flushed", &[]);
+}
+
+fn analytics_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".mangocode").join("analytics"))
+}
 
 /// Always returns false. Enhanced telemetry is disabled.
 pub fn is_enhanced_telemetry_enabled() -> bool {
-    false
+    is_telemetry_enabled()
 }
 
 /// Returns telemetry status based on environment variable.

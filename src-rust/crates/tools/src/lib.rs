@@ -226,6 +226,7 @@ pub struct ToolContext {
     pub permission_mode: PermissionMode,
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
+    pub session_metrics: Option<Arc<mangocode_core::analytics::SessionMetrics>>,
     pub session_id: String,
     pub file_history: Arc<parking_lot::Mutex<mangocode_core::file_history::FileHistory>>,
     pub current_turn: Arc<AtomicUsize>,
@@ -551,6 +552,7 @@ mod tests {
             permission_mode: mangocode_core::config::PermissionMode::Default,
             permission_handler: handler,
             cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
@@ -579,6 +581,7 @@ mod tests {
             permission_mode: mangocode_core::config::PermissionMode::Default,
             permission_handler: handler,
             cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
             session_id: "test".to_string(),
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),

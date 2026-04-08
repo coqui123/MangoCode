@@ -63,6 +63,12 @@ impl GoogleProvider {
         }
     }
 
+    /// Override API base URL for tests or compatible proxy endpoints.
+    pub fn with_base_url(mut self, url: String) -> Self {
+        self.base_url = url;
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------

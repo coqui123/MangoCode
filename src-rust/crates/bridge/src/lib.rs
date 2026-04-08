@@ -22,6 +22,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -398,8 +399,7 @@ pub struct BridgeSession {
     state: Arc<RwLock<BridgeState>>,
     http: reqwest::Client,
     reconnect_count: u32,
-    #[allow(dead_code)]
-    last_ping: Option<std::time::Instant>,
+    last_ping: Option<Instant>,
 }
 
 impl BridgeSession {
@@ -428,6 +428,10 @@ impl BridgeSession {
 
     pub fn current_state(&self) -> BridgeState {
         self.state.read().clone()
+    }
+
+    pub fn time_since_last_ping(&self) -> Option<Duration> {
+        self.last_ping.map(|t| t.elapsed())
     }
 
     fn set_state(&self, s: BridgeState) {
@@ -671,6 +675,8 @@ impl BridgeSession {
             if !events.is_empty() {
                 if let Err(e) = self.upload_events(events).await {
                     warn!(session_id = %self.session_id, error = %e, "Event upload error");
+                } else {
+                    self.last_ping = Some(Instant::now());
                 }
             }
 
@@ -680,6 +686,10 @@ impl BridgeSession {
                     // Successful poll — reset reconnect counter.
                     self.reconnect_count = 0;
 
+                    if !messages.is_empty() {
+                        self.last_ping = Some(Instant::now());
+                    }
+
                     for msg in messages {
                         if msg_tx.send(msg).await.is_err() {
                             debug!(
@@ -688,6 +698,19 @@ impl BridgeSession {
                             );
                             return;
                         }
+
+                    if self
+                        .time_since_last_ping()
+                        .is_some_and(|elapsed| elapsed > Duration::from_secs(60))
+                    {
+                        warn!(
+                            session_id = %self.session_id,
+                            stale_for_secs = 60,
+                            "Bridge inactive; reconnecting"
+                        );
+                        self.reconnect_count += 1;
+                        continue;
+                    }
                     }
                 }
                 Err(e) => {

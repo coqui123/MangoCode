@@ -55,7 +55,6 @@ const PASTE_BURST_MIN_STREAK: usize = 4;
 // ---------------------------------------------------------------------------
 
 /// Return the environment variable name for a given provider ID.
-#[allow(dead_code)]
 fn get_env_var_for_provider(id: &str) -> &'static str {
     match id {
         "anthropic" => "ANTHROPIC_API_KEY",
@@ -103,7 +102,6 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
 }
 
 /// Return a URL hint for obtaining an API key from a given provider.
-#[allow(dead_code)]
 fn get_url_for_provider(id: &str) -> &'static str {
     match id {
         "anthropic" => "console.anthropic.com",
@@ -141,8 +139,10 @@ fn validate_provider_credential(
         return Err((
             "Configuration",
             format!(
-                "Missing credential. Set {} or paste it here.",
-                get_env_var_for_provider(provider_id)
+                "Missing credential for {}. Set {} or visit {}.",
+                provider_id,
+                get_env_var_for_provider(provider_id),
+                get_url_for_provider(provider_id)
             ),
         ));
     }
@@ -4679,7 +4679,6 @@ impl App {
 
     /// Find line boundaries for the row containing the click.
     /// Returns (start_row, end_row) for the line.
-    #[allow(dead_code)]
     fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
         let selectable_area = self.last_selectable_area.get();
         let line_start = selectable_area.y;
@@ -4969,6 +4968,23 @@ impl App {
 
                     let current_pos = (mouse_event.column, mouse_event.row);
                     let now = std::time::Instant::now();
+
+                    if mouse_event.modifiers.contains(KeyModifiers::ALT) {
+                        if let Some((start_row, end_row)) = self.find_line_boundaries(current_pos.1) {
+                            self.selection_anchor = Some((selectable_area.x, start_row));
+                            self.selection_focus = Some((
+                                selectable_area
+                                    .x
+                                    .saturating_add(selectable_area.width)
+                                    .saturating_sub(1),
+                                end_row,
+                            ));
+                        }
+                        self.last_click_time = Some(now);
+                        self.last_click_position = Some(current_pos);
+                        self.click_count = 0;
+                        return;
+                    }
 
                     // Check for double-click
                     if self.is_double_click(current_pos) {

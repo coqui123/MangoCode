@@ -3516,6 +3516,12 @@ pub mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_message_user() {
@@ -3602,6 +3608,7 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_from_config() {
+        let _guard = env_lock().lock().expect("env test lock");
         // When config.api_key is set, it should be returned regardless of env var
         // (Config key takes priority — resolve_api_key returns it first)
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
@@ -3620,6 +3627,7 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_none() {
+        let _guard = env_lock().lock().expect("env test lock");
         // Temporarily ensure no env var override
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -3635,6 +3643,7 @@ mod tests {
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
+        let _guard = env_lock().lock().expect("env test lock");
         let orig = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 

@@ -1382,7 +1382,6 @@ mod tests {
     use tempfile::NamedTempFile;
 
     // Helper: create a temporary settings.json with a given JSON body.
-    #[allow(dead_code)]
     fn write_temp_settings(json: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().expect("tempfile");
         f.write_all(json.as_bytes()).expect("write");
@@ -1418,6 +1417,15 @@ mod tests {
         let settings = Settings::default();
         let result = read_setting_bool(&settings, "anotherMissingKey_abc123", false);
         assert!(!result);
+    }
+
+    #[test]
+    fn write_temp_settings_writes_json_body() {
+        let file = write_temp_settings(r#"{"theme":"dark","model":"claude-3-opus"}"#);
+        let content = std::fs::read_to_string(file.path()).expect("read temp settings");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse temp settings");
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["model"], "claude-3-opus");
     }
 
     // ---------------------------------------------------------------------------

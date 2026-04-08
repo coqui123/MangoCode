@@ -48,6 +48,11 @@ use mangocode_core::constants::TOOL_NAME_BASH;
 use mangocode_core::config::Config;
 use mangocode_core::cost::CostTracker;
 use mangocode_core::error::ClaudeError;
+use mangocode_core::session_tracing::{
+    end_hook_span, end_interaction_span, end_llm_request_span, end_permission_span,
+    end_tool_span, start_hook_span, start_interaction_span, start_llm_request_span,
+    start_permission_span, start_tool_span,
+};
 use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
 use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
 use mangocode_tools::{Tool, ToolContext, ToolResult};
@@ -473,10 +478,14 @@ pub fn fire_post_sampling_hooks(
     use mangocode_core::types::Message;
 
     let mut result = PostSamplingHookResult::default();
+    let hook_span = start_hook_span("PostModelTurn");
 
     let entries = match config.hooks.get(&HookEvent::PostModelTurn) {
         Some(e) => e,
-        None => return result,
+        None => {
+            end_hook_span(hook_span);
+            return result;
+        }
     };
 
     for entry in entries {
@@ -527,6 +536,7 @@ pub fn fire_post_sampling_hooks(
         }
     }
 
+    end_hook_span(hook_span);
     result
 }
 
@@ -937,6 +947,7 @@ pub async fn run_query_loop(
         }
 
         let request = req_builder.build();
+        let llm_span = start_llm_request_span(&effective_model, config.max_tokens);
 
         // Create a stream handler that forwards to the event channel
         let handler: Arc<dyn StreamHandler> = if let Some(ref tx) = event_tx {
@@ -1271,6 +1282,7 @@ pub async fn run_query_loop(
 
                     // Use create_message_stream so the TUI receives real-time
                     // text deltas instead of waiting for the full response.
+                    let api_started = std::time::Instant::now();
                     let mut stream = match provider.create_message_stream(provider_request).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -1557,6 +1569,7 @@ pub async fn run_query_loop(
                         uuid: Some(msg_id),
                         cost: None,
                     };
+                    let api_duration_ms = api_started.elapsed().as_millis() as u64;
 
                     cost_tracker.add_usage(
                         usage.input_tokens,
@@ -1564,8 +1577,16 @@ pub async fn run_query_loop(
                         usage.cache_creation_input_tokens,
                         usage.cache_read_input_tokens,
                     );
+                    if let Some(metrics) = &tool_ctx.session_metrics {
+                        metrics.add_tokens(
+                            usage.input_tokens.min(u32::MAX as u64) as u32,
+                            usage.output_tokens.min(u32::MAX as u64) as u32,
+                        );
+                        metrics.add_api_duration(api_duration_ms);
+                    }
 
                     messages.push(assistant_msg.clone());
+                    let interaction_span = start_interaction_span(&tool_ctx.session_id);
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks
@@ -1582,6 +1603,7 @@ pub async fn run_query_loop(
                     if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
+                            let tool_started = std::time::Instant::now();
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolStart {
                                     tool_name: tool_name.clone(),
@@ -1601,6 +1623,7 @@ pub async fn run_query_loop(
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
+                            let pre_hook_span = start_hook_span("PreToolUse");
                             let pre_outcome = mangocode_core::hooks::run_hooks(
                                 hooks,
                                 mangocode_core::config::HookEvent::PreToolUse,
@@ -1608,6 +1631,7 @@ pub async fn run_query_loop(
                                 &tool_ctx.working_dir,
                             )
                             .await;
+                            end_hook_span(pre_hook_span);
 
                             // Check if hook blocked execution
                             let result = if let mangocode_core::hooks::HookOutcome::Blocked(
@@ -1658,6 +1682,7 @@ pub async fn run_query_loop(
                                 is_error: Some(result.is_error),
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
+                            let post_hook_span = start_hook_span("PostToolUse");
                             let _ = mangocode_core::hooks::run_hooks(
                                 hooks,
                                 mangocode_core::config::HookEvent::PostToolUse,
@@ -1665,6 +1690,7 @@ pub async fn run_query_loop(
                                 &tool_ctx.working_dir,
                             )
                             .await;
+                            end_hook_span(post_hook_span);
 
                             // --- LSP diagnostics injection for file-modifying tools ---
                             let result = if !result.is_error {
@@ -1678,6 +1704,11 @@ pub async fn run_query_loop(
                             } else {
                                 result
                             };
+                            let tool_duration_ms = tool_started.elapsed().as_millis() as u64;
+                            if let Some(metrics) = &tool_ctx.session_metrics {
+                                metrics.increment_tool_use();
+                                metrics.add_tool_duration(tool_duration_ms);
+                            }
 
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -1703,6 +1734,7 @@ pub async fn run_query_loop(
                             uuid: None,
                             cost: None,
                         });
+                        end_interaction_span(interaction_span);
                         continue; // loop for next turn
                     }
 
@@ -1715,6 +1747,7 @@ pub async fn run_query_loop(
                         });
                     }
 
+                    end_interaction_span(interaction_span);
                     return QueryOutcome::EndTurn {
                         message: assistant_msg,
                         usage,
@@ -1749,6 +1782,7 @@ pub async fn run_query_loop(
 
         // Send to API
         debug!(turn, model = %effective_model, "Sending API request");
+        let api_started = std::time::Instant::now();
         let mut stream_rx = match client.create_message_stream(request, handler).await {
             Ok(rx) => rx,
             Err(e) => {
@@ -1812,6 +1846,8 @@ pub async fn run_query_loop(
         }
 
         let (assistant_msg, usage, stop_reason) = accumulator.finish();
+        end_llm_request_span(llm_span, usage.input_tokens, usage.output_tokens);
+        let api_duration_ms = api_started.elapsed().as_millis() as u64;
 
         // Track costs
         cost_tracker.add_usage(
@@ -1820,6 +1856,13 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        if let Some(metrics) = &tool_ctx.session_metrics {
+            metrics.add_tokens(
+                usage.input_tokens.min(u32::MAX as u64) as u32,
+                usage.output_tokens.min(u32::MAX as u64) as u32,
+            );
+            metrics.add_api_duration(api_duration_ms);
+        }
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -1994,6 +2037,7 @@ pub async fn run_query_loop(
                     is_error: None,
                     session_id: Some(tool_ctx.session_id.clone()),
                 };
+                let stop_hook_span = start_hook_span("Stop");
                 mangocode_core::hooks::run_hooks(
                     &tool_ctx.config.hooks,
                     mangocode_core::config::HookEvent::Stop,
@@ -2001,6 +2045,7 @@ pub async fn run_query_loop(
                     &tool_ctx.working_dir,
                 )
                 .await;
+                end_hook_span(stop_hook_span);
             }};
         }
 
@@ -2213,6 +2258,7 @@ pub async fn run_query_loop(
                             is_error: None,
                             session_id: Some(tool_ctx.session_id.clone()),
                         };
+                        let pre_hook_span = start_hook_span("PreToolUse");
                         let pre_outcome = mangocode_core::hooks::run_hooks(
                             hooks,
                             mangocode_core::config::HookEvent::PreToolUse,
@@ -2220,6 +2266,7 @@ pub async fn run_query_loop(
                             &tool_ctx.working_dir,
                         )
                         .await;
+                        end_hook_span(pre_hook_span);
 
                         let plugin_pre_outcome =
                             mangocode_plugins::run_global_pre_tool_hook(&name, &input);
@@ -2279,7 +2326,7 @@ pub async fn run_query_loop(
                     .map(|p| {
                         let event_tx_for_exec = event_tx.clone();
                         if let Some(r) = p.blocked_result.clone() {
-                            futures::future::Either::Left(async move { r })
+                            futures::future::Either::Left(async move { (r, 0_u64) })
                         } else {
                             let id = p.id.clone();
                             let name = p.name.clone();
@@ -2290,7 +2337,8 @@ pub async fn run_query_loop(
                                 None
                             };
                             futures::future::Either::Right(async move {
-                                execute_tool(ExecuteToolRequest {
+                                let tool_started = std::time::Instant::now();
+                                let result = execute_tool(ExecuteToolRequest {
                                     client,
                                     query_config: config,
                                     tool_id: &id,
@@ -2301,18 +2349,23 @@ pub async fn run_query_loop(
                                     event_tx: event_tx_for_exec.as_ref(),
                                     parent_messages: parent_msgs,
                                 })
-                                .await
+                                .await;
+                                (result, tool_started.elapsed().as_millis() as u64)
                             })
                         }
                     })
                     .collect();
 
                 // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<ToolResult> = futures::future::join_all(exec_futures).await;
+                let exec_results: Vec<(ToolResult, u64)> = futures::future::join_all(exec_futures).await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
                 let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                for (p, result) in prepared.iter().zip(exec_results.into_iter()) {
+                for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter()) {
+                    if let Some(metrics) = &tool_ctx.session_metrics {
+                        metrics.increment_tool_use();
+                        metrics.add_tool_duration(tool_duration_ms);
+                    }
                     let hooks = &tool_ctx.config.hooks;
                     let post_ctx = mangocode_core::hooks::HookContext {
                         event: "PostToolUse".to_string(),
@@ -2322,6 +2375,7 @@ pub async fn run_query_loop(
                         is_error: Some(result.is_error),
                         session_id: Some(tool_ctx.session_id.clone()),
                     };
+                    let post_hook_span = start_hook_span("PostToolUse");
                     mangocode_core::hooks::run_hooks(
                         hooks,
                         mangocode_core::config::HookEvent::PostToolUse,
@@ -2329,6 +2383,7 @@ pub async fn run_query_loop(
                         &tool_ctx.working_dir,
                     )
                     .await;
+                    end_hook_span(post_hook_span);
 
                     mangocode_plugins::run_global_post_tool_hook(
                         &p.name,
@@ -2513,6 +2568,8 @@ async fn check_critic(
         return None;
     }
 
+    let permission_span = start_permission_span(tool_name);
+
     // Extract last user message as intent context.
     let user_intent = messages
         .iter()
@@ -2533,6 +2590,7 @@ async fn check_critic(
                 critic_cfg.fallback_to_classifier,
             );
             warn!(tool = %tool_name, message = %warning, "Permission critic unavailable");
+            end_permission_span(permission_span);
             return None;
         }
     };
@@ -2549,9 +2607,13 @@ async fn check_critic(
         )
         .await
     {
-        Ok((true, _)) => None,
+        Ok((true, _)) => {
+            end_permission_span(permission_span);
+            None
+        }
         Ok((false, reasoning)) => {
             warn!(tool = %tool_name, reason = %reasoning, "Permission critic denied execution");
+            end_permission_span(permission_span);
             Some(mangocode_tools::ToolResult::error(format!(
                 "Blocked by permission critic: {}",
                 reasoning
@@ -2559,6 +2621,7 @@ async fn check_critic(
         }
         Err(e) => {
             warn!(error = %e, "Permission critic error");
+            end_permission_span(permission_span);
             if critic_cfg.fallback_to_classifier {
                 static_classifier_fallback(tool_name, tool_input).map(|reason| mangocode_tools::ToolResult::error(format!(
                     "Blocked by permission classifier fallback: {} (critic unavailable: {})",
@@ -2625,9 +2688,11 @@ struct ExecuteToolRequest<'a> {
 }
 
 async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
+    let tool_span = start_tool_span(req.name);
+
     if req.name == mangocode_core::constants::TOOL_NAME_AGENT {
         let parent_msgs = req.parent_messages.as_deref();
-        return Box::pin(crate::agent_tool::execute_with_runtime(
+        let result = Box::pin(crate::agent_tool::execute_with_runtime(
             req.input.clone(),
             req.ctx,
             req.client,
@@ -2637,6 +2702,8 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
             parent_msgs,
         ))
         .await;
+        end_tool_span(tool_span, !result.is_error, if result.is_error { Some(result.content.as_str()) } else { None });
+        return result;
     }
 
     if req.name == "LSP" {
@@ -2686,11 +2753,15 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
     match tool {
         Some(tool) => {
             debug!(tool = req.name, "Executing tool");
-            tool.execute(req.input.clone(), req.ctx).await
+            let result = tool.execute(req.input.clone(), req.ctx).await;
+            end_tool_span(tool_span, !result.is_error, if result.is_error { Some(result.content.as_str()) } else { None });
+            result
         }
         None => {
             warn!(tool = req.name, "Unknown tool requested");
-            ToolResult::error(format!("Unknown tool: {}", req.name))
+            let result = ToolResult::error(format!("Unknown tool: {}", req.name));
+            end_tool_span(tool_span, false, Some(result.content.as_str()));
+            result
         }
     }
 }
@@ -2897,6 +2968,8 @@ pub async fn run_single_query(
         .messages(api_messages)
         .system(system)
         .build();
+    let llm_span = start_llm_request_span(&config.model, config.max_tokens);
+    let interaction_span = start_interaction_span("single_query");
 
     let handler: Arc<dyn StreamHandler> = Arc::new(mangocode_api::streaming::NullStreamHandler);
 
@@ -2910,7 +2983,9 @@ pub async fn run_single_query(
         }
     }
 
-    let (msg, _usage, _stop) = acc.finish();
+    let (msg, usage, _stop) = acc.finish();
+    end_llm_request_span(llm_span, usage.input_tokens, usage.output_tokens);
+    end_interaction_span(interaction_span);
     Ok(msg)
 }
 
@@ -3183,6 +3258,7 @@ mod tests {
                 mode: PermissionMode::BypassPermissions,
             }),
             cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
             session_id: "query-loop-test".to_string(),
             file_history: std::sync::Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),

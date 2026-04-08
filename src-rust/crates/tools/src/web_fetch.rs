@@ -15,16 +15,16 @@ pub struct WebFetchTool;
 struct WebFetchInput {
     url: String,
     #[serde(default)]
-    #[allow(dead_code)]
     prompt: Option<String>,
 }
 
 /// Compute a simple hash of the URL for cache purposes.
-fn url_hash(url: &str) -> String {
+fn cache_key(url: &str, prompt: Option<&str>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     url.hash(&mut hasher);
+    prompt.unwrap_or("").hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
 
@@ -37,9 +37,9 @@ fn get_cache_dir() -> PathBuf {
 }
 
 /// Attempt to load cached extracted content for a URL.
-fn load_cached_extraction(url: &str) -> Option<String> {
+fn load_cached_extraction(url: &str, prompt: Option<&str>) -> Option<String> {
     let cache_dir = get_cache_dir();
-    let cache_file = cache_dir.join(format!("{}.txt", url_hash(url)));
+    let cache_file = cache_dir.join(format!("{}.txt", cache_key(url, prompt)));
 
     if cache_file.exists() {
         match fs::read_to_string(&cache_file) {
@@ -56,18 +56,54 @@ fn load_cached_extraction(url: &str) -> Option<String> {
 }
 
 /// Save extracted content to cache.
-fn save_cached_extraction(url: &str, content: &str) {
+fn save_cached_extraction(url: &str, prompt: Option<&str>, content: &str) {
     let cache_dir = get_cache_dir();
     if let Err(e) = fs::create_dir_all(&cache_dir) {
         warn!(dir = ?cache_dir, error = %e, "Failed to create cache directory");
         return;
     }
 
-    let cache_file = cache_dir.join(format!("{}.txt", url_hash(url)));
+    let cache_file = cache_dir.join(format!("{}.txt", cache_key(url, prompt)));
     if let Err(e) = fs::write(&cache_file, content) {
         warn!(file = ?cache_file, error = %e, "Failed to write cache file");
     } else {
         debug!(file = ?cache_file, "Cached extracted web content");
+    }
+}
+
+fn prompt_filter_text(text: &str, prompt: &str) -> String {
+    let prompt_terms: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| part.len() > 2)
+        .map(|part| part.to_lowercase())
+        .collect();
+
+    let paragraphs: Vec<&str> = text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if prompt_terms.is_empty() || paragraphs.is_empty() {
+        return text.to_string();
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_score = 0usize;
+
+    for (idx, paragraph) in paragraphs.iter().enumerate() {
+        let lower = paragraph.to_lowercase();
+        let score = prompt_terms.iter().filter(|term| lower.contains(term.as_str())).count();
+        if score > best_score {
+            best_score = score;
+            best_idx = idx;
+        }
+    }
+
+    if best_score == 0 {
+        paragraphs.iter().take(2).copied().collect::<Vec<_>>().join("\n\n")
+    } else {
+        paragraphs[best_idx].to_string()
     }
 }
 
@@ -353,8 +389,8 @@ impl Tool for WebFetchTool {
             Err(e) => return ToolResult::error(format!("Failed to read response body: {}", e)),
         };
 
-        // Try to load from cache first
-        if let Some(cached) = load_cached_extraction(&params.url) {
+        // Try to load from cache first.
+        if let Some(cached) = load_cached_extraction(&params.url, params.prompt.as_deref()) {
             return ToolResult::success(cached);
         }
 
@@ -375,6 +411,10 @@ impl Tool for WebFetchTool {
             }
         }
 
+        if let Some(prompt) = params.prompt.as_deref() {
+            text = prompt_filter_text(&text, prompt);
+        }
+
         // Truncate very long content
         const MAX_LEN: usize = 100_000;
         let text = if text.len() > MAX_LEN {
@@ -388,7 +428,7 @@ impl Tool for WebFetchTool {
         };
 
         // Cache the final result
-        save_cached_extraction(&params.url, &text);
+        save_cached_extraction(&params.url, params.prompt.as_deref(), &text);
 
         ToolResult::success(text)
     }

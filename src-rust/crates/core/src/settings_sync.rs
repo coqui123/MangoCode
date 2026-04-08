@@ -14,6 +14,7 @@
 // and values are the UTF-8 file contents (JSON or Markdown).
 
 use anyhow::Result;
+use crate::Settings;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -26,7 +27,6 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 
 const SYNC_TIMEOUT_SECS: u64 = 10;
-#[allow(dead_code)]
 const DEFAULT_MAX_RETRIES: u32 = 3;
 /// 500 KB per-file size limit (matches backend enforcement).
 const MAX_FILE_SIZE_BYTES: u64 = 500 * 1024;
@@ -63,22 +63,17 @@ struct UserSyncContent {
 /// Full GET /api/claude_code/user_settings response.
 #[derive(Debug, Deserialize)]
 struct UserSyncData {
-    #[allow(dead_code)]
     #[serde(rename = "userId")]
     user_id: Option<String>,
-    #[allow(dead_code)]
     version: Option<u64>,
-    #[allow(dead_code)]
     #[serde(rename = "lastModified")]
     last_modified: Option<String>,
-    #[allow(dead_code)]
     checksum: Option<String>,
     content: UserSyncContent,
 }
 
 /// PUT response (partial — only fields we care about).
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
 struct UploadResponse {
     checksum: Option<String>,
     #[serde(rename = "lastModified")]
@@ -96,6 +91,10 @@ pub struct SyncedData {
     pub settings: Option<Value>,
     /// Raw file contents keyed by their sync keys.
     pub memory_files: HashMap<String, String>,
+    /// Remote version for cache invalidation.
+    pub version: Option<u64>,
+    /// Remote checksum for ETag-style caching.
+    pub checksum: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +128,6 @@ impl SettingsSyncManager {
         format!("{}/api/claude_code/user_settings", self.base_url)
     }
 
-    #[allow(dead_code)]
     fn auth_headers(&self) -> [(&'static str, String); 2] {
         [
             ("Authorization", format!("Bearer {}", self.oauth_token)),
@@ -145,34 +143,60 @@ impl SettingsSyncManager {
     ///
     /// Returns `Ok(None)` when the server has no data for this user (404).
     /// Fails open — callers should treat errors as "no remote data".
-    pub async fn download(&self) -> Result<Option<SyncedData>> {
-        let resp = self
-            .http
-            .get(self.endpoint())
-            .header("Authorization", format!("Bearer {}", self.oauth_token))
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .send()
-            .await?;
+    pub async fn download(&self, cached_checksum: Option<&str>) -> Result<Option<SyncedData>> {
+        let mut req = self.http.get(self.endpoint());
+        for (name, value) in self.auth_headers() {
+            req = req.header(name, value);
+        }
+        if let Some(checksum) = cached_checksum {
+            req = req.header("If-None-Match", format!("\"{}\"", checksum));
+        }
+
+        let resp = req.send().await?;
 
         let status = resp.status().as_u16();
         if status == 404 {
             debug!("Settings sync: no remote data (404)");
             return Ok(None);
         }
+        if status == 304 {
+            debug!("Settings sync: remote data unchanged (304)");
+            return Ok(None);
+        }
         if status != 200 {
             anyhow::bail!("Settings sync download: unexpected status {}", status);
         }
 
-        let data: UserSyncData = resp.json().await?;
-        Ok(Some(entries_to_synced_data(data.content.entries)))
+        let UserSyncData {
+            user_id,
+            version,
+            last_modified,
+            checksum,
+            content,
+        } = resp.json().await?;
+
+        if let Some(ref uid) = user_id {
+            debug!(user_id = %uid, "Settings sync: authenticated as user");
+        }
+        if let Some(ref lm) = last_modified {
+            debug!(last_modified = %lm, "Settings sync: server timestamp");
+        }
+
+        Ok(Some(entries_to_synced_data(
+            content.entries,
+            version,
+            checksum,
+        )))
     }
 
     /// Download with exponential-backoff retry.
-    #[allow(dead_code)]
-    async fn download_with_retry(&self) -> Result<Option<SyncedData>> {
+    async fn download_with_retry(
+        &self,
+        cached_checksum: Option<&str>,
+    ) -> Result<Option<SyncedData>> {
         let mut last_err = anyhow::anyhow!("No attempts made");
         for attempt in 1..=(DEFAULT_MAX_RETRIES + 1) {
-            match self.download().await {
+            match self.download(cached_checksum).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     let msg = e.to_string();
@@ -205,11 +229,12 @@ impl SettingsSyncManager {
 
         // Global user settings
         if let Some(ref settings_json) = data.settings {
-            let path = claude_config_dir().join("settings.json");
+            let path = Settings::config_dir().join("settings.json");
             let content = serde_json::to_string_pretty(settings_json).unwrap_or_default();
             match write_file_for_sync(&path, &content).await {
                 Ok(()) => {
                     result.settings_written = true;
+                    result.settings_applied = true;
                     result.applied_count += 1;
                 }
                 Err(e) => warn!("Settings sync: failed to write user settings: {}", e),
@@ -218,7 +243,7 @@ impl SettingsSyncManager {
 
         // Global user memory
         if let Some(memory) = data.memory_files.get(SYNC_KEY_USER_MEMORY) {
-            let path = claude_config_dir().join("AGENTS.md");
+            let path = Settings::config_dir().join("AGENTS.md");
             match write_file_for_sync(&path, memory).await {
                 Ok(()) => {
                     result.memory_written = true;
@@ -276,7 +301,7 @@ impl SettingsSyncManager {
     /// Compares with existing remote entries and only uploads changed keys.
     pub async fn upload(&self, local_entries: HashMap<String, String>) -> Result<()> {
         // Fetch current remote state for diff
-        let remote_entries = match self.download().await? {
+        let remote_entries = match self.download_with_retry(None).await? {
             Some(data) => data.memory_files,
             None => HashMap::new(),
         };
@@ -301,20 +326,27 @@ impl SettingsSyncManager {
 
     async fn put_entries(&self, entries: HashMap<String, String>) -> Result<()> {
         let body = serde_json::json!({ "entries": entries });
-        let resp = self
+        let mut req = self
             .http
             .put(self.endpoint())
-            .header("Authorization", format!("Bearer {}", self.oauth_token))
-            .header("anthropic-beta", "oauth-2025-04-20")
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body);
+        for (name, value) in self.auth_headers() {
+            req = req.header(name, value);
+        }
+
+        let resp = req.send().await?;
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             anyhow::bail!("Settings sync upload: unexpected status {}", status);
         }
+        let resp_body: UploadResponse = resp.json().await.unwrap_or_default();
+        debug!(
+            checksum = ?resp_body.checksum,
+            last_modified = ?resp_body.last_modified,
+            "Settings sync: upload response"
+        );
         Ok(())
     }
 
@@ -347,6 +379,7 @@ impl SettingsSyncManager {
 #[derive(Debug, Default)]
 pub struct ApplyResult {
     pub applied_count: usize,
+    pub settings_applied: bool,
     pub settings_written: bool,
     pub memory_written: bool,
 }
@@ -358,7 +391,11 @@ pub struct ApplyResult {
 /// Convert raw sync entries into the `SyncedData` structure.
 ///
 /// The user settings entry is parsed as JSON; memory files are kept as-is.
-fn entries_to_synced_data(entries: HashMap<String, String>) -> SyncedData {
+fn entries_to_synced_data(
+    entries: HashMap<String, String>,
+    version: Option<u64>,
+    checksum: Option<String>,
+) -> SyncedData {
     let mut data = SyncedData::default();
 
     for (key, value) in entries {
@@ -369,6 +406,8 @@ fn entries_to_synced_data(entries: HashMap<String, String>) -> SyncedData {
         }
     }
 
+    data.version = version;
+    data.checksum = checksum;
     data
 }
 
@@ -381,13 +420,13 @@ pub async fn collect_local_entries(project_id: Option<&str>) -> HashMap<String, 
     let mut entries = HashMap::new();
 
     // Global user settings
-    let settings_path = claude_config_dir().join("settings.json");
+    let settings_path = Settings::config_dir().join("settings.json");
     if let Some(content) = try_read_for_sync(&settings_path).await {
         entries.insert(SYNC_KEY_USER_SETTINGS.to_string(), content);
     }
 
     // Global user memory
-    let memory_path = claude_config_dir().join("AGENTS.md");
+    let memory_path = Settings::config_dir().join("AGENTS.md");
     if let Some(content) = try_read_for_sync(&memory_path).await {
         entries.insert(SYNC_KEY_USER_MEMORY.to_string(), content);
     }
@@ -434,15 +473,7 @@ async fn write_file_for_sync(path: &PathBuf, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Return the ~/.mangocode directory.
-fn claude_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".mangocode"))
-        .unwrap_or_else(|| PathBuf::from(".mangocode"))
-}
-
 /// Exponential backoff delay for retry attempt `n` (1-indexed), capped at 30 s.
-#[allow(dead_code)]
 fn retry_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(30);
     let secs: u64 = 1u64.checked_shl(shift).unwrap_or(u64::MAX).min(30);
@@ -481,27 +512,29 @@ mod tests {
         );
         entries.insert(SYNC_KEY_USER_MEMORY.to_string(), "# My notes".to_string());
 
-        let data = entries_to_synced_data(entries);
+        let data = entries_to_synced_data(entries, Some(7), Some("sha256:abc".to_string()));
         assert!(data.settings.is_some());
         assert_eq!(data.settings.unwrap()["model"], json!("claude-3"));
         assert_eq!(
             data.memory_files.get(SYNC_KEY_USER_MEMORY).unwrap(),
             "# My notes"
         );
+        assert_eq!(data.version, Some(7));
+        assert_eq!(data.checksum.as_deref(), Some("sha256:abc"));
     }
 
     #[test]
     fn test_entries_to_synced_data_invalid_json_settings() {
         let mut entries = HashMap::new();
         entries.insert(SYNC_KEY_USER_SETTINGS.to_string(), "not-json".to_string());
-        let data = entries_to_synced_data(entries);
+        let data = entries_to_synced_data(entries, None, None);
         // Malformed settings JSON → field is None (graceful degradation)
         assert!(data.settings.is_none());
     }
 
     #[test]
     fn test_entries_to_synced_data_empty() {
-        let data = entries_to_synced_data(HashMap::new());
+        let data = entries_to_synced_data(HashMap::new(), None, None);
         assert!(data.settings.is_none());
         assert!(data.memory_files.is_empty());
     }

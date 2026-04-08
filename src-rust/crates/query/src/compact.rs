@@ -35,7 +35,6 @@ use tracing::{debug, info, warn};
 // ---------------------------------------------------------------------------
 
 /// We target keeping this many context tokens free after compaction.
-#[allow(dead_code)]
 const AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
 
 /// Start warning when this many tokens remain in the context window.
@@ -971,6 +970,15 @@ pub async fn reactive_compact(
 
     let tokens_after = estimate_tokens_for_messages(&new_messages) as u64;
     let tokens_freed = original_token_estimate.saturating_sub(tokens_after);
+    let max_tokens = context_window_for_model(&config.model);
+    let headroom = max_tokens.saturating_sub(tokens_after);
+    if headroom < AUTOCOMPACT_BUFFER_TOKENS {
+        warn!(
+            headroom,
+            target = AUTOCOMPACT_BUFFER_TOKENS,
+            "Compaction did not free enough tokens"
+        );
+    }
 
     Ok(CompactResult {
         messages: new_messages,

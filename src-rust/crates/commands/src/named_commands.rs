@@ -1184,6 +1184,7 @@ mod tests {
         CommandContext {
             config: mangocode_core::config::Config::default(),
             cost_tracker: CostTracker::new(),
+            session_metrics: None,
             messages: vec![],
             working_dir: std::path::PathBuf::from("."),
             session_id: "named-test-session".to_string(),

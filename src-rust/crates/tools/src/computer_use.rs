@@ -46,11 +46,11 @@ const DISPLAY_WIDTH_PX: u32 = 1920;
 const DISPLAY_HEIGHT_PX: u32 = 1080;
 
 /// Maximum dimensions the API accepts for screenshots.
-#[allow(dead_code)]
+#[cfg(feature = "computer-use")]
 const MAX_SCREENSHOT_WIDTH: u32 = 1366;
-#[allow(dead_code)]
+#[cfg(feature = "computer-use")]
 const MAX_SCREENSHOT_HEIGHT: u32 = 768;
-#[allow(dead_code)]
+#[cfg(feature = "computer-use")]
 const JPEG_QUALITY: u8 = 75;
 
 // ---------------------------------------------------------------------------

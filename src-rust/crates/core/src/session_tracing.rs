@@ -1,9 +1,18 @@
 //! Session Tracing — OpenTelemetry span stubs.
 //!
-//! Telemetry spans are no-ops: all span operations compile unchanged but
-//! discard all tracing data.
+//! Telemetry spans are no-ops by default. When the `otel` feature is enabled,
+//! spans are exported through OpenTelemetry.
 
 use std::sync::Arc;
+
+/// Shared span interface used by the query loop.
+pub trait SpanLike: Send + Sync {
+    fn set_attribute(&self, key: &str, value: &str);
+    fn set_attributes(&self, attrs: &[(&str, &str)]);
+    fn add_event(&self, name: &str);
+    fn record_exception(&self, error: &str);
+    fn end(&self);
+}
 
 /// A no-op span that implements the minimal span interface.
 #[derive(Debug, Clone)]
@@ -37,55 +46,194 @@ impl Default for NoopSpan {
     }
 }
 
+impl SpanLike for NoopSpan {
+    fn set_attribute(&self, _: &str, _: &str) {}
+    fn set_attributes(&self, _: &[(&str, &str)]) {}
+    fn add_event(&self, _: &str) {}
+    fn record_exception(&self, _: &str) {}
+    fn end(&self) {}
+}
+
+#[cfg(feature = "otel")]
+pub(crate) mod otel_impl {
+    use super::SpanLike;
+    use opentelemetry::global;
+    use opentelemetry::trace::{Span as _, Status, Tracer as _};
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::{runtime::Tokio, trace::Config as TraceConfig, Resource};
+    use opentelemetry_sdk::trace::TracerProvider as SdkProvider;
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+
+    pub static PROVIDER: OnceLock<SdkProvider> = OnceLock::new();
+
+    pub fn init_provider() {
+        if PROVIDER.get().is_some() {
+            return;
+        }
+
+        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:4317".to_string());
+
+        let trace_config = TraceConfig::default()
+            .with_resource(Resource::new(vec![KeyValue::new("service.name", "mangocode")]));
+
+        let provider = opentelemetry_otlp::new_pipeline()
+            .tracing()
+            .with_trace_config(trace_config)
+            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(&endpoint))
+            .install_batch(Tokio)
+            .expect("Failed to install OTLP trace pipeline");
+
+        let _ = global::set_tracer_provider(provider.clone());
+        let _ = PROVIDER.set(provider);
+    }
+
+    pub fn tracer() -> Option<global::BoxedTracer> {
+        PROVIDER.get().map(|_| global::tracer("mangocode"))
+    }
+
+    #[derive(Debug)]
+    pub struct OtelSpanWrapper {
+        span: Mutex<global::BoxedSpan>,
+    }
+
+    impl OtelSpanWrapper {
+        pub fn new(span: global::BoxedSpan) -> Self {
+            Self {
+                span: Mutex::new(span),
+            }
+        }
+    }
+
+    impl SpanLike for OtelSpanWrapper {
+        fn set_attribute(&self, key: &str, value: &str) {
+            self.span
+                .lock()
+                .set_attribute(KeyValue::new(key.to_string(), value.to_string()));
+        }
+
+        fn set_attributes(&self, attrs: &[(&str, &str)]) {
+            let mut span = self.span.lock();
+            span.set_attributes(attrs.iter().map(|(key, value)| {
+                KeyValue::new((*key).to_string(), (*value).to_string())
+            }));
+        }
+
+        fn add_event(&self, name: &str) {
+            self.span.lock().add_event(name.to_string(), Vec::new());
+        }
+
+        fn record_exception(&self, error: &str) {
+            let err = std::io::Error::other(error.to_string());
+            let mut span = self.span.lock();
+            span.record_error(&err);
+            span.set_status(Status::error(error.to_string()));
+        }
+
+        fn end(&self) {
+            self.span.lock().end();
+        }
+    }
+
+    pub fn boxed_span(name: String) -> Option<std::sync::Arc<dyn SpanLike>> {
+        let tracer = tracer()?;
+        let span = tracer.start(name);
+        Some(std::sync::Arc::new(OtelSpanWrapper::new(span)))
+    }
+}
+
+fn new_span(name: &str) -> Arc<dyn SpanLike> {
+    let _ = name;
+    #[cfg(feature = "otel")]
+    {
+        if let Some(span) = otel_impl::boxed_span(name.to_string()) {
+            return span;
+        }
+    }
+
+    Arc::new(NoopSpan::new())
+}
+
 // ---------------------------------------------------------------------------
-// Public Span API — all no-ops
+// Public Span API
 // ---------------------------------------------------------------------------
 
 /// Start an interaction span (root span for a user request).
-/// Returns a no-op span; data is discarded.
-pub fn start_interaction_span(_request_id: &str) -> Arc<NoopSpan> {
-    Arc::new(NoopSpan::new())
+pub fn start_interaction_span(request_id: &str) -> Arc<dyn SpanLike> {
+    let span = new_span("interaction");
+    span.set_attribute("request_id", request_id);
+    span
 }
 
-/// End an interaction span (no-op).
-pub fn end_interaction_span(_span: Arc<NoopSpan>) {}
+/// End an interaction span.
+pub fn end_interaction_span(span: Arc<dyn SpanLike>) {
+    span.end();
+}
 
 /// Start an LLM request span (traces API calls).
-/// Normally tracks TTFT, token counts, model, fast-mode status.
-/// In free builds, this is a no-op.
-pub fn start_llm_request_span(_model: &str, _max_tokens: u32) -> Arc<NoopSpan> {
-    Arc::new(NoopSpan::new())
+pub fn start_llm_request_span(model: &str, max_tokens: u32) -> Arc<dyn SpanLike> {
+    let span = new_span("llm.request");
+    span.set_attribute("model", model);
+    span.set_attribute("max_tokens", &max_tokens.to_string());
+    span
 }
 
-/// End an LLM request span (no-op).
-pub fn end_llm_request_span(_span: Arc<NoopSpan>, _input_tokens: u32, _output_tokens: u32) {}
+/// End an LLM request span.
+pub fn end_llm_request_span(span: Arc<dyn SpanLike>, input_tokens: u64, output_tokens: u64) {
+    span.set_attribute("input_tokens", &input_tokens.to_string());
+    span.set_attribute("output_tokens", &output_tokens.to_string());
+    span.end();
+}
 
 /// Start a tool execution span.
-pub fn start_tool_span(_tool_name: &str) -> Arc<NoopSpan> {
-    Arc::new(NoopSpan::new())
+pub fn start_tool_span(tool_name: &str) -> Arc<dyn SpanLike> {
+    let span = new_span("tool.execute");
+    span.set_attribute("tool_name", tool_name);
+    span
 }
 
-/// End a tool execution span (no-op).
-pub fn end_tool_span(_span: Arc<NoopSpan>, _success: bool, _error: Option<&str>) {}
+/// End a tool execution span.
+pub fn end_tool_span(span: Arc<dyn SpanLike>, success: bool, error: Option<&str>) {
+    span.set_attribute("success", if success { "true" } else { "false" });
+    if let Some(error) = error {
+        span.record_exception(error);
+        span.set_attribute("error", error);
+    }
+    span.end();
+}
 
 /// Start a permission dialog span.
-pub fn start_permission_span(_tool_name: &str) -> Arc<NoopSpan> {
-    Arc::new(NoopSpan::new())
+pub fn start_permission_span(tool_name: &str) -> Arc<dyn SpanLike> {
+    let span = new_span("permission.check");
+    span.set_attribute("tool_name", tool_name);
+    span
 }
 
-/// End a permission dialog span (no-op).
-pub fn end_permission_span(_span: Arc<NoopSpan>) {}
+/// End a permission dialog span.
+pub fn end_permission_span(span: Arc<dyn SpanLike>) {
+    span.end();
+}
 
 /// Start a hook execution span.
-pub fn start_hook_span(_hook_name: &str) -> Arc<NoopSpan> {
-    Arc::new(NoopSpan::new())
+pub fn start_hook_span(hook_name: &str) -> Arc<dyn SpanLike> {
+    let span = new_span("hook.execute");
+    span.set_attribute("hook_name", hook_name);
+    span
 }
 
-/// End a hook execution span (no-op).
-pub fn end_hook_span(_span: Arc<NoopSpan>) {}
+/// End a hook execution span.
+pub fn end_hook_span(span: Arc<dyn SpanLike>) {
+    span.end();
+}
 
-/// Add tool content event to span (no-op).
-pub fn add_tool_content_event(_span: &Arc<NoopSpan>, _label: &str, _content: &str) {}
+/// Add tool content event to span.
+pub fn add_tool_content_event(span: &Arc<dyn SpanLike>, label: &str, content: &str) {
+    span.add_event(label);
+    span.set_attribute("tool_content_label", label);
+    span.set_attribute("tool_content", content);
+}
 
 /// Execute an async operation within a span (no-op wrapper).
 pub async fn execute_in_span<F, T>(f: F) -> T
@@ -95,9 +243,9 @@ where
     f.await
 }
 
-/// Check if enhanced telemetry is enabled (always false).
+/// Check if enhanced telemetry is enabled.
 pub fn is_enhanced_telemetry_enabled() -> bool {
-    false
+    crate::analytics::is_telemetry_enabled()
 }
 
 #[cfg(test)]
@@ -112,7 +260,6 @@ mod tests {
         span.add_event("test_event");
         span.record_exception("test error");
         span.end();
-        // If this test passes, the no-ops work correctly
     }
 
     #[test]

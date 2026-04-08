@@ -101,7 +101,6 @@ struct TodoItem {
     content: String,
     status: TodoStatus,
     #[serde(default)]
-    #[allow(dead_code)]
     priority: Option<String>,
 }
 
@@ -266,13 +265,25 @@ impl Tool for TodoWriteTool {
             total, pending, in_progress, completed
         );
 
-        for item in &params.todos {
+        let mut display_items: Vec<&TodoItem> = params.todos.iter().collect();
+        display_items.sort_by_key(|item| match item.priority.as_deref() {
+            Some("high") | Some("urgent") => 0,
+            Some("medium") => 1,
+            Some("low") => 2,
+            _ => 1,
+        });
+
+        for item in display_items {
             let icon = match item.status {
                 TodoStatus::Pending => "[ ]",
                 TodoStatus::InProgress => "[~]",
                 TodoStatus::Completed => "[x]",
             };
-            output.push_str(&format!("{} {} ({})\n", icon, item.content, item.id));
+            let priority_tag = item.priority.as_deref().unwrap_or("normal");
+            output.push_str(&format!(
+                "{} {} ({}) [{}]\n",
+                icon, item.content, item.id, priority_tag
+            ));
         }
 
         // --- 6. Persist to disk ----------------------------------------------

@@ -634,6 +634,7 @@ async fn main() -> anyhow::Result<()> {
                 let cmd_ctx = mangocode_commands::CommandContext {
                     config,
                     cost_tracker: CostTracker::new(),
+                    session_metrics: None,
                     messages: vec![],
                     working_dir: cwd,
                     session_id: "pre-session".to_string(),
@@ -888,6 +889,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
     let cost_tracker = CostTracker::new();
+    let session_metrics = mangocode_core::analytics::SessionMetrics::new();
     // Use --session-id if provided, otherwise generate a fresh UUID.
     let session_id = cli
         .session_id_flag
@@ -907,6 +909,7 @@ async fn main() -> anyhow::Result<()> {
         permission_mode: config.permission_mode.clone(),
         permission_handler: permission_handler.clone(),
         cost_tracker: cost_tracker.clone(),
+        session_metrics: Some(session_metrics.clone()),
         session_id: session_id.clone(),
         file_history: file_history.clone(),
         current_turn: current_turn.clone(),
@@ -1055,6 +1058,21 @@ async fn main() -> anyhow::Result<()> {
         proactive_cancel.clone(),
     );
 
+    // Spawn background remote settings poller.
+    let remote_settings_cancel = tokio_util::sync::CancellationToken::new();
+    let remote_config = mangocode_core::remote_settings::RemoteSettingsConfig::from_env();
+    if mangocode_core::remote_settings::RemoteSettingsManager::is_eligible(
+        remote_config.api_key.as_deref(),
+    ) {
+        let manager = std::sync::Arc::new(
+            mangocode_core::remote_settings::RemoteSettingsManager::new(remote_config),
+        );
+        let poll_cancel = remote_settings_cancel.child_token();
+        tokio::spawn(async move {
+            manager.start_polling(poll_cancel).await;
+        });
+    }
+
     // --print mode (headless)
     let result = if is_headless {
         run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
@@ -1086,6 +1104,7 @@ async fn main() -> anyhow::Result<()> {
 
     cron_cancel.cancel();
     proactive_cancel.cancel();
+    remote_settings_cancel.cancel();
     result
 }
 
@@ -1099,7 +1118,9 @@ async fn connect_mcp_manager_arc(config: &Config) -> Option<Arc<mangocode_mcp::M
         "Connecting to MCP servers"
     );
     let mcp_manager = mangocode_mcp::McpManager::connect_all(&config.mcp_servers).await;
-    Some(Arc::new(mcp_manager))
+    let mcp_manager = Arc::new(mcp_manager);
+    mcp_manager.clone().spawn_notification_poll_loop();
+    Some(mcp_manager)
 }
 
 fn build_tools_with_mcp(
@@ -2139,6 +2160,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     let mut cmd_ctx = CommandContext {
         config: live_config,
         cost_tracker: cost_tracker.clone(),
+        session_metrics: tool_ctx.session_metrics.clone(),
         messages: messages.clone(),
         working_dir: tool_ctx.working_dir.clone(),
         session_id: session.id.clone(),
@@ -2474,7 +2496,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
                                     mangocode_tui::restore_terminal(&mut terminal).ok();
                                     match oauth_flow::run_oauth_login_flow(with_claude_ai).await {
-                                        Ok(_) => {
+                                        Ok(result) => {
+                                            debug!(
+                                                credential_len = result.credential.len(),
+                                                bearer = result.use_bearer_auth,
+                                                "OAuth login complete"
+                                            );
                                             app.status_message =
                                                 Some("Login successful!".to_string());
                                             eprintln!(
@@ -3345,6 +3372,11 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             println!("Starting authentication...");
             match oauth_flow::run_oauth_login_flow(login_with_claude_ai).await {
                 Ok(result) => {
+                    debug!(
+                        credential_len = result.credential.len(),
+                        bearer = result.use_bearer_auth,
+                        "OAuth login complete"
+                    );
                     println!("Successfully logged in!");
                     if let Some(email) = &result.tokens.email {
                         println!("  Account: {}", email);

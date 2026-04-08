@@ -34,10 +34,20 @@ use tracing::debug;
 struct ReplSession {
     // We hold the Child handle so that the process is not killed when the
     // session is dropped.  We don't read from it directly after spawn.
-    #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+impl ReplSession {
+    /// Check whether the interpreter is still running.
+    fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(_) => false,
+        }
+    }
 }
 
 type ReplSessionKey = (String, String);
@@ -135,6 +145,9 @@ async fn run_in_session(
     let wrapped = wrap_code(language, code);
 
     let mut guard = session.lock().await;
+    if !guard.is_alive() {
+        return Err("Interpreter exited unexpectedly.".to_string());
+    }
     guard
         .stdin
         .write_all(wrapped.as_bytes())

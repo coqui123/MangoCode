@@ -42,7 +42,6 @@ const INLINE_TARGET_W_ITERM: u32 = 260;
 /// Horizontal stretch factor used for text-cell rendering fallback.
 /// Many Windows terminal fonts are effectively taller than the ideal 2:1 cell
 /// model, so a wider fit improves mascot recognizability.
-#[allow(dead_code)]
 const FALLBACK_CELL_ASPECT_X: f32 = 3.0;
 
 /// Parsed SVG tree, cached once.
@@ -72,7 +71,6 @@ static SVG_CONTENT_BOUNDS: Lazy<Option<SvgCropRect>> = Lazy::new(|| {
 /// Quadrant block characters indexed by 4-bit pattern.
 /// Bit layout: bit0=top-left, bit1=top-right, bit2=bottom-left, bit3=bottom-right.
 /// A set bit means that quadrant uses the foreground color.
-#[allow(dead_code)]
 const QUADRANT_CHARS: [char; 16] = [
     ' ', // 0b0000 - empty (all bg)
     '▘', // 0b0001 - TL
@@ -218,7 +216,13 @@ pub fn rustle_lines_sized(max_rows: u16) -> Vec<Line<'static>> {
         }
     }
 
-    let lines = render_svg_braille(max_rows);
+    let lines = match std::env::var("MANGOCODE_MASCOT_RENDERER")
+        .ok()
+        .as_deref()
+    {
+        Some("quadrant") => render_svg_quadrants(max_rows),
+        _ => render_svg_braille(max_rows),
+    };
 
     {
         let mut cache = CACHED_RENDER.lock();
@@ -238,7 +242,6 @@ pub fn rustle_lines(_pose: &RustlePose) -> Vec<Line<'static>> {
 /// Each terminal cell encodes a 2×2 pixel grid using quadrant block characters.
 /// The rasterizer produces a pixel grid of (cols*2) × (rows*2) pixels, then
 /// for each 2×2 block picks the best quadrant character + fg/bg color pair.
-#[allow(dead_code)]
 fn render_svg_quadrants(max_rows: u16) -> Vec<Line<'static>> {
     let tree = match SVG_TREE.as_ref() {
         Some(t) => t,
@@ -452,7 +455,6 @@ fn render_svg_braille(max_rows: u16) -> Vec<Line<'static>> {
 ///
 /// Tries all 16 quadrant patterns. For each, computes the average fg and bg
 /// colors and the total squared error. Returns the pattern with minimum error.
-#[allow(dead_code)]
 fn best_quadrant(px: [(u8, u8, u8); 4]) -> (char, (u8, u8, u8), (u8, u8, u8)) {
     // Preserve true empty background cells as spaces.
     if px
@@ -487,7 +489,6 @@ fn best_quadrant(px: [(u8, u8, u8); 4]) -> (char, (u8, u8, u8), (u8, u8, u8)) {
 
 /// Compute average fg and bg colors for a given quadrant pattern.
 /// Bit i of `pat` → pixel i is foreground; otherwise background.
-#[allow(dead_code)]
 fn avg_for_pattern(px: &[(u8, u8, u8); 4], pat: u8) -> ((u8, u8, u8), (u8, u8, u8)) {
     let mut fg_r = 0u32;
     let mut fg_g = 0u32;
@@ -536,7 +537,6 @@ fn avg_for_pattern(px: &[(u8, u8, u8); 4], pat: u8) -> ((u8, u8, u8), (u8, u8, u
 }
 
 /// Total squared color error for a pattern + fg/bg assignment.
-#[allow(dead_code)]
 fn pattern_error(px: &[(u8, u8, u8); 4], pat: u8, fg: (u8, u8, u8), bg: (u8, u8, u8)) -> u64 {
     let mut err = 0u64;
     for i in 0..4u8 {
@@ -551,7 +551,6 @@ fn pattern_error(px: &[(u8, u8, u8); 4], pat: u8, fg: (u8, u8, u8), bg: (u8, u8,
 }
 
 /// Build a styled Span for `n` repetitions of a quadrant character.
-#[allow(dead_code)]
 fn make_span(ch: char, fg: (u8, u8, u8), bg: (u8, u8, u8), n: usize) -> Span<'static> {
     let s: String = std::iter::repeat_n(ch, n).collect();
     let style = if ch == '█' {
