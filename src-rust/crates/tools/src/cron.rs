@@ -356,7 +356,7 @@ impl Tool for CronCreateTool {
         let where_note = if params.durable {
             "Persisted to ~/.mangocode/scheduled_tasks.json"
         } else {
-            "Session-only (dies when Claude exits)"
+            "Session-only (dies when MangoCode exits)"
         };
 
         let msg = if params.recurring {

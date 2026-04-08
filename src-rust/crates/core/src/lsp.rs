@@ -16,6 +16,7 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::io::ErrorKind;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{
@@ -43,6 +44,9 @@ pub struct LspServerConfig {
     pub file_patterns: Vec<String>,
     /// Optional server-specific initialization options (passed in LSP `initialize`)
     pub initialization_options: Option<serde_json::Value>,
+    /// Optional shell command used to install the server binary when missing.
+    #[serde(default)]
+    pub install_command: Option<String>,
     /// Map of file extension (e.g. `.rs`) to LSP language identifier (e.g.
     /// `rust`).  Used to supply `textDocument/didOpen::languageId` and to
     /// route files to the right server.
@@ -155,6 +159,28 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<ser
     Ok(serde_json::from_slice(&buf)?)
 }
 
+async fn run_install_command(command: &str) -> anyhow::Result<()> {
+    let mut parts = command.split_whitespace();
+    let Some(program) = parts.next() else {
+        return Err(anyhow::anyhow!("Empty install command"));
+    };
+    let args: Vec<&str> = parts.collect();
+
+    let output = Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("Install command failed: {}", command));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // LspClient
 // ---------------------------------------------------------------------------
@@ -200,9 +226,58 @@ impl LspClient {
             cmd.creation_flags(0x0800_0000u32);
         }
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to start LSP server '{}': {}", config.command, e)
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(install_command) = config.install_command.as_deref() {
+                    tracing::warn!(
+                        server = %config.name,
+                        command = %config.command,
+                        install_command = %install_command,
+                        "LSP server missing; attempting install"
+                    );
+                    run_install_command(install_command).await?;
+
+                    let mut retry_cmd = Command::new(&config.command);
+                    retry_cmd
+                        .args(&config.args)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .kill_on_drop(true);
+
+                    for (k, v) in &config.env {
+                        retry_cmd.env(k, v);
+                    }
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        retry_cmd.creation_flags(0x0800_0000u32);
+                    }
+
+                    retry_cmd.spawn().map_err(|retry_err| {
+                        anyhow::anyhow!(
+                            "Failed to start LSP server '{}' after install attempt: {}",
+                            config.command,
+                            retry_err
+                        )
+                    })?
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Failed to start LSP server '{}': {}",
+                        config.command,
+                        err
+                    ));
+                }
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to start LSP server '{}': {}",
+                    config.command,
+                    err
+                ));
+            }
+        };
 
         let stdin = child
             .stdin
@@ -292,7 +367,13 @@ impl LspClient {
             send_message(&mut w, &body).await?;
         }
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        let timeout = if method == "initialize" {
+            std::time::Duration::from_secs(120)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
+
+        let response = tokio::time::timeout(timeout, rx)
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -357,6 +438,15 @@ impl LspClient {
                         "willSave": false,
                         "willSaveWaitUntil": false,
                         "didSave": true
+                    },
+                    "callHierarchy": {
+                        "dynamicRegistration": false
+                    },
+                    "implementation": {
+                        "dynamicRegistration": false
+                    },
+                    "typeDefinition": {
+                        "dynamicRegistration": false
                     }
                 },
                 "workspace": {
@@ -554,6 +644,112 @@ impl LspClient {
         Ok(symbols)
     }
 
+    /// Prepare call hierarchy items at a position (1-based line/column).
+    /// Returns the raw JSON array of `CallHierarchyItem` objects from the server.
+    pub async fn prepare_call_hierarchy(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/prepareCallHierarchy",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    }
+                }),
+            )
+            .await?;
+
+        match result.as_array() {
+            Some(arr) => Ok(arr.clone()),
+            None if result.is_null() => Ok(Vec::new()),
+            None => Ok(vec![result]),
+        }
+    }
+
+    /// Get incoming calls for a `CallHierarchyItem`.
+    /// Returns formatted strings: `"file:line — caller_name()"`.
+    pub async fn incoming_calls(
+        &self,
+        item: &serde_json::Value,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "callHierarchy/incomingCalls",
+                json!({ "item": item }),
+            )
+            .await?;
+
+        Ok(format_call_hierarchy_results(&result, "from"))
+    }
+
+    /// Get outgoing calls for a `CallHierarchyItem`.
+    /// Returns formatted strings: `"file:line — callee_name()"`.
+    pub async fn outgoing_calls(
+        &self,
+        item: &serde_json::Value,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "callHierarchy/outgoingCalls",
+                json!({ "item": item }),
+            )
+            .await?;
+
+        Ok(format_call_hierarchy_results(&result, "to"))
+    }
+
+    /// Get implementation locations for a position (1-based line/column).
+    pub async fn implementations(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/implementation",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    }
+                }),
+            )
+            .await?;
+
+        Ok(extract_locations(&result))
+    }
+
+    /// Get type definition locations for a position (1-based line/column).
+    pub async fn type_definition(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let result = self
+            .send_request_inner(
+                "textDocument/typeDefinition",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": {
+                        "line": line.saturating_sub(1),
+                        "character": character.saturating_sub(1),
+                    }
+                }),
+            )
+            .await?;
+
+        Ok(extract_locations(&result))
+    }
+
     /// Get cached diagnostics for `file_path`.
     pub fn get_diagnostics(&self, file_path: &str) -> Vec<LspDiagnostic> {
         let uri = path_to_uri(file_path);
@@ -712,6 +908,31 @@ fn parse_diagnostic(
 // ---------------------------------------------------------------------------
 // Location / symbol helpers
 // ---------------------------------------------------------------------------
+
+/// Format call hierarchy results (incoming or outgoing) into human-readable strings.
+/// `key` is `"from"` for incoming calls or `"to"` for outgoing calls.
+fn format_call_hierarchy_results(result: &serde_json::Value, key: &str) -> Vec<String> {
+    let items = match result.as_array() {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    items
+        .iter()
+        .filter_map(|entry| {
+            let item = entry.get(key)?;
+            let name = item.get("name")?.as_str()?;
+            let uri = item.get("uri")?.as_str()?;
+            let line = item
+                .pointer("/range/start/line")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1;
+            let path = uri_to_path(uri);
+            Some(format!("{}:{} — {}()", path, line, name))
+        })
+        .collect()
+}
 
 /// Extract a list of `"path:line"` strings from an LSP `Location | Location[]` result.
 fn extract_locations(result: &serde_json::Value) -> Vec<String> {
@@ -977,30 +1198,10 @@ impl LspManager {
         Ok(self.clients.get_mut(&server_name))
     }
 
-    /// Spawn and initialize servers for all registered configurations.
-    pub async fn start_servers(&mut self, root_dir: &Path) {
-        let configs: Vec<LspServerConfig> = self.configs.clone();
-        for config in configs {
-            let name = config.name.clone();
-            if self.clients.contains_key(&name) {
-                continue;
-            }
-            match LspClient::start(config).await {
-                Ok(mut client) => {
-                    let root_uri = path_to_uri(&root_dir.to_string_lossy());
-                    if let Err(e) = client.initialize(&root_uri).await {
-                        tracing::warn!("Failed to initialize LSP server '{}': {}", name, e);
-                        continue;
-                    }
-                    self.clients.insert(name.clone(), client);
-                    tracing::info!("LSP server '{}' started", name);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to start LSP server '{}': {}", name, e);
-                }
-            }
-        }
-    }
+    // NOTE: start_servers (eager startup of all servers) has been removed.
+    // MangoCode enforces on-demand LSP startup via ensure_started to minimize
+    // RAM, CPU, and startup time. File-specific tools (LSP, diagnostics injection)
+    // trigger server startup only when needed.
 
     /// Open a file on the appropriate LSP server.
     pub async fn open_file(&mut self, file_path: &str, root_dir: &Path) -> anyhow::Result<()> {
@@ -1130,6 +1331,104 @@ impl LspManager {
         client.document_symbols(&uri).await
     }
 
+    /// Prepare call hierarchy at a position, then fetch incoming calls.
+    /// Returns formatted `"file:line — caller()"` strings.
+    pub async fn incoming_calls(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| anyhow::anyhow!("No LSP server configured for '{}'", file_path))?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+
+        let items = client.prepare_call_hierarchy(&uri, line, character).await?;
+        let mut results = Vec::new();
+        for item in &items {
+            results.extend(client.incoming_calls(item).await?);
+        }
+        Ok(results)
+    }
+
+    /// Prepare call hierarchy at a position, then fetch outgoing calls.
+    /// Returns formatted `"file:line — callee()"` strings.
+    pub async fn outgoing_calls(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| anyhow::anyhow!("No LSP server configured for '{}'", file_path))?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+
+        let items = client.prepare_call_hierarchy(&uri, line, character).await?;
+        let mut results = Vec::new();
+        for item in &items {
+            results.extend(client.outgoing_calls(item).await?);
+        }
+        Ok(results)
+    }
+
+    /// Get implementation locations for `file_path` at the given 1-based position.
+    pub async fn implementations(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| anyhow::anyhow!("No LSP server configured for '{}'", file_path))?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.implementations(&uri, line, character).await
+    }
+
+    /// Get type definition locations for `file_path` at the given 1-based position.
+    pub async fn type_definition(
+        &mut self,
+        file_path: &str,
+        root_dir: &Path,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        let uri = path_to_uri(file_path);
+        let server_name = self
+            .server_name_for_file(file_path)
+            .ok_or_else(|| anyhow::anyhow!("No LSP server configured for '{}'", file_path))?
+            .to_string();
+        self.ensure_started(file_path, root_dir).await?;
+        let client = self
+            .clients
+            .get(&server_name)
+            .ok_or_else(|| anyhow::anyhow!("LSP server '{}' not running", server_name))?;
+        client.type_definition(&uri, line, character).await
+    }
+
     /// Get cached diagnostics for `file_path` across all running servers.
     pub fn get_diagnostics_for_file(&self, file_path: &str) -> Vec<LspDiagnostic> {
         self.clients
@@ -1172,6 +1471,104 @@ impl Default for LspManager {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-detect language servers
+// ---------------------------------------------------------------------------
+
+/// Detect project languages by probing for well-known config files and return
+/// matching `LspServerConfig` presets.  Callers should feed these into
+/// `LspManager::seed_from_config` so servers start automatically.
+pub fn detect_project_languages(working_dir: &Path) -> Vec<LspServerConfig> {
+    let mut configs = Vec::new();
+
+    // Rust
+    if working_dir.join("Cargo.toml").exists() {
+        configs.push(LspServerConfig {
+            name: "rust-analyzer".to_string(),
+            command: "rust-analyzer".to_string(),
+            args: vec![],
+            install_command: Some("rustup component add rust-analyzer".to_string()),
+            file_patterns: vec!["*.rs".to_string()],
+            initialization_options: None,
+            extension_to_language: {
+                let mut m = HashMap::new();
+                m.insert(".rs".to_string(), "rust".to_string());
+                m
+            },
+            env: HashMap::new(),
+        });
+    }
+
+    // TypeScript / JavaScript
+    if working_dir.join("tsconfig.json").exists() || working_dir.join("package.json").exists() {
+        configs.push(LspServerConfig {
+            name: "typescript-language-server".to_string(),
+            command: "typescript-language-server".to_string(),
+            args: vec!["--stdio".to_string()],
+            install_command: Some(
+                "npm install -g typescript-language-server typescript".to_string(),
+            ),
+            file_patterns: vec![
+                "*.ts".to_string(),
+                "*.tsx".to_string(),
+                "*.js".to_string(),
+                "*.jsx".to_string(),
+            ],
+            initialization_options: None,
+            extension_to_language: {
+                let mut m = HashMap::new();
+                m.insert(".ts".to_string(), "typescript".to_string());
+                m.insert(".tsx".to_string(), "typescriptreact".to_string());
+                m.insert(".js".to_string(), "javascript".to_string());
+                m.insert(".jsx".to_string(), "javascriptreact".to_string());
+                m
+            },
+            env: HashMap::new(),
+        });
+    }
+
+    // Python
+    if working_dir.join("pyproject.toml").exists()
+        || working_dir.join("setup.py").exists()
+        || working_dir.join("requirements.txt").exists()
+    {
+        configs.push(LspServerConfig {
+            name: "pylsp".to_string(),
+            command: "pylsp".to_string(),
+            args: vec![],
+            install_command: Some("python -m pip install python-lsp-server".to_string()),
+            file_patterns: vec!["*.py".to_string()],
+            initialization_options: None,
+            extension_to_language: {
+                let mut m = HashMap::new();
+                m.insert(".py".to_string(), "python".to_string());
+                m
+            },
+            env: HashMap::new(),
+        });
+    }
+
+    // Go
+    if working_dir.join("go.mod").exists() {
+        configs.push(LspServerConfig {
+            name: "gopls".to_string(),
+            command: "gopls".to_string(),
+            args: vec!["serve".to_string()],
+            install_command: Some("go install golang.org/x/tools/gopls@latest".to_string()),
+            file_patterns: vec!["*.go".to_string()],
+            initialization_options: None,
+            extension_to_language: {
+                let mut m = HashMap::new();
+                m.insert(".go".to_string(), "go".to_string());
+                m
+            },
+            env: HashMap::new(),
+        });
+    }
+
+    configs
+}
+
+// ---------------------------------------------------------------------------
 // Global singleton
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +1597,7 @@ mod tests {
             args: vec![],
             file_patterns: vec!["*.rs".to_string()],
             initialization_options: None,
+            install_command: None,
             extension_to_language: {
                 let mut m = HashMap::new();
                 m.insert(".rs".to_string(), "rust".to_string());

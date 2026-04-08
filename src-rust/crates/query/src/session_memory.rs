@@ -20,6 +20,7 @@ use mangocode_api::{
 };
 use mangocode_core::types::{Message, Role};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -62,14 +63,33 @@ impl MemoryCategory {
         }
     }
 
-    /// Display label used in the persisted markdown.
-    fn label(&self) -> &'static str {
+    fn topic_file_name(&self) -> &'static str {
         match self {
-            Self::UserPreference => "user-preference",
-            Self::ProjectFact => "project-fact",
-            Self::CodePattern => "code-pattern",
-            Self::Decision => "decision",
-            Self::Constraint => "constraint",
+            Self::UserPreference => "user-preferences.md",
+            Self::ProjectFact => "project-facts.md",
+            Self::CodePattern => "code-patterns.md",
+            Self::Decision => "decisions.md",
+            Self::Constraint => "constraints.md",
+        }
+    }
+
+    fn topic_title(&self) -> &'static str {
+        match self {
+            Self::UserPreference => "User Preferences",
+            Self::ProjectFact => "Project Facts",
+            Self::CodePattern => "Code Patterns",
+            Self::Decision => "Decisions",
+            Self::Constraint => "Constraints",
+        }
+    }
+
+    fn topic_hook(&self) -> &'static str {
+        match self {
+            Self::UserPreference => "User workflow and communication preferences",
+            Self::ProjectFact => "Stable facts about the project and stack",
+            Self::CodePattern => "Reusable coding patterns and idioms",
+            Self::Decision => "Decisions and rationale from past sessions",
+            Self::Constraint => "Important constraints and non-negotiable limits",
         }
     }
 }
@@ -276,72 +296,229 @@ impl SessionMemoryExtractor {
         Ok(memories)
     }
 
-    /// Persist extracted memories to `target_path` (creates directories and
-    /// the file if they don't exist).  Appends under `## Auto-extracted memories`.
-    pub async fn persist(memories: &[ExtractedMemory], target_path: &Path) -> anyhow::Result<()> {
+    /// Persist extracted memories into the 3-layer memory hierarchy rooted at
+    /// `memory_dir`:
+    /// - layer 1 index: `MEMORY.md`
+    /// - layer 2 topics: `*.md`
+    /// - layer 3 transcripts: handled elsewhere (`conversations/*.jsonl`)
+    pub async fn persist(memories: &[ExtractedMemory], memory_dir: &Path) -> anyhow::Result<()> {
+        fs::create_dir_all(memory_dir).await?;
+        migrate_legacy_agents_if_needed(memory_dir).await?;
+
         if memories.is_empty() {
             return Ok(());
         }
 
-        // Ensure parent directory exists
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        // Read existing content (or start fresh)
-        let existing = match fs::read_to_string(target_path).await {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
-        };
-
-        // Build the new entries block
-        let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let mut new_block = format!("\n### Session memories — {}\n\n", date_str);
+        let mut grouped: BTreeMap<&'static str, (MemoryCategory, Vec<&ExtractedMemory>)> =
+            BTreeMap::new();
         for memory in memories {
-            new_block.push_str(&format!(
-                "- **[{}]** {} *(confidence: {:.0}%)*\n",
-                memory.category.label(),
-                memory.content,
-                memory.confidence * 100.0
-            ));
+            let key = memory.category.topic_file_name();
+            let entry = grouped
+                .entry(key)
+                .or_insert_with(|| (memory.category.clone(), Vec::new()));
+            entry.1.push(memory);
         }
 
-        // Insert under the auto-extracted memories section header (or append it)
-        const SECTION_HEADER: &str = "## Auto-extracted memories";
+        let mut updated_topics: Vec<(MemoryCategory, String)> = Vec::new();
+        let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        for (topic_file, (category, mems)) in grouped {
+            let path = memory_dir.join(topic_file);
+            append_topic_memories(&path, &date_str, &mems).await?;
+            updated_topics.push((category, topic_file.to_string()));
+        }
 
-        let updated = if existing.contains(SECTION_HEADER) {
-            // Find the section and append to it
-            if let Some(section_pos) = existing.find(SECTION_HEADER) {
-                // Find the end of the section (next ## or end of file)
-                let after_header = &existing[section_pos + SECTION_HEADER.len()..];
-                let section_end = after_header
-                    .find("\n## ")
-                    .map(|p| p + section_pos + SECTION_HEADER.len())
-                    .unwrap_or(existing.len());
-
-                let mut result = existing[..section_end].to_string();
-                result.push_str(&new_block);
-                result.push_str(&existing[section_end..]);
-                result
-            } else {
-                existing
-            }
-        } else {
-            // Append the section at the end
-            let mut result = existing;
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&format!("\n{}\n", SECTION_HEADER));
-            result.push_str(&new_block);
-            result
-        };
-
-        fs::write(target_path, updated).await?;
-        info!(path = %target_path.display(), count = memories.len(), "Memories persisted");
+        update_memory_index(memory_dir, &updated_topics).await?;
+        info!(path = %memory_dir.display(), count = memories.len(), "Memories persisted");
         Ok(())
     }
+}
+
+pub async fn migrate_legacy_agents_if_needed(memory_dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(memory_dir).await?;
+
+    let index_path = memory_dir.join("MEMORY.md");
+    if path_exists(&index_path).await {
+        return Ok(());
+    }
+
+    let Some(parent_dir) = memory_dir.parent() else {
+        return Ok(());
+    };
+    let agents_path = parent_dir.join("AGENTS.md");
+    if !path_exists(&agents_path).await {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&agents_path).await.unwrap_or_default();
+    let legacy_memories = parse_legacy_agents_memories(&content);
+    if !legacy_memories.is_empty() {
+        let mut grouped: BTreeMap<&'static str, (MemoryCategory, Vec<&ExtractedMemory>)> =
+            BTreeMap::new();
+        for memory in &legacy_memories {
+            let key = memory.category.topic_file_name();
+            let entry = grouped
+                .entry(key)
+                .or_insert_with(|| (memory.category.clone(), Vec::new()));
+            entry.1.push(memory);
+        }
+
+        let mut updated_topics: Vec<(MemoryCategory, String)> = Vec::new();
+        let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        for (topic_file, (category, mems)) in grouped {
+            let path = memory_dir.join(topic_file);
+            append_topic_memories(&path, &date_str, &mems).await?;
+            updated_topics.push((category, topic_file.to_string()));
+        }
+        update_memory_index(memory_dir, &updated_topics).await?;
+    } else {
+        fs::write(&index_path, "").await?;
+        if !content.trim().is_empty() {
+            warn!(
+                path = %agents_path.display(),
+                "Legacy AGENTS.md format not recognized; leaving file in place"
+            );
+            return Ok(());
+        }
+    }
+
+    let backup_path = parent_dir.join("AGENTS.md.bak");
+    let _ = fs::rename(&agents_path, &backup_path).await;
+    info!(
+        path = %agents_path.display(),
+        backup = %backup_path.display(),
+        "Migrated legacy AGENTS.md to memory hierarchy"
+    );
+
+    Ok(())
+}
+
+async fn append_topic_memories(
+    topic_path: &Path,
+    date_str: &str,
+    memories: &[&ExtractedMemory],
+) -> anyhow::Result<()> {
+    let mut existing = match fs::read_to_string(topic_path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+
+    existing.push_str(&format!("\n### {}\n", date_str));
+    for memory in memories {
+        existing.push_str(&format!(
+            "- {} *(confidence: {:.0}%)*\n",
+            memory.content,
+            memory.confidence * 100.0
+        ));
+    }
+
+    fs::write(topic_path, existing).await?;
+    Ok(())
+}
+
+async fn update_memory_index(
+    memory_dir: &Path,
+    updated_topics: &[(MemoryCategory, String)],
+) -> anyhow::Result<()> {
+    let index_path = memory_dir.join("MEMORY.md");
+    let existing = match fs::read_to_string(&index_path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    for (category, topic_file) in updated_topics {
+        let link = format!("memory/{}", topic_file);
+        if !lines.iter().any(|line| line.contains(&format!("({})", link))) {
+            lines.push(format!(
+                "- [{}]({}) — {}",
+                category.topic_title(),
+                link,
+                category.topic_hook()
+            ));
+        }
+    }
+
+    while lines.len() > 200 {
+        if let Some(idx) = lines.iter().position(|line| {
+            parse_index_topic_path(line)
+                .map(|topic| memory_dir.join(topic).exists())
+                .unwrap_or(false)
+        }) {
+            lines.remove(idx);
+        } else {
+            lines.remove(0);
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    fs::write(index_path, out).await?;
+    Ok(())
+}
+
+fn parse_index_topic_path(line: &str) -> Option<String> {
+    let start = line.find("(memory/")?;
+    let rest = &line[start + 8..];
+    let end = rest.find(')')?;
+    Some(rest[..end].to_string())
+}
+
+fn parse_legacy_agents_memories(content: &str) -> Vec<ExtractedMemory> {
+    let mut memories = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if !line.starts_with("- **[") {
+            continue;
+        }
+
+        let category = if line.contains("[user-preference]") {
+            MemoryCategory::UserPreference
+        } else if line.contains("[project-fact]") {
+            MemoryCategory::ProjectFact
+        } else if line.contains("[code-pattern]") {
+            MemoryCategory::CodePattern
+        } else if line.contains("[decision]") {
+            MemoryCategory::Decision
+        } else if line.contains("[constraint]") {
+            MemoryCategory::Constraint
+        } else {
+            MemoryCategory::ProjectFact
+        };
+
+        let body = line
+            .split("**")
+            .nth(2)
+            .map(str::trim)
+            .unwrap_or("")
+            .split("*(confidence")
+            .next()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+
+        if body.is_empty() {
+            continue;
+        }
+
+        memories.push(ExtractedMemory {
+            content: body,
+            category,
+            confidence: 0.7,
+        });
+    }
+    memories
+}
+
+async fn path_exists(path: &Path) -> bool {
+    fs::metadata(path).await.is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +639,12 @@ mod tests {
     }
 
     #[test]
+    fn test_should_extract_above_threshold() {
+        let msgs = make_messages(MIN_MESSAGES_TO_EXTRACT + 1);
+        assert!(SessionMemoryExtractor::should_extract(&msgs));
+    }
+
+    #[test]
     fn test_should_not_extract_mid_tool_chain() {
         use mangocode_core::types::ContentBlock;
         let mut msgs = make_messages(MIN_MESSAGES_TO_EXTRACT);
@@ -568,9 +751,9 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
     // ---- persist (integration-ish with tempfile) -----------------------
 
     #[tokio::test]
-    async fn test_persist_creates_file() {
+    async fn test_persist_creates_topic_files_and_index() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join(".mangocode").join("AGENTS.md");
+        let memory_dir = dir.path().join(".mangocode").join("memory");
 
         let memories = vec![ExtractedMemory {
             content: "Uses async Rust".to_string(),
@@ -578,23 +761,26 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
             confidence: 0.9,
         }];
 
-        SessionMemoryExtractor::persist(&memories, &target)
+        SessionMemoryExtractor::persist(&memories, &memory_dir)
             .await
             .unwrap();
 
-        let content = fs::read_to_string(&target).await.unwrap();
-        assert!(content.contains("Auto-extracted memories"));
-        assert!(content.contains("Uses async Rust"));
-        assert!(content.contains("project-fact"));
+        let topic = fs::read_to_string(memory_dir.join("project-facts.md"))
+            .await
+            .unwrap();
+        let index = fs::read_to_string(memory_dir.join("MEMORY.md")).await.unwrap();
+        assert!(topic.contains("Uses async Rust"));
+        assert!(index.contains("memory/project-facts.md"));
     }
 
     #[tokio::test]
-    async fn test_persist_appends_to_existing() {
+    async fn test_persist_appends_to_existing_topic() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
+        let memory_dir = dir.path().join("memory");
+        fs::create_dir_all(&memory_dir).await.unwrap();
+        let topic_path = memory_dir.join("user-preferences.md");
 
-        // Write initial content
-        fs::write(&target, "# My Project\n\nExisting content.\n")
+        fs::write(&topic_path, "# Existing\n")
             .await
             .unwrap();
 
@@ -604,52 +790,100 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
             confidence: 0.8,
         }];
 
-        SessionMemoryExtractor::persist(&memories, &target)
+        SessionMemoryExtractor::persist(&memories, &memory_dir)
             .await
             .unwrap();
 
-        let content = fs::read_to_string(&target).await.unwrap();
-        assert!(content.contains("Existing content."));
-        assert!(content.contains("Auto-extracted memories"));
+        let content = fs::read_to_string(&topic_path).await.unwrap();
+        assert!(content.contains("# Existing"));
         assert!(content.contains("Prefers explicit error handling"));
     }
 
     #[tokio::test]
-    async fn test_persist_appends_under_existing_section() {
+    async fn test_migration_from_legacy_agents() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
+        let dot_dir = dir.path().join(".mangocode");
+        let memory_dir = dot_dir.join("memory");
+        fs::create_dir_all(&dot_dir).await.unwrap();
 
-        // Pre-populate the auto-extracted section
-        let initial = "# Notes\n\n## Auto-extracted memories\n\n### Old memories\n- old fact\n";
-        fs::write(&target, initial).await.unwrap();
+        let legacy = "# Notes\n\n## Auto-extracted memories\n\n- **[project-fact]** Uses serde *(confidence: 80%)*\n";
+        fs::write(dot_dir.join("AGENTS.md"), legacy).await.unwrap();
 
-        let memories = vec![ExtractedMemory {
-            content: "New fact discovered".to_string(),
-            category: MemoryCategory::ProjectFact,
-            confidence: 0.7,
-        }];
+        migrate_legacy_agents_if_needed(&memory_dir).await.unwrap();
 
-        SessionMemoryExtractor::persist(&memories, &target)
+        let topic = fs::read_to_string(memory_dir.join("project-facts.md"))
+            .await
+            .unwrap();
+        let index = fs::read_to_string(memory_dir.join("MEMORY.md")).await.unwrap();
+        assert!(topic.contains("Uses serde"));
+        assert!(index.contains("memory/project-facts.md"));
+        assert!(dot_dir.join("AGENTS.md.bak").exists());
+    }
+
+    #[tokio::test]
+    async fn test_migration_preserves_unrecognized_legacy_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let dot_dir = dir.path().join(".mangocode");
+        let memory_dir = dot_dir.join("memory");
+        fs::create_dir_all(&dot_dir).await.unwrap();
+
+        // Valid legacy file may exist in custom formats; migration should not
+        // move it away if we cannot parse any structured memory entries.
+        fs::write(dot_dir.join("AGENTS.md"), "# Notes\n- plain bullet\n")
             .await
             .unwrap();
 
-        let content = fs::read_to_string(&target).await.unwrap();
-        // Should have both old and new facts
-        assert!(content.contains("old fact"));
-        assert!(content.contains("New fact discovered"));
-        // Section header should appear only once
-        assert_eq!(content.matches("## Auto-extracted memories").count(), 1);
+        migrate_legacy_agents_if_needed(&memory_dir).await.unwrap();
+
+        assert!(dot_dir.join("AGENTS.md").exists());
+        assert!(!dot_dir.join("AGENTS.md.bak").exists());
+        assert!(memory_dir.join("MEMORY.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_index_trim_to_200_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        fs::create_dir_all(&memory_dir).await.unwrap();
+
+        let mut long_index = String::new();
+        for i in 0..220 {
+            let topic = format!("topic-{}.md", i);
+            fs::write(memory_dir.join(&topic), "x").await.unwrap();
+            long_index.push_str(&format!(
+                "- [Topic {}](memory/{}) — hook {}\n",
+                i, topic, i
+            ));
+        }
+        fs::write(memory_dir.join("MEMORY.md"), long_index).await.unwrap();
+
+        let memories = vec![ExtractedMemory {
+            content: "constraint here".to_string(),
+            category: MemoryCategory::Constraint,
+            confidence: 0.8,
+        }];
+
+        SessionMemoryExtractor::persist(&memories, &memory_dir)
+            .await
+            .unwrap();
+
+        let lines = fs::read_to_string(memory_dir.join("MEMORY.md"))
+            .await
+            .unwrap()
+            .lines()
+            .count();
+        assert!(lines <= 200);
     }
 
     #[tokio::test]
     async fn test_persist_no_op_for_empty_memories() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
+        let target = dir.path().join("memory");
 
         SessionMemoryExtractor::persist(&[], &target).await.unwrap();
 
-        // File should NOT be created when there are no memories to persist
-        assert!(!target.exists());
+        // Directory may be created for migration checks, but no topic files exist
+        assert!(!target.join("project-facts.md").exists());
     }
 
     // ---- SessionMemoryState --------------------------------------------

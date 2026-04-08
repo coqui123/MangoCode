@@ -23,6 +23,7 @@ lodestone = ["mangocode-core/lodestone"]
 # Agents & Memory features (pass-through from cc-core)
 agent_triggers = ["mangocode-core/agent_triggers"]
 agent_triggers_remote = ["mangocode-core/agent_triggers_remote"]
+proactive = ["mangocode-core/proactive"]
 extract_memories = ["mangocode-core/extract_memories"]
 verification_agent = ["mangocode-core/verification_agent"]
 builtin_explore_plan_agents = ["mangocode-core/builtin_explore_plan_agents"]
@@ -76,6 +77,7 @@ icy_sixel = { workspace = true }
 image = { workspace = true }
 regex = { workspace = true }
 resvg = { workspace = true }
+notify-rust = "4"
 # Optional audio capture for voice PTT (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }

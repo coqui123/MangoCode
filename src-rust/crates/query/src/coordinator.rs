@@ -27,6 +27,9 @@ pub const COORDINATOR_BANNED_TOOLS: &[&str] = &[
 pub enum AgentMode {
     Coordinator,
     Worker,
+    /// Worker running in an isolated git worktree — has all Worker tools plus
+    /// EnterWorktree/ExitWorktree for managing worktree state.
+    WorktreeWorker,
     Normal,
 }
 
@@ -151,6 +154,9 @@ impl Default for ScratchpadGate {
 ///   full set including Agent/SendMessage/TaskStop).
 /// - `AgentMode::Worker`: COORDINATOR_ONLY_TOOLS are removed.
 /// - `AgentMode::Normal`: no filtering.
+///   Tools that WorktreeWorker is additionally allowed to use on top of Worker tools.
+const WORKTREE_EXTRA_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
+
 pub fn filter_tools_for_mode(
     tools: &[Box<dyn mangocode_tools::Tool>],
     mode: AgentMode,
@@ -160,6 +166,16 @@ pub fn filter_tools_for_mode(
         AgentMode::Worker => tools
             .iter()
             .filter(|t| !COORDINATOR_ONLY_TOOLS.contains(&t.name()))
+            .map(|t| t.as_ref())
+            .collect(),
+        AgentMode::WorktreeWorker => tools
+            .iter()
+            .filter(|t| {
+                let name = t.name();
+                // Allow everything a Worker can use, plus worktree tools.
+                !COORDINATOR_ONLY_TOOLS.contains(&name)
+                    || WORKTREE_EXTRA_TOOLS.contains(&name)
+            })
             .map(|t| t.as_ref())
             .collect(),
     }
@@ -218,7 +234,9 @@ pub fn match_session_mode(stored_coordinator: bool) -> Option<String> {
 pub fn match_session_mode_from_agent_mode(session_mode: AgentMode) -> Option<String> {
     match session_mode {
         AgentMode::Coordinator => match_session_mode(true),
-        AgentMode::Normal | AgentMode::Worker => match_session_mode(false),
+        AgentMode::Normal | AgentMode::Worker | AgentMode::WorktreeWorker => {
+            match_session_mode(false)
+        }
     }
 }
 

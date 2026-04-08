@@ -333,7 +333,7 @@ Each entry: `- [Title](file.md) — one-line hook`
 
 Return a brief summary of what you consolidated, updated, or pruned. If nothing changed, say so.
 
-**Tool constraints for this run:** Use only read-only Bash commands (ls, find, grep, cat, stat, wc, head, tail). Anything that writes, redirects to a file, or modifies state will be denied.
+**Tool constraints for this run:** You may read and write files within the memory directory ({memory_dir}). You may use read-only Bash commands (ls, find, grep, cat, head, tail, wc, stat) on the conversations directory. Do not modify conversation transcripts.
 "#,
             memory_dir = self.memory_dir.display(),
             conv_dir = self.conversations_dir.display(),
@@ -484,5 +484,62 @@ mod tests {
 
         dream.release_lock().await.unwrap();
         assert!(!dream.lock_file.exists());
+    }
+
+    #[tokio::test]
+    async fn test_session_gate_triggers_at_min_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = AutoDreamConfig {
+            min_hours: 0.0,
+            min_sessions: 3,
+        };
+        let dream = AutoDream::with_config(
+            cfg,
+            tmp.path().join("memory"),
+            tmp.path().join("conversations"),
+        );
+
+        tokio::fs::create_dir_all(&dream.conversations_dir)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            tokio::fs::write(dream.conversations_dir.join(format!("s-{}.jsonl", i)), "{}")
+                .await
+                .unwrap();
+        }
+
+        let allowed = dream
+            .should_consolidate(&ConsolidationState::default())
+            .await
+            .unwrap();
+        assert!(allowed);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_trigger_returns_task_when_gates_pass() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = AutoDreamConfig {
+            min_hours: 0.0,
+            min_sessions: 2,
+        };
+        let dream = AutoDream::with_config(
+            cfg,
+            tmp.path().join("memory"),
+            tmp.path().join("conversations"),
+        );
+
+        tokio::fs::create_dir_all(&dream.conversations_dir)
+            .await
+            .unwrap();
+        tokio::fs::write(dream.conversations_dir.join("a.jsonl"), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(dream.conversations_dir.join("b.jsonl"), "{}")
+            .await
+            .unwrap();
+
+        let task = dream.maybe_trigger().await.unwrap();
+        assert!(task.is_some());
+        assert!(dream.lock_file.exists());
     }
 }

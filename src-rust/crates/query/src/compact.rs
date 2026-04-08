@@ -1221,6 +1221,7 @@ pub fn collapse_search_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mangocode_core::types::{ContentBlock, ToolResultContent};
     use mangocode_core::types::Message;
 
     fn make_user(text: &str) -> Message {
@@ -1438,5 +1439,90 @@ mod tests {
         let est = estimate_tokens_for_messages(&msgs);
         // "Hello, world!" = 13 chars → 13/4 = 3 rough tokens → 3*4/3 = 4 padded
         assert!(est > 0);
+    }
+
+    #[test]
+    fn test_snip_compact_with_many_large_tool_results() {
+        let mut messages = vec![make_user("session start")];
+        for i in 0..100 {
+            if i % 3 == 0 {
+                messages.push(Message::assistant_blocks(vec![
+                    ContentBlock::ToolUse {
+                        id: format!("tool-{}", i),
+                        name: "grep_search".to_string(),
+                        input: serde_json::json!({"query": "x"}),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: format!("tool-{}", i),
+                        content: ToolResultContent::Text("line\n".repeat(400)),
+                        is_error: Some(false),
+                    },
+                ]));
+            } else {
+                messages.push(make_assistant(&format!("assistant {}", i)));
+            }
+        }
+
+        let before = estimate_tokens_for_messages(&messages);
+        let (after_msgs, _) = snip_compact(messages, 12);
+        let after = estimate_tokens_for_messages(&after_msgs);
+
+        assert!(after < before);
+        assert_eq!(after_msgs.len(), 13);
+    }
+
+    #[test]
+    fn test_calculate_messages_to_keep_index_exact_token_limit() {
+        let messages = vec![
+            make_user("aaaa bbbb cccc dddd"),
+            make_assistant("eeee ffff gggg hhhh"),
+            make_user("iiii jjjj kkkk llll"),
+        ];
+        let total = estimate_tokens_for_messages(&messages) as u64;
+        let idx = calculate_messages_to_keep_index(&messages, total);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_snip_compact_empty_messages() {
+        let (out, freed) = snip_compact(Vec::new(), 10);
+        assert!(out.is_empty());
+        assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn test_collapse_read_tool_results_mixed_blocks() {
+        let messages = vec![Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "intro".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: ToolResultContent::Text("same payload".to_string()),
+                is_error: Some(false),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t2".to_string(),
+                content: ToolResultContent::Text("same payload".to_string()),
+                is_error: Some(false),
+            },
+        ])];
+
+        let out = collapse_read_tool_results(messages);
+        let MessageContent::Blocks(blocks) = &out[0].content else {
+            panic!("expected block content");
+        };
+        let ContentBlock::Text { text } = &blocks[0] else {
+            panic!("expected leading text block");
+        };
+        assert_eq!(text, "intro");
+
+        let ContentBlock::ToolResult { content, .. } = &blocks[1] else {
+            panic!("expected first tool result block");
+        };
+        let ToolResultContent::Text(text) = content else {
+            panic!("expected collapsed text tool result");
+        };
+        assert!(text.contains("showing last occurrence only"));
     }
 }

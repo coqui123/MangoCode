@@ -17,7 +17,7 @@ fn main() {
     // Package/distribution metadata
     println!("cargo:rustc-env=PACKAGE_URL=mangocode-source-snapshot");
     println!("cargo:rustc-env=FEEDBACK_CHANNEL=github");
-    println!("cargo:rustc-env=ISSUES_EXPLAINER=This build does not include Anthropic internal issue routing.");
+    println!("cargo:rustc-env=ISSUES_EXPLAINER=Report issues at the MangoCode GitHub repository.");
 
     // Trigger rebuild if git HEAD changes
     println!("cargo:rerun-if-changed=.git/HEAD");

@@ -3,6 +3,10 @@ name = "mangocode-query"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["proactive"]
+proactive = ["mangocode-core/proactive"]
+
 [dependencies]
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
@@ -24,6 +28,7 @@ parking_lot = { workspace = true }
 tokio-util = { workspace = true }
 once_cell = { workspace = true }
 dashmap = { workspace = true }
+notify = "6"
 
 [dev-dependencies]
 tempfile = { workspace = true }

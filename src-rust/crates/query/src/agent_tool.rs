@@ -82,13 +82,36 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
-async fn create_worktree(git_root: &Path, agent_id: &str) -> Option<PathBuf> {
-    let worktree_dir = std::env::temp_dir().join(format!("claude-agent-{}", agent_id));
+/// Create a worktree on a named branch for the worktree execution mode.
+/// Branch: `mangocode/{task_slug}`, path: `/tmp/mangocode-worktree-{uuid}`.
+async fn create_worktree_with_branch(
+    git_root: &Path,
+    agent_id: &str,
+    task_slug: &str,
+) -> Option<(PathBuf, String)> {
+    let worktree_dir = std::env::temp_dir().join(format!("mangocode-worktree-{}", agent_id));
+    let base_branch_name = format!("mangocode/{}", task_slug);
+    let mut branch_name = base_branch_name.clone();
+
+    // Ensure branch name is unique so worktree mode doesn't silently fall back
+    // to shared directory when a previous run already created the same branch.
+    let short_agent = agent_id.chars().take(8).collect::<String>();
+
+    if branch_exists(git_root, &branch_name).await {
+        branch_name = format!("{}-{}", base_branch_name, short_agent);
+    }
+
+    if branch_exists(git_root, &branch_name).await {
+        let ts = chrono::Utc::now().timestamp();
+        branch_name = format!("{}-{}", base_branch_name, ts);
+    }
+
     let output = tokio::process::Command::new("git")
         .args([
             "worktree",
             "add",
-            "--detach",
+            "-b",
+            &branch_name,
             worktree_dir.to_str().unwrap_or_default(),
             "HEAD",
         ])
@@ -97,14 +120,64 @@ async fn create_worktree(git_root: &Path, agent_id: &str) -> Option<PathBuf> {
         .await
         .ok()?;
     if output.status.success() {
-        Some(worktree_dir)
+        Some((worktree_dir, branch_name))
     } else {
         warn!(
-            "git worktree add failed: {}",
+            "git worktree add (branch) failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         None
     }
+}
+
+async fn branch_exists(git_root: &Path, name: &str) -> bool {
+    tokio::process::Command::new("git")
+        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{}", name)])
+        .current_dir(git_root)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Get a diff summary of changes made in the worktree branch vs main.
+async fn worktree_diff_summary(git_root: &Path, branch_name: &str) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(["diff", "--stat", &format!("HEAD...{}", branch_name)])
+        .current_dir(git_root)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let diff = String::from_utf8_lossy(&o.stdout).to_string();
+            if diff.trim().is_empty() {
+                "No changes detected in worktree.".to_string()
+            } else {
+                format!(
+                    "Changes on branch `{}`:\n```\n{}\n```",
+                    branch_name,
+                    diff.trim()
+                )
+            }
+        }
+        _ => "Could not compute worktree diff.".to_string(),
+    }
+}
+
+/// Derive a URL-safe slug from a task description.
+fn task_slug(description: &str) -> String {
+    description
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(40)
+        .collect()
 }
 
 async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
@@ -118,6 +191,69 @@ async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
         .current_dir(git_root)
         .output()
         .await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreePreserveResult {
+    NoChanges,
+    Committed,
+    DirtyUncommitted,
+}
+
+/// If the worktree has uncommitted edits, commit them on the worktree branch
+/// so removing the temporary worktree does not lose results.
+async fn preserve_worktree_changes(
+    worktree_dir: &Path,
+    branch_name: &str,
+) -> anyhow::Result<WorktreePreserveResult> {
+    let status = tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_dir)
+        .output()
+        .await?;
+
+    if !status.status.success() {
+        return Ok(WorktreePreserveResult::DirtyUncommitted);
+    }
+
+    if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        return Ok(WorktreePreserveResult::NoChanges);
+    }
+
+    let _ = tokio::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(worktree_dir)
+        .output()
+        .await?;
+
+    let commit_message = format!("mangocode agent worktree snapshot ({})", branch_name);
+    let commit = tokio::process::Command::new("git")
+        .args(["commit", "-m", &commit_message])
+        .current_dir(worktree_dir)
+        .output()
+        .await?;
+
+    if commit.status.success() {
+        return Ok(WorktreePreserveResult::Committed);
+    }
+
+    // Commit can fail due to identity/hooks/conflicts. Re-check status so we
+    // never remove a worktree that still contains uncommitted edits.
+    let post_status = tokio::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_dir)
+        .output()
+        .await?;
+
+    if !post_status.status.success() {
+        return Ok(WorktreePreserveResult::DirtyUncommitted);
+    }
+
+    if String::from_utf8_lossy(&post_status.stdout).trim().is_empty() {
+        Ok(WorktreePreserveResult::NoChanges)
+    } else {
+        Ok(WorktreePreserveResult::DirtyUncommitted)
+    }
 }
 
 fn build_provider_and_model_registries(
@@ -152,6 +288,19 @@ fn build_provider_and_model_registries(
 
 pub struct AgentTool;
 
+/// Execution mode for a sub-agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum AgentExecMode {
+    /// Inherits parent's full conversation history as context prefix (cache-friendly).
+    #[default]
+    Fork,
+    /// Independent context — only system prompt + task description (no parent history).
+    Teammate,
+    /// Runs in an isolated git worktree on a named branch.
+    Worktree,
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentInput {
     /// Short description of the agent's task (used for logging).
@@ -170,10 +319,17 @@ struct AgentInput {
     /// Optional: model override for this sub-agent.
     #[serde(default)]
     model: Option<String>,
-    /// Set to "worktree" to run the agent in an isolated git worktree.
-    /// Omit (or set to null) for shared working directory.
+    /// Execution mode: fork (default), teammate, or worktree.
+    #[serde(default)]
+    mode: AgentExecMode,
+    /// Legacy: Set to "worktree" to run in an isolated git worktree.
+    /// Prefer `mode: "worktree"` instead. When both are set, `mode` wins.
     #[serde(default)]
     isolation: Option<String>,
+    /// Optional: allow fork mode to downgrade to teammate mode when parent
+    /// context is unavailable. Default false.
+    #[serde(default)]
+    allow_teammate_fallback: Option<bool>,
     /// If true, start the agent in the background and return agent_id immediately.
     /// Default: false (wait for completion).
     #[serde(default)]
@@ -227,11 +383,24 @@ impl Tool for AgentTool {
                     "type": "string",
                     "description": "Optional model to use for this agent"
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["fork", "teammate", "worktree"],
+                    "default": "fork",
+                    "description": "Execution mode. fork: inherits parent context (fast, cache-friendly). \
+                                    teammate: independent context, shares workspace. \
+                                    worktree: runs in a separate git worktree for isolation."
+                },
                 "isolation": {
                     "type": "string",
                     "enum": ["worktree"],
-                    "description": "Set to \"worktree\" to run the agent in an isolated git worktree. \
-                                    Prevents file-edit conflicts when multiple agents run in parallel."
+                    "description": "Legacy. Set to \"worktree\" to run the agent in an isolated git worktree. \
+                                    Prefer mode=worktree instead."
+                },
+                "allow_teammate_fallback": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "If true, fork mode may downgrade to teammate mode when parent context is unavailable. Default: false."
                 },
                 "run_in_background": {
                     "type": "boolean",
@@ -291,13 +460,35 @@ impl Tool for AgentTool {
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| ctx.config.effective_model().to_string());
 
-        let system_prompt = params.system_prompt.unwrap_or_else(|| {
-            let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
+        // Resolve effective mode (same logic as execute_with_runtime).
+        let allow_teammate_fallback = params.allow_teammate_fallback.unwrap_or(false);
+        let effective_mode = match params.mode {
+            AgentExecMode::Worktree => AgentExecMode::Worktree,
+            AgentExecMode::Fork => {
+                if params.isolation.as_deref() == Some("worktree") {
+                    AgentExecMode::Worktree
+                } else if allow_teammate_fallback {
+                    // This legacy execute path does not receive parent messages.
+                    warn!(
+                        "Fork mode requested without parent context; allow_teammate_fallback=true so downgrading to teammate"
+                    );
+                    AgentExecMode::Teammate
+                } else {
+                    return ToolResult::error(
+                        "Fork mode requires parent context, but this execution path has none. Set allow_teammate_fallback=true to opt into teammate fallback, or use execute_with_runtime/fork from an active query.".to_string()
+                    );
+                }
+            }
+            other => other,
+        };
+
+        let (system_prompt, append_system_prompt) = if let Some(custom) = params.system_prompt {
+            (Some(custom), None)
+        } else {
+            let mut role = "You are a specialized AI agent helping with a specific sub-task. \
              Complete the task thoroughly and return your findings."
                 .to_string();
 
-            // Append plugin-contributed agent definitions so the sub-agent
-            // is aware of any specialised agents declared by plugins.
             if let Some(registry) = mangocode_plugins::global_plugin_registry() {
                 let mut agent_defs = String::new();
                 for agent_dir in registry.all_agent_paths() {
@@ -319,51 +510,58 @@ impl Tool for AgentTool {
                     }
                 }
                 if !agent_defs.is_empty() {
-                    prompt.push_str("\n\nThe following specialized agents are available:");
-                    prompt.push_str(&agent_defs);
+                    role.push_str("\n\nThe following specialized agents are available:");
+                    role.push_str(&agent_defs);
                 }
             }
 
-            prompt
-        });
+            (None, Some(role))
+        };
 
         // -----------------------------------------------------------------------
-        // Determine working directory - optionally isolate in a git worktree.
+        // Determine working directory based on effective mode.
         // -----------------------------------------------------------------------
-        let use_isolation = params.isolation.as_deref() == Some("worktree");
         let agent_id = uuid::Uuid::new_v4().to_string();
 
-        let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
-            if use_isolation {
+        let (working_dir_str, worktree_path, git_root, worktree_branch): (
+            String,
+            Option<PathBuf>,
+            Option<PathBuf>,
+            Option<String>,
+        ) = match effective_mode {
+            AgentExecMode::Worktree => {
                 let git_root = find_git_root(&ctx.working_dir);
                 if let Some(ref root) = git_root {
-                    if let Some(wt) = create_worktree(root, &agent_id).await {
+                    let slug = task_slug(&params.description);
+                    if let Some((wt, branch)) =
+                        create_worktree_with_branch(root, &agent_id, &slug).await
+                    {
                         let wd = wt.display().to_string();
-                        (wd, Some(wt), git_root)
+                        (wd, Some(wt), git_root, Some(branch))
                     } else {
                         warn!(
                             agent_id = %agent_id,
                             "Worktree creation failed; running agent in shared working directory"
                         );
-                        (ctx.working_dir.display().to_string(), None, None)
+                        (ctx.working_dir.display().to_string(), None, None, None)
                     }
                 } else {
                     warn!(
                         agent_id = %agent_id,
-                        "No git root found; isolation=worktree ignored"
+                        "No git root found; worktree mode ignored"
                     );
-                    (ctx.working_dir.display().to_string(), None, None)
+                    (ctx.working_dir.display().to_string(), None, None, None)
                 }
-            } else {
-                (ctx.working_dir.display().to_string(), None, None)
-            };
+            }
+            _ => (ctx.working_dir.display().to_string(), None, None, None),
+        };
 
         let query_config = QueryConfig {
             model,
             max_tokens: mangocode_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: params.max_turns.unwrap_or(10),
-            system_prompt: Some(system_prompt),
-            append_system_prompt: None,
+            system_prompt,
+            append_system_prompt,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
@@ -394,6 +592,7 @@ impl Tool for AgentTool {
                 config_bg: query_config,
                 git_root,
                 worktree_path,
+                worktree_branch,
             });
         }
 
@@ -416,19 +615,76 @@ impl Tool for AgentTool {
         )
         .await;
 
+        // Worktree mode: preserve edits and compute diff before cleanup.
+        let mut preserved_changes = false;
+        let mut remove_worktree_dir = true;
+        if let (Some(ref wt), Some(ref branch)) = (&worktree_path, &worktree_branch) {
+            match preserve_worktree_changes(wt, branch).await {
+                Ok(WorktreePreserveResult::Committed) => preserved_changes = true,
+                Ok(WorktreePreserveResult::NoChanges) => {}
+                Ok(WorktreePreserveResult::DirtyUncommitted) => {
+                    remove_worktree_dir = false;
+                    warn!("Worktree has uncommitted changes; skipping worktree removal");
+                }
+                Err(e) => {
+                    remove_worktree_dir = false;
+                    warn!(error = %e, "Failed to preserve worktree changes; keeping worktree");
+                }
+            }
+        }
+
+        let worktree_summary = if let (Some(ref root), Some(ref branch)) =
+            (&git_root, &worktree_branch)
+        {
+            Some(worktree_diff_summary(root, branch).await)
+        } else {
+            None
+        };
+
         // Cleanup worktree if one was created.
         if let (Some(root), Some(wt)) = (git_root, worktree_path) {
-            remove_worktree(&root, &wt).await;
+            if worktree_branch.is_some() && remove_worktree_dir {
+                // Keep the branch, only remove the worktree directory.
+                let _ = tokio::process::Command::new("git")
+                    .args([
+                        "worktree",
+                        "remove",
+                        "--force",
+                        wt.to_str().unwrap_or_default(),
+                    ])
+                    .current_dir(&root)
+                    .output()
+                    .await;
+            } else if worktree_branch.is_none() {
+                remove_worktree(&root, &wt).await;
+            }
         }
 
         match outcome {
             QueryOutcome::EndTurn { message, usage } => {
-                let text = message.get_all_text();
+                let mut text = message.get_all_text();
                 debug!(
                     description = %params.description,
                     output_tokens = usage.output_tokens,
                     "Sub-agent completed"
                 );
+                if let Some(summary) = worktree_summary {
+                    if let Some(ref branch) = worktree_branch {
+                        text.push_str(&format!(
+                            "\n\n---\n**Worktree result** (branch `{}`)\n{}\n\
+                             Worker completed in worktree. {}",
+                            branch,
+                            summary,
+                            if preserved_changes {
+                                "Changes preserved on branch. Merge when ready."
+                            } else if !remove_worktree_dir {
+                                "Changes are still uncommitted in worktree. Worktree was kept to avoid data loss."
+                            } else {
+                                "No file changes were detected to preserve."
+                            }
+                        ));
+                    }
+                }
                 ToolResult::success(text)
             }
             QueryOutcome::MaxTokens {
@@ -460,6 +716,7 @@ struct BackgroundAgentSpec {
     config_bg: QueryConfig,
     git_root: Option<PathBuf>,
     worktree_path: Option<PathBuf>,
+    worktree_branch: Option<String>,
 }
 
 fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
@@ -473,6 +730,7 @@ fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
         config_bg,
         git_root,
         worktree_path,
+        worktree_branch,
     } = spec;
 
     let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -499,7 +757,29 @@ fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
         .await;
 
         if let (Some(root), Some(wt)) = (git_root, worktree_path) {
-            remove_worktree(&root, &wt).await;
+            if let Some(ref branch) = worktree_branch {
+                let preserve = preserve_worktree_changes(&wt, branch).await;
+                let should_remove = matches!(
+                    preserve,
+                    Ok(WorktreePreserveResult::Committed | WorktreePreserveResult::NoChanges)
+                );
+                if should_remove {
+                    let _ = tokio::process::Command::new("git")
+                        .args([
+                            "worktree",
+                            "remove",
+                            "--force",
+                            wt.to_str().unwrap_or_default(),
+                        ])
+                        .current_dir(&root)
+                        .output()
+                        .await;
+                } else {
+                    warn!("Background worktree kept because changes were not safely preserved");
+                }
+            } else {
+                remove_worktree(&root, &wt).await;
+            }
         }
 
         let result_text = format_outcome(outcome);
@@ -534,6 +814,7 @@ pub async fn execute_with_runtime(
     parent_query_config: &QueryConfig,
     parent_event_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::QueryEvent>>,
     parent_tool_use_id: Option<String>,
+    parent_messages: Option<&[Message]>,
 ) -> ToolResult {
     let params: AgentInput = match serde_json::from_value(input.clone()) {
         Ok(p) => p,
@@ -565,75 +846,150 @@ pub async fn execute_with_runtime(
         })
         .unwrap_or_else(|| mangocode_core::constants::DEFAULT_MODEL.to_string());
 
-    let system_prompt = params.system_prompt.clone().unwrap_or_else(|| {
-        let mut prompt = "You are a specialized AI agent helping with a specific sub-task. \
-             Complete the task thoroughly and return your findings."
-            .to_string();
-
-        if let Some(registry) = mangocode_plugins::global_plugin_registry() {
-            let mut agent_defs = String::new();
-            for agent_dir in registry.all_agent_paths() {
-                if let Ok(entries) = std::fs::read_dir(&agent_dir) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.extension().is_some_and(|e| e == "md") {
-                            if let Ok(content) = std::fs::read_to_string(&p) {
-                                let name =
-                                    p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
-                                agent_defs.push_str(&format!(
-                                    "\n\n## Agent: {}\n{}",
-                                    name,
-                                    content.trim()
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            if !agent_defs.is_empty() {
-                prompt.push_str("\n\nThe following specialized agents are available:");
-                prompt.push_str(&agent_defs);
+    // -----------------------------------------------------------------------
+    // Resolve effective execution mode.
+    // `mode` field takes precedence; fall back to legacy `isolation` field.
+    // -----------------------------------------------------------------------
+    let allow_teammate_fallback = params.allow_teammate_fallback.unwrap_or(false);
+    let mut effective_mode = match params.mode {
+        AgentExecMode::Worktree => AgentExecMode::Worktree,
+        AgentExecMode::Fork => {
+            // Legacy compat: `isolation: "worktree"` upgrades fork → worktree.
+            if params.isolation.as_deref() == Some("worktree") {
+                AgentExecMode::Worktree
+            } else {
+                AgentExecMode::Fork
             }
         }
+        other => other,
+    };
 
-        prompt
-    });
+    if effective_mode == AgentExecMode::Fork && parent_messages.is_none() {
+        if allow_teammate_fallback {
+            warn!(
+                "Fork mode requested without parent context; allow_teammate_fallback=true so downgrading to teammate"
+            );
+            effective_mode = AgentExecMode::Teammate;
+        } else {
+            return ToolResult::error(
+                "Fork mode requires parent context, but no parent messages were provided. Set allow_teammate_fallback=true to opt into teammate fallback.".to_string()
+            );
+        }
+    }
 
-    // Determine working directory - optionally isolate in a git worktree.
-    let use_isolation = params.isolation.as_deref() == Some("worktree");
+    info!(mode = ?effective_mode, "Agent execution mode");
+
+    // -----------------------------------------------------------------------
+    // System prompt strategy depends on mode.
+    // -----------------------------------------------------------------------
+    let (agent_system_prompt, agent_append_system_prompt) =
+        if let Some(custom) = params.system_prompt.clone() {
+            (Some(custom), None)
+        } else {
+            match effective_mode {
+                AgentExecMode::Fork => {
+                    // Fork mode: preserve parent prompt stack so request shape
+                    // stays aligned with parent context and cache keys.
+                    let fork_nudge = "You are continuing work delegated by a parent agent. \
+                         The conversation history above is your parent's context. \
+                         Complete the task thoroughly and return your findings."
+                        .to_string();
+
+                    let append = match parent_query_config.append_system_prompt.clone() {
+                        Some(existing) => format!("{}\n\n{}", existing, fork_nudge),
+                        None => fork_nudge,
+                    };
+
+                    (parent_query_config.system_prompt.clone(), Some(append))
+                }
+                AgentExecMode::Teammate | AgentExecMode::Worktree => {
+                    // Teammate / Worktree: independent context, build role prompt.
+                    let mut role = "You are a specialized AI agent helping with a specific sub-task. \
+                     Complete the task thoroughly and return your findings."
+                        .to_string();
+
+                    if let Some(registry) = mangocode_plugins::global_plugin_registry() {
+                        let mut agent_defs = String::new();
+                        for agent_dir in registry.all_agent_paths() {
+                            if let Ok(entries) = std::fs::read_dir(&agent_dir) {
+                                for entry in entries.flatten() {
+                                    let p = entry.path();
+                                    if p.extension().is_some_and(|e| e == "md") {
+                                        if let Ok(content) = std::fs::read_to_string(&p) {
+                                            let name = p
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .unwrap_or("agent");
+                                            agent_defs.push_str(&format!(
+                                                "\n\n## Agent: {}\n{}",
+                                                name,
+                                                content.trim()
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if !agent_defs.is_empty() {
+                            role.push_str("\n\nThe following specialized agents are available:");
+                            role.push_str(&agent_defs);
+                        }
+                    }
+
+                    (None, Some(role))
+                }
+            }
+        };
+
+    // -----------------------------------------------------------------------
+    // Determine working directory and worktree state.
+    // -----------------------------------------------------------------------
     let agent_id = uuid::Uuid::new_v4().to_string();
 
-    let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
-        if use_isolation {
+    // worktree_branch is set only for the new worktree mode (named branch).
+    let (working_dir_str, worktree_path, git_root, worktree_branch): (
+        String,
+        Option<PathBuf>,
+        Option<PathBuf>,
+        Option<String>,
+    ) = match effective_mode {
+        AgentExecMode::Worktree => {
             let git_root = find_git_root(&ctx.working_dir);
             if let Some(ref root) = git_root {
-                if let Some(wt) = create_worktree(root, &agent_id).await {
+                let slug = task_slug(&params.description);
+                if let Some((wt, branch)) =
+                    create_worktree_with_branch(root, &agent_id, &slug).await
+                {
                     let wd = wt.display().to_string();
-                    (wd, Some(wt), git_root)
+                    (wd, Some(wt), git_root, Some(branch))
                 } else {
                     warn!(
                         agent_id = %agent_id,
-                        "Worktree creation failed; running agent in shared working directory"
+                        "Worktree creation failed; falling back to shared working directory"
                     );
-                    (ctx.working_dir.display().to_string(), None, None)
+                    (ctx.working_dir.display().to_string(), None, None, None)
                 }
             } else {
                 warn!(
                     agent_id = %agent_id,
-                    "No git root found; isolation=worktree ignored"
+                    "No git root found; worktree mode ignored"
                 );
-                (ctx.working_dir.display().to_string(), None, None)
+                (ctx.working_dir.display().to_string(), None, None, None)
             }
-        } else {
-            (ctx.working_dir.display().to_string(), None, None)
-        };
+        }
+        AgentExecMode::Fork | AgentExecMode::Teammate => {
+            // Legacy `isolation: "worktree"` already handled by effective_mode
+            // resolution above; if we're here it's a shared-directory mode.
+            (ctx.working_dir.display().to_string(), None, None, None)
+        }
+    };
 
     let mut query_config = parent_query_config.clone();
     query_config.model = model;
     query_config.max_tokens = mangocode_core::constants::DEFAULT_MAX_TOKENS;
     query_config.max_turns = params.max_turns.unwrap_or(10);
-    query_config.system_prompt = Some(system_prompt);
-    query_config.append_system_prompt = None;
+    query_config.system_prompt = agent_system_prompt;
+    query_config.append_system_prompt = agent_append_system_prompt;
     query_config.output_style = ctx.config.effective_output_style();
     query_config.output_style_prompt = ctx.config.resolve_output_style_prompt();
     query_config.working_directory = Some(working_dir_str);
@@ -642,8 +998,10 @@ pub async fn execute_with_runtime(
     query_config.agent_name = None;
     query_config.agent_definition = None;
 
+    // -----------------------------------------------------------------------
     // Background mode: launch a detached sub-agent while preserving the active
     // provider/model runtime context from the parent query config.
+    // -----------------------------------------------------------------------
     if params.run_in_background {
         let (credential, use_bearer_auth) = ctx
             .config
@@ -671,10 +1029,13 @@ pub async fn execute_with_runtime(
             config_bg: query_config,
             git_root,
             worktree_path,
+            worktree_branch,
         });
     }
 
+    // -----------------------------------------------------------------------
     // Foreground mode: optionally forward child events and attach parent tool id.
+    // -----------------------------------------------------------------------
     let (event_tx, forward_task) = if let Some(parent_tx) = parent_event_tx {
         let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<crate::QueryEvent>();
         let parent_id = parent_tool_use_id.clone();
@@ -693,7 +1054,27 @@ pub async fn execute_with_runtime(
         (None, None)
     };
 
-    let mut messages = vec![Message::user(params.prompt)];
+    // -----------------------------------------------------------------------
+    // Build initial messages based on mode.
+    // -----------------------------------------------------------------------
+    let mut messages = match effective_mode {
+        AgentExecMode::Fork => {
+            // Fork: clone parent conversation history and append the new task.
+            // This shares the same prompt prefix → API cache hit.
+            let mut msgs = if let Some(parent) = parent_messages {
+                parent.to_vec()
+            } else {
+                Vec::new()
+            };
+            msgs.push(Message::user(params.prompt));
+            msgs
+        }
+        AgentExecMode::Teammate | AgentExecMode::Worktree => {
+            // Teammate / Worktree: fresh context with only the task prompt.
+            vec![Message::user(params.prompt)]
+        }
+    };
+
     let cancel = CancellationToken::new();
 
     let outcome = run_query_loop(
@@ -714,19 +1095,83 @@ pub async fn execute_with_runtime(
         let _ = task.await;
     }
 
-    // Cleanup worktree if one was created.
-    if let (Some(root), Some(wt)) = (git_root, worktree_path) {
-        remove_worktree(&root, &wt).await;
+    // -----------------------------------------------------------------------
+    // Worktree mode: preserve edits and compute diff summary before cleanup.
+    // -----------------------------------------------------------------------
+    let mut preserved_changes = false;
+    let mut remove_worktree_dir = true;
+    if let (Some(ref wt), Some(ref branch)) = (&worktree_path, &worktree_branch) {
+        match preserve_worktree_changes(wt, branch).await {
+            Ok(WorktreePreserveResult::Committed) => preserved_changes = true,
+            Ok(WorktreePreserveResult::NoChanges) => {}
+            Ok(WorktreePreserveResult::DirtyUncommitted) => {
+                remove_worktree_dir = false;
+                warn!("Worktree has uncommitted changes; skipping worktree removal");
+            }
+            Err(e) => {
+                remove_worktree_dir = false;
+                warn!(error = %e, "Failed to preserve worktree changes; keeping worktree");
+            }
+        }
     }
 
+    let worktree_summary = if let (Some(ref root), Some(ref branch)) =
+        (&git_root, &worktree_branch)
+    {
+        Some(worktree_diff_summary(root, branch).await)
+    } else {
+        None
+    };
+
+    // Cleanup worktree if one was created.
+    if let (Some(root), Some(wt)) = (git_root, worktree_path) {
+        // For worktree mode with a named branch, only remove the worktree
+        // directory but keep the branch so the user can merge later.
+        if worktree_branch.is_some() && remove_worktree_dir {
+            let _ = tokio::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "remove",
+                    "--force",
+                    wt.to_str().unwrap_or_default(),
+                ])
+                .current_dir(&root)
+                .output()
+                .await;
+        } else if worktree_branch.is_none() {
+            remove_worktree(&root, &wt).await;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Format result.
+    // -----------------------------------------------------------------------
     match outcome {
         QueryOutcome::EndTurn { message, usage } => {
-            let text = message.get_all_text();
+            let mut text = message.get_all_text();
             debug!(
                 description = %params.description,
                 output_tokens = usage.output_tokens,
                 "Sub-agent completed"
             );
+            // Append worktree diff summary if applicable.
+            if let Some(summary) = worktree_summary {
+                if let Some(ref branch) = worktree_branch {
+                    text.push_str(&format!(
+                        "\n\n---\n**Worktree result** (branch `{}`)\n{}\n\
+                         Worker completed in worktree. {}",
+                        branch,
+                        summary,
+                        if preserved_changes {
+                            "Changes preserved on branch. Merge when ready."
+                        } else if !remove_worktree_dir {
+                            "Changes are still uncommitted in worktree. Worktree was kept to avoid data loss."
+                        } else {
+                            "No file changes were detected to preserve."
+                        }
+                    ));
+                }
+            }
             ToolResult::success(text)
         }
         QueryOutcome::MaxTokens {

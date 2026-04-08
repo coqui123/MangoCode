@@ -35,3 +35,6 @@ pub use copilot::CopilotProvider;
 
 pub mod vertex_openai;
 pub use vertex_openai::VertexOpenAiProvider;
+
+pub mod mock;
+pub use mock::MockProvider;

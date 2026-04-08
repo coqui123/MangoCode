@@ -16,9 +16,10 @@ impl Tool for LspTool {
     }
 
     fn description(&self) -> &str {
-        "Query a language server for code intelligence. Supports hover documentation, \
-         go-to-definition, find-references, document symbols, and diagnostics. \
-         Language servers must be configured in settings (lsp_servers)."
+        "Query a language server for code intelligence. Supports hover, go-to-definition, \
+         find-references, document symbols, diagnostics, call hierarchy (incoming/outgoing), \
+         implementations, and type definitions. Language servers are auto-detected or \
+         can be configured in settings (lsp_servers)."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -31,7 +32,7 @@ impl Tool for LspTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["hover", "definition", "references", "symbols", "diagnostics"],
+                    "enum": ["hover", "definition", "references", "symbols", "diagnostics", "incoming_calls", "outgoing_calls", "implementations", "type_definition"],
                     "description": "The LSP action to perform."
                 },
                 "file": {
@@ -81,7 +82,11 @@ impl Tool for LspTool {
         let lsp_manager_arc = mangocode_core::lsp::global_lsp_manager();
         {
             let mut manager = lsp_manager_arc.lock().await;
+            // First seed explicit user configs
             manager.seed_from_config(&ctx.config.lsp_servers);
+            // Then auto-detect from project files (idempotent — skips existing)
+            let detected = mangocode_core::lsp::detect_project_languages(&ctx.working_dir);
+            manager.seed_from_config(&detected);
         }
 
         // Check that at least one server is registered for this file before
@@ -200,8 +205,89 @@ impl Tool for LspTool {
                 ToolResult::success(output)
             }
 
+            "incoming_calls" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .incoming_calls(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(calls) if calls.is_empty() => ToolResult::success(format!(
+                        "No incoming calls at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(calls) => ToolResult::success(format!(
+                        "{} incoming call(s):\n{}",
+                        calls.len(),
+                        calls.join("\n")
+                    )),
+                    Err(e) => ToolResult::error(format!("incoming_calls failed: {}", e)),
+                }
+            }
+
+            "outgoing_calls" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .outgoing_calls(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(calls) if calls.is_empty() => ToolResult::success(format!(
+                        "No outgoing calls at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(calls) => ToolResult::success(format!(
+                        "{} outgoing call(s):\n{}",
+                        calls.len(),
+                        calls.join("\n")
+                    )),
+                    Err(e) => ToolResult::error(format!("outgoing_calls failed: {}", e)),
+                }
+            }
+
+            "implementations" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .implementations(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(locs) if locs.is_empty() => ToolResult::success(format!(
+                        "No implementations found at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(locs) => ToolResult::success(format!(
+                        "{} implementation(s):\n{}",
+                        locs.len(),
+                        locs.join("\n")
+                    )),
+                    Err(e) => ToolResult::error(format!("implementations failed: {}", e)),
+                }
+            }
+
+            "type_definition" => {
+                let result = {
+                    let mut manager = lsp_manager_arc.lock().await;
+                    manager
+                        .type_definition(&file_path, &ctx.working_dir, line, column)
+                        .await
+                };
+                match result {
+                    Ok(locs) if locs.is_empty() => ToolResult::success(format!(
+                        "No type definition found at {}:{}:{}",
+                        file_path, line, column
+                    )),
+                    Ok(locs) => ToolResult::success(locs.join("\n")),
+                    Err(e) => ToolResult::error(format!("type_definition failed: {}", e)),
+                }
+            }
+
             other => ToolResult::error(format!(
-                "Unknown action '{}'. Valid actions: hover, definition, references, symbols, diagnostics",
+                "Unknown action '{}'. Valid actions: hover, definition, references, symbols, \
+                 diagnostics, incoming_calls, outgoing_calls, implementations, type_definition",
                 other
             )),
         }

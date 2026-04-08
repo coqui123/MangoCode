@@ -10,7 +10,7 @@ edition.workspace = true
 voice = ["dep:cpal"]
 
 # Experimental/feature-flagged capabilities
-default = ["voice", "ultraplan"]
+default = ["voice", "ultraplan", "cached_microcompact"]
 
 # Interaction & UI features
 ultraplan = []
@@ -28,6 +28,7 @@ lodestone = []
 # Agents & Memory features
 agent_triggers = []
 agent_triggers_remote = []
+proactive = []
 extract_memories = []
 verification_agent = []
 builtin_explore_plan_agents = []
@@ -60,6 +61,7 @@ dev_full = [
     "token_budget", "message_actions", "quick_search", "away_summary",
     "hook_prompts", "kairos_brief", "kairos_channels", "lodestone",
     "agent_triggers", "agent_triggers_remote",
+    "proactive",
     "extract_memories", "verification_agent", "builtin_explore_plan_agents",
     "cached_microcompact", "compaction_reminders", "agent_memory_snapshot",
     "teammem", "bash_classifier", "bridge_mode", "mcp_rich_output",

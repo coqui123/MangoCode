@@ -7,6 +7,8 @@
 use async_trait::async_trait;
 use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
+use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
+use mangocode_core::feature_flags::FeatureFlags;
 use mangocode_core::types::Message;
 use std::collections::BTreeMap;
 #[allow(unused_imports)]
@@ -102,6 +104,7 @@ pub struct CostCommand;
 pub struct ExitCommand;
 pub struct ModelCommand;
 pub struct ConfigCommand;
+pub struct FlagsCommand;
 pub struct ColorCommand;
 pub struct VersionCommand;
 pub struct ResumeCommand;
@@ -122,6 +125,7 @@ pub struct PlanCommand;
 pub struct TasksCommand;
 pub struct SessionCommand;
 pub struct ThinkingCommand;
+pub struct ProactiveCommand;
 // New commands
 pub struct ExportCommand;
 pub struct SkillsCommand;
@@ -175,6 +179,7 @@ pub struct ConnectCommand;
 pub struct AgentCommand;
 pub struct SearchCommand;
 pub struct ForkCommand;
+pub struct CriticCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -377,7 +382,7 @@ fn command_category(name: &str) -> &'static str {
             "Conversation"
         }
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
-        | "statusline" | "output-style" | "keybindings" | "privacy-settings"
+        | "statusline" | "output-style" | "keybindings" | "privacy-settings" | "flags"
         | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "upgrade" | "release-notes" => {
@@ -390,7 +395,9 @@ fn command_category(name: &str) -> &'static str {
             "Sessions & Remote"
         }
         "help" | "exit" | "feedback" | "bug" => "General",
-        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
+        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "proactive" => {
+            "AI & Thinking"
+        }
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
         | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
@@ -882,6 +889,68 @@ impl SlashCommand for ConfigCommand {
 
 // ---- /color --------------------------------------------------------------
 
+// ---- /flags --------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for FlagsCommand {
+    fn name(&self) -> &str {
+        "flags"
+    }
+
+    fn description(&self) -> &str {
+        "List or toggle runtime experimental feature flags"
+    }
+
+    fn help(&self) -> &str {
+        "Usage:\n\
+         /flags\n\
+         /flags <name> on\n\
+         /flags <name> off\n\n\
+         Examples:\n\
+         /flags\n\
+         /flags proactive on\n\
+         /flags cached_microcompact off"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+        if args.is_empty() {
+            let mut out = String::from("Runtime feature flags\n─────────────────────\n");
+            for (name, enabled) in FeatureFlags::list_all() {
+                out.push_str(&format!(
+                    "{}: {}\n",
+                    name,
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            return CommandResult::Message(out);
+        }
+
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() != 2 {
+            return CommandResult::Error("Usage: /flags | /flags <name> <on|off>".to_string());
+        }
+
+        let name = parts[0].trim().to_ascii_lowercase();
+        let value = match parts[1].trim().to_ascii_lowercase().as_str() {
+            "on" => true,
+            "off" => false,
+            _ => {
+                return CommandResult::Error("Usage: /flags <name> <on|off>".to_string());
+            }
+        };
+
+        FeatureFlags::set(&name, value);
+        CommandResult::Message(format!(
+            "Flag '{}' is now {}.",
+            name,
+            if value { "on" } else { "off" }
+        ))
+    }
+}
+
+// ---- /color --------------------------------------------------------------
+
 #[async_trait]
 impl SlashCommand for ColorCommand {
     fn name(&self) -> &str {
@@ -1215,6 +1284,20 @@ impl SlashCommand for StatusCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        fn format_with_commas(n: u64) -> String {
+            let s = n.to_string();
+            let mut out = String::with_capacity(s.len() + (s.len() / 3));
+            let len = s.len();
+            for (i, ch) in s.chars().enumerate() {
+                out.push(ch);
+                let remaining = len - i - 1;
+                if remaining > 0 && remaining.is_multiple_of(3) {
+                    out.push(',');
+                }
+            }
+            out
+        }
+
         // Auth status
         let auth_status = match mangocode_core::oauth::OAuthTokens::load().await {
             Some(tokens) => {
@@ -1255,6 +1338,34 @@ impl SlashCommand for StatusCommand {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "n/a".to_string());
 
+        // Token usage details for current conversation context.
+        let model = ctx.config.effective_model();
+        let tokens_used = estimate_message_tokens(&ctx.messages);
+        let registry = mangocode_api::ModelRegistry::new();
+        let (provider_id, model_id) = if let Some((provider, model_name)) = model.split_once('/') {
+            (provider.to_string(), model_name.to_string())
+        } else {
+            let provider = ctx
+                .config
+                .provider
+                .clone()
+                .or_else(|| registry.find_provider_for_model(model).map(|p| p.to_string()))
+                .unwrap_or_else(|| "anthropic".to_string());
+            (provider, model.to_string())
+        };
+        let max_tokens = registry
+            .get(&provider_id, &model_id)
+            .map(|e| u64::from(e.info.context_window))
+            .unwrap_or_else(|| mangocode_core::message_utils::context_window_for_model(model));
+        let pct_used = if max_tokens > 0 {
+            (tokens_used as f64 / max_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+        let compacted = load_collapse_state(&ctx.session_id)
+            .map(|state| state.tokens_before > state.tokens_after || state.messages_dropped > 0)
+            .unwrap_or(false);
+
         CommandResult::Message(format!(
             "MangoCode Status\n\
              ══════════════════\n\
@@ -1270,6 +1381,12 @@ impl SlashCommand for StatusCommand {
              Messages:       {msgs}\n\
              Working dir:    {wd}\n\
              Git branch:     {branch}\n\n\
+             📊 Token Usage\n\
+             Estimated:      {tokens_used} / {max_tokens} ({pct:.1}%)\n\
+             Messages:       {msgs}\n\
+             Compacted:      {compacted}\n\
+             Cache write:    {cache_write}\n\
+             Cache read:     {cache_read_stat}\n\n\
              Integrations\n\
              ────────────\n\
              MCP servers:    {mcp}\n\
@@ -1278,7 +1395,7 @@ impl SlashCommand for StatusCommand {
              ─────\n\
              {summary}",
             auth_status = auth_status,
-            model = ctx.config.effective_model(),
+            model = model,
             perm = ctx.config.permission_mode,
             fast = if fast_mode { "on" } else { "off" },
             editor = editor_mode,
@@ -1287,6 +1404,12 @@ impl SlashCommand for StatusCommand {
             msgs = ctx.messages.len(),
             wd = ctx.working_dir.display(),
             branch = git_branch,
+            tokens_used = format_with_commas(tokens_used),
+            max_tokens = format_with_commas(max_tokens),
+            pct = pct_used,
+            compacted = if compacted { "Yes" } else { "No" },
+            cache_write = format_with_commas(ctx.cost_tracker.cache_creation_tokens()),
+            cache_read_stat = format_with_commas(ctx.cost_tracker.cache_read_tokens()),
             mcp = mcp_status,
             hooks = hook_count,
             summary = ctx.cost_tracker.summary(),
@@ -3588,6 +3711,114 @@ impl SlashCommand for PermissionsCommand {
     }
 }
 
+// ---- /critic -------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for CriticCommand {
+    fn name(&self) -> &str {
+        "critic"
+    }
+    fn description(&self) -> &str {
+        "Toggle the LLM-powered permission critic or show recent evaluations"
+    }
+    fn help(&self) -> &str {
+        "Usage: /critic [on|off|status|history|model <name>]\n\n\
+         The permission critic uses a lightweight LLM call to evaluate\n\
+         whether each tool invocation is safe before executing it.\n\n\
+         Examples:\n\
+           /critic           — toggle on/off\n\
+           /critic on        — enable the critic\n\
+           /critic off       — disable the critic\n\
+           /critic status    — show current configuration\n\
+           /critic history   — show last 5 evaluations\n\
+           /critic model haiku — change the evaluation model"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let critic = mangocode_core::global_critic();
+        let args = args.trim();
+
+        match args {
+            "" => {
+                let new_state = critic.toggle();
+                let mut new_config = ctx.config.clone();
+                new_config.critic_mode = new_state;
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!(
+                        "Permission critic {}.",
+                        if new_state { "enabled" } else { "disabled" }
+                    ),
+                )
+            }
+            "on" => {
+                critic.set_enabled(true);
+                let mut new_config = ctx.config.clone();
+                new_config.critic_mode = true;
+                CommandResult::ConfigChangeMessage(new_config, "Permission critic enabled.".to_string())
+            }
+            "off" => {
+                critic.set_enabled(false);
+                let mut new_config = ctx.config.clone();
+                new_config.critic_mode = false;
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    "Permission critic disabled.".to_string(),
+                )
+            }
+            "status" => {
+                let cfg = critic.get_config();
+                CommandResult::Message(format!(
+                    "Permission Critic\n\
+                     ─────────────────\n\
+                     Enabled:  {}\n\
+                     Model:    {}\n\
+                     Fallback: {}",
+                    cfg.enabled, cfg.model, cfg.fallback_to_classifier,
+                ))
+            }
+            "history" => {
+                let evals = critic.recent_evaluations(5);
+                if evals.is_empty() {
+                    return CommandResult::Message("No evaluations yet.".to_string());
+                }
+                let mut out = String::from("Recent Critic Evaluations\n─────────────────────────\n");
+                for (i, eval) in evals.iter().enumerate() {
+                    out.push_str(&format!(
+                        "\n{}. [{}] {} — {}\n   {} | {}{}\n",
+                        i + 1,
+                        if eval.allowed { "ALLOW" } else { "DENY" },
+                        eval.tool_name,
+                        eval.tool_input_summary,
+                        eval.timestamp.format("%H:%M:%S"),
+                        eval.reasoning,
+                        if eval.cached { " (cached)" } else { "" },
+                    ));
+                }
+                CommandResult::Message(out)
+            }
+            other => {
+                if let Some(model_name) = other.strip_prefix("model").map(|s| s.trim()) {
+                    if model_name.is_empty() {
+                        return CommandResult::Error(
+                            "Specify a model name: /critic model <name>".to_string(),
+                        );
+                    }
+                    let mut cfg = critic.get_config();
+                    cfg.model = model_name.to_string();
+                    critic.update_config(cfg);
+                    CommandResult::Message(format!("Critic model set to: {}", model_name))
+                } else {
+                    CommandResult::Error(format!(
+                        "Unknown subcommand '{}'. Use: /critic [on|off|status|history|model <name>]",
+                        other
+                    ))
+                }
+            }
+        }
+    }
+}
+
 // ---- /plan ---------------------------------------------------------------
 
 #[async_trait]
@@ -3832,6 +4063,65 @@ impl SlashCommand for ThinkingCommand {
                  'think carefully before answering'.",
                 model
             ))
+        }
+    }
+}
+
+// ---- /proactive -----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ProactiveCommand {
+    fn name(&self) -> &str {
+        "proactive"
+    }
+
+    fn description(&self) -> &str {
+        "Control background proactive monitoring (on/off/status)"
+    }
+
+    fn help(&self) -> &str {
+        "Usage: /proactive <on|off|status>\n\n\
+         Enables or disables the background proactive agent for this session.\n\
+         Default is off."
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let cmd = args.trim().to_ascii_lowercase();
+
+        match cmd.as_str() {
+            "" | "status" => {
+                let (enabled, heartbeats, actions, last_summary, interval_secs) =
+                    mangocode_query::proactive_state();
+                let support = if mangocode_query::proactive_supported() {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                CommandResult::Message(format!(
+                    "Proactive support: {}\nSession opt-in: {}\nInterval: {}s\nHeartbeats: {}\nActions: {}\nLast summary: {}",
+                    support,
+                    if enabled { "ON" } else { "OFF" },
+                    interval_secs,
+                    heartbeats,
+                    actions,
+                    last_summary.unwrap_or_else(|| "(none)".to_string()),
+                ))
+            }
+            "on" => {
+                if !mangocode_query::proactive_supported() {
+                    return CommandResult::Error(
+                        "Proactive support is disabled in this build (feature: proactive)."
+                            .to_string(),
+                    );
+                }
+                mangocode_query::set_proactive_enabled(true);
+                CommandResult::Message("Proactive agent enabled for this session.".to_string())
+            }
+            "off" => {
+                mangocode_query::set_proactive_enabled(false);
+                CommandResult::Message("Proactive agent disabled for this session.".to_string())
+            }
+            _ => CommandResult::Error("Usage: /proactive <on|off|status>".to_string()),
         }
     }
 }
@@ -8194,6 +8484,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ExitCommand),
         Box::new(ModelCommand),
         Box::new(ConfigCommand),
+        Box::new(FlagsCommand),
         Box::new(ColorCommand),
         Box::new(PluginCommand),
         Box::new(VersionCommand),
@@ -8212,11 +8503,13 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HooksCommand),
         Box::new(McpCommand),
         Box::new(PermissionsCommand),
+        Box::new(CriticCommand),
         Box::new(PlanCommand),
         Box::new(TasksCommand),
         Box::new(SessionCommand),
         Box::new(ForkCommand),
         Box::new(ThinkingCommand),
+        Box::new(ProactiveCommand),
         Box::new(ThemeCommand),
         Box::new(OutputStyleCommand),
         Box::new(KeybindingsCommand),

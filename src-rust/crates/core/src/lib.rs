@@ -55,8 +55,13 @@ pub mod file_history;
 // Snapshot/undo system — tracks file changes per session for /undo support.
 pub mod snapshot;
 
-// Feature flag management via GrowthBook.
+// Runtime feature flag management.
 pub mod feature_flags;
+
+/// Initialize runtime feature flags early at process startup.
+pub fn init_runtime_feature_flags() {
+    let _ = feature_flags::FeatureFlags::ensure_initialized();
+}
 
 // MCP resource prompt template rendering with variable substitution.
 pub mod mcp_templates;
@@ -84,7 +89,10 @@ pub use types::{
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
 pub use cost::CostTracker;
-pub use feature_flags::FeatureFlagManager;
+pub use feature_flags::{
+    FeatureFlagManager, FeatureFlags, FLAG_AUTO_LSP, FLAG_CRITIC_PERMISSIONS,
+    FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
+};
 pub use history::ConversationSession;
 pub use permissions::{
     format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
@@ -92,6 +100,7 @@ pub use permissions::{
     PermissionDecision, PermissionHandler, PermissionLevel, PermissionManager, PermissionRequest,
     PermissionRule, PermissionScope, SerializedPermissionRule,
 };
+pub use permission_critic::{global_critic, CriticConfig, CriticEvaluation, PermissionCritic};
 pub use skill_discovery::{discover_skills, parse_skill_file, DiscoveredSkill};
 pub use snapshot::SnapshotManager;
 
@@ -761,6 +770,12 @@ pub mod config {
         /// When absent, `/share` falls back to a local Markdown export.
         #[serde(default, rename = "shareEndpoint")]
         pub share_endpoint: Option<String>,
+        /// Enable LLM-powered permission critic (alternative to static classifiers).
+        #[serde(default)]
+        pub critic_mode: bool,
+        /// Model to use for the permission critic (default: claude-3-haiku-20240307).
+        #[serde(default)]
+        pub critic_model: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1355,6 +1370,8 @@ pub mod config {
                     SkillsConfig { paths, urls }
                 },
                 share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
+                critic_mode: over.config.critic_mode || base.config.critic_mode,
+                critic_model: over.config.critic_model.or(base.config.critic_model),
             };
             Self {
                 config: merged_config,
@@ -3332,6 +3349,7 @@ pub mod migrations;
 pub mod oauth_config;
 pub mod output_styles;
 pub mod prompt_history;
+pub mod permission_critic;
 pub mod ps_classifier;
 pub mod remote_settings;
 pub mod session_tracing;

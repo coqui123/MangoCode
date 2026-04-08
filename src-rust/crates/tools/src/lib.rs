@@ -20,6 +20,7 @@ pub mod ask_user;
 pub mod bash;
 pub mod batch_edit;
 pub mod brief;
+pub mod browser_tool;
 pub mod bundled_skills;
 pub mod computer_use;
 pub mod config_tool;
@@ -37,6 +38,7 @@ pub mod mcp_auth_tool;
 pub mod mcp_resources;
 pub mod notebook_edit;
 pub mod powershell;
+pub mod pr_watch;
 pub mod pty_bash;
 pub mod remote_trigger;
 pub mod repl_tool;
@@ -58,6 +60,7 @@ pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use batch_edit::BatchEditTool;
 pub use brief::BriefTool;
+pub use browser_tool::BrowserTool;
 pub use computer_use::ComputerUseTool;
 pub use config_tool::ConfigTool;
 pub use cron::{CronCreateTool, CronDeleteTool, CronListTool};
@@ -74,6 +77,7 @@ pub use mcp_auth_tool::McpAuthTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use notebook_edit::NotebookEditTool;
 pub use powershell::PowerShellTool;
+pub use pr_watch::{heartbeat_scan_watched_prs, PrWatchTool};
 pub use pty_bash::PtyBashTool;
 pub use remote_trigger::RemoteTriggerTool;
 pub use repl_tool::ReplTool;
@@ -370,6 +374,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ExitPlanModeTool),
         Box::new(PowerShellTool),
         Box::new(SleepTool),
+        Box::new(PrWatchTool),
         Box::new(CronCreateTool),
         Box::new(CronDeleteTool),
         Box::new(CronListTool),
@@ -392,6 +397,9 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
+        // Browser automation is only available when compiled with the feature flag.
+        #[cfg(feature = "browser")]
+        Box::new(browser_tool::BrowserTool),
     ]
 }
 

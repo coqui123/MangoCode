@@ -4300,14 +4300,12 @@ impl App {
             }
             "submit" => !self.is_streaming,
             "indent" => {
-                if !self.is_streaming {
-                    if !self.prompt_input.suggestions.is_empty() {
-                        if self.prompt_input.suggestion_index.is_none() {
-                            self.prompt_input.suggestion_index = Some(0);
-                        }
-                        self.prompt_input.accept_suggestion();
-                        self.refresh_prompt_input();
+                if !self.is_streaming && !self.prompt_input.suggestions.is_empty() {
+                    if self.prompt_input.suggestion_index.is_none() {
+                        self.prompt_input.suggestion_index = Some(0);
                     }
+                    self.prompt_input.accept_suggestion();
+                    self.refresh_prompt_input();
                 }
                 false
             }

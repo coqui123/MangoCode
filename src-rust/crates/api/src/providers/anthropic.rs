@@ -22,7 +22,9 @@ use crate::provider_types::{
     StreamEvent, SystemPromptStyle,
 };
 use crate::streaming::{AnthropicStreamEvent, ContentDelta, NullStreamHandler};
-use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
+use crate::types::{
+    ApiMessage, ApiToolDefinition, CacheControl, CreateMessageRequest, SystemBlock, SystemPrompt,
+};
 
 use super::message_normalization::normalize_anthropic_messages;
 
@@ -56,6 +58,44 @@ impl AnthropicProvider {
         }
     }
 
+    /// Split a [`SystemPrompt::Text`] at the dynamic-boundary marker into
+    /// cacheable (static) and uncacheable (dynamic) blocks with
+    /// `cache_control: { type: "ephemeral" }` on the static portion.
+    fn split_system_prompt_for_caching(prompt: SystemPrompt) -> SystemPrompt {
+        use mangocode_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
+
+        let text = match &prompt {
+            SystemPrompt::Text(t) => t.as_str(),
+            // Already structured — return as-is.
+            SystemPrompt::Blocks(_) => return prompt,
+        };
+
+        let Some(pos) = text.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY) else {
+            return prompt;
+        };
+
+        let static_part = text[..pos].trim_end().to_string();
+        let dynamic_part = text[pos + SYSTEM_PROMPT_DYNAMIC_BOUNDARY.len()..]
+            .trim_start()
+            .to_string();
+
+        let mut blocks = vec![SystemBlock {
+            block_type: "text".to_string(),
+            text: static_part,
+            cache_control: Some(CacheControl::ephemeral()),
+        }];
+
+        if !dynamic_part.is_empty() {
+            blocks.push(SystemBlock {
+                block_type: "text".to_string(),
+                text: dynamic_part,
+                cache_control: None,
+            });
+        }
+
+        SystemPrompt::Blocks(blocks)
+    }
+
     /// Build a [`CreateMessageRequest`] from a [`ProviderRequest`].
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
         let normalized_messages = normalize_anthropic_messages(&request.messages);
@@ -68,7 +108,12 @@ impl AnthropicProvider {
             Some(request.tools.iter().map(ApiToolDefinition::from).collect())
         };
 
-        let system = request.system_prompt.clone();
+        // Split the system prompt at the dynamic boundary so the static
+        // portion gets prompt-cached by the Anthropic API.
+        let system = request
+            .system_prompt
+            .clone()
+            .map(Self::split_system_prompt_for_caching);
 
         let mut builder = CreateMessageRequest::builder(&request.model, request.max_tokens)
             .messages(api_messages);
@@ -375,6 +420,77 @@ impl LlmProvider for AnthropicProvider {
             caching: true,
             structured_output: true,
             system_prompt_style: SystemPromptStyle::TopLevel,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_request_splits_system_prompt_for_cache() {
+        let boundary = mangocode_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
+        let request = ProviderRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            messages: vec![mangocode_core::types::Message::user("hi")],
+            system_prompt: Some(SystemPrompt::Text(format!(
+                "static part\n{}\ndynamic part",
+                boundary
+            ))),
+            tools: vec![],
+            max_tokens: 128,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: json!({}),
+        };
+
+        let built = AnthropicProvider::build_request(&request);
+        let wire = serde_json::to_value(&built).expect("serialize request");
+        let system = wire["system"].as_array().expect("system blocks");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["cache_control"]["type"], json!("ephemeral"));
+        assert_eq!(system[1]["text"], json!("dynamic part"));
+    }
+
+    #[test]
+    fn map_stream_event_maps_tool_use_stop_reason() {
+        let evt = AnthropicStreamEvent::MessageDelta {
+            stop_reason: Some("tool_use".to_string()),
+            usage: Some(UsageInfo::default()),
+        };
+        let mapped = AnthropicProvider::map_stream_event(evt).expect("mapped event");
+
+        match mapped {
+            StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            } => {}
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn map_stream_event_preserves_error_payload() {
+        let evt = AnthropicStreamEvent::Error {
+            error_type: "overloaded_error".to_string(),
+            message: "please retry".to_string(),
+        };
+        let mapped = AnthropicProvider::map_stream_event(evt).expect("mapped error");
+
+        match mapped {
+            StreamEvent::Error {
+                error_type,
+                message,
+            } => {
+                assert_eq!(error_type, "overloaded_error");
+                assert_eq!(message, "please retry");
+            }
+            other => panic!("unexpected event: {:?}", other),
         }
     }
 }

@@ -21,6 +21,9 @@ pub const BUILD_TIME: &str = env!("BUILD_TIME");
 /// Short git commit hash (or "unknown" if not a git repo)
 pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
 
+/// Full version string: "0.0.7 (abc1234)"
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
 /// Package/distribution identifier
 pub const PACKAGE_URL: &str = env!("PACKAGE_URL");
 
@@ -36,7 +39,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use mangocode_core::types::ToolDefinition;
 use mangocode_core::{
     config::{Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, Settings},
-    constants::{APP_VERSION, DEFAULT_MODEL},
+    constants::DEFAULT_MODEL,
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
@@ -112,8 +115,8 @@ impl Tool for McpToolWrapper {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "claude",
-    version = APP_VERSION,
+    name = "mangocode",
+    version = VERSION,
     about = "MangoCode - AI-powered coding assistant",
     long_about = None,
 )]
@@ -572,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
     // Fast-path: handle --version before parsing everything
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("claude {}", APP_VERSION);
+        println!("MangoCode v{}", VERSION);
         return Ok(());
     }
 
@@ -1038,6 +1041,20 @@ async fn main() -> anyhow::Result<()> {
         cron_cancel.clone(),
     );
 
+    // Spawn proactive monitor loop (feature-gated + opt-in via /proactive on).
+    let proactive_cancel = tokio_util::sync::CancellationToken::new();
+    let _proactive_handle = mangocode_query::ProactiveAgent::new(
+        cwd.clone(),
+        tool_ctx.session_id.clone(),
+    )
+    .start(
+        client.clone(),
+        tools.clone(),
+        tool_ctx.clone(),
+        query_config.clone(),
+        proactive_cancel.clone(),
+    );
+
     // --print mode (headless)
     let result = if is_headless {
         run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
@@ -1068,6 +1085,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     cron_cancel.cancel();
+    proactive_cancel.cancel();
     result
 }
 

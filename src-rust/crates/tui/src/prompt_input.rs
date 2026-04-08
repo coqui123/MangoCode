@@ -1508,18 +1508,24 @@ pub fn compute_typeahead(
     input: &str,
     slash_commands: &[SlashCommandSpec],
 ) -> Vec<TypeaheadSuggestion> {
+    let mut slash_matches: Vec<&SlashCommandSpec> = Vec::new();
     let mut suggestions = Vec::new();
 
     if let Some(cmd_prefix) = input.strip_prefix('/') {
         let prefix_lower = cmd_prefix.to_lowercase();
         for cmd in slash_commands {
             if cmd.name.to_lowercase().starts_with(&prefix_lower) {
-                suggestions.push(TypeaheadSuggestion {
-                    text: format!("/{}", cmd.name),
-                    description: cmd.description.to_string(),
-                    source: TypeaheadSource::SlashCommand,
-                });
+                slash_matches.push(cmd);
             }
+        }
+
+        slash_matches.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        for cmd in slash_matches {
+            suggestions.push(TypeaheadSuggestion {
+                text: format!("/{}", cmd.name),
+                description: cmd.description.to_string(),
+                source: TypeaheadSource::SlashCommand,
+            });
         }
     }
 
@@ -1534,7 +1540,8 @@ pub fn compute_typeahead(
 /// `[Pasted text #N +X lines]`; single-line pastes are inserted inline.
 pub fn handle_paste(content: &str, paste_counter: &mut u32) -> (String, Option<String>) {
     // In raw terminal mode, newlines may arrive as \r, \r\n, or \n.
-    let line_count = content.split(|c: char| c == '\n' || c == '\r')
+    let line_count = content
+        .split(['\n', '\r'])
         .filter(|s| !s.is_empty())
         .count();
     if line_count <= 1 {
