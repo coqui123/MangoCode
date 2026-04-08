@@ -3235,6 +3235,11 @@ pub mod oauth {
             }
         }
 
+        /// Returns true if the token is expired or will expire within 5 minutes.
+        pub fn is_expired_or_expiring_soon(&self) -> bool {
+            self.is_expired()
+        }
+
         pub fn token_file_path() -> std::path::PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
+use tiktoken_rs::CoreBPE;
 
 /// Strategy for collapsing a conversation when it exceeds token limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,12 +53,28 @@ const TEXT_CHARS_PER_TOKEN: f64 = 4.0;
 /// Code-heavy average chars/token.
 const CODE_CHARS_PER_TOKEN: f64 = 2.8;
 
-/// Estimate token count from text using a code-aware heuristic.
+static TOKENIZER: OnceLock<CoreBPE> = OnceLock::new();
+
+fn get_tokenizer() -> &'static CoreBPE {
+    TOKENIZER.get_or_init(|| tiktoken_rs::cl100k_base().expect("Failed to load cl100k tokenizer"))
+}
+
+/// Estimate token count from text using tiktoken with a small-string heuristic fast path.
 fn estimate_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 1;
     }
 
+    // For very short strings, the heuristic is faster and close enough.
+    if text.len() < 20 {
+        return estimate_tokens_heuristic(text);
+    }
+
+    get_tokenizer().encode_with_special_tokens(text).len() as u64
+}
+
+/// Heuristic fallback used for very short strings.
+fn estimate_tokens_heuristic(text: &str) -> u64 {
     let divisor = if looks_like_code(text) {
         CODE_CHARS_PER_TOKEN
     } else {
@@ -641,6 +659,13 @@ mod tests {
         let code = "fn main() { let x = 1; println!(\"{}\", x); }\n".repeat(40);
         let prose = "This is a plain sentence with mostly normal language content.\n".repeat(40);
         assert!(estimate_tokens(&code) > estimate_tokens(&prose));
+    }
+
+    #[test]
+    fn token_estimation_uses_tiktoken() {
+        // "Hello, world!" is 4 tokens in cl100k_base
+        let tokens = estimate_tokens("Hello, world!");
+        assert_eq!(tokens, 4);
     }
 
     #[test]

@@ -818,7 +818,30 @@ async fn main() -> anyhow::Result<()> {
         active_provider != "anthropic" || has_non_anthropic_env
     };
 
-    let (api_key, use_bearer_auth) = match config.resolve_auth_async().await {
+    let mut cached_tokens = mangocode_core::oauth::OAuthTokens::load().await;
+    if let Some(ref tokens) = cached_tokens {
+        if tokens.is_expired_or_expiring_soon() {
+            match crate::oauth_flow::refresh_oauth_token(tokens).await {
+                Ok(refreshed) => {
+                    tracing::info!("OAuth token refreshed");
+                    cached_tokens = Some(refreshed);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Token refresh failed - will re-login if needed");
+                }
+            }
+        }
+    }
+
+    let resolved_auth = config.resolve_auth_async().await.or_else(|| {
+        cached_tokens.as_ref().and_then(|tokens| {
+            tokens
+                .effective_credential()
+                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+        })
+    });
+
+    let (api_key, use_bearer_auth) = match resolved_auth {
         Some(auth) => auth,
         None if other_provider_configured
             && config.provider.as_deref().unwrap_or("anthropic") != "anthropic" =>
