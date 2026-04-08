@@ -209,6 +209,9 @@ pub struct SystemPromptOptions {
     pub custom_output_style_prompt: Option<String>,
     /// Absolute path to the working directory (injected as dynamic section).
     pub working_directory: Option<String>,
+    /// Git repository context (branch, status, recent log) injected into the dynamic section.
+    /// Empty string if not in a git repo or if git context gathering failed.
+    pub git_context: String,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
     /// Custom system prompt (--system-prompt flag or settings).
@@ -303,6 +306,11 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 11. Working directory (legacy XML tag kept for caching compat)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+    }
+
+    // 11.5. Git repository context
+    if !opts.git_context.is_empty() {
+        parts.push(format!("\n<git_context>\n{}\n</git_context>", opts.git_context));
     }
 
     // 12. Memory injection (from memdir)
@@ -409,6 +417,137 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         os_version,
         shell_line,
     )
+}
+
+/// Gather git repository context for system prompt injection.
+/// Returns an empty string if not in a git repo or if git commands fail.
+/// Designed to be fast - each git command has a 2-second timeout.
+pub fn gather_git_context(working_dir: &str) -> String {
+    use std::fs;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    let dir = std::path::Path::new(working_dir);
+    let run_raw = |args: &[&str]| -> Option<String> {
+        // Route stdout to a temp file so large outputs cannot block on pipe capacity
+        // while we poll try_wait() for timeout handling.
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "mangocode_git_ctx_{}_{}.tmp",
+            std::process::id(),
+            ts
+        ));
+        let out_file = std::fs::File::create(&tmp_path).ok()?;
+
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+
+        let cleanup = || {
+            let _ = fs::remove_file(&tmp_path);
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        cleanup();
+                        return None;
+                    }
+
+                    let output = fs::read_to_string(&tmp_path).ok()?;
+                    cleanup();
+
+                    return Some(output.trim().to_string());
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        cleanup();
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => {
+                    cleanup();
+                    return None;
+                }
+            }
+        }
+    };
+
+    // Use git itself for repo detection (handles nested dirs and worktrees).
+    if run_raw(&["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        return String::new();
+    }
+
+    let run = |args: &[&str]| -> Option<String> {
+        run_raw(args).filter(|s| !s.is_empty())
+    };
+
+    let mut parts = Vec::new();
+
+    // Current branch
+    if let Some(branch) = run(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        parts.push(format!("Branch: {}", branch));
+    }
+
+    // Short status (uncommitted changes)
+    match run_raw(&["status", "--porcelain", "--untracked-files=no"]) {
+        Some(status) if status.is_empty() => {
+            parts.push("Working tree: clean".to_string());
+        }
+        Some(status) => {
+            let lines: Vec<&str> = status.lines().collect();
+            let shown = if lines.len() > 15 {
+                format!(
+                    "{}\n  ... and {} more changed files",
+                    lines[..15].join("\n"),
+                    lines.len() - 15
+                )
+            } else {
+                lines.join("\n")
+            };
+            parts.push(format!("Uncommitted changes:\n{}", shown));
+        }
+        None => {}
+    }
+
+    // Recent commits (last 5, one-line format)
+    if let Some(log) = run(&["log", "--oneline", "-5", "--no-decorate"]) {
+        parts.push(format!("Recent commits:\n{}", log));
+    }
+
+    // Repo root-level file listing for project structure awareness
+    if let Some(ls) = run(&["ls-tree", "--name-only", "HEAD"]) {
+        let files: Vec<&str> = ls.lines().collect();
+        let shown = if files.len() > 20 {
+            format!(
+                "{}\n  ... and {} more",
+                files[..20].join(", "),
+                files.len() - 20
+            )
+        } else {
+            files.join(", ")
+        };
+        parts.push(format!("Root files: {}", shown));
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    parts.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +688,42 @@ mod tests {
             mem_pos > boundary_pos,
             "Memory content must appear after the dynamic boundary"
         );
+    }
+
+    #[test]
+    fn test_git_context_in_dynamic_section() {
+        let opts = SystemPromptOptions {
+            working_directory: Some("/home/user/project".to_string()),
+            git_context:
+                "Branch: main\nWorking tree: clean\nRecent commits:\nabc1234 Initial commit"
+                    .to_string(),
+            skip_env_info: true,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(prompt.contains("<git_context>"));
+        assert!(prompt.contains("Branch: main"));
+        assert!(prompt.contains("abc1234 Initial commit"));
+
+        // Verify it's in the dynamic section (after the boundary)
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let git_pos = prompt.find("<git_context>").unwrap();
+        assert!(
+            git_pos > boundary_pos,
+            "git_context should be in the dynamic section"
+        );
+    }
+
+    #[test]
+    fn test_empty_git_context_not_injected() {
+        let opts = SystemPromptOptions {
+            working_directory: Some("/home/user/project".to_string()),
+            git_context: String::new(),
+            skip_env_info: true,
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(!prompt.contains("<git_context>"));
     }
 
     #[test]

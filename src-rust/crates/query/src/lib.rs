@@ -2796,7 +2796,13 @@ fn build_todo_nudge(session_id: &str) -> String {
 /// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
 /// - `append_system_prompt` → `append_system_prompt` (added after boundary)
 fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
-    use mangocode_core::system_prompt::SystemPromptOptions;
+    use mangocode_core::system_prompt::{gather_git_context, SystemPromptOptions};
+
+    let git_context = config
+        .working_directory
+        .as_deref()
+        .map(gather_git_context)
+        .unwrap_or_default();
 
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
@@ -2809,6 +2815,7 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
+        git_context,
         ..Default::default()
     };
 
