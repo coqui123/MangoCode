@@ -58,6 +58,9 @@ pub mod snapshot;
 // Runtime feature flag management.
 pub mod feature_flags;
 
+// Persistent cumulative usage ledger (~/.mangocode/usage.json).
+pub mod usage_ledger;
+
 /// Initialize runtime feature flags early at process startup.
 pub fn init_runtime_feature_flags() {
     let _ = feature_flags::FeatureFlags::ensure_initialized();
@@ -1576,8 +1579,13 @@ pub mod constants {
 // context module
 // ---------------------------------------------------------------------------
 pub mod context {
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
     use tokio::process::Command;
+
+    /// Maximum character length for git context to prevent context window bloat.
+    const MAX_GIT_CONTEXT_CHARS: usize = 2000;
 
     /// Builds the system-level and user-level context that gets prepended to
     /// every conversation with the model.
@@ -1636,36 +1644,165 @@ pub mod context {
             parts.join("\n\n")
         }
 
-        /// Gather short git status + recent log.
+        /// Gather structured repository context for prompt injection.
         async fn get_git_context(&self) -> Option<String> {
-            let output = Command::new("git")
+            let branch_output = Command::new("git")
                 .args(["status", "--short", "--branch"])
                 .current_dir(&self.cwd)
                 .output()
                 .await
                 .ok()?;
 
-            if !output.status.success() {
+            if !branch_output.status.success() {
                 return None;
             }
 
-            let status = String::from_utf8_lossy(&output.stdout).to_string();
+            let status_lines = String::from_utf8_lossy(&branch_output.stdout);
+            let (branch_line, tracking_line) = {
+                let mut lines = status_lines.lines();
+                let raw = lines
+                    .next()
+                    .unwrap_or("")
+                    .trim_start_matches("## ")
+                    .trim();
+                if let Some((branch, tracking)) = raw.split_once("...") {
+                    (
+                        branch.trim().to_string(),
+                        Some(tracking.trim().to_string()).filter(|s| !s.is_empty()),
+                    )
+                } else {
+                    (raw.to_string(), None)
+                }
+            };
+
+            let mut parts = vec![];
+            let mut repo_header = String::from("# Repository Context\n");
+            if branch_line.is_empty() {
+                repo_header.push_str("Branch: (unknown)");
+            } else {
+                repo_header.push_str(&format!("Branch: {}", branch_line));
+            }
+            if let Some(tracking) = tracking_line {
+                repo_header.push_str(&format!("\nTracking: {}", tracking));
+            }
+            parts.push(repo_header);
+
+            let porcelain = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if porcelain.is_empty() {
+                parts.push("## Working Tree (git status --porcelain)\nClean - no uncommitted changes.".to_string());
+            } else {
+                parts.push(format!("## Working Tree (git status --porcelain)\n{}", porcelain));
+            }
 
             let log_output = Command::new("git")
                 .args(["log", "--oneline", "-5"])
                 .current_dir(&self.cwd)
                 .output()
                 .await
-                .ok()?;
+                .ok()
+                .filter(|o| o.status.success());
+            if let Some(out) = log_output {
+                let log = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !log.is_empty() {
+                    parts.push(format!("## Recent Commits\n{}", log));
+                }
+            }
 
-            let log = String::from_utf8_lossy(&log_output.stdout).to_string();
+            if let Some(language_section) = self.get_language_breakdown().await {
+                parts.push(language_section);
+            }
 
-            let mut result = format!("# Git Status\n{}", status.trim());
-            if !log.trim().is_empty() {
-                result.push_str(&format!("\n\n# Recent Commits\n{}", log.trim()));
+            let mut result = parts.join("\n\n");
+            if result.len() > MAX_GIT_CONTEXT_CHARS {
+                result.truncate(MAX_GIT_CONTEXT_CHARS);
+                if let Some(last_newline) = result.rfind('\n') {
+                    result.truncate(last_newline);
+                }
+                result.push_str("\n... (truncated)");
             }
 
             Some(result)
+        }
+
+        /// Fast language breakdown by tracked file extension.
+        async fn get_language_breakdown(&self) -> Option<String> {
+            let output = Command::new("git")
+                .args(["ls-files"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())?;
+
+            let files = String::from_utf8_lossy(&output.stdout);
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut total = 0usize;
+
+            for line in files.lines() {
+                let path = Path::new(line.trim());
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("(no ext)");
+                let lang = match ext {
+                    "rs" => "Rust",
+                    "ts" | "tsx" => "TypeScript",
+                    "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+                    "py" => "Python",
+                    "go" => "Go",
+                    "java" => "Java",
+                    "c" | "h" => "C",
+                    "cpp" | "cc" | "cxx" | "hpp" => "C++",
+                    "md" | "mdx" => "Markdown",
+                    "toml" => "TOML",
+                    "yaml" | "yml" => "YAML",
+                    "json" => "JSON",
+                    "html" => "HTML",
+                    "css" | "scss" | "sass" => "CSS",
+                    "sh" | "bash" | "zsh" => "Shell",
+                    "sql" => "SQL",
+                    "swift" => "Swift",
+                    "kt" | "kts" => "Kotlin",
+                    "rb" => "Ruby",
+                    "lock" | "sum" => continue,
+                    "(no ext)" => continue,
+                    _ => ext,
+                };
+                *counts.entry(lang.to_string()).or_default() += 1;
+                total += 1;
+            }
+
+            if total == 0 {
+                return None;
+            }
+
+            let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut lines: Vec<String> = sorted
+                .iter()
+                .take(5)
+                .map(|(lang, count)| {
+                    let pct = (*count as f64 / total as f64) * 100.0;
+                    format!("{}: {:.1}% ({} files)", lang, pct, count)
+                })
+                .collect();
+
+            let remainder: usize = sorted.iter().skip(5).map(|(_, c)| *c).sum();
+            if remainder > 0 {
+                let pct = (remainder as f64 / total as f64) * 100.0;
+                lines.push(format!("Other: {:.1}% ({} files)", pct, remainder));
+            }
+
+            Some(format!("## Language Breakdown\n{}", lines.join("\n")))
         }
 
         /// Walk up from cwd looking for AGENTS.md files and the global one.

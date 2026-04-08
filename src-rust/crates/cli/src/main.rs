@@ -1685,12 +1685,13 @@ async fn run_headless(
     session.total_cost = cost_tracker.total_cost_usd();
     session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
     session.updated_at = chrono::Utc::now();
+    let duration_ms = start_time.elapsed().as_millis() as u64;
 
     if let Err(e) = mangocode_core::history::save_session(&session).await {
         eprintln!("Warning: failed to save session {}: {}", session.id, e);
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
+    persist_session_usage(&cost_tracker, &session, duration_ms);
 
     // Final output
     match cli.output_format {
@@ -1905,6 +1906,26 @@ struct InteractiveRunArgs {
     model_registry: Arc<mangocode_api::ModelRegistry>,
 }
 
+fn persist_session_usage(
+    cost_tracker: &Arc<CostTracker>,
+    session: &mangocode_core::history::ConversationSession,
+    duration_ms: u64,
+) {
+    let mut ledger = mangocode_core::usage_ledger::UsageLedger::load();
+    ledger.record_session(mangocode_core::usage_ledger::SessionCostRecord {
+        session_id: session.id.clone(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        model: session.model.clone(),
+        cost_usd: cost_tracker.total_cost_usd(),
+        input_tokens: cost_tracker.input_tokens(),
+        output_tokens: cost_tracker.output_tokens(),
+        cache_creation_tokens: cost_tracker.cache_creation_tokens(),
+        cache_read_tokens: cost_tracker.cache_read_tokens(),
+        duration_ms,
+        working_dir: session.working_dir.clone().unwrap_or_default(),
+    });
+}
+
 async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     let InteractiveRunArgs {
         config,
@@ -1937,6 +1958,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     use tokio_util::sync::CancellationToken;
 
     let mut tool_ctx = tool_ctx;
+    let session_start = std::time::Instant::now();
     let mut session = if let Some(ref id) = resume_id {
         match mangocode_core::history::load_session(id).await {
             Ok(session) => {
@@ -3371,6 +3393,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }
+
+    session.total_cost = cost_tracker.total_cost_usd();
+    session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
+    session.updated_at = chrono::Utc::now();
+    let _ = mangocode_core::history::save_session(&session).await;
+    let duration_ms = session_start.elapsed().as_millis() as u64;
+    persist_session_usage(&cost_tracker, &session, duration_ms);
+
     restore_terminal(&mut terminal)?;
     Ok(())
 }

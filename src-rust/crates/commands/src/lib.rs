@@ -595,17 +595,30 @@ impl SlashCommand for CostCommand {
         "cost"
     }
     fn description(&self) -> &str {
-        "Show token usage and cost for this session"
+        "Show token usage and cost for this session (use '/cost history' for all sessions)"
     }
     fn help(&self) -> &str {
-        "Usage: /cost\n\n\
-         Shows per-category token counts and the estimated cost for this session.\n\
-         Cache write tokens are priced slightly higher than input; cache read tokens\n\
-         are ~10x cheaper — caching reduces cost significantly in long sessions.\n\
-         For per-call breakdown use /extra-usage. For account quotas use /usage."
+        "Usage: /cost [history [N]]\n\n\
+         /cost            - show current session cost breakdown\n\
+         /cost history    - show cumulative cost across all sessions (last 20)\n\
+         /cost history 50 - show last 50 sessions"
     }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+
+        // Handle /cost history [N]
+        if args.starts_with("history") || args.starts_with('h') {
+            let n: usize = args
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+
+            let ledger = mangocode_core::usage_ledger::UsageLedger::load();
+            return CommandResult::Message(ledger.format_history(n));
+        }
+
         let tracker = &ctx.cost_tracker;
         let model = ctx.config.effective_model();
         let pricing = mangocode_core::cost::ModelPricing::for_model(model);

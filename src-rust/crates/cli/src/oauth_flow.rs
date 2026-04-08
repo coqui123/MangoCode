@@ -370,7 +370,6 @@ async fn create_api_key(access_token: &str) -> anyhow::Result<String> {
 
 /// Attempt to refresh an expired access token using the stored refresh token.
 /// Saves updated tokens on success.
-#[allow(dead_code)]
 pub async fn refresh_oauth_token(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
     let refresh_token = tokens
         .refresh_token
