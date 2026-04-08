@@ -50,9 +50,8 @@ const GOOGLE_STREAM_LOGICAL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(6
 impl GoogleProvider {
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .read_timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

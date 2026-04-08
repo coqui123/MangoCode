@@ -2622,8 +2622,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             }
                         }
 
-                        // Fire UserPromptSubmit hook (non-blocking)
-                        if !config.hooks.is_empty() {
+                        // Fire UserPromptSubmit hook without blocking query launch.
+                        let hook_handle = if !config.hooks.is_empty() {
+                            let hooks = config.hooks.clone();
+                            let working_dir = tool_ctx.working_dir.clone();
                             let hook_ctx = mangocode_core::hooks::HookContext {
                                 event: "UserPromptSubmit".to_string(),
                                 tool_name: None,
@@ -2632,14 +2634,25 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
-                            mangocode_core::hooks::run_hooks(
-                                &config.hooks,
-                                mangocode_core::config::HookEvent::UserPromptSubmit,
-                                &hook_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
-                        }
+                            Some(tokio::spawn(async move {
+                                tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    mangocode_core::hooks::run_hooks(
+                                        &hooks,
+                                        mangocode_core::config::HookEvent::UserPromptSubmit,
+                                        &hook_ctx,
+                                        &working_dir,
+                                    ),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    eprintln!("Hooks timed out after 5s, continuing query");
+                                    mangocode_core::hooks::HookOutcome::Allowed
+                                })
+                            }))
+                        } else {
+                            None
+                        };
 
                         // Regular user message (with optional image attachments)
                         let pending_imgs = app.prompt_input.clear_images();
@@ -2718,6 +2731,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 None,
                             )
                             .await;
+                            if let Some(hook_handle) = hook_handle {
+                                let _ = hook_handle.await;
+                            }
                             // Write updated messages (with tool calls + assistant response) back
                             *msgs_arc_clone.lock().await = msgs;
                             outcome
@@ -3301,58 +3317,92 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             .unwrap_or(false);
 
         if task_finished {
-            if let Some((handle, msgs_arc)) = current_query.take() {
-                // Get the outcome (ignore errors for now)
-                let _ = handle.await;
-                // Sync the updated conversation back to our local vector
-                messages = msgs_arc.lock().await.clone();
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-                session.model =
-                    mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                session.working_dir = Some(tool_ctx.working_dir.display().to_string());
-                app.is_streaming = false;
-                app.status_message = None;
+            let synced_messages = current_query.as_ref().and_then(|(_, msgs_arc)| {
+                if let Ok(msgs) = msgs_arc.try_lock() {
+                    Some(msgs.clone())
+                } else {
+                    None
+                }
+            });
 
-                // Save session to JSONL (primary storage)
-                let _ = mangocode_core::history::save_session(&session).await;
+            if let Some(synced_messages) = synced_messages {
+                if let Some((handle, _msgs_arc)) = current_query.take() {
+                    // Get the outcome (ignore errors for now)
+                    let _ = handle.await;
+                    // Sync the updated conversation back to our local vector
+                    messages = synced_messages;
+                    session.messages = messages.clone();
+                    session.updated_at = chrono::Utc::now();
+                    session.model =
+                        mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+                    app.is_streaming = false;
+                    app.status_message = None;
 
-                // Also index into SQLite for /search support
-                {
-                    let db_path =
-                        mangocode_core::config::Settings::config_dir().join("sessions.db");
-                    if let Ok(store) = mangocode_core::SqliteSessionStore::open(&db_path) {
-                        let _ = store.save_session(
-                            &session.id,
-                            session.title.as_deref(),
-                            &session.model,
-                        );
-                        for msg in &session.messages {
-                            let content_str = match &msg.content {
-                                mangocode_core::types::MessageContent::Text(t) => t.clone(),
-                                mangocode_core::types::MessageContent::Blocks(blocks) => blocks
-                                    .iter()
-                                    .filter_map(|b| {
-                                        if let mangocode_core::types::ContentBlock::Text { text } =
-                                            b
-                                        {
-                                            Some(text.as_str())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" "),
-                            };
-                            let role = match msg.role {
-                                mangocode_core::types::Role::User => "user",
-                                mangocode_core::types::Role::Assistant => "assistant",
-                            };
-                            let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
-                            let _ =
-                                store.save_message(&session.id, msg_id, role, &content_str, None);
+                    // Persist session and search index in background so UI loop stays responsive.
+                    let session_clone = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = mangocode_core::history::save_session(&session_clone).await {
+                            eprintln!("Session save failed: {e}");
                         }
-                    }
+
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            let db_path =
+                                mangocode_core::config::Settings::config_dir().join("sessions.db");
+                            match mangocode_core::SqliteSessionStore::open(&db_path) {
+                                Ok(store) => {
+                                    if let Err(e) = store.save_session(
+                                        &session_clone.id,
+                                        session_clone.title.as_deref(),
+                                        &session_clone.model,
+                                    ) {
+                                        eprintln!("SQLite session index failed: {e}");
+                                    }
+
+                                    for msg in &session_clone.messages {
+                                        let content_str = match &msg.content {
+                                            mangocode_core::types::MessageContent::Text(t) => t.clone(),
+                                            mangocode_core::types::MessageContent::Blocks(blocks) => {
+                                                blocks
+                                                    .iter()
+                                                    .filter_map(|b| {
+                                                        if let mangocode_core::types::ContentBlock::Text {
+                                                            text,
+                                                        } = b
+                                                        {
+                                                            Some(text.as_str())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ")
+                                            }
+                                        };
+                                        let role = match msg.role {
+                                            mangocode_core::types::Role::User => "user",
+                                            mangocode_core::types::Role::Assistant => "assistant",
+                                        };
+                                        let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
+                                        if let Err(e) = store.save_message(
+                                            &session_clone.id,
+                                            msg_id,
+                                            role,
+                                            &content_str,
+                                            None,
+                                        ) {
+                                            eprintln!("SQLite message index failed: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("SQLite open failed: {e}"),
+                            }
+                        })
+                        .await
+                        {
+                            eprintln!("SQLite indexing task join failed: {e}");
+                        }
+                    });
                 }
             }
         }

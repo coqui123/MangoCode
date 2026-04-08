@@ -39,12 +39,15 @@ pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
 
+use once_cell::sync::Lazy;
 use mangocode_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use mangocode_core::bash_classifier::{classify_bash_command, BashRiskLevel};
-use mangocode_core::constants::TOOL_NAME_BASH;
+use mangocode_core::constants::{
+    TOOL_NAME_APPLY_PATCH, TOOL_NAME_BASH, TOOL_NAME_FILE_EDIT, TOOL_NAME_FILE_WRITE,
+};
 use mangocode_core::config::Config;
 use mangocode_core::cost::CostTracker;
 use mangocode_core::error::ClaudeError;
@@ -57,7 +60,10 @@ use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
 use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
 use mangocode_tools::{Tool, ToolContext, ToolResult};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -81,6 +87,82 @@ pub enum QueryOutcome {
     Error(ClaudeError),
     /// The configured USD budget was exceeded.
     BudgetExceeded { cost_usd: f64, limit_usd: f64 },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryState {
+    pub cached_git_context: Option<String>,
+    pub git_context_dirty: bool,
+    pub last_access_tick: u64,
+}
+
+static QUERY_STATE: Lazy<Mutex<HashMap<String, QueryState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static QUERY_STATE_CLOCK: AtomicU64 = AtomicU64::new(1);
+const QUERY_STATE_MAX_ENTRIES: usize = 256;
+
+fn touch_query_state(state: &mut QueryState) {
+    state.last_access_tick = QUERY_STATE_CLOCK.fetch_add(1, Ordering::Relaxed);
+}
+
+fn evict_query_state_if_needed(states: &mut HashMap<String, QueryState>) {
+    while states.len() > QUERY_STATE_MAX_ENTRIES {
+        let oldest = states
+            .iter()
+            .min_by_key(|(_, state)| state.last_access_tick)
+            .map(|(session_id, _)| session_id.clone());
+        if let Some(oldest) = oldest {
+            states.remove(&oldest);
+        } else {
+            break;
+        }
+    }
+}
+
+fn resolve_git_context(session_id: &str, working_directory: &str) -> String {
+    if working_directory.is_empty() {
+        return String::new();
+    }
+
+    let cached = {
+        let mut states = QUERY_STATE.lock().unwrap();
+        match states.get_mut(session_id) {
+            Some(state) if !state.git_context_dirty => {
+                touch_query_state(state);
+                state.cached_git_context.clone()
+            }
+            _ => None,
+        }
+    };
+
+    if let Some(cached) = cached {
+        return cached;
+    }
+
+    use mangocode_core::system_prompt::gather_git_context;
+
+    let git_context = gather_git_context(working_directory);
+    let mut states = QUERY_STATE.lock().unwrap();
+    let state = states.entry(session_id.to_string()).or_default();
+    state.cached_git_context = Some(git_context.clone());
+    state.git_context_dirty = false;
+    touch_query_state(state);
+    evict_query_state_if_needed(&mut states);
+    git_context
+}
+
+fn mark_git_context_dirty(session_id: &str) {
+    let mut states = QUERY_STATE.lock().unwrap();
+    let state = states.entry(session_id.to_string()).or_default();
+    state.git_context_dirty = true;
+    touch_query_state(state);
+    evict_query_state_if_needed(&mut states);
+}
+
+fn tool_invalidates_git_context(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        TOOL_NAME_FILE_WRITE | TOOL_NAME_FILE_EDIT | TOOL_NAME_BASH | "PowerShell" | TOOL_NAME_APPLY_PATCH
+    )
 }
 
 /// Configuration for a single query-loop invocation.
@@ -908,7 +990,13 @@ pub async fn run_query_loop(
                 }
             }
 
-            build_system_prompt(&patched)
+            let working_directory = patched
+                .working_directory
+                .as_deref()
+                .or_else(|| tool_ctx.working_dir.to_str())
+                .unwrap_or("");
+            let git_context = resolve_git_context(&tool_ctx.session_id, working_directory);
+            build_system_prompt_with_git_context(&patched, git_context)
         };
 
         let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
@@ -1704,6 +1792,11 @@ pub async fn run_query_loop(
                             } else {
                                 result
                             };
+
+                            if !result.is_error && tool_invalidates_git_context(tool_name.as_str()) {
+                                mark_git_context_dirty(&tool_ctx.session_id);
+                            }
+
                             let tool_duration_ms = tool_started.elapsed().as_millis() as u64;
                             if let Some(metrics) = &tool_ctx.session_metrics {
                                 metrics.increment_tool_use();
@@ -2392,6 +2485,10 @@ pub async fn run_query_loop(
                         result.is_error,
                     );
 
+                    if !result.is_error && tool_invalidates_git_context(&p.name) {
+                        mark_git_context_dirty(&tool_ctx.session_id);
+                    }
+
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::ToolEnd {
                             tool_name: p.name.clone(),
@@ -2812,6 +2909,24 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         // - memory_content:        empty (callers inject via append if needed)
         // - replace_system_prompt: false (additive mode)
         // - coordinator_mode:      false
+        output_style: config.output_style,
+        custom_output_style_prompt: config.output_style_prompt.clone(),
+        working_directory: config.working_directory.clone(),
+        git_context,
+        ..Default::default()
+    };
+
+    let text = mangocode_core::system_prompt::build_system_prompt(&opts);
+    SystemPrompt::Text(text)
+}
+
+fn build_system_prompt_with_git_context(
+    config: &QueryConfig,
+    git_context: String,
+) -> SystemPrompt {
+    let opts = mangocode_core::system_prompt::SystemPromptOptions {
+        custom_system_prompt: config.system_prompt.clone(),
+        append_system_prompt: config.append_system_prompt.clone(),
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
