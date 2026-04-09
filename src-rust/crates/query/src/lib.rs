@@ -817,6 +817,12 @@ pub async fn run_query_loop(
         }
     };
 
+    let send_query_error = |msg: String| {
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::Error(msg));
+        }
+    };
+
     // If an agent defines a max_turns override, respect it (agent wins over config).
     let effective_max_turns = config
         .agent_definition
@@ -1484,6 +1490,7 @@ pub async fn run_query_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
+                            send_query_error(e.to_string());
                             return QueryOutcome::Error(mangocode_core::error::ClaudeError::Api(
                                 e.to_string(),
                             ));
@@ -1976,10 +1983,12 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
-                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                    let err_msg = format!(
                         "No API key for provider '{}' (model '{}'). {}",
                         provider_id_str, model_id_str, hint
-                    )));
+                    );
+                    send_query_error(err_msg.clone());
+                    return QueryOutcome::Error(ClaudeError::Api(err_msg));
                 }
             }
         }
@@ -2016,6 +2025,7 @@ pub async fn run_query_loop(
                     }
                 }
                 error!(error = %e, "API request failed");
+                send_query_error(e.to_string());
                 return QueryOutcome::Error(e);
             }
         };
