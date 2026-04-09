@@ -1521,13 +1521,6 @@ pub async fn run_query_loop(
                             _ = cancel_token.cancelled() => {
                                 return QueryOutcome::Cancelled;
                             }
-                            // Hard timeout: if we've been waiting > 90s total, bail.
-                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                                api_started + std::time::Duration::from_secs(90)
-                            )) => {
-                                stream_error = Some("query_loop_hard_timeout:90s".to_string());
-                                break;
-                            }
                             // Disabled the logical inactivity watchdog and hard
                             // stream chunk timeout for slow provider responses.
                             // _ = tokio::time::sleep_until(last_meaningful_stream_event + logical_inactivity_limit), if had_any_content => {
