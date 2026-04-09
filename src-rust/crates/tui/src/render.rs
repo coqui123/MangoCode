@@ -148,6 +148,7 @@ fn provider_status_name(provider_id: &str) -> &'static str {
         "google" => "Google Gemini",
         "google-vertex" => "Google Vertex AI",
         "github-copilot" => "GitHub Copilot",
+        "minimax" => "MiniMax",
         "openrouter" => "OpenRouter",
         _ => "Provider",
     }
@@ -409,7 +410,19 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // One blank separator row above the status/input area when status is active,
     // matching the visual breathing room in the TS layout.
     let separator_height: u16 = if status_visible { 1 } else { 0 };
-    let status_height: u16 = if status_visible { 1 } else { 0 };
+    let status_height: u16 = if status_visible {
+        if app.is_streaming {
+            1
+        } else if let Some(text) = app.status_message.as_deref() {
+            let usable_width = size.width.max(1) as usize;
+            let char_count = text.chars().count();
+            char_count.div_ceil(usable_width).clamp(1, 3) as u16
+        } else {
+            1
+        }
+    } else {
+        0
+    };
     let suggestions_height = if prompt_focused && !app.prompt_input.suggestions.is_empty() {
         app.prompt_input.suggestions.len().min(5) as u16
     } else {
@@ -1931,7 +1944,10 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Build spans for a text string with a right-to-left glimmer sweep, matching
@@ -2372,7 +2388,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 parts.push(Span::raw("  "));
             }
             parts.push(Span::styled(
-                format!("↑ v{} available — /upgrade", version),
+                format!("↑ v{} available — /update", version),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

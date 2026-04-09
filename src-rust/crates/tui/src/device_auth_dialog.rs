@@ -49,6 +49,8 @@ pub struct DeviceAuthDialogState {
     pub verification_uri: String,
     pub device_code: String,
     pub interval: u64,
+    /// Browser URL fallback for OAuth flows.
+    pub auth_url: String,
 }
 
 impl Default for DeviceAuthDialogState {
@@ -68,6 +70,7 @@ impl DeviceAuthDialogState {
             verification_uri: String::new(),
             device_code: String::new(),
             interval: 5,
+            auth_url: String::new(),
         }
     }
 
@@ -86,6 +89,13 @@ impl DeviceAuthDialogState {
     pub fn close(&mut self) {
         self.visible = false;
         self.status = DeviceAuthStatus::Idle;
+        self.auth_url.clear();
+    }
+
+    /// Set browser URL fallback for OAuth flows.
+    pub fn set_browser_url(&mut self, url: String) {
+        self.auth_url = url;
+        self.status = DeviceAuthStatus::BrowserAuth;
     }
 
     /// Set the device code information received from the authorization server.
@@ -134,6 +144,8 @@ pub enum DeviceAuthEvent {
         device_code: String,
         interval: u64,
     },
+    /// OAuth URL is ready to display/copy in the dialog.
+    GotBrowserUrl { url: String },
     /// Access token obtained — auth succeeded.
     TokenReceived(String),
     /// Something went wrong.
@@ -238,15 +250,31 @@ pub fn render_device_auth_dialog(frame: &mut Frame, state: &DeviceAuthDialogStat
                 " Opening browser for authentication...",
                 Style::default().fg(Color::Yellow),
             )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " Complete the login in your browser.",
-                Style::default().fg(dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                " This dialog will update when done.",
-                Style::default().fg(dim),
-            )));
+            if !state.auth_url.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " If browser did not open, visit:",
+                    Style::default().fg(dim),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", state.auth_url),
+                    Style::default().fg(pink).add_modifier(Modifier::UNDERLINED),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " URL copied to clipboard.",
+                    Style::default().fg(dim),
+                )));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " Complete the login in your browser.",
+                    Style::default().fg(dim),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " This dialog will update when done.",
+                    Style::default().fg(dim),
+                )));
+            }
         }
         DeviceAuthStatus::Success(_) => {
             lines.push(Line::from(""));

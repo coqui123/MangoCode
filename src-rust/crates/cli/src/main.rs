@@ -2240,6 +2240,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
+        app.notifications.tick();
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
@@ -3299,6 +3300,15 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         mangocode_tui::NotificationKind::Info,
                         "Code copied to clipboard & browser opened.".to_string(),
                         Some(4),
+                    );
+                }
+                DeviceAuthEvent::GotBrowserUrl { url } => {
+                    let _ = mangocode_tui::try_copy_to_clipboard(&url);
+                    app.device_auth_dialog.set_browser_url(url);
+                    app.notifications.push(
+                        mangocode_tui::NotificationKind::Info,
+                        "Login URL copied to clipboard.".to_string(),
+                        Some(5),
                     );
                 }
                 DeviceAuthEvent::TokenReceived(token) => {

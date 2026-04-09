@@ -315,8 +315,12 @@ impl GoogleProvider {
     fn sanitize_schema(schema: Value) -> Value {
         match schema {
             Value::Object(mut map) => {
-                // Gemini function declaration schemas reject this JSON Schema key.
+                // Gemini function declaration schemas reject some JSON Schema keys.
                 map.remove("additionalProperties");
+                map.remove("$schema");
+                map.remove("default");
+                map.remove("examples");
+                map.remove("title");
 
                 // Recurse into nested schemas first.
                 let schema_type = map

@@ -182,6 +182,8 @@ impl ModelPickerState {
                     "openai".to_string()
                 } else if m.contains("gemini") {
                     "google".to_string()
+                } else if m.to_ascii_lowercase().contains("minimax") {
+                    "minimax".to_string()
                 } else {
                     "other".to_string()
                 }
@@ -319,6 +321,11 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("gemini-2.5-flash", "Gemini 2.5 Flash", "1M context"),
             model_entry("gemini-2.0-flash", "Gemini 2.0 Flash", "1M context"),
         ],
+        "minimax" => vec![model_entry(
+            "MiniMax-M2.7",
+            "MiniMax M2.7",
+            "Anthropic-compatible (128K context)",
+        )],
         "groq" => vec![
             model_entry("llama-3.3-70b-versatile", "Llama 3.3 70B", "128K context"),
             model_entry("llama-3.1-8b-instant", "Llama 3.1 8B", "128K context"),
@@ -456,6 +463,7 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         "anthropic" => "claude-opus-4-6".to_string(),
         "openai" => "openai/gpt-4o".to_string(),
         "google" => "google/gemini-2.5-flash".to_string(),
+        "minimax" => "minimax/MiniMax-M2.7".to_string(),
         "groq" => "groq/llama-3.3-70b-versatile".to_string(),
         "cerebras" => "cerebras/llama-3.3-70b".to_string(),
         "deepseek" => "deepseek/deepseek-chat".to_string(),

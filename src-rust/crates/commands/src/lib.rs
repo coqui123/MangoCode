@@ -418,7 +418,7 @@ fn command_category(name: &str) -> &'static str {
         | "statusline" | "output-style" | "keybindings" | "privacy-settings" | "flags"
         | "rate-limit-options" | "sandbox-toggle" => "Settings",
         "cost" | "analytics" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
-        "status" | "doctor" | "terminal-setup" | "version" | "upgrade" | "release-notes" => {
+        "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade" | "release-notes" => {
             "System"
         }
         "login" | "logout" | "permissions" => "Auth & Permissions",
@@ -6134,20 +6134,23 @@ impl SlashCommand for VoiceCommand {
     }
 }
 
-// ---- /upgrade ------------------------------------------------------------
+// ---- /update -------------------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for UpgradeCommand {
     fn name(&self) -> &str {
-        "upgrade"
+        "update"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["upgrade"]
     }
     fn description(&self) -> &str {
-        "Check for updates and show upgrade options"
+        "Check for updates and show download options"
     }
     fn help(&self) -> &str {
-        "Usage: /upgrade\n\n\
+        "Usage: /update\n\n\
          Checks GitHub releases for the latest version of MangoCode.\n\
-         If a newer version is available, shows the upgrade command."
+         If a newer version is available, shows where to download it."
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -6371,7 +6374,7 @@ impl SlashCommand for RateLimitOptionsCommand {
              │ Max (20x)     │ 20× Pro limits (highest tier)   │\n\
              │ API / Console │ Usage-billed, no hard cap       │\n\
              └─────────────────────────────────────────────────┘\n\n\
-             To upgrade: /upgrade\n\
+             To upgrade: /update\n\
              Manage billing: https://claude.ai/settings/billing",
             tier_info = tier_info,
         ))

@@ -10,6 +10,9 @@ pub use openai::OpenAiProvider;
 pub mod google;
 pub use google::GoogleProvider;
 
+pub mod minimax;
+pub use minimax::MinimaxProvider;
+
 pub mod openai_compat;
 pub use openai_compat::OpenAiCompatProvider;
 

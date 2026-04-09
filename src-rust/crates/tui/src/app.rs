@@ -89,6 +89,7 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "siliconflow" => "SILICONFLOW_API_KEY",
         "nebius" => "NEBIUS_API_KEY",
         "novita" => "NOVITA_API_KEY",
+        "minimax" => "MINIMAX_API_KEY",
         "ovhcloud" => "OVHCLOUD_API_KEY",
         "scaleway" => "SCALEWAY_API_KEY",
         "vultr" => "VULTR_API_KEY",
@@ -121,6 +122,7 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "deepinfra" => "deepinfra.com/dash/api_keys",
         "azure" => "portal.azure.com",
         "amazon-bedrock" => "console.aws.amazon.com/bedrock",
+        "minimax" => "platform.minimaxi.com",
         "huggingface" => "huggingface.co/settings/tokens",
         "nvidia" => "build.nvidia.com",
         "venice" => "venice.ai/settings/api",
@@ -403,11 +405,15 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
     }
-    // Linux / X11
+    // Linux / Wayland / X11
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &[
+            "wl-copy",
+            "xclip -selection clipboard",
+            "xsel --clipboard --input",
+        ] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 if let Ok(mut child) = std::process::Command::new(prog)
@@ -429,6 +435,47 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
 }
 
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
+    fn layout_to_latin(c: char) -> String {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        let mapped: Option<char> = match lower {
+            // Russian/Ukrainian JCUKEN -> QWERTY position mapping
+            'й' => Some('q'),
+            'ц' => Some('w'),
+            'у' => Some('e'),
+            'к' => Some('r'),
+            'е' => Some('t'),
+            'н' => Some('y'),
+            'г' => Some('u'),
+            'ш' => Some('i'),
+            'щ' => Some('o'),
+            'з' => Some('p'),
+            'ф' => Some('a'),
+            'ы' => Some('s'),
+            'в' => Some('d'),
+            'а' => Some('f'),
+            'п' => Some('g'),
+            'р' => Some('h'),
+            'о' => Some('j'),
+            'л' => Some('k'),
+            'д' => Some('l'),
+            'я' => Some('z'),
+            'ч' => Some('x'),
+            'с' => Some('c'),
+            'м' => Some('v'),
+            'и' => Some('b'),
+            'т' => Some('n'),
+            'ь' => Some('m'),
+            'і' => Some('s'),
+            'ї' => Some(']'),
+            'є' => Some('\''),
+            _ => None,
+        };
+        mapped.unwrap_or(lower).to_string()
+    }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
     let normalized_key = match key.code {
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Delete => "delete".to_string(),
@@ -445,14 +492,20 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
         KeyCode::Up => "up".to_string(),
         KeyCode::BackTab => "tab".to_string(),
         KeyCode::Char(' ') => "space".to_string(),
-        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Char(c) => {
+            if (ctrl || alt) && !c.is_ascii() {
+                layout_to_latin(c)
+            } else {
+                c.to_lowercase().to_string()
+            }
+        }
         _ => return None,
     };
 
     Some(ParsedKeystroke {
         key: normalized_key,
-        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-        alt: key.modifiers.contains(KeyModifiers::ALT),
+        ctrl,
+        alt,
         shift: key.modifiers.contains(KeyModifiers::SHIFT),
         meta: key.modifiers.contains(KeyModifiers::SUPER),
     })
@@ -1356,6 +1409,13 @@ impl App {
                         badge: None,
                     },
                     SelectItem {
+                        id: "minimax".into(),
+                        title: "MiniMax".into(),
+                        description: "Anthropic-compatible (M2.7)".into(),
+                        category: "More Providers".into(),
+                        badge: None,
+                    },
+                    SelectItem {
                         id: "ovhcloud".into(),
                         title: "OVHcloud".into(),
                         description: "EU-hosted AI".into(),
@@ -1710,6 +1770,7 @@ impl App {
                 "together-ai",
                 "deepinfra",
                 "venice",
+                "minimax",
                 "ollama",
                 "lmstudio",
                 "llamacpp",
@@ -1729,6 +1790,8 @@ impl App {
             || model.starts_with("o4")
         {
             Some("openai".to_string())
+        } else if model.to_ascii_lowercase().starts_with("minimax") {
+            Some("minimax".to_string())
         } else if model.starts_with("gemini") || model.starts_with("gemma") {
             Some("google".to_string())
         } else {
@@ -2348,6 +2411,12 @@ impl App {
             Role::User => Message::user(text),
             Role::Assistant => Message::assistant(text),
         };
+        if matches!(role, Role::User) {
+            // Start latency timing at prompt submission time.
+            self.turn_start = Some(std::time::Instant::now());
+            self.last_turn_elapsed = None;
+            self.last_turn_verb = None;
+        }
         self.messages.push(msg);
         self.invalidate_transcript();
         self.on_new_message();
@@ -2361,6 +2430,12 @@ impl App {
     }
 
     pub fn push_message(&mut self, message: Message) {
+        if matches!(message.role, Role::User) {
+            // Start latency timing at prompt submission time.
+            self.turn_start = Some(std::time::Instant::now());
+            self.last_turn_elapsed = None;
+            self.last_turn_verb = None;
+        }
         self.messages.push(message);
         self.invalidate_transcript();
         self.on_new_message();
@@ -3320,6 +3395,16 @@ impl App {
         // Permission dialog mode intercepts most keys
         if self.permission_request.is_some() {
             self.handle_permission_key(key);
+            return false;
+        }
+
+        // ESC should always stop an active stream.
+        if key.code == KeyCode::Esc && self.is_streaming {
+            self.is_streaming = false;
+            self.spinner_verb = None;
+            self.streaming_text.clear();
+            self.tool_use_blocks.clear();
+            self.status_message = Some("Cancelled.".to_string());
             return false;
         }
 
@@ -5082,9 +5167,13 @@ impl App {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
-                    self.turn_start = Some(std::time::Instant::now());
-                    self.last_turn_elapsed = None;
-                    self.last_turn_verb = None;
+                    // Fallback only: if a user message was not pushed first,
+                    // start timing when the first stream event arrives.
+                    if self.turn_start.is_none() {
+                        self.turn_start = Some(std::time::Instant::now());
+                        self.last_turn_elapsed = None;
+                        self.last_turn_verb = None;
+                    }
                 }
                 self.is_streaming = true;
                 match stream_evt {

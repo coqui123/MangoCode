@@ -14,6 +14,9 @@ use mangocode_core::oauth_config::CodexTokens;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+
+use mangocode_tui::DeviceAuthEvent;
 
 /// Generate a PKCE code verifier (random 64-byte base64url string).
 pub fn generate_code_verifier() -> String {
@@ -61,7 +64,16 @@ pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
 
 /// Start local HTTP server on port 1455, open browser, wait for callback,
 /// exchange code for tokens, return CodexTokens.
-pub async fn run_oauth_flow() -> anyhow::Result<CodexTokens> {
+pub async fn run_oauth_flow(event_tx: mpsc::Sender<DeviceAuthEvent>) -> anyhow::Result<CodexTokens> {
+    // Emit a URL anyway so UI can show copy/paste fallback when this flow is re-enabled.
+    let verifier = generate_code_verifier();
+    let challenge = compute_code_challenge(&verifier);
+    let state = generate_state();
+    let auth_url = build_auth_url(&challenge, &state);
+    let _ = event_tx
+        .send(DeviceAuthEvent::GotBrowserUrl { url: auth_url })
+        .await;
+
     anyhow::bail!(
         "OpenAI Codex OAuth requires a registered application.\n\
          Use an OpenAI API key instead: set OPENAI_API_KEY or use /connect → OpenAI."

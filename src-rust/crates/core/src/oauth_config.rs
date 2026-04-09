@@ -345,12 +345,8 @@ pub fn clear_codex_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Returns true if the user has a valid Codex access token AND
-/// MANGOCODE_USE_OPENAI=1 is set.
+/// Returns true if the user has a valid Codex access token.
 pub fn is_codex_subscriber() -> bool {
-    if std::env::var("MANGOCODE_USE_OPENAI").as_deref() != Ok("1") {
-        return false;
-    }
     get_codex_tokens()
         .map(|t| !t.access_token.is_empty())
         .unwrap_or(false)

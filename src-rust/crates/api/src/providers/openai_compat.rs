@@ -9,6 +9,7 @@ use std::pin::Pin;
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
+use futures::StreamExt;
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
@@ -63,6 +64,10 @@ pub struct ProviderQuirks {
     /// reasoning / thinking text.  `None` means the provider does not expose
     /// reasoning output.  Example: `Some("reasoning_content")` for DeepSeek.
     pub reasoning_field: Option<String>,
+
+    /// Optional hard cap for `max_tokens` on providers/models with lower
+    /// output ceilings than the default request budget.
+    pub max_tokens_cap: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +111,12 @@ impl OpenAiCompatProvider {
     /// Set an API key that will be sent as `Authorization: Bearer <key>`.
     pub fn with_api_key(mut self, key: String) -> Self {
         self.api_key = if key.is_empty() { None } else { Some(key) };
+        self
+    }
+
+    /// Override the provider base URL.
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
         self
     }
 
@@ -242,10 +253,15 @@ impl OpenAiCompatProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let max_tokens = self
+            .quirks
+            .max_tokens_cap
+            .map(|cap| request.max_tokens.min(cap))
+            .unwrap_or(request.max_tokens);
 
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": false,
         });
@@ -315,10 +331,15 @@ impl OpenAiCompatProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let max_tokens = self
+            .quirks
+            .max_tokens_cap
+            .map(|cap| request.max_tokens.min(cap))
+            .unwrap_or(request.max_tokens);
 
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": true,
         });
@@ -408,8 +429,6 @@ impl LlmProvider for OpenAiCompatProvider {
         let reasoning_field = self.quirks.reasoning_field.clone();
 
         let s = stream! {
-            use futures::StreamExt;
-
             let mut byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
 
@@ -517,14 +536,33 @@ impl LlmProvider for OpenAiCompatProvider {
                         None => continue,
                     };
 
-                    // Reasoning / thinking field (e.g. DeepSeek "reasoning_content")
-                    if let Some(ref field) = reasoning_field {
-                        if let Some(reasoning) = delta.get(field).and_then(|v| v.as_str()) {
-                            if !reasoning.is_empty() {
-                                yield Ok(StreamEvent::ReasoningDelta {
-                                    index: 0,
-                                    reasoning: reasoning.to_string(),
-                                });
+                    // Reasoning / thinking extraction.
+                    // Check provider-specific field first, then common aliases.
+                    {
+                        const COMMON_REASONING_FIELDS: &[&str] =
+                            &["reasoning_content", "reasoning_text", "reasoning"];
+
+                        let fields_to_check: Vec<&str> = if let Some(ref f) = reasoning_field {
+                            let mut v = vec![f.as_str()];
+                            for common in COMMON_REASONING_FIELDS {
+                                if *common != f.as_str() {
+                                    v.push(common);
+                                }
+                            }
+                            v
+                        } else {
+                            COMMON_REASONING_FIELDS.to_vec()
+                        };
+
+                        for field in &fields_to_check {
+                            if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
+                                if !reasoning.is_empty() {
+                                    yield Ok(StreamEvent::ReasoningDelta {
+                                        index: 0,
+                                        reasoning: reasoning.to_string(),
+                                    });
+                                    break;
+                                }
                             }
                         }
                     }

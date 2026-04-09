@@ -1153,132 +1153,241 @@ pub async fn run_query_loop(
                 let registry_provider = registry.get(&pid).cloned();
                 let dynamic_provider: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> =
                     if registry_provider.is_none() {
-                        let auth_store = mangocode_core::AuthStore::load();
-                        if let Some(key) = auth_store.api_key_for(&provider_id_str) {
-                            if !key.is_empty() {
-                                match provider_id_str.as_str() {
-                                    "openai" => Some(std::sync::Arc::new(
-                                        mangocode_api::OpenAiProvider::new(key),
-                                    )),
-                                    "google" => Some(std::sync::Arc::new(
-                                        mangocode_api::GoogleProvider::new(key),
-                                    )),
-                                    "github-copilot" => Some(std::sync::Arc::new(
-                                        mangocode_api::CopilotProvider::new(key),
-                                    )),
-                                    "cohere" => {
-                                        if let Some(p) = mangocode_api::CohereProvider::from_env() {
-                                            Some(std::sync::Arc::new(p))
-                                        } else {
-                                            None
+                        // Local OpenAI-compatible providers can run without API keys.
+                        // Build them directly when missing from the registry.
+                        if matches!(
+                            provider_id_str.as_str(),
+                            "ollama"
+                                | "lmstudio"
+                                | "lm-studio"
+                                | "llamacpp"
+                                | "llama-cpp"
+                                | "vllm"
+                                | "llama-server"
+                        ) {
+                            use mangocode_api::providers::openai_compat_providers;
+
+                            let base_override = tool_ctx
+                                .config
+                                .provider_configs
+                                .get(&provider_id_str)
+                                .and_then(|c| c.api_base.clone());
+
+                            let provider = match provider_id_str.as_str() {
+                                "ollama" => openai_compat_providers::ollama(),
+                                "lmstudio" | "lm-studio" => openai_compat_providers::lm_studio(),
+                                "llamacpp" | "llama-cpp" => openai_compat_providers::llama_cpp(),
+                                "vllm" => mangocode_api::OpenAiCompatProvider::new(
+                                    "vllm",
+                                    "vLLM",
+                                    "http://localhost:8000/v1",
+                                ),
+                                "llama-server" => mangocode_api::OpenAiCompatProvider::new(
+                                    "llama-server",
+                                    "llama-server",
+                                    "http://localhost:8080/v1",
+                                ),
+                                _ => unreachable!(),
+                            };
+
+                            let provider = if let Some(base) = base_override {
+                                provider.with_base_url(base)
+                            } else {
+                                provider
+                            };
+
+                            Some(std::sync::Arc::new(provider))
+                        } else {
+                            let auth_store = mangocode_core::AuthStore::load();
+                            if let Some(key) = auth_store.api_key_for(&provider_id_str) {
+                                if !key.is_empty() {
+                                    match provider_id_str.as_str() {
+                                        "openai" => Some(std::sync::Arc::new(
+                                            mangocode_api::OpenAiProvider::new(key),
+                                        )),
+                                        "google" => Some(std::sync::Arc::new(
+                                            mangocode_api::GoogleProvider::new(key),
+                                        )),
+                                        "github-copilot" => Some(std::sync::Arc::new(
+                                            mangocode_api::CopilotProvider::new(key),
+                                        )),
+                                        "cohere" => {
+                                            if let Some(p) = mangocode_api::CohereProvider::from_env()
+                                            {
+                                                Some(std::sync::Arc::new(p))
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => {
+                                            // Use the factory functions that include correct provider quirks
+                                            // (e.g. Mistral tool_id_max_len=9, DeepSeek reasoning_field).
+                                            // The factory reads an env var for the key, but .with_api_key()
+                                            // below replaces it with the runtime-provided key.
+                                            use mangocode_api::providers::openai_compat_providers;
+                                            let provider =
+                                                match provider_id_str.as_str() {
+                                                    "groq" => openai_compat_providers::groq()
+                                                        .with_api_key(key),
+                                                    "mistral" => openai_compat_providers::mistral()
+                                                        .with_api_key(key),
+                                                    "deepseek" => openai_compat_providers::deepseek()
+                                                        .with_api_key(key),
+                                                    "xai" => {
+                                                        openai_compat_providers::xai().with_api_key(key)
+                                                    }
+                                                    "openrouter" => {
+                                                        openai_compat_providers::openrouter()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "togetherai" | "together-ai" => {
+                                                        openai_compat_providers::together_ai()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "perplexity" => {
+                                                        openai_compat_providers::perplexity()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "cerebras" => {
+                                                        openai_compat_providers::cerebras()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "deepinfra" => {
+                                                        openai_compat_providers::deepinfra()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "venice" => openai_compat_providers::venice()
+                                                        .with_api_key(key),
+                                                    "huggingface" => {
+                                                        openai_compat_providers::huggingface()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "nvidia" => openai_compat_providers::nvidia()
+                                                        .with_api_key(key),
+                                                    "siliconflow" => {
+                                                        openai_compat_providers::siliconflow()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "sambanova" => {
+                                                        openai_compat_providers::sambanova()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "moonshot" => {
+                                                        openai_compat_providers::moonshot()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "zhipu" => openai_compat_providers::zhipu()
+                                                        .with_api_key(key),
+                                                    "qwen" => openai_compat_providers::qwen()
+                                                        .with_api_key(key),
+                                                    "nebius" => openai_compat_providers::nebius()
+                                                        .with_api_key(key),
+                                                    "novita" => openai_compat_providers::novita()
+                                                        .with_api_key(key),
+                                                    "ovhcloud" => {
+                                                        openai_compat_providers::ovhcloud()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "scaleway" => {
+                                                        openai_compat_providers::scaleway()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "vultr" | "vultr-ai" => {
+                                                        openai_compat_providers::vultr_ai()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "baseten" => {
+                                                        openai_compat_providers::baseten()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "friendli" => {
+                                                        openai_compat_providers::friendli()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "upstage" => {
+                                                        openai_compat_providers::upstage()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "stepfun" => {
+                                                        openai_compat_providers::stepfun()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "fireworks" => {
+                                                        openai_compat_providers::fireworks()
+                                                            .with_api_key(key)
+                                                    }
+                                                    "ollama" => openai_compat_providers::ollama(),
+                                                    "lmstudio" | "lm-studio" => {
+                                                        openai_compat_providers::lm_studio()
+                                                    }
+                                                    "llamacpp" | "llama-cpp" => {
+                                                        openai_compat_providers::llama_cpp()
+                                                    }
+                                                    _ => {
+                                                        // True fallback: unknown provider, generic OpenAI-compatible
+                                                        mangocode_api::OpenAiCompatProvider::new(
+                                                            &provider_id_str,
+                                                            &provider_id_str,
+                                                            "https://api.openai.com/v1",
+                                                        )
+                                                        .with_api_key(key)
+                                                    }
+                                                };
+                                            Some(std::sync::Arc::new(provider))
                                         }
                                     }
-                                    _ => {
-                                        // Use the factory functions that include correct provider quirks
-                                        // (e.g. Mistral tool_id_max_len=9, DeepSeek reasoning_field).
-                                        // The factory reads an env var for the key, but .with_api_key()
-                                        // below replaces it with the runtime-provided key.
-                                        use mangocode_api::providers::openai_compat_providers;
-                                        let provider =
-                                            match provider_id_str.as_str() {
-                                                "groq" => openai_compat_providers::groq()
-                                                    .with_api_key(key),
-                                                "mistral" => openai_compat_providers::mistral()
-                                                    .with_api_key(key),
-                                                "deepseek" => openai_compat_providers::deepseek()
-                                                    .with_api_key(key),
-                                                "xai" => {
-                                                    openai_compat_providers::xai().with_api_key(key)
-                                                }
-                                                "openrouter" => {
-                                                    openai_compat_providers::openrouter()
-                                                        .with_api_key(key)
-                                                }
-                                                "togetherai" | "together-ai" => {
-                                                    openai_compat_providers::together_ai()
-                                                        .with_api_key(key)
-                                                }
-                                                "perplexity" => {
-                                                    openai_compat_providers::perplexity()
-                                                        .with_api_key(key)
-                                                }
-                                                "cerebras" => openai_compat_providers::cerebras()
-                                                    .with_api_key(key),
-                                                "deepinfra" => openai_compat_providers::deepinfra()
-                                                    .with_api_key(key),
-                                                "venice" => openai_compat_providers::venice()
-                                                    .with_api_key(key),
-                                                "huggingface" => {
-                                                    openai_compat_providers::huggingface()
-                                                        .with_api_key(key)
-                                                }
-                                                "nvidia" => openai_compat_providers::nvidia()
-                                                    .with_api_key(key),
-                                                "siliconflow" => {
-                                                    openai_compat_providers::siliconflow()
-                                                        .with_api_key(key)
-                                                }
-                                                "sambanova" => openai_compat_providers::sambanova()
-                                                    .with_api_key(key),
-                                                "moonshot" => openai_compat_providers::moonshot()
-                                                    .with_api_key(key),
-                                                "zhipu" => openai_compat_providers::zhipu()
-                                                    .with_api_key(key),
-                                                "qwen" => openai_compat_providers::qwen()
-                                                    .with_api_key(key),
-                                                "nebius" => openai_compat_providers::nebius()
-                                                    .with_api_key(key),
-                                                "novita" => openai_compat_providers::novita()
-                                                    .with_api_key(key),
-                                                "ovhcloud" => openai_compat_providers::ovhcloud()
-                                                    .with_api_key(key),
-                                                "scaleway" => openai_compat_providers::scaleway()
-                                                    .with_api_key(key),
-                                                "vultr" | "vultr-ai" => {
-                                                    openai_compat_providers::vultr_ai()
-                                                        .with_api_key(key)
-                                                }
-                                                "baseten" => openai_compat_providers::baseten()
-                                                    .with_api_key(key),
-                                                "friendli" => openai_compat_providers::friendli()
-                                                    .with_api_key(key),
-                                                "upstage" => openai_compat_providers::upstage()
-                                                    .with_api_key(key),
-                                                "stepfun" => openai_compat_providers::stepfun()
-                                                    .with_api_key(key),
-                                                "fireworks" => openai_compat_providers::fireworks()
-                                                    .with_api_key(key),
-                                                "ollama" => openai_compat_providers::ollama(),
-                                                "lmstudio" | "lm-studio" => {
-                                                    openai_compat_providers::lm_studio()
-                                                }
-                                                "llamacpp" | "llama-cpp" => {
-                                                    openai_compat_providers::llama_cpp()
-                                                }
-                                                _ => {
-                                                    // True fallback: unknown provider, generic OpenAI-compatible
-                                                    mangocode_api::OpenAiCompatProvider::new(
-                                                        &provider_id_str,
-                                                        &provider_id_str,
-                                                        "https://api.openai.com/v1",
-                                                    )
-                                                    .with_api_key(key)
-                                                }
-                                            };
-                                        Some(std::sync::Arc::new(provider))
-                                    }
+                                } else {
+                                    None
                                 }
                             } else {
                                 None
                             }
-                        } else {
-                            None
                         }
                     } else {
                         None
                     };
 
-                let provider = registry_provider.or(dynamic_provider);
+                let mut provider = registry_provider.or(dynamic_provider);
+
+                // For local OpenAI-compatible backends, respect per-provider
+                // api_base overrides and avoid appending /v1 twice.
+                if let Some(override_base) = tool_ctx
+                    .config
+                    .provider_configs
+                    .get(&provider_id_str)
+                    .and_then(|pc| pc.api_base.as_deref())
+                {
+                    let trimmed = override_base.trim_end_matches('/');
+                    let base_url = if trimmed.ends_with("/v1") {
+                        trimmed.to_string()
+                    } else {
+                        format!("{}/v1", trimmed)
+                    };
+
+                    let overridden: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> =
+                        match provider_id_str.as_str() {
+                            "ollama" => Some(std::sync::Arc::new(
+                                mangocode_api::providers::openai_compat_providers::ollama()
+                                    .with_base_url(base_url),
+                            )),
+                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
+                                mangocode_api::providers::openai_compat_providers::lm_studio()
+                                    .with_base_url(base_url),
+                            )),
+                            "llamacpp" | "llama-cpp" | "llama-server" => {
+                                Some(std::sync::Arc::new(
+                                    mangocode_api::providers::openai_compat_providers::llama_cpp()
+                                        .with_base_url(base_url),
+                                ))
+                            }
+                            _ => None,
+                        };
+
+                    if overridden.is_some() {
+                        provider = overridden;
+                    }
+                }
+
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -1688,7 +1797,9 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
-                    if !tool_use_blocks.is_empty() && stop_str == "tool_use" {
+                    // Some OpenAI-compatible providers report finish_reason="stop"
+                    // even when tool calls are present.
+                    if !tool_use_blocks.is_empty() {
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             let tool_started = std::time::Instant::now();

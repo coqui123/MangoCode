@@ -75,6 +75,7 @@ pub fn deepseek() -> OpenAiCompatProvider {
         reasoning_field: Some("reasoning_content".to_string()),
         overflow_patterns: vec!["maximum context length is".to_string()],
         include_usage_in_stream: true,
+        max_tokens_cap: Some(8192),
         ..Default::default()
     })
 }

@@ -69,6 +69,7 @@ impl ProviderId {
     pub const STEPFUN: &'static str = "stepfun";
     pub const FIREWORKS: &'static str = "fireworks";
     pub const NOVITA: &'static str = "novita";
+    pub const MINIMAX: &'static str = "minimax";
 }
 
 impl fmt::Display for ProviderId {

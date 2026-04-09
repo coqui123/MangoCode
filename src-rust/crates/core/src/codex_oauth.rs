@@ -1,10 +1,11 @@
 //! OpenAI Codex OAuth configuration and constants.
 //!
 
-/// OpenAI Codex OAuth requires a registered application.
-/// MangoCode does not have its own registered OAuth app with OpenAI.
-/// Users should use an API key from platform.openai.com instead.
-pub const CODEX_CLIENT_ID: &str = ""; // Requires own registered app
+/// OpenAI Codex OAuth client ID shared by the browser flow.
+pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// OpenAI OAuth issuer base URL.
+pub const CODEX_ISSUER: &str = "https://auth.openai.com";
 
 /// OpenAI OAuth authorization endpoint
 pub const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -12,8 +13,14 @@ pub const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 /// OpenAI OAuth token endpoint
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+/// Codex Responses API endpoint.
+pub const CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+
 /// Local redirect URI for OAuth callback
 pub const CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+
+/// OAuth callback port.
+pub const CODEX_OAUTH_PORT: u16 = 1455;
 
 /// OAuth scopes requested from OpenAI
 pub const CODEX_SCOPES: &str = "openid profile email offline_access";
@@ -37,14 +44,12 @@ mod tests {
 
     #[test]
     fn test_codex_constants_not_empty() {
-        // CODEX_CLIENT_ID is intentionally empty — MangoCode has no registered OAuth app
-        assert!(
-            CODEX_CLIENT_ID.is_empty(),
-            "CODEX_CLIENT_ID should be empty (no registered app)"
-        );
+        assert!(!CODEX_CLIENT_ID.is_empty());
         assert!(!CODEX_AUTHORIZE_URL.is_empty());
         assert!(!CODEX_TOKEN_URL.is_empty());
+        assert!(!CODEX_API_ENDPOINT.is_empty());
         assert!(!CODEX_REDIRECT_URI.is_empty());
+        assert_eq!(CODEX_OAUTH_PORT, 1455);
         assert!(!CODEX_SCOPES.is_empty());
         assert!(!CODEX_MODELS.is_empty());
         assert!(!DEFAULT_CODEX_MODEL.is_empty());

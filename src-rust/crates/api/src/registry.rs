@@ -13,7 +13,7 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CohereProvider, CopilotProvider,
-    GoogleProvider, OpenAiProvider, VertexOpenAiProvider,
+    GoogleProvider, MinimaxProvider, OpenAiProvider, VertexOpenAiProvider,
 };
 
 /// Registry of all available LLM providers.
@@ -221,6 +221,7 @@ impl ProviderRegistry {
                 let provider: Option<Arc<dyn LlmProvider>> = match provider_id.as_str() {
                     "openai" => Some(Arc::new(OpenAiProvider::new(key))),
                     "google" => Some(Arc::new(GoogleProvider::new(key))),
+                    "minimax" => Some(Arc::new(MinimaxProvider::new(key))),
                     "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
                     "cohere" => Some(Arc::new(CohereProvider::new(key))),
                     "groq" => Some(Arc::new(p::groq().with_api_key(key))),
@@ -382,6 +383,13 @@ impl ProviderRegistry {
             .unwrap_or(false)
         {
             self.register(Arc::new(p::huggingface()));
+        }
+        if std::env::var("MINIMAX_API_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            let key = std::env::var("MINIMAX_API_KEY").unwrap_or_default();
+            self.register(Arc::new(MinimaxProvider::new(key)));
         }
         if std::env::var("NVIDIA_API_KEY")
             .map(|v| !v.is_empty())
