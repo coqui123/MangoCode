@@ -281,23 +281,31 @@ impl OpenAiCompatProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let builder = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json");
-        let builder = self.apply_auth(builder);
-        let builder = self.apply_extra_headers(builder);
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to serialize request: {}", e),
+            status: None,
+            body: None,
+        })?;
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let provider_name = self.name.clone();
+        let resp = crate::retry::retry_request(&retry_cfg, &provider_name, |_attempt| {
+            let mut builder = self
+                .http_client
+                .post(&url)
+                .header("Content-Type", "application/json");
+            builder = self.apply_auth(builder);
+            builder = self.apply_extra_headers(builder);
+            let b = body_str.clone();
+            async move { builder.body(b).send().await }
+        }, |msg| eprintln!("{}", msg))
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("HTTP request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
 
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| ProviderError::Other {
@@ -363,24 +371,32 @@ impl OpenAiCompatProvider {
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let builder = self
-            .http_client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = self.apply_auth(builder);
-        let builder = self.apply_extra_headers(builder);
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to serialize request: {}", e),
+            status: None,
+            body: None,
+        })?;
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let provider_name = self.name.clone();
+        let resp = crate::retry::retry_request(&retry_cfg, &provider_name, |_attempt| {
+            let mut builder = self
+                .http_client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            builder = self.apply_auth(builder);
+            builder = self.apply_extra_headers(builder);
+            let b = body_str.clone();
+            async move { builder.body(b).send().await }
+        }, |msg| eprintln!("{}", msg))
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("HTTP request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {

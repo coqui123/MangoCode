@@ -49,6 +49,7 @@ pub mod model_registry;
 
 // Provider-aware error handling (Phase 6).
 pub mod error_handling;
+pub mod retry;
 
 // Message transform layer — concrete transformers (Phase 4).
 pub mod transformers;

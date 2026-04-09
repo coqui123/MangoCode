@@ -346,20 +346,36 @@ impl VertexOpenAiProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to serialize request: {}", e),
+            status: None,
+            body: None,
+        })?;
+        let auth_header = format!("Bearer {}", token);
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let resp = crate::retry::retry_request(&retry_cfg, "google-vertex", |_attempt| {
+            let client = self.http_client.clone();
+            let u = url.clone();
+            let b = body_str.clone();
+            let a = auth_header.clone();
+            async move {
+                client
+                    .post(&u)
+                    .header("Authorization", a)
+                    .header("Content-Type", "application/json")
+                    .body(b)
+                    .send()
+                    .await
+            }
+        }, |msg| eprintln!("{}", msg))
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("HTTP request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
 
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| ProviderError::Other {
@@ -426,21 +442,37 @@ impl VertexOpenAiProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
-        let resp = self
-            .http_client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to serialize request: {}", e),
+            status: None,
+            body: None,
+        })?;
+        let auth_header = format!("Bearer {}", token);
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let resp = crate::retry::retry_request(&retry_cfg, "google-vertex", |_attempt| {
+            let client = self.http_client.clone();
+            let u = url.clone();
+            let b = body_str.clone();
+            let a = auth_header.clone();
+            async move {
+                client
+                    .post(&u)
+                    .header("Authorization", a)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .body(b)
+                    .send()
+                    .await
+            }
+        }, |msg| eprintln!("{}", msg))
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("HTTP request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
