@@ -971,7 +971,7 @@ pub mod config {
             }
             match self.provider.as_deref() {
                 Some("openai") => "gpt-4o",
-                Some("google") => "gemini-2.5-flash",
+                Some("google") | Some("google-vertex") => "gemini-2.5-flash",
                 Some("groq") => "llama-3.3-70b-versatile",
                 Some("cerebras") => "llama-3.3-70b",
                 Some("deepseek") => "deepseek-chat",
