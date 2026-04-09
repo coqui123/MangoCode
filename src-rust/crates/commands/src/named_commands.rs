@@ -1191,6 +1191,7 @@ mod tests {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            model_registry: None,
         }
     }
 
