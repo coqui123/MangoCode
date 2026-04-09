@@ -1950,7 +1950,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         device_auth_dialog::DeviceAuthEvent,
         init_mascot,
         notifications::NotificationKind,
-        render::{flush_sixel_blit, render_app},
+        render::{flush_sixel_blit, render_app, reset_sixel_blit_state},
         restore_terminal, setup_terminal, App,
     };
     use std::time::Duration;
@@ -2776,6 +2776,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 }
                 Event::Resize(_, _) => {
                     let _ = terminal.clear();
+                    reset_sixel_blit_state();
                     // Regenerate the mascot image at a bounded size for the new viewport.
                     init_mascot(&mut app);
                 }

@@ -74,21 +74,42 @@ const MAX_WELCOME_BOX_HEIGHT: u16 = 20;
 // the event loop calls `flush_sixel_blit()` to write the inline image on top.
 thread_local! {
     static SIXEL_BLIT: RefCell<Option<(u16, u16)>> = const { RefCell::new(None) };
+    static LAST_SIXEL_POS: RefCell<Option<(u16, u16)>> = const { RefCell::new(None) };
 }
 
 /// Write any pending inline mascot image to stdout.
 /// Call this **after** `terminal.draw()` so ratatui's buffer flush doesn't
 /// overwrite the image.  Pass the same `App` that was used for rendering.
 pub fn flush_sixel_blit(app: &App) {
+    if app.is_streaming {
+        SIXEL_BLIT.with(|cell| {
+            cell.borrow_mut().take();
+        });
+        return;
+    }
+
     SIXEL_BLIT.with(|cell| {
         let pos = cell.borrow_mut().take();
         if let (Some((row, col)), Some(ref image_escape)) = (pos, &app.mascot_sixel) {
-            use std::io::Write;
-            let mut stdout = std::io::stdout();
-            // ANSI cursor position is 1-indexed.
-            let _ = write!(stdout, "\x1b[{};{}H{}", row + 1, col + 1, image_escape);
-            let _ = stdout.flush();
+            LAST_SIXEL_POS.with(|last| {
+                if *last.borrow() == Some((row, col)) {
+                    return;
+                }
+
+                use std::io::Write;
+                let mut stdout = std::io::stdout();
+                // ANSI cursor position is 1-indexed.
+                let _ = write!(stdout, "\x1b[{};{}H{}", row + 1, col + 1, image_escape);
+                let _ = stdout.flush();
+                *last.borrow_mut() = Some((row, col));
+            });
         }
+    });
+}
+
+pub fn reset_sixel_blit_state() {
+    LAST_SIXEL_POS.with(|cell| {
+        *cell.borrow_mut() = None;
     });
 }
 
