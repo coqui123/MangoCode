@@ -184,6 +184,10 @@ struct Cli {
     #[arg(long = "dump-system-prompt", action = ArgAction::SetTrue, hide = true)]
     dump_system_prompt: bool,
 
+    /// List available models and exit
+    #[arg(long = "list-models", action = ArgAction::SetTrue)]
+    list_models: bool,
+
     /// MCP config JSON string (inline server definitions)
     #[arg(long = "mcp-config")]
     mcp_config: Option<String>,
@@ -750,6 +754,72 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(ref mcp_config) = cli.mcp_config {
         apply_mcp_config_override(&mut config, mcp_config)?;
+    }
+
+    // --list-models fast path
+    if cli.list_models {
+        let mut registry = mangocode_api::ModelRegistry::new();
+        let cache_path = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("mangocode")
+            .join("models.json");
+        registry.load_cache(&cache_path);
+        let mut entries = registry.list_all();
+        entries.sort_by(|a, b| {
+            (*a.info.provider_id)
+                .cmp(&*b.info.provider_id)
+                .then_with(|| (*a.info.id).cmp(&*b.info.id))
+        });
+
+        match cli.output_format {
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                let mut grouped: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for entry in &entries {
+                    let provider = entry.info.provider_id.to_string();
+                    let model_obj = serde_json::json!({
+                        "id": &*entry.info.id,
+                        "name": &entry.info.name,
+                        "provider": &provider,
+                        "context_window": entry.info.context_window,
+                        "max_output_tokens": entry.info.max_output_tokens,
+                        "cost_per_million_input_tokens": entry.cost_input,
+                        "cost_per_million_output_tokens": entry.cost_output,
+                    });
+                    grouped
+                        .entry(provider)
+                        .or_insert_with(|| serde_json::json!([]))
+                        .as_array_mut()
+                        .unwrap()
+                        .push(model_obj);
+                }
+                println!("{}", serde_json::to_string_pretty(&grouped).unwrap());
+            }
+            CliOutputFormat::Text => {
+                let mut current_provider = String::new();
+                for entry in &entries {
+                    let provider = entry.info.provider_id.to_string();
+                    if provider != current_provider {
+                        if !current_provider.is_empty() {
+                            println!();
+                        }
+                        println!("{}:", provider);
+                        current_provider = provider;
+                    }
+                    print!(
+                        "  {:<40} {:>6}K ctx  {:>6} max out",
+                        &*entry.info.id,
+                        entry.info.context_window / 1000,
+                        entry.info.max_output_tokens,
+                    );
+                    if let (Some(ci), Some(co)) = (entry.cost_input, entry.cost_output) {
+                        print!("  ${:.2}/${:.2} per 1M tok", ci, co);
+                    }
+                    println!();
+                }
+            }
+        }
+        return Ok(());
     }
 
     // --dump-system-prompt fast path
