@@ -13,6 +13,7 @@
 // from OpenAiProvider, only swapping the base URL and auth layer.
 
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -20,7 +21,7 @@ use futures::Stream;
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::openai::OpenAiProvider;
 use super::request_options::merge_openai_compatible_options;
@@ -230,6 +231,9 @@ pub struct VertexOpenAiProvider {
     base_url: String,
     http_client: reqwest::Client,
 }
+
+const VERTEX_STREAM_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const VERTEX_STREAM_PRE_START_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl VertexOpenAiProvider {
     /// Resolve the model to use for a request. Vertex requires `publisher/model`
@@ -672,6 +676,7 @@ impl LlmProvider for VertexOpenAiProvider {
 
             let mut byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
+            let stream_started_at = tokio::time::Instant::now();
 
             let mut message_started = false;
             let mut message_id = String::from("unknown");
@@ -681,7 +686,50 @@ impl LlmProvider for VertexOpenAiProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            loop {
+                if !message_started
+                    && stream_started_at.elapsed() >= VERTEX_STREAM_PRE_START_TIMEOUT
+                {
+                    warn!(
+                        "Vertex SSE: pre-start timeout after {}s without MessageStart",
+                        VERTEX_STREAM_PRE_START_TIMEOUT.as_secs()
+                    );
+                    yield Err(ProviderError::StreamError {
+                        provider: provider_id.clone(),
+                        message: format!(
+                            "stream_timeout:pre_start:{}s_without_message_start",
+                            VERTEX_STREAM_PRE_START_TIMEOUT.as_secs()
+                        ),
+                        partial_response: None,
+                    });
+                    return;
+                }
+
+                let chunk_result = match tokio::time::timeout(
+                    VERTEX_STREAM_TRANSPORT_IDLE_TIMEOUT,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(result)) => result,
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!(
+                            "Vertex SSE: transport idle timeout after {}s",
+                            VERTEX_STREAM_TRANSPORT_IDLE_TIMEOUT.as_secs()
+                        );
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "stream_timeout:transport_idle:{}s_without_bytes",
+                                VERTEX_STREAM_TRANSPORT_IDLE_TIMEOUT.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
+
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {

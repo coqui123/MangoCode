@@ -46,6 +46,7 @@ pub struct GoogleProvider {
 
 const GOOGLE_STREAM_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const GOOGLE_STREAM_LOGICAL_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const GOOGLE_STREAM_PRE_START_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl GoogleProvider {
     pub fn new(api_key: String) -> Self {
@@ -817,6 +818,7 @@ impl LlmProvider for GoogleProvider {
             let mut tool_name_counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             let mut terminal_stream_error: Option<String> = None;
+            let stream_started_at = tokio::time::Instant::now();
 
             // Logical inactivity watchdog: track when we last received a
             // *meaningful* event (candidate parsed, text delta, tool delta,
@@ -844,6 +846,21 @@ impl LlmProvider for GoogleProvider {
                     warn!(
                         "Google SSE: logical inactivity timeout after {}s without meaningful progress",
                         elapsed
+                    );
+                    break;
+                }
+
+                // Pre-start watchdog: bound wait for first MessageStart/candidate.
+                if !emitted_message_start
+                    && stream_started_at.elapsed() >= GOOGLE_STREAM_PRE_START_TIMEOUT
+                {
+                    terminal_stream_error = Some(format!(
+                        "stream_timeout:pre_start:{}s_without_message_start",
+                        GOOGLE_STREAM_PRE_START_TIMEOUT.as_secs()
+                    ));
+                    warn!(
+                        "Google SSE: pre-start timeout after {}s without MessageStart",
+                        GOOGLE_STREAM_PRE_START_TIMEOUT.as_secs()
                     );
                     break;
                 }

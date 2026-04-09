@@ -2326,6 +2326,15 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         || app.context_menu_state.is_some()
                         || app.permission_request.is_some()
                         || app.global_search.open;
+                    // Esc during streaming cancels the active query turn.
+                    if key.code == KeyCode::Esc && app.is_streaming {
+                        if let Some(ref ct) = cancel {
+                            ct.cancel();
+                        }
+                        app.is_streaming = false;
+                        app.status_message = Some("Cancelled.".to_string());
+                        continue;
+                    }
                     if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
                         // If a slash-command suggestion is active, accept and execute immediately.
                         if !app.prompt_input.suggestions.is_empty()
@@ -2743,12 +2752,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         // Store the Arc so we can read messages after task completes
                         current_query = Some((handle, msgs_arc));
                         continue;
-                    }
-
-                    if key.code == KeyCode::Esc && app.is_streaming {
-                        if let Some(ref ct) = cancel {
-                            ct.cancel();
-                        }
                     }
 
                     app.handle_key_event(key);
