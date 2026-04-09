@@ -644,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
                     session_title: None,
                     remote_session_url: None,
                     mcp_manager: None,
+                    model_registry: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -2290,6 +2291,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
+        model_registry: Some(model_registry.clone()),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.

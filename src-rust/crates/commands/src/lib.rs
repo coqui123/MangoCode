@@ -34,6 +34,8 @@ pub struct CommandContext {
     // Note: config already contains hooks, mcp_servers, etc.
     /// Live MCP manager — present when servers are connected.
     pub mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    /// Model registry for validating model names.
+    pub model_registry: Option<Arc<mangocode_api::ModelRegistry>>,
 }
 
 /// Result of running a slash command.
@@ -803,10 +805,24 @@ impl SlashCommand for ModelCommand {
         if args.is_empty() {
             CommandResult::Message(format!("Current model: {}", ctx.config.effective_model()))
         } else {
-            // Accept both "provider/model" and bare model names.
-            // The config stores the full string (including provider prefix when present)
-            // so that downstream dispatch can route to the correct provider.
             let model_str = args.to_string();
+
+            // Validate against the model registry if available.
+            if let Some(ref registry) = ctx.model_registry {
+                let (pid, mid) = mangocode_api::ModelRegistry::resolve(&model_str);
+                let known = registry.get(&pid, &mid).is_some()
+                    || registry.list_all().iter().any(|e| {
+                        *e.info.id == model_str
+                            || format!("{}/{}", e.info.provider_id, e.info.id) == model_str
+                    });
+                if !known {
+                    return CommandResult::Message(format!(
+                        "Model '{}' not found. Use /model to see available models.",
+                        model_str,
+                    ));
+                }
+            }
+
             let confirmation = if let Some((provider, model)) = model_str.split_once('/') {
                 if provider == "anthropic" {
                     format!("Switched to {}", model)
@@ -8972,6 +8988,7 @@ mod tests {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            model_registry: None,
         }
     }
 
