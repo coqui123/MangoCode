@@ -62,7 +62,7 @@ impl Tool for ConfigTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: ConfigInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -182,7 +182,7 @@ impl Tool for ConfigTool {
             match key {
                 "model" => ToolResult::success(format!(
                     "model = \"{}\"",
-                    settings.config.effective_model()
+                    ctx.config.effective_model()
                 )),
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",

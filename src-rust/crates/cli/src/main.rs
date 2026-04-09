@@ -39,7 +39,6 @@ use clap::{ArgAction, Parser, ValueEnum};
 use mangocode_core::types::ToolDefinition;
 use mangocode_core::{
     config::{Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, Settings},
-    constants::DEFAULT_MODEL,
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
@@ -128,9 +127,9 @@ struct Cli {
     #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
     print: bool,
 
-    /// Model to use
-    #[arg(short = 'm', long = "model", default_value = DEFAULT_MODEL)]
-    model: String,
+    /// Model to use (defaults to provider-appropriate model if not set)
+    #[arg(short = 'm', long = "model")]
+    model: Option<String>,
 
     /// Permission mode
     #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
@@ -698,7 +697,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
-    config.model = Some(cli.model.clone());
+    config.model = cli.model.clone();
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
     }
@@ -997,7 +996,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
-    let tool_ctx = ToolContext {
+    let mut tool_ctx = ToolContext {
         working_dir: cwd.clone(),
         permission_mode: config.permission_mode.clone(),
         permission_handler: permission_handler.clone(),
@@ -1069,6 +1068,15 @@ async fn main() -> anyhow::Result<()> {
         reg.load_cache(&cache_path);
         Arc::new(reg)
     };
+
+    // Resolve the effective model and write it back to config so all consumers
+    // (Config tool, TUI status bar, init event) report the same model that's
+    // actually used for API calls.
+    if config.model.is_none() {
+        config.model = Some(mangocode_api::effective_model_for_config(&config, &model_registry));
+    }
+    // Update the ToolContext config to match (it was cloned before registry was available)
+    tool_ctx.config.model = config.model.clone();
 
     // Build query config
     let mut query_config =
