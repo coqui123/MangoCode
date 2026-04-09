@@ -248,9 +248,9 @@ pub struct RetryConfig {
 impl Default for RetryConfig {
     fn default() -> Self {
         Self {
-            max_retries: 5,
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
+            max_retries: 8,
+            initial_delay: Duration::from_secs(2),
+            max_delay: Duration::from_secs(300),
             backoff_multiplier: 2.0,
         }
     }
