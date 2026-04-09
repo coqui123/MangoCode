@@ -2745,6 +2745,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    if key.code == KeyCode::Esc && app.is_streaming {
+                        if let Some(ref ct) = cancel {
+                            ct.cancel();
+                        }
+                    }
+
                     app.handle_key_event(key);
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
