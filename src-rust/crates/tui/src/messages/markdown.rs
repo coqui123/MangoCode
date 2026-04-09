@@ -50,6 +50,7 @@ pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
                     Style::default().fg(Color::Yellow),
                 )]));
             }
+            idx += 1;
             continue;
         }
 
