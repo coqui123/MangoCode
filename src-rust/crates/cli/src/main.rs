@@ -3437,6 +3437,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                     session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                     app.is_streaming = false;
+                    // Sync the authoritative message list (with ToolUse / ToolResult
+                    // content blocks) from the query task into the TUI so they render
+                    // inline in chronological order. The transient `tool_use_blocks`
+                    // staging area is cleared since the canonical history now owns them.
+                    app.replace_messages(messages.clone());
+                    app.tool_use_blocks.clear();
                     app.status_message = None;
 
                     // Persist session and search index in background so UI loop stays responsive.
