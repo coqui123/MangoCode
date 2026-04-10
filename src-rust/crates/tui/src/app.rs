@@ -5289,8 +5289,11 @@ impl App {
                     let text = std::mem::take(&mut self.streaming_text);
                     self.push_assistant_message(text);
                 }
-                self.tool_use_blocks
-                    .retain(|b| b.status != ToolStatus::Running);
+                // Clear transient tool blocks — the canonical assistant message
+                // (with inline ToolUse / ToolResult content blocks) is synced into
+                // `app.messages` from the query task at task-finished time, so the
+                // bottom-of-screen staging area must not retain completed entries.
+                self.tool_use_blocks.clear();
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
             }
