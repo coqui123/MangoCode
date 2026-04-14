@@ -3341,6 +3341,55 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         }
                     });
                 }
+                "anthropic-max" => {
+                    let tx2 = device_auth_tx.clone();
+                    // Claude Max (OAuth) — PKCE flow using Claude Code's registered client ID.
+                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
+                    tokio::spawn(async move {
+                        // Signal the dialog to enter browser-waiting state
+                        let placeholder_url = "Opening browser for Claude authentication…".to_string();
+                        let _ = tx2
+                            .send(DeviceAuthEvent::GotBrowserUrl {
+                                url: placeholder_url,
+                            })
+                            .await;
+
+                        match crate::oauth_flow::run_oauth_login_flow(true).await {
+                            Ok(result) => {
+                                // Persist into AuthStore under "anthropic-max"
+                                let mut store = mangocode_core::AuthStore::load();
+                                // Unwrap tokens: we need refresh + expiry for full storage.
+                                // access_token is in result.credential when use_bearer_auth=true.
+                                let (refresh_tok, expires_u64) = (
+                                    result
+                                        .tokens
+                                        .refresh_token
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    result
+                                        .tokens
+                                        .expires_at_ms
+                                        .map(|ms| ms as u64)
+                                        .unwrap_or(0),
+                                );
+                                store.set(
+                                    mangocode_core::provider_id::ANTHROPIC_MAX,
+                                    mangocode_core::auth_store::StoredCredential::OAuthToken {
+                                        access: result.credential.clone(),
+                                        refresh: refresh_tok,
+                                        expires: expires_u64,
+                                    },
+                                );
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(result.credential))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e.to_string())).await;
+                            }
+                        }
+                    });
+                }
                 "anthropic" => {
                     let tx2 = device_auth_tx.clone();
                     // Anthropic OAuth requires a registered application.

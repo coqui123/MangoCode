@@ -3014,13 +3014,24 @@ fn build_todo_nudge(session_id: &str) -> String {
 /// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
 /// - `append_system_prompt` → `append_system_prompt` (added after boundary)
 fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
-    use mangocode_core::system_prompt::{gather_git_context, SystemPromptOptions};
+    use mangocode_core::system_prompt::{gather_git_context, OAuthProvider, SystemPromptOptions};
 
     let git_context = config
         .working_directory
         .as_deref()
         .map(gather_git_context)
         .unwrap_or_default();
+
+    // Detect active OAuth provider from the credential store so the system
+    // prompt identity text reflects the correct product branding.
+    let oauth_provider = {
+        let store = mangocode_core::AuthStore::load();
+        if store.get(mangocode_core::provider_id::ANTHROPIC_MAX).is_some() {
+            OAuthProvider::AnthropicMax
+        } else {
+            OAuthProvider::None
+        }
+    };
 
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
@@ -3034,6 +3045,7 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        oauth_provider,
         ..Default::default()
     };
 
@@ -3045,6 +3057,18 @@ fn build_system_prompt_with_git_context(
     config: &QueryConfig,
     git_context: String,
 ) -> SystemPrompt {
+    use mangocode_core::system_prompt::OAuthProvider;
+
+    // Detect active OAuth provider from the credential store.
+    let oauth_provider = {
+        let store = mangocode_core::AuthStore::load();
+        if store.get(mangocode_core::provider_id::ANTHROPIC_MAX).is_some() {
+            OAuthProvider::AnthropicMax
+        } else {
+            OAuthProvider::None
+        }
+    };
+
     let opts = mangocode_core::system_prompt::SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
@@ -3052,6 +3076,7 @@ fn build_system_prompt_with_git_context(
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        oauth_provider,
         ..Default::default()
     };
 
