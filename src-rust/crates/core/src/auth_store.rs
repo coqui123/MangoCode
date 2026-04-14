@@ -98,6 +98,13 @@ impl AuthStore {
                         return Some(access.clone());
                     }
                 }
+                StoredCredential::OAuthToken { access, .. }
+                    if provider_id == "anthropic-max" =>
+                {
+                    if !access.is_empty() {
+                        return Some(access.clone());
+                    }
+                }
                 _ => {}
             }
         }
