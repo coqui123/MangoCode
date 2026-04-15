@@ -269,6 +269,15 @@ fn derive_description_from_markdown(content: &str) -> String {
         if l.is_empty() {
             continue;
         }
+        // Guard against malformed/unclosed frontmatter that begins with `---`
+        // (parse_skill_file_with_dir treats this as template content).
+        if l == "---" {
+            continue;
+        }
+        // Also skip common frontmatter-like keys if present without a closing delimiter.
+        if l.starts_with("name:") || l.starts_with("description:") {
+            continue;
+        }
         if let Some(rest) = l.strip_prefix('#') {
             // Strip all leading '#' (H1/H2/etc) and whitespace.
             let mut r = rest;
@@ -731,7 +740,7 @@ mod tests {
         let path = PathBuf::from("my-skill.md");
         let skill = parse_skill_file(content, &path).unwrap();
         assert_eq!(skill.name, "my-skill");
-        assert_eq!(skill.description, "Custom skill");
+        assert_eq!(skill.description, "Do something useful.");
         assert_eq!(skill.template, "Do something useful.");
     }
 
