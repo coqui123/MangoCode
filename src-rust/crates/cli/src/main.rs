@@ -3387,7 +3387,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         .unwrap_or(0),
                                 );
                                 store.set(
-                                    mangocode_core::provider_id::ANTHROPIC_MAX,
+                                    mangocode_core::ProviderId::ANTHROPIC_MAX,
                                     mangocode_core::auth_store::StoredCredential::OAuthToken {
                                         access: result.credential.clone(),
                                         refresh: refresh_tok,

@@ -46,7 +46,6 @@ impl AnthropicMaxProvider {
     pub fn new(bearer_token: String) -> Self {
         let config = ClientConfig {
             api_key: bearer_token,
-            base_url: Some("https://api.anthropic.com".to_string()),
             use_bearer_auth: true,
             ..Default::default()
         };

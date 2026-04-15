@@ -3280,6 +3280,7 @@ mod tests {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
         }
     }
 

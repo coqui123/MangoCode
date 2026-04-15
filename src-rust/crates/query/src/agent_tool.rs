@@ -577,6 +577,9 @@ impl Tool for AgentTool {
             agent_name: None,
             agent_definition: None,
             model_registry: Some(model_registry),
+            oauth_provider: mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                ctx.config.provider.as_deref().unwrap_or(""),
+            ),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
