@@ -435,6 +435,7 @@ pub mod client {
     }
 
     /// The main Anthropic API client.
+    #[derive(Clone)]
     pub struct AnthropicClient {
         http: reqwest::Client,
         config: ClientConfig,

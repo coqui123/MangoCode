@@ -34,6 +34,7 @@ use super::message_normalization::normalize_anthropic_messages;
 
 /// Wraps [`AnthropicClient`] so it can be held in a [`ProviderRegistry`] behind
 /// `Arc<dyn LlmProvider>`.
+#[derive(Clone)]
 pub struct AnthropicProvider {
     client: Arc<AnthropicClient>,
     id: ProviderId,

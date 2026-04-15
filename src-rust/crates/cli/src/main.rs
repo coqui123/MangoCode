@@ -903,6 +903,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Keep `auth.json` aligned with `oauth_tokens.json` for Claude Max so the
+    // provider registry's AnthropicMaxProvider is not stuck on a stale access token.
+    if let Some(ref t) = cached_tokens {
+        if t.uses_bearer_auth() {
+            mangocode_core::AuthStore::sync_anthropic_max_from_oauth_tokens(t);
+        }
+    }
+
     let resolved_auth = config.resolve_auth_async().await.or_else(|| {
         cached_tokens.as_ref().and_then(|tokens| {
             tokens

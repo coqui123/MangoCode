@@ -1049,65 +1049,13 @@ pub mod config {
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
             // If expired and we have a refresh token, attempt silent refresh.
-            // Clone the refresh token up-front so we don't borrow `tokens` during the async call.
-            let refresh_token_owned = tokens.refresh_token.clone();
-            let tokens = if tokens.is_expired() {
-                if let Some(rt) = refresh_token_owned {
-                    // Inline the refresh HTTP call (cc_core can't depend on cc_cli::oauth_flow).
-                    let body = serde_json::json!({
-                        "grant_type": "refresh_token",
-                        "refresh_token": rt,
-                        "client_id": crate::oauth::CLIENT_ID,
-                        "scope": crate::oauth::ALL_SCOPES.join(" "),
-                    });
-                    let refreshed = 'refresh: {
-                        let Ok(client) = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(30))
-                            .build()
-                        else {
-                            break 'refresh None;
-                        };
-                        let Ok(resp) = client
-                            .post(crate::oauth::TOKEN_URL)
-                            .header("content-type", "application/json")
-                            .json(&body)
-                            .send()
-                            .await
-                        else {
-                            break 'refresh None;
-                        };
-                        if !resp.status().is_success() {
-                            break 'refresh None;
-                        }
-                        let Ok(data) = resp.json::<serde_json::Value>().await else {
-                            break 'refresh None;
-                        };
-                        let new_at = data["access_token"].as_str().unwrap_or("").to_string();
-                        if new_at.is_empty() {
-                            break 'refresh None;
-                        }
-                        let new_rt = data["refresh_token"].as_str().map(String::from);
-                        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
-                        let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
-                        let scopes: Vec<String> = data["scope"]
-                            .as_str()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .map(String::from)
-                            .collect();
-                        let mut r = tokens.clone();
-                        r.access_token = new_at;
-                        if let Some(nrt) = new_rt {
-                            r.refresh_token = Some(nrt);
-                        }
-                        r.expires_at_ms = Some(exp_ms);
-                        r.scopes = scopes;
-                        let _ = r.save().await;
-                        Some(r)
-                    };
-                    refreshed.unwrap_or(tokens)
-                } else {
-                    tokens // expired, no refresh token → can't fix
+            let tokens = if tokens.is_expired() && tokens.refresh_token.is_some() {
+                match crate::oauth::refresh_oauth_tokens_from_refresh(&tokens).await {
+                    Ok(r) => {
+                        let _ = r.persist_to_disk_with_auth_sync().await;
+                        r
+                    }
+                    Err(_) => tokens,
                 }
             } else {
                 tokens
@@ -3406,6 +3354,95 @@ pub mod oauth {
             }
             Ok(())
         }
+
+        /// Write `oauth_tokens.json` and mirror Claude Max bearer credentials to
+        /// `~/.mangocode/auth.json` so the provider registry stays in sync after refresh.
+        pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
+            self.save().await?;
+            crate::AuthStore::sync_anthropic_max_from_oauth_tokens(self);
+            Ok(())
+        }
+    }
+
+    fn default_oauth_expires_in_secs() -> u64 {
+        3600
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TokenRefreshResponse {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        /// Anthropic normally sends this; default matches legacy `resolve_auth_async` parsing.
+        #[serde(default = "default_oauth_expires_in_secs")]
+        expires_in: u64,
+        #[serde(default)]
+        scope: Option<String>,
+    }
+
+    /// Exchange the stored refresh token for new OAuth tokens. Does not persist.
+    pub async fn refresh_oauth_tokens_from_refresh(
+        tokens: &OAuthTokens,
+    ) -> anyhow::Result<OAuthTokens> {
+        use anyhow::Context;
+
+        let refresh_token = tokens
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .context("No refresh token available")?;
+
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLIENT_ID,
+            "scope": ALL_SCOPES.join(" "),
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client for token refresh")?;
+
+        let resp = client
+            .post(TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Token refresh HTTP request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Token refresh failed ({}): {}", status, text);
+        }
+
+        let token_resp: TokenRefreshResponse = resp
+            .json()
+            .await
+            .context("Failed to parse token refresh response")?;
+
+        let expires_at_ms =
+            chrono::Utc::now().timestamp_millis() + (token_resp.expires_in as i64 * 1000);
+
+        let scopes: Vec<String> = token_resp
+            .scope
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+
+        let mut updated = tokens.clone();
+        updated.access_token = token_resp.access_token;
+        if let Some(new_rt) = token_resp.refresh_token {
+            updated.refresh_token = Some(new_rt);
+        }
+        updated.expires_at_ms = Some(expires_at_ms);
+        updated.scopes = scopes;
+
+        Ok(updated)
     }
 
     // ---- PKCE helpers ----

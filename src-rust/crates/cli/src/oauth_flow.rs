@@ -371,59 +371,10 @@ async fn create_api_key(access_token: &str) -> anyhow::Result<String> {
 // ---- Refresh token flow -----------------------------------------------------
 
 /// Attempt to refresh an expired access token using the stored refresh token.
-/// Saves updated tokens on success.
+/// Saves updated tokens on success and mirrors Claude Max credentials to `auth.json`.
 pub async fn refresh_oauth_token(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
-    let refresh_token = tokens
-        .refresh_token
-        .as_deref()
-        .context("No refresh token available")?;
-
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": oauth::CLIENT_ID,
-        "scope": oauth::ALL_SCOPES.join(" "),
-    });
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let resp = client
-        .post(oauth::TOKEN_URL)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("Token refresh HTTP request failed")?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("Token refresh failed ({}): {}", status, text);
-    }
-
-    let token_resp: TokenExchangeResponse = resp.json().await?;
-    let expires_at_ms =
-        chrono::Utc::now().timestamp_millis() + (token_resp.expires_in as i64 * 1000);
-
-    let scopes: Vec<String> = token_resp
-        .scope
-        .as_deref()
-        .unwrap_or("")
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-
-    let mut updated = tokens.clone();
-    updated.access_token = token_resp.access_token;
-    if let Some(new_rt) = token_resp.refresh_token {
-        updated.refresh_token = Some(new_rt);
-    }
-    updated.expires_at_ms = Some(expires_at_ms);
-    updated.scopes = scopes;
-
-    updated.save().await?;
+    let updated = mangocode_core::oauth::refresh_oauth_tokens_from_refresh(tokens).await?;
+    updated.persist_to_disk_with_auth_sync().await?;
     Ok(updated)
 }
 

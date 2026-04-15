@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::oauth::OAuthTokens;
+use crate::ProviderId;
+
 /// A stored credential for a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -28,6 +31,29 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
+    /// Mirror Claude Max bearer credentials from `oauth_tokens.json` into
+    /// `auth.json` after refresh or when the token file is ahead of the auth store.
+    ///
+    /// This keeps [`mangocode_api::providers::AnthropicMaxProvider`] and the
+    /// provider registry aligned with the canonical OAuth token file.
+    pub fn sync_anthropic_max_from_oauth_tokens(tokens: &OAuthTokens) {
+        if !tokens.uses_bearer_auth() || tokens.access_token.is_empty() {
+            return;
+        }
+        let mut store = Self::load();
+        store.set(
+            ProviderId::ANTHROPIC_MAX,
+            StoredCredential::OAuthToken {
+                access: tokens.access_token.clone(),
+                refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                expires: tokens
+                    .expires_at_ms
+                    .map(|ms| ms as u64)
+                    .unwrap_or(0),
+            },
+        );
+    }
+
     /// Path to the auth store file.
     pub fn path() -> PathBuf {
         let dir = dirs::home_dir()
