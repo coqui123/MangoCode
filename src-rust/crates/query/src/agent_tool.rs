@@ -556,6 +556,19 @@ impl Tool for AgentTool {
             _ => (ctx.working_dir.display().to_string(), None, None, None),
         };
 
+        let skill_index = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::SkillIndex::default(),
+        ));
+        let prefetch_root = ctx
+            .config
+            .project_dir
+            .clone()
+            .unwrap_or_else(|| ctx.working_dir.clone());
+        let skill_index_bg = skill_index.clone();
+        tokio::spawn(async move {
+            crate::prefetch_skills(&prefetch_root, skill_index_bg).await;
+        });
+
         let query_config = QueryConfig {
             model,
             max_tokens: mangocode_core::constants::DEFAULT_MAX_TOKENS,
@@ -570,7 +583,7 @@ impl Tool for AgentTool {
             tool_result_budget: 50_000,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
+            skill_index: Some(skill_index),
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(provider_registry),
@@ -580,6 +593,9 @@ impl Tool for AgentTool {
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::from_provider_id(
                 ctx.config.provider.as_deref().unwrap_or(""),
             ),
+            skills: ctx.config.skills.clone(),
+            injected_skills: Vec::new(),
+            skill_qa_blocks: Vec::new(),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -997,7 +1013,6 @@ pub async fn execute_with_runtime(
     query_config.output_style_prompt = ctx.config.resolve_output_style_prompt();
     query_config.working_directory = Some(working_dir_str);
     query_config.command_queue = None;
-    query_config.skill_index = None;
     query_config.agent_name = None;
     query_config.agent_definition = None;
 

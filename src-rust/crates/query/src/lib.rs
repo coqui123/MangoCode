@@ -222,6 +222,15 @@ pub struct QueryConfig {
     /// model receives the correct product branding (e.g. Claude Code / Max wording).
     /// Set from `app.config.provider` at query-dispatch time — no disk reads needed.
     pub oauth_provider: mangocode_core::system_prompt::OAuthProvider,
+    /// Effective skill-discovery config (`settings.json` skills section). Used with
+    /// `discover_skills` for intent-based injection each turn.
+    pub skills: mangocode_core::config::SkillsConfig,
+    /// Per-turn intent-matched skill bodies (name → template) for the cacheable
+    /// system prompt section. Set by `run_query_loop` / `run_single_query`; leave
+    /// empty when constructing a long-lived `QueryConfig`.
+    pub injected_skills: Vec<(String, String)>,
+    /// Per-turn QA enforcement blocks (dynamic section). Set by the query layer.
+    pub skill_qa_blocks: Vec<String>,
 }
 
 impl Default for QueryConfig {
@@ -248,6 +257,9 @@ impl Default for QueryConfig {
             agent_definition: None,
             model_registry: None,
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
+            skills: mangocode_core::config::SkillsConfig::default(),
+            injected_skills: Vec::new(),
+            skill_qa_blocks: Vec::new(),
         }
     }
 }
@@ -260,6 +272,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            skills: cfg.skills.clone(),
             ..Default::default()
         }
     }
@@ -280,6 +293,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            skills: cfg.skills.clone(),
             ..Default::default()
         }
     }
@@ -997,6 +1011,28 @@ pub async fn run_query_loop(
                     patched.append_system_prompt = Some(match patched.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
+                    });
+                }
+            }
+
+            // Intent-based skill injection (trigger match → deps → templates + QA blocks).
+            let (inj, qa) = build_skill_injection_for_turn(
+                messages,
+                &tool_ctx.working_dir,
+                &tool_ctx.config.skills,
+            );
+            patched.injected_skills = inj;
+            patched.skill_qa_blocks = qa;
+
+            // Background skill index: append human-readable listing when prefetch is ready.
+            if let Some(ref skill_idx) = config.skill_index {
+                let guard = skill_idx.read().await;
+                let listing = format_skill_listing(&*guard);
+                drop(guard);
+                if !listing.trim().is_empty() {
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                        Some(existing) => format!("{}\n\n{}", existing, listing),
+                        None => listing,
                     });
                 }
             }
@@ -3018,6 +3054,7 @@ fn build_todo_nudge(session_id: &str) -> String {
 ///
 /// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
 /// - `append_system_prompt` → `append_system_prompt` (added after boundary)
+/// - `injected_skills` / `skill_qa_blocks` → skill system (cacheable vs dynamic)
 fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     use mangocode_core::system_prompt::{gather_git_context, SystemPromptOptions};
 
@@ -3042,6 +3079,8 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         // oauth_provider is set at query-dispatch time from app.config.provider,
         // so we just thread it through here — no disk reads required.
         oauth_provider: config.oauth_provider,
+        injected_skills: config.injected_skills.clone(),
+        skill_qa_blocks: config.skill_qa_blocks.clone(),
         ..Default::default()
     };
 
@@ -3062,11 +3101,65 @@ fn build_system_prompt_with_git_context(
         git_context,
         // Thread through the oauth_provider set at query-dispatch time.
         oauth_provider: config.oauth_provider,
+        injected_skills: config.injected_skills.clone(),
+        skill_qa_blocks: config.skill_qa_blocks.clone(),
         ..Default::default()
     };
 
     let text = mangocode_core::system_prompt::build_system_prompt(&opts);
     SystemPrompt::Text(text)
+}
+
+/// Match the latest user message against skill triggers, expand dependencies,
+/// install bundled scripts under `.mangocode/skill-scripts/`, and return payloads
+/// for the system prompt.
+fn build_skill_injection_for_turn(
+    messages: &[Message],
+    working_dir: &std::path::Path,
+    skills_config: &mangocode_core::config::SkillsConfig,
+) -> (Vec<(String, String)>, Vec<String>) {
+    use mangocode_core::skill_discovery::{
+        discover_skills, format_qa_block, install_skill_scripts, load_skill_with_dependencies,
+        resolve_skills_for_message,
+    };
+    use std::collections::HashSet;
+
+    let Some(user_message) = latest_user_query(messages) else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let skill_index = discover_skills(working_dir, skills_config);
+    if skill_index.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let matched = resolve_skills_for_message(&user_message, &skill_index);
+    if matched.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut loaded = HashSet::new();
+    let mut skill_context = Vec::new();
+    for s in matched {
+        load_skill_with_dependencies(&s.name, &skill_index, &mut loaded, &mut skill_context);
+    }
+
+    let session_scripts_root = working_dir.join(".mangocode").join("skill-scripts");
+    for skill in &skill_context {
+        install_skill_scripts(skill, &session_scripts_root);
+    }
+
+    let injected_skills: Vec<(String, String)> = skill_context
+        .iter()
+        .map(|s| (s.name.clone(), s.template.clone()))
+        .collect();
+
+    let skill_qa_blocks: Vec<String> = skill_context
+        .iter()
+        .filter_map(|s| format_qa_block(s))
+        .collect();
+
+    (injected_skills, skill_qa_blocks)
 }
 
 fn latest_user_query(messages: &[Message]) -> Option<String> {
@@ -3215,7 +3308,26 @@ pub async fn run_single_query(
     config: &QueryConfig,
 ) -> Result<Message, ClaudeError> {
     let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
-    let system = build_system_prompt(config);
+
+    let mut cfg = config.clone();
+    let cwd = std::path::Path::new(config.working_directory.as_deref().unwrap_or("."));
+    let (inj, qa) = build_skill_injection_for_turn(&messages, cwd, &config.skills);
+    cfg.injected_skills = inj;
+    cfg.skill_qa_blocks = qa;
+
+    if let Some(ref skill_idx) = config.skill_index {
+        let guard = skill_idx.read().await;
+        let listing = format_skill_listing(&*guard);
+        drop(guard);
+        if !listing.trim().is_empty() {
+            cfg.append_system_prompt = Some(match cfg.append_system_prompt.take() {
+                Some(existing) => format!("{}\n\n{}", existing, listing),
+                None => listing,
+            });
+        }
+    }
+
+    let system = build_system_prompt(&cfg);
 
     let request = CreateMessageRequest::builder(&config.model, config.max_tokens)
         .messages(api_messages)
@@ -3281,6 +3393,9 @@ mod tests {
             agent_definition: None,
             model_registry: None,
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
+            skills: mangocode_core::config::SkillsConfig::default(),
+            injected_skills: Vec::new(),
+            skill_qa_blocks: Vec::new(),
         }
     }
 

@@ -1118,6 +1118,20 @@ async fn main() -> anyhow::Result<()> {
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
 
+    // Background skill index for `Skill` tool / prefetch listing (parallel to full discovery).
+    let skill_index = std::sync::Arc::new(tokio::sync::RwLock::new(
+        mangocode_query::SkillIndex::default(),
+    ));
+    let prefetch_root = config
+        .project_dir
+        .clone()
+        .unwrap_or_else(|| cwd.clone());
+    let skill_index_bg = skill_index.clone();
+    tokio::spawn(async move {
+        mangocode_query::prefetch_skills(&prefetch_root, skill_index_bg).await;
+    });
+    query_config.skill_index = Some(skill_index);
+
     // Wire in the named agent (--agent flag).
     // Merge built-in default agents with user-defined agents (user wins on collision).
     let tools = if let Some(ref agent_name) = cli.agent {
