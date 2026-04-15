@@ -85,6 +85,7 @@ impl ModelRegistry {
         self.add_anthropic_models();
         self.add_openai_models();
         self.add_google_models();
+        self.add_qwen_models();
     }
 
     fn add_anthropic_models(&mut self) {
@@ -220,6 +221,41 @@ impl ModelRegistry {
                 reasoning: true,
                 vision: true,
                 family: Some("gemini".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
+    fn add_qwen_models(&mut self) {
+        let pid = ProviderId::new("qwen");
+
+        // Keep this list intentionally small and high-signal.
+        // The live `/models` endpoint (when available) is the source of truth.
+        for (id, name, ctx, out, tool_calling, reasoning, vision) in [(
+            "qwen3.6-plus",
+            "Qwen 3.6 Pro",
+            128_000u32,
+            16_384u32,
+            true,
+            true,
+            true,
+        )] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_write: None,
+                tool_calling,
+                reasoning,
+                vision,
+                family: Some("qwen".to_string()),
                 status: "active".to_string(),
             });
         }

@@ -1519,7 +1519,16 @@ pub fn compute_typeahead(
             }
         }
 
-        slash_matches.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        // Prefer built-in commands over dynamically discovered Skills.
+        // This keeps stable UX for common commands (e.g. `/advisor`) even when
+        // a skill happens to sort earlier alphabetically (e.g. `/about-computer`).
+        slash_matches.sort_by(|a, b| {
+            let a_is_skill = a.group == "Skills";
+            let b_is_skill = b.group == "Skills";
+            a_is_skill
+                .cmp(&b_is_skill) // false < true => non-skill first
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         for cmd in slash_matches {
             suggestions.push(TypeaheadSuggestion {
                 text: format!("/{}", cmd.name),

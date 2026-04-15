@@ -234,7 +234,7 @@ fn parse_skill_file_with_dir(
         }
     });
 
-    let description = description.unwrap_or_else(|| "Custom skill".to_string());
+    let description = description.unwrap_or_else(|| derive_description_from_markdown(&template));
 
     if template.is_empty() && name.is_empty() {
         return None;
@@ -261,6 +261,28 @@ fn parse_skill_file_with_dir(
         qa_required,
         qa_steps,
     })
+}
+
+fn derive_description_from_markdown(content: &str) -> String {
+    for line in content.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix('#') {
+            // Strip all leading '#' (H1/H2/etc) and whitespace.
+            let mut r = rest;
+            while let Some(next) = r.strip_prefix('#') {
+                r = next;
+            }
+            let r = r.trim();
+            if !r.is_empty() {
+                return r.to_string();
+            }
+        }
+        return l.to_string();
+    }
+    "Custom skill".to_string()
 }
 
 /// Scan a folder-based skill directory for sub-files and runnable scripts.

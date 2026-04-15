@@ -991,6 +991,7 @@ pub mod config {
                 Some("azure") => "gpt-4o",
                 Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
                 Some("venice") => "llama-3.3-70b",
+                Some("qwen") => "qwen3.6-plus",
                 _ => crate::constants::DEFAULT_MODEL, // Anthropic default
             }
         }

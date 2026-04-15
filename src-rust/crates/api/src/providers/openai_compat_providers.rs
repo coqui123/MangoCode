@@ -177,11 +177,13 @@ pub fn qwen() -> OpenAiCompatProvider {
     OpenAiCompatProvider::new(
         "qwen",
         "Qwen (Alibaba)",
-        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
         default_temperature: Some(0.55),
+        reasoning_field: Some("reasoning_content".to_string()),
+        include_usage_in_stream: true,
         ..Default::default()
     })
 }

@@ -238,10 +238,23 @@ fn load_skill_from_file(path: &std::path::Path) -> Option<SkillDefinition> {
             qa_required,
         })
     } else {
-        // No frontmatter: use filename as name, first line as description
+        // No frontmatter: accept plain markdown skills (common in MangoCode skill packs).
+        // - For folder-based skills, SKILL.md should map to the parent directory name.
+        // - Prefer a human-readable description derived from the first meaningful markdown line.
+        let name = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or(&stem)
+                .to_string()
+        } else {
+            stem
+        };
+
+        let description = derive_description_from_markdown(&content);
         Some(SkillDefinition {
-            name: stem,
-            description: content.lines().next().unwrap_or("").to_string(),
+            name,
+            description,
             tags: Vec::new(),
             source: "user".to_string(),
             path: Some(path.to_path_buf()),
@@ -249,6 +262,28 @@ fn load_skill_from_file(path: &std::path::Path) -> Option<SkillDefinition> {
             qa_required: false,
         })
     }
+}
+
+fn derive_description_from_markdown(content: &str) -> String {
+    for line in content.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix('#') {
+            // Strip all leading '#' (H1/H2/etc) and whitespace.
+            let mut r = rest;
+            while let Some(next) = r.strip_prefix('#') {
+                r = next;
+            }
+            let r = r.trim();
+            if !r.is_empty() {
+                return r.to_string();
+            }
+        }
+        return l.to_string();
+    }
+    String::new()
 }
 
 fn extract_yaml_str(front: &str, key: &str) -> Option<String> {
