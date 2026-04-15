@@ -51,7 +51,7 @@ pub struct CopilotProvider {
 
 impl CopilotProvider {
     pub fn new(token: String) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -64,7 +64,19 @@ impl CopilotProvider {
     }
 
     pub fn from_env() -> Option<Self> {
-        std::env::var("GITHUB_TOKEN").ok().map(Self::new)
+        std::env::var("GITHUB_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                let vault = mangocode_core::Vault::new();
+                mangocode_core::get_vault_passphrase().and_then(|passphrase| {
+                    vault
+                        .get_secret(ProviderId::GITHUB_COPILOT, &passphrase)
+                        .ok()
+                        .flatten()
+                })
+            })
+            .map(Self::new)
     }
 
     fn base_url() -> &'static str {

@@ -28,6 +28,10 @@ pub mod git_utils;
 pub mod auth_store;
 pub use auth_store::{AuthStore, StoredCredential};
 
+// Local encrypted vault and gateway proxy support.
+pub mod vault;
+pub use vault::{clear_vault_passphrase, get_vault_passphrase, GatewayConfig, resolve_api_key_for_provider, set_vault_passphrase, Vault};
+
 // GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
 pub mod device_code;
 
@@ -1029,11 +1033,13 @@ pub mod config {
                 .filter(|prompt| !prompt.trim().is_empty())
         }
 
-        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
+        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY` or the vault.
         pub fn resolve_api_key(&self) -> Option<String> {
-            self.api_key
-                .clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            crate::vault::resolve_api_key_for_provider(
+                self.api_key.as_deref(),
+                "ANTHROPIC_API_KEY",
+                "anthropic",
+            )
         }
 
         /// Async variant: also checks `~/.mangocode/oauth_tokens.json`.

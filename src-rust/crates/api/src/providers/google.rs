@@ -50,7 +50,7 @@ const GOOGLE_STREAM_PRE_START_TIMEOUT: Duration = Duration::from_secs(90);
 
 impl GoogleProvider {
     pub fn new(api_key: String) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()

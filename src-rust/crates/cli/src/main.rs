@@ -45,6 +45,7 @@ use mangocode_core::{
 };
 use mangocode_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use parking_lot::Mutex as ParkingMutex;
+use rpassword::prompt_password;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -880,13 +881,57 @@ async fn main() -> anyhow::Result<()> {
             || std::env::var("DASHSCOPE_API_KEY").is_ok()
             || std::env::var("AZURE_API_KEY").is_ok()
             || std::env::var("GITHUB_TOKEN").is_ok()
+            || std::env::var("MINIMAX_API_KEY").is_ok()
+            || std::env::var("SAMBANOVA_API_KEY").is_ok()
+            || std::env::var("HF_TOKEN").is_ok()
+            || std::env::var("NVIDIA_API_KEY").is_ok()
+            || std::env::var("SILICONFLOW_API_KEY").is_ok()
+            || std::env::var("MOONSHOT_API_KEY").is_ok()
+            || std::env::var("ZHIPU_API_KEY").is_ok()
+            || std::env::var("NEBIUS_API_KEY").is_ok()
+            || std::env::var("NOVITA_API_KEY").is_ok()
+            || std::env::var("OVHCLOUD_API_KEY").is_ok()
+            || std::env::var("SCALEWAY_API_KEY").is_ok()
+            || std::env::var("VULTR_API_KEY").is_ok()
+            || std::env::var("BASETEN_API_KEY").is_ok()
+            || std::env::var("FRIENDLI_TOKEN").is_ok()
+            || std::env::var("UPSTAGE_API_KEY").is_ok()
+            || std::env::var("STEPFUN_API_KEY").is_ok()
+            || std::env::var("FIREWORKS_API_KEY").is_ok()
             || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
             || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
+            || std::env::var("AWS_SESSION_TOKEN").is_ok()
+            || std::env::var("AWS_REGION").is_ok()
+            || std::env::var("AWS_DEFAULT_REGION").is_ok()
             || std::env::var("VERTEX_PROJECT_ID").is_ok()
+            || std::env::var("VERTEX_ACCESS_TOKEN").is_ok()
+            // Forward-looking / gateway-style credentials (may be used by optional providers)
+            || std::env::var("CLOUDFLARE_API_TOKEN").is_ok()
+            || std::env::var("AICORE_SERVICE_KEY").is_ok()
+            || std::env::var("GITLAB_TOKEN").is_ok()
             // Local providers are always available
             || true; // Ollama/LM Studio don't require keys
         active_provider != "anthropic" || has_non_anthropic_env
     };
+
+    let vault = mangocode_core::Vault::new();
+    // If a vault exists, offer a one-time optional unlock so keys for *any*
+    // provider can be resolved from the vault (not just Anthropic).
+    if vault.exists() && !is_headless && mangocode_core::get_vault_passphrase().is_none() {
+        match prompt_password("Vault passphrase (or Enter to skip): ") {
+            Ok(passphrase) if !passphrase.is_empty() => match vault.load(&passphrase) {
+                Ok(_) => {
+                    mangocode_core::set_vault_passphrase(passphrase);
+                    info!("Vault unlocked");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Vault unlock failed: {} — using env vars", e);
+                }
+            },
+            _ => info!("Vault skipped — using env vars only"),
+        }
+    }
 
     let mut cached_tokens = mangocode_core::oauth::OAuthTokens::load().await;
     if let Some(ref tokens) = cached_tokens {

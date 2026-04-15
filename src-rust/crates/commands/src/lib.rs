@@ -11,6 +11,7 @@ use mangocode_core::cost::CostTracker;
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
 use mangocode_core::feature_flags::FeatureFlags;
 use mangocode_core::types::Message;
+use rpassword::prompt_password;
 use std::collections::BTreeMap;
 #[allow(unused_imports)]
 use std::path::PathBuf;
@@ -122,6 +123,8 @@ pub struct DoctorCommand;
 pub struct LoginCommand;
 pub struct LogoutCommand;
 pub struct InitCommand;
+pub struct VaultCommand;
+pub struct GatewayCommand;
 pub struct ReviewCommand;
 pub struct HooksCommand;
 pub struct McpCommand;
@@ -315,6 +318,19 @@ fn parse_theme(name: &str) -> Option<Theme> {
         custom if !custom.is_empty() => Some(Theme::Custom(custom.to_string())),
         _ => None,
     }
+}
+
+fn prompt_secure_input(prompt: &str) -> anyhow::Result<String> {
+    let prompt_text = format!("{}", prompt);
+    let input = prompt_password(&prompt_text)?;
+    Ok(input)
+}
+
+fn get_or_prompt_passphrase() -> anyhow::Result<String> {
+    if let Some(passphrase) = mangocode_core::get_vault_passphrase() {
+        return Ok(passphrase);
+    }
+    prompt_secure_input("Vault passphrase: ")
 }
 
 fn current_output_style_name(config: &Config) -> &str {
@@ -2584,7 +2600,360 @@ impl SlashCommand for LogoutCommand {
             return CommandResult::Error(format!("Failed to update settings: {}", e));
         }
         ctx.config.api_key = None;
+        mangocode_core::clear_vault_passphrase();
         CommandResult::Message("Logged out. Credentials cleared.".to_string())
+    }
+}
+
+// ---- /vault --------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for VaultCommand {
+    fn name(&self) -> &str {
+        "vault"
+    }
+
+    fn description(&self) -> &str {
+        "Manage the local MangoCode credential vault"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut parts = args.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+        let vault = mangocode_core::Vault::new();
+
+        match subcommand {
+            "providers" | "supported" => {
+                let mut out = String::new();
+                out.push_str("Supported vault provider IDs (use with `/vault set <provider-id>`):\n\n");
+
+                // Format: provider-id — env var(s) — notes/aliases
+                let rows: &[(&str, &str, &str)] = &[
+                    ("anthropic", "ANTHROPIC_API_KEY", ""),
+                    ("openai", "OPENAI_API_KEY", ""),
+                    ("google", "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY", ""),
+                    ("azure", "AZURE_API_KEY (+ AZURE_RESOURCE_NAME)", ""),
+                    ("cohere", "COHERE_API_KEY", ""),
+                    ("github-copilot", "GITHUB_TOKEN", ""),
+                    ("amazon-bedrock", "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY", ""),
+                    ("google-vertex", "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)", ""),
+                    ("deepseek", "DEEPSEEK_API_KEY", ""),
+                    ("groq", "GROQ_API_KEY", ""),
+                    ("xai", "XAI_API_KEY", ""),
+                    ("openrouter", "OPENROUTER_API_KEY", ""),
+                    ("together-ai", "TOGETHER_API_KEY", "Alias: togetherai"),
+                    ("perplexity", "PERPLEXITY_API_KEY", ""),
+                    ("cerebras", "CEREBRAS_API_KEY", ""),
+                    ("deepinfra", "DEEPINFRA_API_KEY", ""),
+                    ("venice", "VENICE_API_KEY", ""),
+                    ("qwen", "DASHSCOPE_API_KEY", "Alias: alibaba"),
+                    ("mistral", "MISTRAL_API_KEY", ""),
+                    ("sambanova", "SAMBANOVA_API_KEY", ""),
+                    ("huggingface", "HF_TOKEN", ""),
+                    ("nvidia", "NVIDIA_API_KEY", ""),
+                    ("siliconflow", "SILICONFLOW_API_KEY", ""),
+                    ("moonshotai", "MOONSHOT_API_KEY", "Alias: moonshot"),
+                    ("zhipuai", "ZHIPU_API_KEY", "Alias: zhipu"),
+                    ("nebius", "NEBIUS_API_KEY", ""),
+                    ("novita", "NOVITA_API_KEY", ""),
+                    ("ovhcloud", "OVHCLOUD_API_KEY", ""),
+                    ("scaleway", "SCALEWAY_API_KEY", ""),
+                    ("vultr", "VULTR_API_KEY", ""),
+                    ("baseten", "BASETEN_API_KEY", ""),
+                    ("friendli", "FRIENDLI_TOKEN", ""),
+                    ("upstage", "UPSTAGE_API_KEY", ""),
+                    ("stepfun", "STEPFUN_API_KEY", ""),
+                    ("fireworks", "FIREWORKS_API_KEY", ""),
+                    ("minimax", "MINIMAX_API_KEY", ""),
+                    ("gateway", "(no env var) configured via /gateway setup", ""),
+                ];
+
+                for (id, env, note) in rows {
+                    if note.is_empty() {
+                        out.push_str(&format!("- {} — {}\n", id, env));
+                    } else {
+                        out.push_str(&format!("- {} — {} — {}\n", id, env, note));
+                    }
+                }
+
+                out.push_str("\nTip: `/vault list` shows what you already stored (no secrets displayed).\n");
+                CommandResult::Message(out)
+            }
+            "init" => {
+                if vault.exists() {
+                    return CommandResult::Message(
+                        "Vault already exists. Use `/vault set <provider>` to add keys.".to_string(),
+                    );
+                }
+                let passphrase = match prompt_secure_input("Enter vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                let confirm = match prompt_secure_input("Confirm passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                if passphrase != confirm {
+                    return CommandResult::Error("Passphrases don't match.".to_string());
+                }
+                let data = mangocode_core::vault::VaultData::default();
+                if let Err(e) = vault.save(&data, &passphrase) {
+                    return CommandResult::Error(format!("Failed to initialize vault: {}", e));
+                }
+                mangocode_core::set_vault_passphrase(passphrase);
+                CommandResult::Message("Vault created and unlocked for this session.".to_string())
+            }
+            "unlock" => {
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match prompt_secure_input("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                if let Err(e) = vault.load(&passphrase) {
+                    return CommandResult::Error(format!("Vault unlock failed: {}", e));
+                }
+                mangocode_core::set_vault_passphrase(passphrase);
+                CommandResult::Message("Vault unlocked for this session.".to_string())
+            }
+            "lock" => {
+                mangocode_core::clear_vault_passphrase();
+                CommandResult::Message("Vault locked for this session.".to_string())
+            }
+            "set" => {
+                let provider = match parts.next() {
+                    Some(p) => p,
+                    None => return CommandResult::Error("Usage: /vault set <provider>".to_string()),
+                };
+                if !vault.exists() {
+                    return CommandResult::Error(
+                        "No vault found. Run `/vault init` first.".to_string(),
+                    );
+                }
+                let passphrase = match get_or_prompt_passphrase() {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                let secret = match prompt_secure_input(&format!("Enter API key for {}: ", provider)) {
+                    Ok(s) => s,
+                    Err(e) => return CommandResult::Error(format!("Failed to read API key: {}", e)),
+                };
+                let label = parts.next().map(|s| s.to_string());
+                if let Err(e) = vault.set_secret(provider, &secret, &passphrase, label.as_deref()) {
+                    return CommandResult::Error(format!("Failed to store secret: {}", e));
+                }
+                mangocode_core::set_vault_passphrase(passphrase);
+                CommandResult::Message(format!("Stored key for '{}' in vault.", provider))
+            }
+            "get" => {
+                let provider = match parts.next() {
+                    Some(p) => p,
+                    None => return CommandResult::Error("Usage: /vault get <provider>".to_string()),
+                };
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match get_or_prompt_passphrase() {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                match vault.get_secret(provider, &passphrase) {
+                    Ok(has_secret) => {
+                        mangocode_core::set_vault_passphrase(passphrase);
+                        CommandResult::Message(if has_secret.is_some() {
+                            format!("Provider '{}' has a stored secret in the vault.", provider)
+                        } else {
+                            format!("Provider '{}' does not have a secret stored.", provider)
+                        })
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to read vault: {}", e)),
+                }
+            }
+            "list" => {
+                if !vault.exists() {
+                    return CommandResult::Message("Vault is empty (no vault file).".to_string());
+                }
+                let passphrase = match get_or_prompt_passphrase() {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                match vault.list_providers(&passphrase) {
+                    Ok(entries) => {
+                        mangocode_core::set_vault_passphrase(passphrase);
+                        if entries.is_empty() {
+                            CommandResult::Message(
+                                "Vault file exists but has no stored secrets.".to_string(),
+                            )
+                        } else {
+                            let rows = entries
+                                .into_iter()
+                                .map(|(provider, label, updated_at)| {
+                                    format!(
+                                        "{}{} — updated {}",
+                                        provider,
+                                        label
+                                            .as_ref()
+                                            .map(|l| format!(" ({})", l))
+                                            .unwrap_or_default(),
+                                        updated_at
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            CommandResult::Message(rows.join("\n"))
+                        }
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to read vault: {}", e)),
+                }
+            }
+            "remove" => {
+                let provider = match parts.next() {
+                    Some(p) => p,
+                    None => return CommandResult::Error("Usage: /vault remove <provider>".to_string()),
+                };
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match get_or_prompt_passphrase() {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                };
+                if let Err(e) = vault.remove_secret(provider, &passphrase) {
+                    return CommandResult::Error(format!("Failed to remove secret: {}", e));
+                }
+                mangocode_core::set_vault_passphrase(passphrase);
+                CommandResult::Message(format!("Removed secret for '{}' from vault.", provider))
+            }
+            "export" => {
+                if vault.exists() {
+                    CommandResult::Message(format!(
+                        "Vault path: {}",
+                        vault.path().display()
+                    ))
+                } else {
+                    CommandResult::Message("No vault exists.".to_string())
+                }
+            }
+            _ => CommandResult::Message(
+                "Usage: /vault [providers|init|unlock|lock|set|get|list|remove|export]".to_string(),
+            ),
+        }
+    }
+}
+
+// ---- /gateway ------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for GatewayCommand {
+    fn name(&self) -> &str {
+        "gateway"
+    }
+
+    fn description(&self) -> &str {
+        "Configure OneCLI gateway proxy mode"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let mut parts = args.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+        match subcommand {
+            "setup" => {
+                let url = match parts.next() {
+                    Some(u) => u,
+                    None => return CommandResult::Error("Usage: /gateway setup <url> <token>".to_string()),
+                };
+                let token = match parts.next() {
+                    Some(t) => t,
+                    None => return CommandResult::Error("Usage: /gateway setup <url> <token>".to_string()),
+                };
+                // Prefer storing the gateway token inside the vault (encrypted at rest).
+                // Fall back to gateway.json token storage when the vault is unavailable.
+                let vault = mangocode_core::Vault::new();
+                let mut stored_in_vault = false;
+
+                if vault.exists() {
+                    if let Ok(passphrase) = get_or_prompt_passphrase() {
+                        if vault
+                            .set_secret("gateway", token, &passphrase, Some("gateway access token"))
+                            .is_ok()
+                        {
+                            mangocode_core::set_vault_passphrase(passphrase);
+                            stored_in_vault = true;
+                        }
+                    }
+                }
+
+                let config = mangocode_core::GatewayConfig {
+                    enabled: true,
+                    url: url.to_string(),
+                    access_token: if stored_in_vault {
+                        None
+                    } else {
+                        Some(token.to_string())
+                    },
+                };
+                if let Err(e) = config.save() {
+                    return CommandResult::Error(format!("Failed to save gateway config: {}", e));
+                }
+
+                CommandResult::Message(if stored_in_vault {
+                    "Gateway proxy configured and enabled. Token stored in vault.".to_string()
+                } else {
+                    "Gateway proxy configured and enabled. Token stored in gateway.json (vault unavailable).".to_string()
+                })
+            }
+            "status" => {
+                match mangocode_core::GatewayConfig::load() {
+                    Some(cfg) => CommandResult::Message(format!(
+                        "Gateway status: {}\nURL: {}\nToken: {}",
+                        if cfg.enabled { "enabled" } else { "disabled" },
+                        cfg.url,
+                        match cfg.access_token.as_deref().unwrap_or("") {
+                            t if !t.is_empty() => "(stored in gateway.json)",
+                            _ => {
+                                let vault = mangocode_core::Vault::new();
+                                if vault.exists() {
+                                    "(not in gateway.json; may be in vault as provider \"gateway\")"
+                                } else {
+                                    "(not in gateway.json)"
+                                }
+                            }
+                        }
+                    )),
+                    None => CommandResult::Message("No gateway configuration found.".to_string()),
+                }
+            }
+            "disable" => {
+                let mut config = mangocode_core::GatewayConfig::load().unwrap_or_default();
+                config.enabled = false;
+                if let Err(e) = config.save() {
+                    return CommandResult::Error(format!("Failed to disable gateway: {}", e));
+                }
+                CommandResult::Message("Gateway proxy disabled.".to_string())
+            }
+            "test" => {
+                match mangocode_core::GatewayConfig::load() {
+                    Some(cfg) if cfg.enabled => {
+                        let client = reqwest::Client::new();
+                        match client.get(&cfg.url).send().await {
+                            Ok(resp) => CommandResult::Message(format!(
+                                "Gateway test request succeeded: {}",
+                                resp.status()
+                            )),
+                            Err(e) => CommandResult::Error(format!(
+                                "Gateway test failed: {}",
+                                e
+                            )),
+                        }
+                    }
+                    Some(_) => CommandResult::Message("Gateway is configured but disabled.".to_string()),
+                    None => CommandResult::Message("No gateway configuration found.".to_string()),
+                }
+            }
+            _ => CommandResult::Message(
+                "Usage: /gateway [setup <url> <token>|status|disable|test]".to_string(),
+            ),
+        }
     }
 }
 
@@ -8625,6 +8994,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(DoctorCommand),
         Box::new(LoginCommand),
         Box::new(LogoutCommand),
+        Box::new(VaultCommand),
+        Box::new(GatewayCommand),
         Box::new(InitCommand),
         Box::new(ReviewCommand),
         Box::new(HooksCommand),

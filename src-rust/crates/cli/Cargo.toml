@@ -30,6 +30,7 @@ uuid = { workspace = true }
 tokio-util = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
+rpassword = "7"
 url = { workspace = true }
 crossterm = { workspace = true }
 parking_lot = { workspace = true }

@@ -54,13 +54,25 @@ impl BedrockProvider {
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
 
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
         // Bearer token takes priority over SigV4 credentials.
-        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+        let bearer = std::env::var("AWS_BEARER_TOKEN_BEDROCK")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                // Vault fallback: store the Bedrock bearer token under provider id "amazon-bedrock".
+                let vault = mangocode_core::Vault::new();
+                mangocode_core::get_vault_passphrase().and_then(|passphrase| {
+                    vault.get_secret(ProviderId::AMAZON_BEDROCK, &passphrase)
+                        .ok()
+                        .flatten()
+                })
+            });
+        if let Some(token) = bearer {
             return Some(Self {
                 id: ProviderId::new(ProviderId::AMAZON_BEDROCK),
                 region,

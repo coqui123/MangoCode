@@ -41,7 +41,7 @@ pub struct CohereProvider {
 impl CohereProvider {
     /// Create a new CohereProvider with the given API key.
     pub fn new(api_key: String) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -59,6 +59,11 @@ impl CohereProvider {
         std::env::var("COHERE_API_KEY")
             .ok()
             .filter(|k| !k.is_empty())
+            .or_else(|| {
+                let vault = mangocode_core::Vault::new();
+                mangocode_core::get_vault_passphrase()
+                    .and_then(|passphrase| vault.get_secret("cohere", &passphrase).ok().flatten())
+            })
             .map(Self::new)
     }
 

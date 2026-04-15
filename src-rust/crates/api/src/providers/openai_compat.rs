@@ -92,7 +92,7 @@ impl OpenAiCompatProvider {
         name: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

@@ -90,7 +90,17 @@ impl VertexConfig {
             _ => VertexAuthMode::Adc,
         };
 
-        let access_token = std::env::var("VERTEX_ACCESS_TOKEN").ok();
+        let access_token = std::env::var("VERTEX_ACCESS_TOKEN")
+            .ok()
+            .or_else(|| {
+                // Vault fallback for CI / headless setups using AccessToken mode.
+                let vault = mangocode_core::Vault::new();
+                mangocode_core::get_vault_passphrase().and_then(|passphrase| {
+                    vault.get_secret(mangocode_core::provider_id::ProviderId::GOOGLE_VERTEX, &passphrase)
+                        .ok()
+                        .flatten()
+                })
+            });
         let base_url_override = std::env::var("VERTEX_BASE_URL").ok();
 
         Some(Self {
@@ -256,7 +266,7 @@ impl VertexOpenAiProvider {
             .clone()
             .unwrap_or_else(|| vertex_openai_base_url(&config.project_id, &config.location));
 
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

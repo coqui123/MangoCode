@@ -31,6 +31,7 @@ open = { workspace = true }
 qrcode = { workspace = true }
 mangocode-bridge = { workspace = true }
 hostname = "0.4"
+rpassword = "7"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures = { workspace = true }
 once_cell = { workspace = true }

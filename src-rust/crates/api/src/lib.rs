@@ -447,7 +447,7 @@ pub mod client {
             // Allow empty key at construction — validation is deferred to
             // the first API call, so non-Anthropic provider setups can still
             // create this client without an Anthropic key configured.
-            let http = reqwest::Client::builder()
+            let http = mangocode_core::vault::reqwest_client_builder()
                 .timeout(config.request_timeout)
                 .build()?;
 

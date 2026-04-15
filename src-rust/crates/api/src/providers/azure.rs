@@ -42,7 +42,7 @@ pub struct AzureProvider {
 
 impl AzureProvider {
     pub fn new(resource_name: String, api_key: String) -> Self {
-        let http_client = reqwest::Client::builder()
+        let http_client = mangocode_core::vault::reqwest_client_builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -62,11 +62,18 @@ impl AzureProvider {
     }
 
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("AZURE_API_KEY").ok()?;
+        let key = std::env::var("AZURE_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                let vault = mangocode_core::Vault::new();
+                mangocode_core::get_vault_passphrase()
+                    .and_then(|passphrase| vault.get_secret("azure", &passphrase).ok().flatten())
+            });
         let resource = std::env::var("AZURE_RESOURCE_NAME").ok()?;
         let version =
             std::env::var("AZURE_API_VERSION").unwrap_or_else(|_| "2024-08-01-preview".to_string());
-        Some(Self::new(resource, key).with_api_version(version))
+        key.map(|key| Self::new(resource, key).with_api_version(version))
     }
 
     fn endpoint_url(&self, deployment: &str) -> String {

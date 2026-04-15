@@ -17,6 +17,7 @@
 //!   src/commands/remote-setup/index.ts (implied by component structure)
 
 use crate::{CommandContext, CommandResult};
+use rpassword::prompt_password;
 // `open` crate: used by StickersCommand to launch the browser.
 
 // ---------------------------------------------------------------------------
@@ -196,6 +197,271 @@ impl NamedCommand for AddDirCommand {
             "Added {} to allowed workspace paths.",
             abs_path.display()
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vault
+// ---------------------------------------------------------------------------
+
+pub struct VaultNamedCommand;
+
+fn prompt_secure(prompt: &str) -> Result<String, String> {
+    prompt_password(prompt).map_err(|e| format!("Failed to read input: {e}"))
+}
+
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    print!("{prompt}");
+    stdout.flush().map_err(|e| format!("Failed to write prompt: {e}"))?;
+    let mut s = String::new();
+    std::io::stdin()
+        .read_line(&mut s)
+        .map_err(|e| format!("Failed to read input: {e}"))?;
+    Ok(s.trim().to_string())
+}
+
+fn supported_vault_provider_rows() -> &'static [(&'static str, &'static str, &'static str)] {
+    &[
+        ("anthropic", "ANTHROPIC_API_KEY", ""),
+        ("openai", "OPENAI_API_KEY", ""),
+        ("google", "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY", ""),
+        ("azure", "AZURE_API_KEY (+ AZURE_RESOURCE_NAME)", ""),
+        ("cohere", "COHERE_API_KEY", ""),
+        ("github-copilot", "GITHUB_TOKEN", ""),
+        (
+            "amazon-bedrock",
+            "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY",
+            "",
+        ),
+        ("google-vertex", "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)", ""),
+        ("deepseek", "DEEPSEEK_API_KEY", ""),
+        ("groq", "GROQ_API_KEY", ""),
+        ("xai", "XAI_API_KEY", ""),
+        ("openrouter", "OPENROUTER_API_KEY", ""),
+        ("together-ai", "TOGETHER_API_KEY", "Alias: togetherai"),
+        ("perplexity", "PERPLEXITY_API_KEY", ""),
+        ("cerebras", "CEREBRAS_API_KEY", ""),
+        ("deepinfra", "DEEPINFRA_API_KEY", ""),
+        ("venice", "VENICE_API_KEY", ""),
+        ("qwen", "DASHSCOPE_API_KEY", "Alias: alibaba"),
+        ("mistral", "MISTRAL_API_KEY", ""),
+        ("sambanova", "SAMBANOVA_API_KEY", ""),
+        ("huggingface", "HF_TOKEN", ""),
+        ("nvidia", "NVIDIA_API_KEY", ""),
+        ("siliconflow", "SILICONFLOW_API_KEY", ""),
+        ("moonshotai", "MOONSHOT_API_KEY", "Alias: moonshot"),
+        ("zhipuai", "ZHIPU_API_KEY", "Alias: zhipu"),
+        ("nebius", "NEBIUS_API_KEY", ""),
+        ("novita", "NOVITA_API_KEY", ""),
+        ("ovhcloud", "OVHCLOUD_API_KEY", ""),
+        ("scaleway", "SCALEWAY_API_KEY", ""),
+        ("vultr", "VULTR_API_KEY", ""),
+        ("baseten", "BASETEN_API_KEY", ""),
+        ("friendli", "FRIENDLI_TOKEN", ""),
+        ("upstage", "UPSTAGE_API_KEY", ""),
+        ("stepfun", "STEPFUN_API_KEY", ""),
+        ("fireworks", "FIREWORKS_API_KEY", ""),
+        ("minimax", "MINIMAX_API_KEY", ""),
+        ("gateway", "(no env var) configured via /gateway setup", ""),
+    ]
+}
+
+impl NamedCommand for VaultNamedCommand {
+    fn name(&self) -> &str {
+        "vault"
+    }
+
+    fn description(&self) -> &str {
+        "Manage the local MangoCode credential vault (pre-session)"
+    }
+
+    fn usage(&self) -> &str {
+        "mangocode vault <providers|init|unlock|lock|set|get|list|remove|export> [args...]"
+    }
+
+    fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
+        let sub = args.first().copied().unwrap_or("providers");
+        let vault = mangocode_core::Vault::new();
+
+        match sub {
+            "providers" | "supported" => {
+                let mut out = String::new();
+                out.push_str("Supported vault provider IDs (use with `mangocode vault set <provider-id>`):\n\n");
+                for (id, env, note) in supported_vault_provider_rows() {
+                    if note.is_empty() {
+                        out.push_str(&format!("- {} — {}\n", id, env));
+                    } else {
+                        out.push_str(&format!("- {} — {} — {}\n", id, env, note));
+                    }
+                }
+                CommandResult::Message(out)
+            }
+            "init" => {
+                if vault.exists() {
+                    return CommandResult::Message(
+                        "Vault already exists. Use `mangocode vault set <provider>` to add keys."
+                            .to_string(),
+                    );
+                }
+                let pass1 = match prompt_secure("Enter vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                let pass2 = match prompt_secure("Confirm passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                if pass1 != pass2 {
+                    return CommandResult::Error("Passphrases don't match.".to_string());
+                }
+                let data = mangocode_core::vault::VaultData::default();
+                if let Err(e) = vault.save(&data, &pass1) {
+                    return CommandResult::Error(format!("Failed to initialize vault: {e}"));
+                }
+                mangocode_core::set_vault_passphrase(pass1);
+                CommandResult::Message("Vault created and unlocked for this process.".to_string())
+            }
+            "unlock" => {
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match prompt_secure("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                if let Err(e) = vault.load(&passphrase) {
+                    return CommandResult::Error(format!("Vault unlock failed: {e}"));
+                }
+                mangocode_core::set_vault_passphrase(passphrase);
+                CommandResult::Message("Vault unlocked for this process.".to_string())
+            }
+            "lock" => {
+                mangocode_core::clear_vault_passphrase();
+                CommandResult::Message("Vault locked for this process.".to_string())
+            }
+            "set" => {
+                let provider = match args.get(1).copied() {
+                    Some(p) => p,
+                    None => {
+                        return CommandResult::Error(
+                            "Usage: mangocode vault set <provider-id>".to_string(),
+                        )
+                    }
+                };
+                if !vault.exists() {
+                    return CommandResult::Error(
+                        "No vault found. Run `mangocode vault init` first.".to_string(),
+                    );
+                }
+                let passphrase = match prompt_secure("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                let secret = match prompt_secure(&format!("Enter secret for {provider}: ")) {
+                    Ok(s) => s,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                let label = match prompt_line("Label (optional): ") {
+                    Ok(s) => if s.is_empty() { None } else { Some(s) },
+                    Err(e) => return CommandResult::Error(e),
+                };
+                if let Err(e) = vault.set_secret(provider, &secret, &passphrase, label.as_deref())
+                {
+                    return CommandResult::Error(format!("Failed to store secret: {e}"));
+                }
+                CommandResult::Message(format!("Stored secret for '{provider}' in vault."))
+            }
+            "get" => {
+                let provider = match args.get(1).copied() {
+                    Some(p) => p,
+                    None => {
+                        return CommandResult::Error(
+                            "Usage: mangocode vault get <provider-id>".to_string(),
+                        )
+                    }
+                };
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match prompt_secure("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                match vault.get_secret(provider, &passphrase) {
+                    Ok(Some(_)) => CommandResult::Message(format!(
+                        "Provider '{provider}' has a stored secret in the vault."
+                    )),
+                    Ok(None) => CommandResult::Message(format!(
+                        "Provider '{provider}' does not have a secret stored."
+                    )),
+                    Err(e) => CommandResult::Error(format!("Failed to read vault: {e}")),
+                }
+            }
+            "list" => {
+                if !vault.exists() {
+                    return CommandResult::Message("Vault is empty (no vault file).".to_string());
+                }
+                let passphrase = match prompt_secure("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                match vault.list_providers(&passphrase) {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            CommandResult::Message("Vault is empty.".to_string())
+                        } else {
+                            let rows = entries
+                                .into_iter()
+                                .map(|(provider, label, updated_at)| {
+                                    format!(
+                                        "{}{} — updated {}",
+                                        provider,
+                                        label
+                                            .as_ref()
+                                            .map(|l| format!(" ({})", l))
+                                            .unwrap_or_default(),
+                                        updated_at
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            CommandResult::Message(rows.join("\n"))
+                        }
+                    }
+                    Err(e) => CommandResult::Error(format!("Failed to read vault: {e}")),
+                }
+            }
+            "remove" => {
+                let provider = match args.get(1).copied() {
+                    Some(p) => p,
+                    None => {
+                        return CommandResult::Error(
+                            "Usage: mangocode vault remove <provider-id>".to_string(),
+                        )
+                    }
+                };
+                if !vault.exists() {
+                    return CommandResult::Error("No vault found.".to_string());
+                }
+                let passphrase = match prompt_secure("Vault passphrase: ") {
+                    Ok(p) => p,
+                    Err(e) => return CommandResult::Error(e),
+                };
+                if let Err(e) = vault.remove_secret(provider, &passphrase) {
+                    return CommandResult::Error(format!("Failed to remove secret: {e}"));
+                }
+                CommandResult::Message(format!("Removed secret for '{provider}' from vault."))
+            }
+            "export" => {
+                if vault.exists() {
+                    CommandResult::Message(format!("Vault path: {}", vault.path().display()))
+                } else {
+                    CommandResult::Message("No vault exists.".to_string())
+                }
+            }
+            _ => CommandResult::Error(format!("Unknown vault subcommand: '{sub}'")),
+        }
     }
 }
 
@@ -1149,6 +1415,7 @@ pub fn all_named_commands() -> Vec<Box<dyn NamedCommand>> {
     vec![
         Box::new(AgentsCommand),
         Box::new(AddDirCommand),
+        Box::new(VaultNamedCommand),
         Box::new(BranchCommand),
         Box::new(TagCommand),
         Box::new(PassesCommand),
