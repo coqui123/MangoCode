@@ -1145,10 +1145,17 @@ impl App {
                     // -- RECOMMENDED --
                     SelectItem {
                         id: "anthropic".into(),
-                        title: "Anthropic".into(),
-                        description: "".into(),
+                        title: "Anthropic (API Key)".into(),
+                        description: "API key from console.anthropic.com".into(),
                         category: "Recommended".into(),
                         badge: None,
+                    },
+                    SelectItem {
+                        id: "anthropic-max".into(),
+                        title: "Claude Max (OAuth)".into(),
+                        description: "Login with Claude Pro/Max subscription".into(),
+                        category: "Recommended".into(),
+                        badge: Some("OAUTH".into()),
                     },
                     SelectItem {
                         id: "openai".into(),
@@ -2852,7 +2859,10 @@ impl App {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
-                        let credential = if provider_id == "github-copilot" {
+                        let credential = if provider_id == "github-copilot"
+                            || provider_id == mangocode_core::provider_id::ANTHROPIC_MAX
+                        {
+                            // OAuth flows store a Bearer token, not a plain API key.
                             mangocode_core::StoredCredential::OAuthToken {
                                 access: token.clone(),
                                 refresh: token,
@@ -2966,7 +2976,6 @@ impl App {
                             }
                             "anthropic" => {
                                 // Anthropic: use API key from console.anthropic.com
-                                // (OAuth requires a registered app which MangoCode doesn't have)
                                 self.key_input_dialog
                                     .open("anthropic".into(), "Anthropic (API Key)".into());
                                 self.status_message = Some(format!(
@@ -2974,6 +2983,16 @@ impl App {
                                     get_env_var_for_provider("anthropic"),
                                     get_url_for_provider("anthropic")
                                 ));
+                            }
+                            "anthropic-max" => {
+                                // Claude Max: browser-based OAuth login with Claude.ai
+                                self.device_auth_dialog
+                                    .open("anthropic-max".into(), "Claude Max (OAuth)".into());
+                                self.device_auth_pending = Some("anthropic-max".to_string());
+                                self.status_message = Some(
+                                    "Step 2/3: complete browser OAuth login with your Claude subscription. Step 3/3 will finish automatically."
+                                        .to_string(),
+                                );
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow with MangoCode's registered OAuth app

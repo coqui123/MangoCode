@@ -12,8 +12,8 @@ use crate::client::ClientConfig;
 use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
-    AnthropicProvider, AzureProvider, BedrockProvider, CohereProvider, CopilotProvider,
-    GoogleProvider, MinimaxProvider, OpenAiProvider, VertexOpenAiProvider,
+    AnthropicMaxProvider, AnthropicProvider, AzureProvider, BedrockProvider, CohereProvider,
+    CopilotProvider, GoogleProvider, MinimaxProvider, OpenAiProvider, VertexOpenAiProvider,
 };
 
 /// Registry of all available LLM providers.
@@ -171,6 +171,15 @@ impl ProviderRegistry {
         self
     }
 
+    /// Register [`AnthropicMaxProvider`] if an `anthropic-max` OAuth token is
+    /// stored in the auth store. Returns `&mut self` for builder chaining.
+    pub fn with_anthropic_max_if_configured(&mut self) -> &mut Self {
+        if let Some(p) = AnthropicMaxProvider::from_auth_store() {
+            self.register(Arc::new(p));
+        }
+        self
+    }
+
     /// Build a registry with **all** providers that have credentials configured
     /// in the environment.  Anthropic is always the default provider.
     ///
@@ -185,6 +194,7 @@ impl ProviderRegistry {
             .with_copilot_if_configured()
             .with_cohere_if_key_set()
             .with_vertex_if_configured()
+            .with_anthropic_max_if_configured()
             .with_available_providers();
         registry
     }
@@ -219,6 +229,10 @@ impl ProviderRegistry {
                 }
                 use crate::providers::openai_compat_providers as p;
                 let provider: Option<Arc<dyn LlmProvider>> = match provider_id.as_str() {
+                    "anthropic-max" => {
+                        // Claude Max uses Bearer auth — create from the OAuth access token
+                        Some(Arc::new(AnthropicMaxProvider::new(key)))
+                    }
                     "openai" => Some(Arc::new(OpenAiProvider::new(key))),
                     "google" => Some(Arc::new(GoogleProvider::new(key))),
                     "minimax" => Some(Arc::new(MinimaxProvider::new(key))),

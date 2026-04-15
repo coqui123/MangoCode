@@ -1,6 +1,8 @@
-// WARNING: The OAuth client IDs in this module are registered to Anthropic's Claude Code CLI.
-// They will not work for MangoCode. This module is preserved for reference but disabled.
-// Users should authenticate via API key (/connect → Anthropic → paste key).
+// OAuth 2.0 PKCE login flow for the MangoCode CLI (Claude Max provider).
+//
+// Uses the same OAuth client IDs as Claude Code to authenticate with Anthropic's
+// Claude.ai OAuth endpoints. This enables Bearer-token auth for Claude Max
+// subscriptions (user:inference scope) as an alternative to API key auth.
 //
 // OAuth 2.0 PKCE login flow for the MangoCode CLI.
 //

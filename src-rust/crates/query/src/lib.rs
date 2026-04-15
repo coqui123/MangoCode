@@ -218,6 +218,10 @@ pub struct QueryConfig {
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<mangocode_api::ModelRegistry>>,
+    /// Active OAuth provider, if any. Drives system-prompt identity text so the
+    /// model receives the correct product branding (e.g. Claude Code / Max wording).
+    /// Set from `app.config.provider` at query-dispatch time — no disk reads needed.
+    pub oauth_provider: mangocode_core::system_prompt::OAuthProvider,
 }
 
 impl Default for QueryConfig {
@@ -243,6 +247,7 @@ impl Default for QueryConfig {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
         }
     }
 }
@@ -3034,6 +3039,9 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        // oauth_provider is set at query-dispatch time from app.config.provider,
+        // so we just thread it through here — no disk reads required.
+        oauth_provider: config.oauth_provider,
         ..Default::default()
     };
 
@@ -3052,6 +3060,8 @@ fn build_system_prompt_with_git_context(
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        // Thread through the oauth_provider set at query-dispatch time.
+        oauth_provider: config.oauth_provider,
         ..Default::default()
     };
 

@@ -190,6 +190,65 @@ impl SystemPromptPrefix {
 }
 
 // ---------------------------------------------------------------------------
+// OAuth provider identity — dynamic system prompt variable
+// ---------------------------------------------------------------------------
+
+/// Which OAuth provider is active for the current session.
+///
+/// When the user authenticates via an OAuth provider (e.g. Claude Max, Codex),
+/// the system prompt attribution line is updated to reflect the official
+/// product identity. This matches how Claude Code identifies itself when
+/// running under its own OAuth credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OAuthProvider {
+    /// No OAuth provider active — use default MangoCode identity.
+    #[default]
+    None,
+    /// Anthropic Claude Max (claude.ai OAuth, user:inference scope).
+    /// Uses official Claude Code identity in the system prompt.
+    AnthropicMax,
+    /// OpenAI Codex (chatgpt.com OAuth).
+    OpenAiCodex,
+    /// GitHub Copilot (device code flow).
+    GitHubCopilot,
+}
+
+impl OAuthProvider {
+    /// Returns the system prompt identity/attribution string for this provider.
+    ///
+    /// When an OAuth provider is active, we use the official product identity
+    /// (e.g. "Claude Code" for Anthropic Max) so the model receives the
+    /// correct persona context matching its training.
+    pub fn identity_text(self) -> &'static str {
+        match self {
+            Self::None => "You are MangoCode, a powerful coding assistant built on Claude.",
+            Self::AnthropicMax => {
+                "You are Claude Code, Anthropic's official CLI for Claude. \
+                You are running through MangoCode with a Claude Max subscription."
+            }
+            Self::OpenAiCodex => {
+                "You are MangoCode, running with an OpenAI Codex subscription. \
+                You have access to OpenAI's Codex models for code generation."
+            }
+            Self::GitHubCopilot => {
+                "You are MangoCode, running with GitHub Copilot. \
+                You have access to GitHub Copilot's models for code assistance."
+            }
+        }
+    }
+
+    /// Detect from a provider ID string (e.g. from auth_store key).
+    pub fn from_provider_id(id: &str) -> Self {
+        match id {
+            "anthropic-max" => Self::AnthropicMax,
+            "openai-codex" | "codex" => Self::OpenAiCodex,
+            "github-copilot" => Self::GitHubCopilot,
+            _ => Self::None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Build options
 // ---------------------------------------------------------------------------
 
@@ -198,6 +257,8 @@ impl SystemPromptPrefix {
 pub struct SystemPromptOptions {
     /// Override auto-detected prefix.
     pub prefix: Option<SystemPromptPrefix>,
+    /// Active OAuth provider (affects attribution identity).
+    pub oauth_provider: OAuthProvider,
     /// Whether the session is non-interactive (SDK / pipe mode).
     pub is_non_interactive: bool,
     /// Whether --append-system-prompt is set (affects prefix detection).
@@ -254,8 +315,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // ------------------------------------------------------------------ //
 
     let mut parts: Vec<String> = vec![
-        // 1. Attribution header
-        prefix.attribution_text().to_string(),
+        // 1. Attribution header — OAuth provider overrides default prefix
+        if opts.oauth_provider != OAuthProvider::None {
+            opts.oauth_provider.identity_text().to_string()
+        } else {
+            prefix.attribution_text().to_string()
+        },
         // 2. Core capabilities
         CORE_CAPABILITIES.to_string(),
         // 3. Tool use guidelines

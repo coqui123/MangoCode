@@ -2799,6 +2799,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        // Propagate active OAuth provider so system-prompt identity
+                        // text reflects the correct product branding (e.g. Claude Max).
+                        qcfg.oauth_provider =
+                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                            );
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -3138,6 +3144,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             &model_registry,
                         );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        qcfg.oauth_provider =
+                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                            );
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -3250,6 +3260,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 qcfg.model =
                     mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.oauth_provider =
+                    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                        cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                    );
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -3337,6 +3351,55 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             }
                             Err(e) => {
                                 let _ = tx2.send(DeviceAuthEvent::Error(e)).await;
+                            }
+                        }
+                    });
+                }
+                "anthropic-max" => {
+                    let tx2 = device_auth_tx.clone();
+                    // Claude Max (OAuth) — PKCE flow using Claude Code's registered client ID.
+                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
+                    tokio::spawn(async move {
+                        // Signal the dialog to enter browser-waiting state
+                        let placeholder_url = "Opening browser for Claude authentication…".to_string();
+                        let _ = tx2
+                            .send(DeviceAuthEvent::GotBrowserUrl {
+                                url: placeholder_url,
+                            })
+                            .await;
+
+                        match crate::oauth_flow::run_oauth_login_flow(true).await {
+                            Ok(result) => {
+                                // Persist into AuthStore under "anthropic-max"
+                                let mut store = mangocode_core::AuthStore::load();
+                                // Unwrap tokens: we need refresh + expiry for full storage.
+                                // access_token is in result.credential when use_bearer_auth=true.
+                                let (refresh_tok, expires_u64) = (
+                                    result
+                                        .tokens
+                                        .refresh_token
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    result
+                                        .tokens
+                                        .expires_at_ms
+                                        .map(|ms| ms as u64)
+                                        .unwrap_or(0),
+                                );
+                                store.set(
+                                    mangocode_core::provider_id::ANTHROPIC_MAX,
+                                    mangocode_core::auth_store::StoredCredential::OAuthToken {
+                                        access: result.credential.clone(),
+                                        refresh: refresh_tok,
+                                        expires: expires_u64,
+                                    },
+                                );
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(result.credential))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e.to_string())).await;
                             }
                         }
                     });

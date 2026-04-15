@@ -41,3 +41,6 @@ pub use vertex_openai::VertexOpenAiProvider;
 
 pub mod mock;
 pub use mock::MockProvider;
+
+pub mod anthropic_oauth;
+pub use anthropic_oauth::AnthropicMaxProvider;

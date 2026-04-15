@@ -173,6 +173,8 @@ impl ModelPickerState {
 
         for m in models {
             let provider = if let Some((p, _)) = m.split_once('/') {
+                // If the slash-prefix is "anthropic-max", keep it intact so the
+                // Max section is populated correctly.
                 p.to_string()
             } else {
                 // Bare model name — detect provider from model name
@@ -192,13 +194,15 @@ impl ModelPickerState {
         }
 
         // Define display order
-        let order = ["anthropic", "openai", "google", "ollama", "other"];
+        // anthropic-max appears first so Claude Max is always at the top.
+        let order = ["anthropic-max", "anthropic", "openai", "google", "ollama", "other"];
         let mut sections = Vec::new();
         for provider in order {
             if let Some(models) = by_provider.remove(provider) {
                 sections.push(ProviderSection {
                     provider_name: match provider {
-                        "anthropic" => "ANTHROPIC".to_string(),
+                        "anthropic-max" => "ANTHROPIC (Max — OAuth)".to_string(),
+                        "anthropic" => "ANTHROPIC (API Key)".to_string(),
                         "openai" => "OPENAI".to_string(),
                         "google" => "GOOGLE".to_string(),
                         "ollama" => "OLLAMA (local)".to_string(),
@@ -288,6 +292,26 @@ pub fn models_for_provider_from_registry(
 /// returned a live model list.
 pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
     match provider_id {
+        // Claude Max via OAuth — same model surface as the API provider, but
+        // authenticated via Bearer token (user:inference scope).  The models are
+        // identical; only the auth path differs.
+        "anthropic-max" => vec![
+            model_entry(
+                "claude-opus-4-6",
+                "Claude Opus 4.6",
+                "Most capable — Claude Max subscription required",
+            ),
+            model_entry(
+                "claude-sonnet-4-6",
+                "Claude Sonnet 4.6",
+                "Balanced performance — Claude Max subscription required",
+            ),
+            model_entry(
+                "claude-haiku-4-5-20251001",
+                "Claude Haiku 4.5",
+                "Fast and efficient — Claude Max subscription required",
+            ),
+        ],
         "anthropic" => vec![
             model_entry(
                 "claude-opus-4-6",
@@ -460,6 +484,8 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
 /// immediately shows the right model.
 pub fn default_model_for_provider(provider_id: &str) -> String {
     match provider_id {
+        // Claude Max via OAuth — bare model IDs (no provider prefix), same as anthropic.
+        "anthropic-max" => "claude-opus-4-6".to_string(),
         "anthropic" => "claude-opus-4-6".to_string(),
         "openai" => "openai/gpt-4o".to_string(),
         "google" => "google/gemini-2.5-flash".to_string(),
