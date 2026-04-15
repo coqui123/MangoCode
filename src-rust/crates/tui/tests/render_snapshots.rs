@@ -77,7 +77,7 @@ fn tool_use_shows_summary() {
 #[test]
 fn tool_result_success_shows_output() {
     // Renders raw output lines without a separate header.
-    let lines = render_tool_result_success("output here", false);
+    let lines = render_tool_result_success("output here", false, false);
     assert!(!lines.is_empty());
     let combined = flatten(&lines);
     assert!(combined.contains("output here"));
@@ -85,7 +85,7 @@ fn tool_result_success_shows_output() {
 
 #[test]
 fn tool_result_success_truncated_notice() {
-    let lines = render_tool_result_success("some output", true);
+    let lines = render_tool_result_success("some output", true, false);
     let combined = flatten(&lines);
     assert!(combined.contains("truncated"));
 }

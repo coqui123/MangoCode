@@ -129,7 +129,7 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 /// - **Shift+Tab**: Reverse indent/unindent in input (cycle permission mode)
 /// - **Ctrl+H**: Delete character before cursor (Chat context, Emacs-style)
 /// - **Alt+H**: Open help (alternative to F1)
-/// - **Ctrl+O**: Jump back in history (command history)
+/// - **Ctrl+O**: Expand/collapse truncated tool output when applicable; otherwise previous history entry
 /// - **Ctrl+I**: Jump forward in history
 /// - **Alt+D**: Delete word forward (already implemented)
 /// - **Ctrl+V**: Paste from clipboard (already implemented)
@@ -169,6 +169,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+shift+.", "transcript.issue.prev", KeyContext::Chat),
         ("alt+left", "transcript.jump.prev", KeyContext::Chat),
         ("alt+right", "transcript.jump.next", KeyContext::Chat),
+        // Ctrl+O is handled first in the TUI for tool-output expand; if nothing matches, history prev applies.
         ("ctrl+o", "history.entry.prev", KeyContext::Chat),
         ("ctrl+i", "history.entry.next", KeyContext::Chat),
         // Searching

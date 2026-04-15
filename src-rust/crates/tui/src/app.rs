@@ -34,7 +34,7 @@ use mangocode_core::file_history::FileHistory;
 use mangocode_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
-use mangocode_core::types::{Message, Role};
+use mangocode_core::types::{ContentBlock, Message, Role};
 use mangocode_query::QueryEvent;
 use mangocode_tools;
 use ratatui::backend::CrosstermBackend;
@@ -308,6 +308,8 @@ pub struct ToolUseBlock {
     pub name: String,
     pub status: ToolStatus,
     pub output_preview: Option<String>,
+    /// Full tool result text (staging area); used when the user expands with Ctrl+O.
+    pub full_output: Option<String>,
     /// JSON-serialised input for the tool call (populated from the API stream).
     pub input_json: String,
 }
@@ -813,6 +815,8 @@ pub struct App {
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
+    /// `tool_use_id`s whose tool output is expanded (live staging + transcript).
+    pub expanded_tool_outputs: std::collections::HashSet<String>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
     /// The frame region that supports text selection.
@@ -1542,6 +1546,7 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
+            expanded_tool_outputs: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
@@ -2474,6 +2479,70 @@ impl App {
     pub fn invalidate_transcript(&self) {
         self.transcript_version
             .set(self.transcript_version.get().wrapping_add(1));
+    }
+
+    /// Toggle expand/collapse for the most recent expandable tool output (staging or transcript).
+    /// Returns `true` when a toggle was applied (so Ctrl+O should not fall through to history).
+    pub fn toggle_tool_output_expand(&mut self) -> bool {
+        for block in self.tool_use_blocks.iter().rev() {
+            if !Self::live_tool_block_expandable(block) {
+                continue;
+            }
+            let id = block.id.clone();
+            if self.expanded_tool_outputs.contains(&id) {
+                self.expanded_tool_outputs.remove(&id);
+            } else {
+                self.expanded_tool_outputs.insert(id);
+            }
+            self.invalidate_transcript();
+            return true;
+        }
+
+        let tool_names = crate::render::build_tool_names(&self.messages);
+        for msg in self.messages.iter().rev() {
+            for block in msg.content_blocks().iter().rev() {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } = block
+                {
+                    let text = crate::messages::tool_result_text(content);
+                    let name = tool_names.get(tool_use_id).map(|s| s.as_str());
+                    if !crate::messages::transcript_tool_output_expandable(name, &text) {
+                        continue;
+                    }
+                    if self.expanded_tool_outputs.contains(tool_use_id) {
+                        self.expanded_tool_outputs.remove(tool_use_id);
+                    } else {
+                        self.expanded_tool_outputs.insert(tool_use_id.clone());
+                    }
+                    self.invalidate_transcript();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn live_tool_block_expandable(block: &ToolUseBlock) -> bool {
+        if block.full_output.is_none() {
+            return false;
+        }
+        if matches!(block.status, ToolStatus::Running) {
+            return false;
+        }
+        let Some(full) = block.full_output.as_deref() else {
+            return false;
+        };
+        let total = full.lines().count();
+        if total > 3 {
+            return true;
+        }
+        block
+            .output_preview
+            .as_deref()
+            .map_or(false, |p| p.contains("more lines"))
     }
 
     /// Check current token usage and push token warning notifications as
@@ -3537,6 +3606,16 @@ impl App {
             self.prompt_input.insert_newline();
             self.refresh_prompt_input();
             self.activate_paste_burst(now);
+            return false;
+        }
+
+        // Ctrl+O: expand/collapse truncated tool output when possible; otherwise
+        // keep the default binding (history prev).
+        if key.code == KeyCode::Char('o')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.current_key_context() == KeyContext::Chat
+            && self.toggle_tool_output_expand()
+        {
             return false;
         }
 
@@ -5244,6 +5323,7 @@ impl App {
                 if let Some(existing) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     existing.status = ToolStatus::Running;
                     existing.output_preview = None;
+                    existing.full_output = None;
                     existing.input_json = input_json;
                 } else {
                     self.tool_use_blocks.push(ToolUseBlock {
@@ -5251,6 +5331,7 @@ impl App {
                         name: tool_name,
                         status: ToolStatus::Running,
                         output_preview: None,
+                        full_output: None,
                         input_json,
                     });
                 }
@@ -5272,6 +5353,11 @@ impl App {
                 if remaining > 0 {
                     preview.push_str(&format!("\n\u{2026} {} more lines", remaining));
                 }
+                if is_error {
+                    self.status_message = Some(format!("Tool error: {}", &result));
+                } else {
+                    self.status_message = None;
+                }
                 if let Some(block) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     block.status = if is_error {
                         ToolStatus::Error
@@ -5279,13 +5365,9 @@ impl App {
                         ToolStatus::Done
                     };
                     block.output_preview = Some(preview);
+                    block.full_output = Some(result);
                 }
                 self.invalidate_transcript();
-                if is_error {
-                    self.status_message = Some(format!("Tool error: {}", result));
-                } else {
-                    self.status_message = None;
-                }
                 self.refresh_turn_diff_from_history();
             }
 

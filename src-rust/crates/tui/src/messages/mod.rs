@@ -5,7 +5,7 @@
 //! `render_message()` dispatcher routes to the correct renderer based
 //! on message content.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::kitty_image::render_image;
 use mangocode_core::types::{ContentBlock, Message, Role, ToolResultContent};
@@ -36,6 +36,8 @@ pub struct RenderContext {
     pub tool_names: HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
     pub expanded_thinking: std::collections::HashSet<u64>,
+    /// `tool_use_id`s with expanded tool output (Ctrl+O in transcript).
+    pub expanded_tool_outputs: HashSet<String>,
 }
 
 impl Default for RenderContext {
@@ -46,7 +48,18 @@ impl Default for RenderContext {
             show_thinking: false,
             tool_names: HashMap::new(),
             expanded_thinking: std::collections::HashSet::new(),
+            expanded_tool_outputs: HashSet::new(),
         }
+    }
+}
+
+/// Whether this tool result is truncated in the transcript and can be expanded with Ctrl+O.
+pub fn transcript_tool_output_expandable(tool_name: Option<&str>, text: &str) -> bool {
+    let n = text.lines().count();
+    match tool_name {
+        Some("Bash") | Some("PowerShell") => n > TOOL_RESULT_MAX_LINES,
+        Some("Read") | Some("Edit") | Some("Write") => false,
+        _ => n > TOOL_RESULT_MAX_LINES,
     }
 }
 
@@ -60,7 +73,9 @@ const TRUNCATE_USER_PROMPT_TAIL_CHARS: usize = 2_500;
 /// Golden mango accent
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 176, 32);
 
-const TOOL_RESULT_MAX_LINES: usize = 30;
+pub const TOOL_RESULT_MAX_LINES: usize = 30;
+
+const EXPANDED_TOOL_OUTPUT_MAX_LINES: usize = 10_000;
 
 /// Render a code block with optional language label. Uses basic styling
 /// since full syntect integration is behind a feature flag.
@@ -259,23 +274,38 @@ fn render_file_op_result(is_create: bool) -> Vec<Line<'static>> {
 }
 
 /// Render a tool result (success variant) — generic fallback.
-pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'static>> {
+pub fn render_tool_result_success(output: &str, truncated: bool, expanded: bool) -> Vec<Line<'static>> {
     let total_lines = output.lines().count();
+    let cap = if expanded {
+        EXPANDED_TOOL_OUTPUT_MAX_LINES
+    } else {
+        TOOL_RESULT_MAX_LINES
+    };
     let mut lines: Vec<Line<'static>> = output
         .lines()
-        .enumerate()
-        .take_while(|(i, _)| *i < TOOL_RESULT_MAX_LINES)
-        .map(|(_, l)| {
+        .take(cap)
+        .map(|l| {
             Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::raw(l.to_string()),
             ])
         })
         .collect();
-    if total_lines > TOOL_RESULT_MAX_LINES {
+    if !expanded && total_lines > TOOL_RESULT_MAX_LINES {
         let remaining = total_lines - TOOL_RESULT_MAX_LINES;
         lines.push(Line::from(vec![Span::styled(
             format!("  ... {} more lines  (ctrl+o to expand)", remaining),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )]));
+    } else if expanded && total_lines > EXPANDED_TOOL_OUTPUT_MAX_LINES {
+        let remaining = total_lines - EXPANDED_TOOL_OUTPUT_MAX_LINES;
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  ... {} more lines (use an editor for very large output)",
+                remaining
+            ),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -715,7 +745,7 @@ fn flush_text(lines: &mut Vec<Line<'static>>, role: &Role, text: &mut String, ct
     text.clear();
 }
 
-fn tool_result_text(content: &ToolResultContent) -> String {
+pub fn tool_result_text(content: &ToolResultContent) -> String {
     match content {
         ToolResultContent::Text(text) => text.clone(),
         ToolResultContent::Blocks(blocks) => {
@@ -807,17 +837,23 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let text = tool_result_text(&content);
                 let tool_name = ctx.tool_names.get(&tool_use_id).map(|s| s.as_str());
+                let expanded = ctx.expanded_tool_outputs.contains(&tool_use_id);
                 let rendered = if is_error.unwrap_or(false) {
                     render_tool_result_error(&text)
                 } else {
                     match tool_name {
                         Some("Bash") | Some("PowerShell") => {
-                            render_bash_output_block(&text, TOOL_RESULT_MAX_LINES)
+                            let cap = if expanded {
+                                EXPANDED_TOOL_OUTPUT_MAX_LINES
+                            } else {
+                                TOOL_RESULT_MAX_LINES
+                            };
+                            render_bash_output_block(&text, cap)
                         }
                         Some("Read") => render_file_read_result(&text),
                         Some("Edit") => render_file_op_result(false),
                         Some("Write") => render_file_op_result(true),
-                        _ => render_tool_result_success(&text, false),
+                        _ => render_tool_result_success(&text, false, expanded),
                     }
                 };
                 lines.extend(prefix_message_lines(rendered, &msg.role, ctx.width));
@@ -1350,7 +1386,7 @@ mod tests {
             .map(|i| format!("line {}", i))
             .collect::<Vec<_>>()
             .join("\n");
-        let result = render_tool_result_success(&output, false);
+        let result = render_tool_result_success(&output, false, false);
         // 30 content lines + 1 overflow indicator = 31 (no separate header line)
         assert_eq!(result.len(), 31);
         let overflow_text = line_text(result.last().unwrap());

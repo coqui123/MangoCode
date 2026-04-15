@@ -367,6 +367,18 @@ fn flatten_line_text(line: &Line<'_>) -> String {
         .join("")
 }
 
+fn hash_expanded_tool_outputs(set: &std::collections::HashSet<String>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut v: Vec<_> = set.iter().collect();
+    v.sort();
+    let mut h = DefaultHasher::new();
+    for id in v {
+        id.hash(&mut h);
+    }
+    h.finish()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageLinesCacheKey {
     width: u16,
@@ -375,6 +387,7 @@ struct MessageLinesCacheKey {
     annotations_ptr: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
+    tool_outputs_expand_fp: u64,
 }
 
 #[derive(Clone)]
@@ -390,6 +403,7 @@ struct CompletedMsgCacheKey {
     messages_len: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
+    tool_outputs_expand_fp: u64,
 }
 
 #[derive(Clone)]
@@ -1221,6 +1235,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let streaming = !app.streaming_text.is_empty();
     let has_tool_blocks = !app.tool_use_blocks.is_empty();
     let cacheable = !streaming && !has_tool_blocks;
+    let tool_outputs_expand_fp = hash_expanded_tool_outputs(&app.expanded_tool_outputs);
 
     // Fast path: nothing live — use the full-result cache (ptr-stable check).
     let full_key = MessageLinesCacheKey {
@@ -1230,6 +1245,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
+        tool_outputs_expand_fp,
     };
     if cacheable {
         if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
@@ -1252,6 +1268,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         messages_len: app.messages.len(),
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
+        tool_outputs_expand_fp,
     };
     let completed_lines: Vec<RenderedLineItem> = if let Some(lines) =
         COMPLETED_MSG_CACHE.with(|cache| {
@@ -1286,6 +1303,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     width as usize,
                     &tool_names,
                     &app.thinking_expanded,
+                    &app.expanded_tool_outputs,
                 );
                 if raw.len() > msg_start {
                     header_indices.insert(msg_start);
@@ -1331,7 +1349,12 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let mut live: Vec<Line> = Vec::new();
 
     for block in &app.tool_use_blocks {
-        render_tool_block_lines(&mut live, block, app.frame_count);
+        render_tool_block_lines(
+            &mut live,
+            block,
+            app.frame_count,
+            &app.expanded_tool_outputs,
+        );
     }
 
     if streaming {
@@ -1616,7 +1639,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Build a tool_use_id → tool_name lookup from all messages in the transcript.
 /// This allows ToolResult blocks to dispatch to tool-specific renderers.
-fn build_tool_names(
+pub(crate) fn build_tool_names(
     messages: &[mangocode_core::types::Message],
 ) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
@@ -1636,6 +1659,7 @@ fn render_message_lines(
     width: usize,
     tool_names: &std::collections::HashMap<String, String>,
     expanded_thinking: &std::collections::HashSet<u64>,
+    expanded_tool_outputs: &std::collections::HashSet<String>,
 ) {
     let rendered = render_message(
         msg,
@@ -1645,6 +1669,7 @@ fn render_message_lines(
             show_thinking: false,
             tool_names: tool_names.clone(),
             expanded_thinking: expanded_thinking.clone(),
+            expanded_tool_outputs: expanded_tool_outputs.clone(),
         },
     );
 
@@ -1721,10 +1746,31 @@ fn render_system_annotation_lines(
 
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+fn live_staging_tool_block_expandable(block: &crate::app::ToolUseBlock) -> bool {
+    if block.full_output.is_none() {
+        return false;
+    }
+    if matches!(block.status, ToolStatus::Running) {
+        return false;
+    }
+    let Some(full) = block.full_output.as_deref() else {
+        return false;
+    };
+    let total = full.lines().count();
+    if total > 3 {
+        return true;
+    }
+    block
+        .output_preview
+        .as_deref()
+        .map_or(false, |p| p.contains("more lines"))
+}
+
 fn render_tool_block_lines(
     lines: &mut Vec<Line<'static>>,
     block: &crate::app::ToolUseBlock,
     frame_count: u64,
+    expanded_ids: &std::collections::HashSet<String>,
 ) {
     // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error
     let (icon_color, name_color) = match block.status {
@@ -1795,12 +1841,36 @@ fn render_tool_block_lines(
         }
     }
 
-    // Output preview (done/error state)
-    if let Some(ref preview) = block.output_preview {
-        let preview_style = match block.status {
-            ToolStatus::Error => Style::default().fg(Color::Red),
-            _ => Style::default().fg(Color::DarkGray),
-        };
+    let expanded = expanded_ids.contains(&block.id);
+    let preview_style = match block.status {
+        ToolStatus::Error => Style::default().fg(Color::Red),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+
+    // Full output when expanded; otherwise truncated preview
+    if expanded {
+        if let Some(ref full) = block.full_output {
+            const MAX_LINES: usize = 10_000;
+            for line_text in full.lines().take(MAX_LINES) {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(line_text.to_string(), preview_style),
+                ]));
+            }
+            let total = full.lines().count();
+            if total > MAX_LINES {
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "    ... {} more lines (use an editor for very large output)",
+                        total - MAX_LINES
+                    ),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )]));
+            }
+        }
+    } else if let Some(ref preview) = block.output_preview {
         for line_text in preview.lines() {
             if line_text.starts_with('\u{2026}') {
                 lines.push(Line::from(vec![
@@ -1821,13 +1891,14 @@ fn render_tool_block_lines(
         }
     }
 
-    // (ctrl+o to expand) hint
-    lines.push(Line::from(vec![Span::styled(
-        "  (ctrl+o to expand)".to_string(),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )]));
+    if live_staging_tool_block_expandable(block) && !expanded {
+        lines.push(Line::from(vec![Span::styled(
+            "  (ctrl+o to expand)".to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )]));
+    }
 }
 
 // -----------------------------------------------------------------------

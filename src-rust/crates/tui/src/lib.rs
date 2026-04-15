@@ -1136,6 +1136,7 @@ mod tests {
             name: "Read".to_string(),
             status: ToolStatus::Running,
             output_preview: None,
+            full_output: None,
             input_json: r#"{"file_path":"foo.rs"}"#.to_string(),
         });
         app.handle_query_event(mangocode_query::QueryEvent::ToolEnd {
