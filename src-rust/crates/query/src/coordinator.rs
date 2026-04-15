@@ -240,6 +240,65 @@ pub fn match_session_mode_from_agent_mode(session_mode: AgentMode) -> Option<Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1: Intent-based skill resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve which skills should be auto-loaded for a given user message by
+/// matching against each skill's declared trigger phrases.
+///
+/// Returns an ordered list of `(skill_name, skill_template)` pairs that should
+/// be injected into `SystemPromptOptions::injected_skills` **before** the model
+/// API call is made. Dependencies are resolved and deduplicated by the caller
+/// via `skill_discovery::load_skill_with_dependencies`.
+///
+/// # Design
+///
+/// This is the Phase 1 bridge between the turn loop and the skill system.
+/// Call it inside the query-build path, parallel to context gathering:
+///
+/// ```rust
+/// // Pseudo-code — actual wiring depends on your query-builder structure
+/// let skill_index = discover_skills(&cwd, &config.skills);
+/// let matched = resolve_skills_for_turn(user_message, &skill_index);
+///
+/// // Expand with dependencies (depth-first, cycle-safe)
+/// let mut loaded = std::collections::HashSet::new();
+/// let mut skill_context: Vec<mangocode_core::skill_discovery::DiscoveredSkill> = Vec::new();
+/// for skill_name in &matched {
+///     mangocode_core::skill_discovery::load_skill_with_dependencies(
+///         skill_name, &skill_index, &mut loaded, &mut skill_context,
+///     );
+/// }
+///
+/// // Convert to (name, template) pairs for injection
+/// let injected_skills: Vec<(String, String)> = skill_context
+///     .iter()
+///     .map(|s| (s.name.clone(), s.template.clone()))
+///     .collect();
+///
+/// // Collect QA blocks for the dynamic section
+/// let skill_qa_blocks: Vec<String> = skill_context
+///     .iter()
+///     .filter_map(|s| mangocode_core::skill_discovery::format_qa_block(s))
+///     .collect();
+///
+/// // Install any bundled scripts into the session workspace
+/// for skill in &skill_context {
+///     mangocode_core::skill_discovery::install_skill_scripts(skill, &session_workspace);
+/// }
+/// ```
+pub fn resolve_skills_for_turn(
+    user_message: &str,
+    skill_index: &std::collections::HashMap<String, mangocode_core::skill_discovery::DiscoveredSkill>,
+) -> Vec<String> {
+    use mangocode_core::skill_discovery::resolve_skills_for_message;
+    resolve_skills_for_message(user_message, skill_index)
+        .into_iter()
+        .map(|s| s.name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

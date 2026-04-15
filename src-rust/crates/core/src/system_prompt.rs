@@ -286,6 +286,25 @@ pub struct SystemPromptOptions {
     pub coordinator_mode: bool,
     /// Skip auto-injecting platform/shell/date env info (set true only in tests).
     pub skip_env_info: bool,
+
+    /// Skills to inject into the cacheable section of the prompt.
+    ///
+    /// Each entry is a `(skill_name, skill_content)` pair assembled by the
+    /// skill resolver before the model request is built. Content is injected
+    /// as a `## Skill: <name>` block **before** the dynamic boundary so it
+    /// is eligible for Anthropic prompt caching.
+    ///
+    /// If a skill also declares QA steps, the caller should append the
+    /// formatted QA block to the **dynamic** section (after the boundary)
+    /// so it reads as a live task constraint, not cached boilerplate.
+    pub injected_skills: Vec<(String, String)>,
+
+    /// Mandatory QA blocks to inject **after** the dynamic boundary.
+    ///
+    /// Each entry is a pre-formatted QA block string (produced by
+    /// `skill_discovery::format_qa_block`). These are appended to the
+    /// dynamic section so they appear as a hard per-task constraint.
+    pub skill_qa_blocks: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +367,22 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(COORDINATOR_SYSTEM_PROMPT.to_string());
     }
 
+    // 8.5. Injected skills (cacheable: skill content is static reference material)
+    //
+    // Skills are injected here — before the dynamic boundary — so the API can
+    // cache them across turns. This mirrors the Perplexity Computer architecture
+    // where skill context is loaded into the model's working memory before any
+    // token is generated.
+    for (skill_name, skill_content) in &opts.injected_skills {
+        if !skill_content.trim().is_empty() {
+            parts.push(format!(
+                "\n## Skill: {}\n\n{}",
+                skill_name,
+                skill_content.trim()
+            ));
+        }
+    }
+
     // 9. Custom system prompt addition (appended to cacheable block)
     if let Some(custom) = &opts.custom_system_prompt {
         parts.push(format!(
@@ -381,6 +416,17 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 12. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!("\n<memory>\n{}\n</memory>", opts.memory_content));
+    }
+
+    // 12.5. Mandatory QA blocks from auto-loaded skills
+    //
+    // These are intentionally in the DYNAMIC section so they register as a
+    // live per-task constraint rather than background context. The emphatic
+    // wording in `format_qa_block` makes them non-ignorable.
+    for qa_block in &opts.skill_qa_blocks {
+        if !qa_block.trim().is_empty() {
+            parts.push(format!("\n{}", qa_block.trim()));
+        }
     }
 
     // 13. Appended system prompt (--append-system-prompt)
@@ -855,5 +901,76 @@ mod tests {
         clear_system_prompt_sections();
         let cache = section_cache().lock().unwrap();
         assert!(cache.is_empty());
+    }
+
+    // ---- Phase 6: skill injection -------------------------------------------
+
+    #[test]
+    fn test_injected_skills_in_cacheable_section() {
+        let opts = SystemPromptOptions {
+            injected_skills: vec![
+                ("rust-review".to_string(), "# Rust Review\nCheck for unwrap() misuse.".to_string()),
+            ],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+
+        // Skill must appear before the dynamic boundary (cacheable zone)
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let skill_pos = prompt.find("## Skill: rust-review").unwrap();
+        assert!(
+            skill_pos < boundary_pos,
+            "Injected skill must be in the cacheable section (before boundary)"
+        );
+        assert!(prompt.contains("Check for unwrap() misuse."));
+    }
+
+    #[test]
+    fn test_multiple_injected_skills_ordered() {
+        let opts = SystemPromptOptions {
+            injected_skills: vec![
+                ("design-foundations".to_string(), "Color palette rules.".to_string()),
+                ("pptx".to_string(), "Slide generation steps.".to_string()),
+            ],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let design_pos = prompt.find("## Skill: design-foundations").unwrap();
+        let pptx_pos = prompt.find("## Skill: pptx").unwrap();
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+
+        // Both before boundary, and in insertion order
+        assert!(design_pos < boundary_pos);
+        assert!(pptx_pos < boundary_pos);
+        assert!(design_pos < pptx_pos, "Dependencies should appear before the skill that depends on them");
+    }
+
+    #[test]
+    fn test_skill_qa_blocks_in_dynamic_section() {
+        let qa_block = "## Required QA for this task (skill: pptx)\nYou MUST complete ALL steps below.\n1. Run markitdown output.pptx".to_string();
+        let opts = SystemPromptOptions {
+            skill_qa_blocks: vec![qa_block],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+
+        // QA block must appear AFTER the dynamic boundary (volatile section)
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let qa_pos = prompt.find("Required QA for this task").unwrap();
+        assert!(
+            qa_pos > boundary_pos,
+            "QA enforcement block must be in the dynamic section (after boundary)"
+        );
+        assert!(prompt.contains("Run markitdown output.pptx"));
+    }
+
+    #[test]
+    fn test_empty_injected_skills_not_injected() {
+        let opts = SystemPromptOptions {
+            injected_skills: vec![("empty-skill".to_string(), "   ".to_string())],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(!prompt.contains("## Skill: empty-skill"), "Empty skill content should not be injected");
     }
 }
