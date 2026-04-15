@@ -2859,7 +2859,10 @@ impl App {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
-                        let credential = if provider_id == "github-copilot" {
+                        let credential = if provider_id == "github-copilot"
+                            || provider_id == mangocode_core::provider_id::ANTHROPIC_MAX
+                        {
+                            // OAuth flows store a Bearer token, not a plain API key.
                             mangocode_core::StoredCredential::OAuthToken {
                                 access: token.clone(),
                                 refresh: token,

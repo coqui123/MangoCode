@@ -218,6 +218,10 @@ pub struct QueryConfig {
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<mangocode_api::ModelRegistry>>,
+    /// Active OAuth provider, if any. Drives system-prompt identity text so the
+    /// model receives the correct product branding (e.g. Claude Code / Max wording).
+    /// Set from `app.config.provider` at query-dispatch time — no disk reads needed.
+    pub oauth_provider: mangocode_core::system_prompt::OAuthProvider,
 }
 
 impl Default for QueryConfig {
@@ -243,6 +247,7 @@ impl Default for QueryConfig {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
         }
     }
 }
@@ -3014,24 +3019,13 @@ fn build_todo_nudge(session_id: &str) -> String {
 /// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
 /// - `append_system_prompt` → `append_system_prompt` (added after boundary)
 fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
-    use mangocode_core::system_prompt::{gather_git_context, OAuthProvider, SystemPromptOptions};
+    use mangocode_core::system_prompt::{gather_git_context, SystemPromptOptions};
 
     let git_context = config
         .working_directory
         .as_deref()
         .map(gather_git_context)
         .unwrap_or_default();
-
-    // Detect active OAuth provider from the credential store so the system
-    // prompt identity text reflects the correct product branding.
-    let oauth_provider = {
-        let store = mangocode_core::AuthStore::load();
-        if store.get(mangocode_core::provider_id::ANTHROPIC_MAX).is_some() {
-            OAuthProvider::AnthropicMax
-        } else {
-            OAuthProvider::None
-        }
-    };
 
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
@@ -3045,7 +3039,9 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
-        oauth_provider,
+        // oauth_provider is set at query-dispatch time from app.config.provider,
+        // so we just thread it through here — no disk reads required.
+        oauth_provider: config.oauth_provider,
         ..Default::default()
     };
 
@@ -3057,18 +3053,6 @@ fn build_system_prompt_with_git_context(
     config: &QueryConfig,
     git_context: String,
 ) -> SystemPrompt {
-    use mangocode_core::system_prompt::OAuthProvider;
-
-    // Detect active OAuth provider from the credential store.
-    let oauth_provider = {
-        let store = mangocode_core::AuthStore::load();
-        if store.get(mangocode_core::provider_id::ANTHROPIC_MAX).is_some() {
-            OAuthProvider::AnthropicMax
-        } else {
-            OAuthProvider::None
-        }
-    };
-
     let opts = mangocode_core::system_prompt::SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
@@ -3076,7 +3060,8 @@ fn build_system_prompt_with_git_context(
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
-        oauth_provider,
+        // Thread through the oauth_provider set at query-dispatch time.
+        oauth_provider: config.oauth_provider,
         ..Default::default()
     };
 

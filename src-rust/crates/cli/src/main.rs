@@ -2799,6 +2799,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
                         qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        // Propagate active OAuth provider so system-prompt identity
+                        // text reflects the correct product branding (e.g. Claude Max).
+                        qcfg.oauth_provider =
+                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                            );
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -3138,6 +3144,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             &model_registry,
                         );
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        qcfg.oauth_provider =
+                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                            );
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -3250,6 +3260,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 qcfg.model =
                     mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.oauth_provider =
+                    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+                        cmd_ctx.config.provider.as_deref().unwrap_or(""),
+                    );
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
