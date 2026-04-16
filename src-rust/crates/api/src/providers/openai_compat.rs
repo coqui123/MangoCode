@@ -68,6 +68,18 @@ pub struct ProviderQuirks {
     /// Optional hard cap for `max_tokens` on providers/models with lower
     /// output ceilings than the default request budget.
     pub max_tokens_cap: Option<u32>,
+
+    /// When `true`, inject `preserve_thinking: true` into the request body
+    /// for models that support it (Qwen3.6-Plus agentic mode).
+    /// Retains reasoning traces across turns, improving decision consistency
+    /// and reducing redundant computation in long tool-heavy sessions.
+    /// Per Alibaba docs: recommended for agentic scenarios, default false.
+    pub preserve_thinking: bool,
+
+    /// When `Some(true)`, explicitly enable parallel tool calls for providers
+    /// that support it. When `Some(false)`, disable. `None` omits the param.
+    /// For Qwen3.6-Plus, parallel_tool_calls is supported via OpenAI compat.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +295,18 @@ impl OpenAiCompatProvider {
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
         }
+        // Qwen-specific: preserve_thinking keeps reasoning traces across turns.
+        // Only inject when the quirk is explicitly enabled (set by query layer
+        // via build_provider_options based on session heuristics).
+        if self.quirks.preserve_thinking {
+            body["preserve_thinking"] = json!(true);
+        }
+        // parallel_tool_calls: let providers that support it run tools concurrently.
+        if let Some(parallel) = self.quirks.parallel_tool_calls {
+            if !tools.is_empty() {
+                body["parallel_tool_calls"] = json!(parallel);
+            }
+        }
         merge_openai_compatible_options(&mut body, &request.provider_options);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -389,6 +413,16 @@ impl OpenAiCompatProvider {
         }
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
+        }
+        // Qwen-specific: preserve_thinking keeps reasoning traces across turns.
+        if self.quirks.preserve_thinking {
+            body["preserve_thinking"] = json!(true);
+        }
+        // parallel_tool_calls for providers that support concurrent tool execution.
+        if let Some(parallel) = self.quirks.parallel_tool_calls {
+            if !tools.is_empty() {
+                body["parallel_tool_calls"] = json!(parallel);
+            }
         }
         merge_openai_compatible_options(&mut body, &request.provider_options);
 

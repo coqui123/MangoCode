@@ -229,17 +229,26 @@ impl ModelRegistry {
     fn add_qwen_models(&mut self) {
         let pid = ProviderId::new("qwen");
 
-        // Keep this list intentionally small and high-signal.
-        // The live `/models` endpoint (when available) is the source of truth.
-        for (id, name, ctx, out, tool_calling, reasoning, vision) in [(
-            "qwen3.6-plus",
-            "Qwen 3.6 Pro",
-            128_000u32,
-            16_384u32,
-            true,
-            true,
-            true,
-        )] {
+        // Specs sourced from Alibaba Cloud Model Studio docs (April 2026).
+        // qwen3.6-plus: 1M context, 65,536 max output, native tool calling,
+        // hybrid thinking model (enable_thinking + preserve_thinking for agents).
+        // DashScope intl endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+        // Recommended agentic temperature: 1.0 (long-horizon), 0.6 (eval tasks).
+        // Default temperature override of 0.55 applied in ProviderQuirks.
+        for (id, name, ctx, out, tool_calling, reasoning, vision) in [
+            (
+                // Model ID used in DashScope API calls.
+                "qwen3.6-plus",
+                "Qwen 3.6 Plus",
+                // 1M token context window per official docs.
+                1_000_000u32,
+                // 65,536 max output tokens per official docs (some sources cite 66K).
+                65_536u32,
+                true,
+                true,
+                true,
+            ),
+        ] {
             self.insert(ModelEntry {
                 info: ModelInfo {
                     id: ModelId::new(id),

@@ -171,7 +171,23 @@ pub fn venice() -> OpenAiCompatProvider {
 }
 
 /// Qwen / Alibaba DashScope.  Reads `DASHSCOPE_API_KEY`.
-/// Uses a default temperature of 0.55 as recommended by Alibaba's docs.
+///
+/// Targets the DashScope international endpoint (Singapore).
+/// Model: qwen3.6-plus — 1M context, 65,536 max output, native tool calling,
+/// hybrid thinking (enable_thinking controlled by query layer via provider_options).
+///
+/// Key agentic parameters:
+///   - `enable_thinking`: injected via provider_options when thinking_budget is set
+///   - `preserve_thinking`: injected via quirks when FLAG_QWEN_PRESERVE_THINKING
+///     is enabled and session heuristics trigger (turn >= 4 or tool_calls >= 3)
+///   - `parallel_tool_calls`: enabled (Qwen3.6-Plus supports concurrent tool calls)
+///   - `reasoning_content`: the field carrying incremental reasoning tokens
+///   - `include_usage_in_stream`: true so token counts are available for budget tracking
+///
+/// Temperature guidance per Alibaba benchmark docs:
+///   - 1.0 for long-horizon / SWE-Bench style tasks
+///   - 0.6 for evaluation / structured tasks
+///   - We default to 0.6 as a balanced agentic default; callers can override.
 pub fn qwen() -> OpenAiCompatProvider {
     let key = std::env::var("DASHSCOPE_API_KEY").unwrap_or_default();
     OpenAiCompatProvider::new(
@@ -181,9 +197,17 @@ pub fn qwen() -> OpenAiCompatProvider {
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {
-        default_temperature: Some(0.55),
+        // 0.6 balanced default; query layer can bump to 1.0 for long-horizon tasks.
+        default_temperature: Some(0.6),
+        // DashScope returns incremental reasoning tokens in this field.
         reasoning_field: Some("reasoning_content".to_string()),
+        // Required to receive token counts in streaming responses.
         include_usage_in_stream: true,
+        // Qwen3.6-Plus supports parallel tool calls; enable for faster agentic loops.
+        parallel_tool_calls: Some(true),
+        // preserve_thinking is toggled at runtime by the query layer based on
+        // FLAG_QWEN_PRESERVE_THINKING and session heuristics; start false here.
+        preserve_thinking: false,
         ..Default::default()
     })
 }

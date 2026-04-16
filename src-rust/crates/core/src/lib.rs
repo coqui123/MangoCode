@@ -100,7 +100,8 @@ pub mod skill_discovery;
 pub use cost::CostTracker;
 pub use feature_flags::{
     FeatureFlagManager, FeatureFlags, FLAG_AUTO_LSP, FLAG_CRITIC_PERMISSIONS,
-    FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
+    FLAG_EXECUTION_SCRATCHPAD, FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION,
+    FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING, FLAG_QWEN_PRESERVE_THINKING,
 };
 pub use history::ConversationSession;
 pub use permissions::{
