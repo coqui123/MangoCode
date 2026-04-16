@@ -13,7 +13,7 @@ use futures::StreamExt;
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
@@ -263,6 +263,11 @@ impl OpenAiCompatProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
+        let dump_http = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_HTTP")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .unwrap_or(false);
+
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
         let max_tokens = self
@@ -311,6 +316,15 @@ impl OpenAiCompatProvider {
             status: None,
             body: None,
         })?;
+
+        if dump_http {
+            const MAX: usize = 8192;
+            let truncated = if body_str.len() > MAX { &body_str[..MAX] } else { &body_str };
+            // Use stderr directly to avoid any logger filtering/compilation issues.
+            eprintln!("[openai_compat wire] request_json={}", truncated);
+            trace!(target: "mangocode_api::providers::openai_compat::wire", request_json = %truncated);
+        }
+
         let retry_cfg = crate::error_handling::RetryConfig::default();
         let provider_name = self.name.clone();
         let resp = crate::retry::retry_request(&retry_cfg, &provider_name, |_attempt| {
@@ -338,6 +352,14 @@ impl OpenAiCompatProvider {
             status: Some(status),
             body: None,
         })?;
+
+        if dump_http {
+            const MAX: usize = 16384;
+            let truncated = if text.len() > MAX { &text[..MAX] } else { &text };
+            // Use stderr directly to avoid any logger filtering/compilation issues.
+            eprintln!("[openai_compat wire] status={} response_json={}", status, truncated);
+            trace!(target: "mangocode_api::providers::openai_compat::wire", status = status, response_json = %truncated);
+        }
 
         if !(200..300).contains(&(status as usize)) {
             return Err(self.map_http_error(status, &text));
@@ -477,6 +499,10 @@ impl LlmProvider for OpenAiCompatProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
         let reasoning_field = self.quirks.reasoning_field.clone();
+        let dump_sse = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_SSE")
+            .ok()
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .unwrap_or(false);
 
         let s = stream! {
             let mut byte_stream = resp.bytes_stream();
@@ -485,10 +511,15 @@ impl LlmProvider for OpenAiCompatProvider {
             let mut message_started = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
-            let mut tool_call_buffers: std::collections::HashMap<
-                usize,
-                (String, String, String),
-            > = std::collections::HashMap::new();
+            #[derive(Debug, Clone)]
+            struct ToolCallBuf {
+                id: String,
+                name: String,
+                args: String,
+                started: bool,
+            }
+            let mut tool_call_buffers: std::collections::HashMap<usize, ToolCallBuf> =
+                std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -533,6 +564,14 @@ impl LlmProvider for OpenAiCompatProvider {
                     if data == "[DONE]" {
                         yield Ok(StreamEvent::MessageStop);
                         return;
+                    }
+
+                    if dump_sse {
+                        // Log raw provider frames to stderr (truncated) for debugging tool-call wire formats.
+                        // This is intentionally opt-in because it can include sensitive content.
+                        const MAX: usize = 8192;
+                        let truncated = if data.len() > MAX { &data[..MAX] } else { data };
+                        trace!(target: "mangocode_api::providers::openai_compat::wire", sse_data = %truncated);
                     }
 
                     let chunk_json: Value = match serde_json::from_str(data) {
@@ -636,44 +675,63 @@ impl LlmProvider for OpenAiCompatProvider {
                                 .get("index")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0) as usize;
-                            if let Some(tc_id) =
-                                tc.get("id").and_then(|v| v.as_str())
+                            let block_index = 1 + tc_index;
+
+                            let buf = tool_call_buffers.entry(block_index).or_insert_with(|| ToolCallBuf {
+                                id: String::new(),
+                                name: String::new(),
+                                args: String::new(),
+                                started: false,
+                            });
+
+                            // Qwen/DashScope and other OpenAI-compatible providers may stream tool calls in fragments:
+                            // id/name can arrive in separate deltas and may not be repeated on each chunk.
+                            if let Some(tc_id) = tc.get("id").and_then(|v| v.as_str()) {
+                                if !tc_id.is_empty() {
+                                    buf.id = tc_id.to_string();
+                                }
+                            }
+
+                            // Tool name may appear either at tool_calls[].function.name (OpenAI) or tool_calls[].name (some compat providers).
+                            if let Some(name) = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .or_else(|| tc.get("name").and_then(|v| v.as_str()))
                             {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let block_index = 1 + tc_index;
-                                tool_call_buffers.insert(
-                                    block_index,
-                                    (tc_id.to_string(), name.clone(), String::new()),
-                                );
+                                if !name.is_empty() {
+                                    buf.name = name.to_string();
+                                }
+                            }
+
+                            // Emit ContentBlockStart only once we have a tool name. If the provider didn't send an id,
+                            // generate a stable one so tool_result can reference it.
+                            if !buf.started && !buf.name.is_empty() {
+                                if buf.id.is_empty() {
+                                    buf.id = format!("call_{}_{}", message_id, tc_index);
+                                }
+                                buf.started = true;
                                 yield Ok(StreamEvent::ContentBlockStart {
                                     index: block_index,
                                     content_block: ContentBlock::ToolUse {
-                                        id: tc_id.to_string(),
-                                        name,
+                                        id: buf.id.clone(),
+                                        name: buf.name.clone(),
                                         input: json!({}),
                                     },
                                 });
                             }
+
+                            // Argument fragment(s): usually function.arguments is a JSON string fragment; some providers may emit an object.
                             if let Some(args_frag) = tc
                                 .get("function")
                                 .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
+                                .and_then(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
                             {
                                 if !args_frag.is_empty() {
-                                    let block_index = 1 + tc_index;
-                                    if let Some((_, _, buf)) =
-                                        tool_call_buffers.get_mut(&block_index)
-                                    {
-                                        buf.push_str(args_frag);
-                                    }
+                                    buf.args.push_str(&args_frag);
                                     yield Ok(StreamEvent::InputJsonDelta {
                                         index: block_index,
-                                        partial_json: args_frag.to_string(),
+                                        partial_json: args_frag,
                                     });
                                 }
                             }

@@ -152,11 +152,57 @@ cd src-rust
 cargo run -p mangocode -- -p "Summarize the crate structure in 6 bullets."
 ```
 
+### Using Vault Credentials In Headless Mode
+
+If you store provider API keys in the local encrypted vault, headless runs (for example `-p` / `--print`) can unlock the vault using one of these flags:
+
+- `--vault-prompt`: prompt for the vault passphrase (even in headless mode).
+- `--vault-passphrase <PASSPHRASE>`: unlock non-interactively.
+
+Security note: `--vault-passphrase` may leak via shell history and process lists. Prefer `--vault-prompt` when possible.
+
 ### Structured Streaming Output
 
 ```powershell
 cd src-rust
 cargo run -p mangocode -- --output-format stream-json -p "Generate a concise release note draft for the latest provider refactor."
+```
+
+### Saving `stream-json` Output (Clean JSONL)
+
+If you use `cargo run`, Cargo will print build and `Running ...` lines which will pollute a `.jsonl` file. For clean JSONL logs, build once and run the binary directly:
+
+```powershell
+cd src-rust
+cargo build -p mangocode
+.\target\debug\mangocode.exe --output-format stream-json -p "Hello from headless stream-json." |& Tee-Object -FilePath .\mangocode-stream.jsonl
+```
+
+PowerShell note: use `|&` (or `2>&1 |`) to capture both stdout and stderr into the log.
+
+### Debug: Dump Raw Provider SSE Frames (OpenAI-Compatible Providers)
+
+When debugging tool calling, it's often necessary to see the raw streaming frames (`data: ...`) coming back from the provider (especially for OpenAI-compatible backends that differ slightly from OpenAI's tool-call streaming).
+
+Set `MANGOCODE_DUMP_OPENAI_COMPAT_SSE=1` and enable trace logs for the wire target:
+
+```powershell
+cd src-rust
+$env:MANGOCODE_DUMP_OPENAI_COMPAT_SSE = "1"
+$env:RUST_LOG = "mangocode_api::providers::openai_compat::wire=trace"
+.\target\debug\mangocode.exe --output-format stream-json -p "Call a tool, then stop." |& Tee-Object -FilePath .\provider-wire.log
+```
+
+Notes:
+
+- This logs to stderr, so it won’t corrupt `--output-format stream-json` stdout.
+- The dump is truncated per frame and may include sensitive content—use with care.
+
+Example: Qwen (DashScope) headless stream output using vault unlock:
+
+```powershell
+cd src-rust
+.\target\debug\mangocode.exe --provider qwen --model qwen3.6-plus --output-format stream-json --vault-prompt --max-turns 2 -p "Call one tool (Grep for 'openai_compat' in the repo), then stop." |& Tee-Object -FilePath .\qwen-stream.jsonl
 ```
 
 ### Useful CI-Safe Flags
@@ -167,6 +213,9 @@ cargo run -p mangocode -- --output-format stream-json -p "Generate a concise rel
 - `--provider <id>`
 - `--model <id>`
 - `--cwd <path>`
+- `--vault-prompt`
+- `--vault-passphrase <PASSPHRASE>`
+- `--qwen-preserve-thinking`
 
 ## Useful In-App Commands
 

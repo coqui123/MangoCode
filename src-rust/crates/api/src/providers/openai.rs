@@ -474,12 +474,12 @@ impl OpenAiProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let args_str = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}");
-                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let args_str = match tc.get("function").and_then(|f| f.get("arguments")) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => "{}".to_string(),
+                };
+                let input: Value = serde_json::from_str(&args_str).unwrap_or(json!({}));
                 content_blocks.push(ContentBlock::ToolUse { id, name, input });
             }
         }

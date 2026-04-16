@@ -128,6 +128,17 @@ struct Cli {
     #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
     print: bool,
 
+    /// Vault passphrase to unlock the local vault (enables loading provider keys from vault).
+    ///
+    /// NOTE: Passing secrets on the command line can leak via shell history and process lists.
+    /// Prefer `--vault-prompt` when possible.
+    #[arg(long = "vault-passphrase", value_name = "PASSPHRASE")]
+    vault_passphrase: Option<String>,
+
+    /// Prompt for vault passphrase even in headless/print mode.
+    #[arg(long = "vault-prompt", action = ArgAction::SetTrue)]
+    vault_prompt: bool,
+
     /// Model to use (defaults to provider-appropriate model if not set)
     #[arg(short = 'm', long = "model")]
     model: Option<String>,
@@ -223,6 +234,11 @@ struct Cli {
     /// Extended thinking budget in tokens (enables extended thinking)
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
+
+    /// Qwen/DashScope: request reasoning persistence across turns when supported by the model.
+    /// Only applied to supported Qwen 3.6 Plus model IDs.
+    #[arg(long = "qwen-preserve-thinking", action = ArgAction::SetTrue)]
+    qwen_preserve_thinking: bool,
 
     /// Continue the most recent conversation
     #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
@@ -704,6 +720,9 @@ async fn main() -> anyhow::Result<()> {
         config.max_tokens = Some(mt);
     }
     config.verbose = cli.verbose;
+    if cli.qwen_preserve_thinking {
+        config.qwen_preserve_thinking = true;
+    }
     config.output_format = cli.output_format.into();
     config.disable_claude_mds = cli.no_claude_md;
     if let Some(sp) = cli.system_prompt.clone() {
@@ -918,9 +937,10 @@ async fn main() -> anyhow::Result<()> {
     let vault = mangocode_core::Vault::new();
     // If a vault exists, offer a one-time optional unlock so keys for *any*
     // provider can be resolved from the vault (not just Anthropic).
-    if vault.exists() && !is_headless && mangocode_core::get_vault_passphrase().is_none() {
-        match prompt_password("Vault passphrase (or Enter to skip): ") {
-            Ok(passphrase) if !passphrase.is_empty() => match vault.load(&passphrase) {
+    if vault.exists() && mangocode_core::get_vault_passphrase().is_none() {
+        // 1) Non-interactive unlock via CLI flag (works in headless).
+        if let Some(passphrase) = cli.vault_passphrase.clone().filter(|p| !p.is_empty()) {
+            match vault.load(&passphrase) {
                 Ok(_) => {
                     mangocode_core::set_vault_passphrase(passphrase);
                     info!("Vault unlocked");
@@ -928,8 +948,21 @@ async fn main() -> anyhow::Result<()> {
                 Err(e) => {
                     warn!(error = %e, "Vault unlock failed: {} — using env vars", e);
                 }
-            },
-            _ => info!("Vault skipped — using env vars only"),
+            }
+        } else if !is_headless || cli.vault_prompt {
+            // 2) Interactive prompt (default only when not headless; can be forced in headless).
+            match prompt_password("Vault passphrase (or Enter to skip): ") {
+                Ok(passphrase) if !passphrase.is_empty() => match vault.load(&passphrase) {
+                    Ok(_) => {
+                        mangocode_core::set_vault_passphrase(passphrase);
+                        info!("Vault unlocked");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Vault unlock failed: {} — using env vars", e);
+                    }
+                },
+                _ => info!("Vault skipped — using env vars only"),
+            }
         }
     }
 
