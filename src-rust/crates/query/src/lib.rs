@@ -1355,7 +1355,9 @@ pub async fn run_query_loop(
                                 provider
                             };
 
-                            Some(std::sync::Arc::new(provider))
+                            let provider: std::sync::Arc<dyn mangocode_api::LlmProvider> =
+                                std::sync::Arc::new(provider);
+                            Some(provider)
                         } else {
                             let auth_store = mangocode_core::AuthStore::load();
                             if let Some(key) = auth_store.api_key_for(&provider_id_str) {
@@ -1492,7 +1494,10 @@ pub async fn run_query_loop(
                                                         .with_api_key(key)
                                                     }
                                                 };
-                                            Some(std::sync::Arc::new(provider))
+                                            let provider: std::sync::Arc<
+                                                dyn mangocode_api::LlmProvider,
+                                            > = std::sync::Arc::new(provider);
+                                            Some(provider)
                                         }
                                     }
                                 } else {
@@ -1525,20 +1530,30 @@ pub async fn run_query_loop(
 
                     let overridden: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> =
                         match provider_id_str.as_str() {
-                            "ollama" => Some(std::sync::Arc::new(
-                                mangocode_api::providers::openai_compat_providers::ollama()
-                                    .with_base_url(base_url),
-                            )),
-                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
-                                mangocode_api::providers::openai_compat_providers::lm_studio()
-                                    .with_base_url(base_url),
-                            )),
-                            "llamacpp" | "llama-cpp" | "llama-server" => {
-                                Some(std::sync::Arc::new(
-                                    mangocode_api::providers::openai_compat_providers::llama_cpp()
-                                        .with_base_url(base_url),
-                                ))
-                            }
+                            "ollama" => Some({
+                                let p: std::sync::Arc<dyn mangocode_api::LlmProvider> =
+                                    std::sync::Arc::new(
+                                        mangocode_api::providers::openai_compat_providers::ollama()
+                                            .with_base_url(base_url),
+                                    );
+                                p
+                            }),
+                            "lmstudio" | "lm-studio" => Some({
+                                let p: std::sync::Arc<dyn mangocode_api::LlmProvider> =
+                                    std::sync::Arc::new(
+                                        mangocode_api::providers::openai_compat_providers::lm_studio()
+                                            .with_base_url(base_url),
+                                    );
+                                p
+                            }),
+                            "llamacpp" | "llama-cpp" | "llama-server" => Some({
+                                let p: std::sync::Arc<dyn mangocode_api::LlmProvider> =
+                                    std::sync::Arc::new(
+                                        mangocode_api::providers::openai_compat_providers::llama_cpp()
+                                            .with_base_url(base_url),
+                                    );
+                                p
+                            }),
                             _ => None,
                         };
 
@@ -3766,6 +3781,7 @@ mod tests {
             Some(10_000),
             0,
             0,
+            false,
         );
         assert_eq!(options["enable_thinking"], serde_json::json!(true));
         assert_eq!(options["thinking_budget"], serde_json::json!(10_000));
@@ -3781,6 +3797,7 @@ mod tests {
             None,
             0,
             0,
+            false,
         );
         assert!(options["enable_thinking"].is_null() || !options["enable_thinking"].as_bool().unwrap_or(false));
     }
