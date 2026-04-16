@@ -9,6 +9,8 @@
 // 6. Manages stop conditions (end_turn, max_turns, cancellation)
 
 pub mod agent_tool;
+pub mod execution_scratchpad;
+pub use execution_scratchpad::ScratchpadState;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
@@ -371,11 +373,45 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Qwen agentic thinking heuristic
+// ---------------------------------------------------------------------------
+
+/// Decides whether to enable Qwen `preserve_thinking` for the current session.
+///
+/// `preserve_thinking` (Alibaba Cloud, April 2026) retains reasoning traces
+/// across turns, improving decision consistency in long tool-heavy sessions.
+/// It is recommended by Alibaba for agentic scenarios but adds overhead for
+/// short/simple tasks, so we enable it selectively.
+///
+/// Thresholds (conservative defaults):
+///   - turn_count >= 4: the session is multi-turn and likely complex
+///   - tool_call_count >= 3: multiple tool dispatches signal a real agentic loop
+///
+/// The feature flag FLAG_QWEN_PRESERVE_THINKING must also be set (opt-in).
+fn should_enable_qwen_preserve_thinking(
+    provider_id: &str,
+    turn_count: u32,
+    tool_call_count: u64,
+) -> bool {
+    if provider_id != "qwen" {
+        return false;
+    }
+    if !mangocode_core::FeatureFlags::is_enabled(
+        mangocode_core::FLAG_QWEN_PRESERVE_THINKING,
+    ) {
+        return false;
+    }
+    turn_count >= 4 || tool_call_count >= 3
+}
+
 fn build_provider_options(
     provider_id: &str,
     model_id: &str,
     effort_level: Option<mangocode_core::effort::EffortLevel>,
     thinking_budget: Option<u32>,
+    turn_count: u32,
+    tool_call_count: u64,
 ) -> Value {
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
@@ -485,6 +521,18 @@ fn build_provider_options(
     if provider_id == "qwen" && thinking_budget.is_some() && !model_id.contains("kimi-k2-thinking")
     {
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
+        // thinking_budget controls how many tokens Qwen can spend on reasoning.
+        // Inject it explicitly so the caller doesn't need extra_body wiring.
+        if let Some(budget) = thinking_budget {
+            options.insert("thinking_budget".to_string(), serde_json::json!(budget));
+        }
+    }
+
+    // Qwen preserve_thinking: retain reasoning traces across turns for long sessions.
+    // Only enabled when FLAG_QWEN_PRESERVE_THINKING is set AND session heuristics trigger.
+    // Per Alibaba docs: "recommended for agent scenarios", default false.
+    if should_enable_qwen_preserve_thinking(provider_id, turn_count, tool_call_count) {
+        options.insert("preserve_thinking".to_string(), serde_json::json!(true));
     }
 
     if provider_id == "zhipu" && thinking_budget.is_some() {
@@ -819,6 +867,11 @@ pub async fn run_query_loop(
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
+    // Execution scratchpad: per-turn state tracking for all models.
+    // Provides deterministic scaffolding (plan / last tool / next step) to
+    // reduce goal-drift in long agentic sessions.
+    // Enabled by default via FLAG_EXECUTION_SCRATCHPAD; can be disabled at runtime.
+    let mut scratchpad = execution_scratchpad::ScratchpadState::new();
     // Active model — may switch to fallback on overloaded errors.
     // Agent model override takes priority over the session model when set.
     let mut effective_model = if let Some(ref agent) = config.agent_definition {
@@ -1044,6 +1097,45 @@ pub async fn run_query_loop(
                 .unwrap_or("");
             let git_context = resolve_git_context(&tool_ctx.session_id, working_directory);
             build_system_prompt_with_git_context(&patched, git_context)
+        };
+
+        // Execution scratchpad injection: prepend structured state block to the
+        // dynamic system prompt section when FLAG_EXECUTION_SCRATCHPAD is enabled.
+        // This gives all models explicit context about the current plan, last tool
+        // result, and declared next action — reducing goal-drift across turns.
+        //
+        // SystemPrompt is an enum (Text | Blocks). We prepend to the text variant;
+        // Blocks prompts (e.g. with cache_control) have the block prepended as a
+        // plain text block so the cache boundary is preserved.
+        let system = if mangocode_core::FeatureFlags::is_enabled(mangocode_core::FLAG_EXECUTION_SCRATCHPAD)
+        {
+            // Update scratchpad state from message history so next render is fresh.
+            scratchpad.update_from_turn(&messages, turn);
+            if let Some(scratch_block) = scratchpad.render() {
+                match system {
+                    mangocode_api::SystemPrompt::Text(existing) => {
+                        mangocode_api::SystemPrompt::Text(
+                            format!("{}
+
+{}", scratch_block, existing)
+                        )
+                    }
+                    mangocode_api::SystemPrompt::Blocks(mut blocks) => {
+                        // Prepend as a plain (non-cached) text block so the
+                        // cache boundary on the static portion is unaffected.
+                        blocks.insert(0, mangocode_api::SystemBlock {
+                            block_type: "text".to_string(),
+                            text: scratch_block,
+                            cache_control: None,
+                        });
+                        mangocode_api::SystemPrompt::Blocks(blocks)
+                    }
+                }
+            } else {
+                system
+            }
+        } else {
+            system
         };
 
         let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
@@ -1521,6 +1613,11 @@ pub async fn run_query_loop(
                             &model_id_str,
                             config.effort_level,
                             effective_thinking_budget,
+                            turn,
+                            tool_ctx.session_metrics
+                                .as_ref()
+                                .map(|m| m.tool_use_count.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(0),
                         ),
                     };
 
@@ -3532,6 +3629,8 @@ mod tests {
             "gemini-3-flash-preview",
             Some(mangocode_core::effort::EffortLevel::High),
             None,
+            0,
+            0,
         );
         assert_eq!(
             options["thinkingConfig"]["thinkingLevel"],
@@ -3550,6 +3649,8 @@ mod tests {
             "gpt-5.4",
             Some(mangocode_core::effort::EffortLevel::Medium),
             None,
+            0,
+            0,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
@@ -3563,11 +3664,75 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1",
             Some(mangocode_core::effort::EffortLevel::High),
             Some(10_000),
+            0,
+            0,
         );
         assert_eq!(
             options["reasoningConfig"]["budgetTokens"],
             serde_json::json!(10_000)
         );
+    }
+
+    #[test]
+    fn test_should_enable_qwen_preserve_thinking_wrong_provider() {
+        // Non-Qwen providers never get preserve_thinking regardless of thresholds.
+        assert!(!should_enable_qwen_preserve_thinking("anthropic", 10, 10));
+        assert!(!should_enable_qwen_preserve_thinking("google", 10, 10));
+        assert!(!should_enable_qwen_preserve_thinking("openai", 10, 10));
+    }
+
+    #[test]
+    fn test_should_enable_qwen_preserve_thinking_flag_off() {
+        // When the feature flag is off (default), never enable preserve_thinking.
+        // FLAG_QWEN_PRESERVE_THINKING defaults to false in default_flags().
+        let result = should_enable_qwen_preserve_thinking("qwen", 10, 10);
+        // Flag is off by default, so this should be false.
+        assert!(!result, "preserve_thinking should be off when flag is disabled");
+    }
+
+    #[test]
+    fn test_qwen_enable_thinking_injected_with_budget() {
+        // When thinking_budget is set, enable_thinking and thinking_budget should
+        // both appear in Qwen provider options.
+        let options = build_provider_options(
+            "qwen",
+            "qwen3.6-plus",
+            None,
+            Some(10_000),
+            0,
+            0,
+        );
+        assert_eq!(options["enable_thinking"], serde_json::json!(true));
+        assert_eq!(options["thinking_budget"], serde_json::json!(10_000));
+    }
+
+    #[test]
+    fn test_qwen_no_enable_thinking_without_budget() {
+        // Without a thinking budget, enable_thinking should not be set.
+        let options = build_provider_options(
+            "qwen",
+            "qwen3.6-plus",
+            None,
+            None,
+            0,
+            0,
+        );
+        assert!(options["enable_thinking"].is_null() || !options["enable_thinking"].as_bool().unwrap_or(false));
+    }
+
+    #[test]
+    fn test_execution_scratchpad_renders_after_first_update() {
+        let mut state = execution_scratchpad::ScratchpadState::new();
+        // Before any update, nothing to render.
+        assert!(state.render().is_none());
+        // Set a plan and verify render works.
+        state.set_plan("Fix the authentication bug");
+        state.last_tool_summary = Some("bash: exit 0".to_string());
+        let rendered = state.render().unwrap();
+        assert!(rendered.contains("[SCRATCHPAD]"));
+        assert!(rendered.contains("Fix the authentication bug"));
+        assert!(rendered.contains("bash: exit 0"));
+        assert!(rendered.contains("[/SCRATCHPAD]"));
     }
 
     struct EchoTool;
