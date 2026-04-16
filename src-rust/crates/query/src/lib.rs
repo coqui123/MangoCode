@@ -177,6 +177,8 @@ pub struct QueryConfig {
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
+    /// Qwen/DashScope: request reasoning persistence across turns when supported by the model.
+    pub qwen_preserve_thinking: bool,
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
     /// history before older results are replaced with a truncation notice.
@@ -245,6 +247,7 @@ impl Default for QueryConfig {
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
+            qwen_preserve_thinking: false,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -273,6 +276,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
+            qwen_preserve_thinking: cfg.qwen_preserve_thinking,
             ..Default::default()
         }
     }
@@ -294,6 +298,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
+            qwen_preserve_thinking: cfg.qwen_preserve_thinking,
             ..Default::default()
         }
     }
@@ -376,6 +381,7 @@ fn build_provider_options(
     model_id: &str,
     effort_level: Option<mangocode_core::effort::EffortLevel>,
     thinking_budget: Option<u32>,
+    qwen_preserve_thinking: bool,
 ) -> Value {
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
@@ -484,7 +490,20 @@ fn build_provider_options(
 
     if provider_id == "qwen" && thinking_budget.is_some() && !model_id.contains("kimi-k2-thinking")
     {
-        options.insert("enable_thinking".to_string(), serde_json::json!(true));
+        // DashScope "OpenAI-compatible" models expect Qwen-specific flags under extra_body.
+        let mut extra_body = serde_json::Map::new();
+        extra_body.insert("enable_thinking".to_string(), serde_json::json!(true));
+
+        // Only send preserve_thinking for Qwen 3.6 Plus variants that advertise support.
+        let supports_preserve = matches!(
+            model_id.as_str(),
+            "qwen3.6-plus" | "qwen3.6-plus-2026-04-02"
+        );
+        if qwen_preserve_thinking && supports_preserve {
+            extra_body.insert("preserve_thinking".to_string(), serde_json::json!(true));
+        }
+
+        options.insert("extra_body".to_string(), Value::Object(extra_body));
     }
 
     if provider_id == "zhipu" && thinking_budget.is_some() {
@@ -1521,6 +1540,7 @@ pub async fn run_query_loop(
                             &model_id_str,
                             config.effort_level,
                             effective_thinking_budget,
+                            config.qwen_preserve_thinking,
                         ),
                     };
 
@@ -1550,6 +1570,7 @@ pub async fn run_query_loop(
                     }
 
                     let mut text_chunks: Vec<String> = Vec::new();
+                    let mut reasoning_chunks: Vec<String> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     let mut tool_call_blocks: std::collections::HashMap<
                         usize,
@@ -1666,6 +1687,11 @@ pub async fn run_query_loop(
                                             mangocode_api::StreamEvent::TextDelta { text, .. } => {
                                                 turn_state = ProviderTurnState::StreamingText;
                                                 text_chunks.push(text.clone());
+                                            }
+                                            mangocode_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
+                                                // Preserve provider-emitted reasoning separately from visible text.
+                                                // We store it as a Thinking block in the final assistant message.
+                                                reasoning_chunks.push(reasoning.clone());
                                             }
                                             mangocode_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 turn_state = ProviderTurnState::StreamingToolCall;
@@ -1785,6 +1811,14 @@ pub async fn run_query_loop(
                         });
                     }
 
+                    let combined_reasoning = reasoning_chunks.join("");
+                    if !combined_reasoning.is_empty() {
+                        content_blocks.push(ContentBlock::Thinking {
+                            thinking: combined_reasoning,
+                            signature: String::new(),
+                        });
+                    }
+
                     // Reconstruct tool-use blocks (sorted by index for determinism).
                     let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
                     tc_indices.sort();
@@ -1848,24 +1882,30 @@ pub async fn run_query_loop(
                     // Some OpenAI-compatible providers report finish_reason="stop"
                     // even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
-                        let mut tool_results = Vec::new();
-                        for (tool_id, tool_name, tool_input) in tool_use_blocks {
-                            let tool_started = std::time::Instant::now();
+                        // Parallel dispatch for non-Agent tools (same approach as the streaming tool executor path).
+                        struct PreparedTool {
+                            id: String,
+                            name: String,
+                            input: Value,
+                            blocked_result: Option<ToolResult>,
+                        }
+
+                        let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_use_blocks.len());
+                        for (id, name, input) in tool_use_blocks {
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolStart {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
-                                    input_json: tool_input.to_string(),
+                                    tool_name: name.clone(),
+                                    tool_id: id.clone(),
+                                    input_json: input.to_string(),
                                     parent_tool_use_id: None,
                                 });
                             }
 
-                            // Run PreToolUse hooks (same as Anthropic path)
                             let hooks = &tool_ctx.config.hooks;
                             let hook_ctx = mangocode_core::hooks::HookContext {
                                 event: "PreToolUse".to_string(),
-                                tool_name: Some(tool_name.clone()),
-                                tool_input: Some(tool_input.clone()),
+                                tool_name: Some(name.clone()),
+                                tool_input: Some(input.clone()),
                                 tool_output: None,
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
@@ -1880,51 +1920,74 @@ pub async fn run_query_loop(
                             .await;
                             end_hook_span(pre_hook_span);
 
-                            // Check if hook blocked execution
-                            let result = if let mangocode_core::hooks::HookOutcome::Blocked(
-                                reason,
-                            ) = pre_outcome
-                            {
-                                warn!(tool = %tool_name, reason = %reason, "PreToolUse hook blocked execution");
-                                mangocode_tools::ToolResult::error(format!(
+                            let blocked_result = if let mangocode_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
+                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                                Some(mangocode_tools::ToolResult::error(format!(
                                     "Blocked by hook: {}",
                                     reason
-                                ))
-                            } else if let Some(critic_denial) = check_critic(
-                                &tool_name,
-                                &tool_input,
-                                &tool_ctx.working_dir,
-                                messages,
-                                &tool_ctx.config,
-                            )
-                            .await
-                            {
-                                critic_denial
+                                )))
                             } else {
-                                execute_tool(ExecuteToolRequest {
-                                    client,
-                                    query_config: config,
-                                    tool_id: &tool_id,
-                                    name: &tool_name,
-                                    input: &tool_input,
-                                    tools,
-                                    ctx: tool_ctx,
-                                    event_tx: event_tx.as_ref(),
-                                    // Only clone messages for Agent tool (fork mode needs parent history).
-                                    parent_messages: if tool_name == mangocode_core::constants::TOOL_NAME_AGENT {
-                                        Some(messages.clone())
-                                    } else {
-                                        None
-                                    },
-                                })
+                                check_critic(
+                                    &name,
+                                    &input,
+                                    &tool_ctx.working_dir,
+                                    messages,
+                                    &tool_ctx.config,
+                                )
                                 .await
                             };
 
+                            prepared.push(PreparedTool { id, name, input, blocked_result });
+                        }
+
+                        let has_agent_tool = prepared.iter().any(|p| p.blocked_result.is_none() && p.name == mangocode_core::constants::TOOL_NAME_AGENT);
+                        let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool { Some(messages.clone()) } else { None };
+
+                        let exec_futures: Vec<_> = prepared
+                            .iter()
+                            .map(|p| {
+                                let event_tx_for_exec = event_tx.clone();
+                                if let Some(r) = p.blocked_result.clone() {
+                                    futures::future::Either::Left(async move { (r, 0_u64) })
+                                } else {
+                                    let id = p.id.clone();
+                                    let name = p.name.clone();
+                                    let input = p.input.clone();
+                                    let parent_msgs = if name == mangocode_core::constants::TOOL_NAME_AGENT {
+                                        parent_msgs_snapshot.clone()
+                                    } else {
+                                        None
+                                    };
+                                    futures::future::Either::Right(async move {
+                                        let tool_started = std::time::Instant::now();
+                                        let result = execute_tool(ExecuteToolRequest {
+                                            client,
+                                            query_config: config,
+                                            tool_id: &id,
+                                            name: &name,
+                                            input: &input,
+                                            tools,
+                                            ctx: tool_ctx,
+                                            event_tx: event_tx_for_exec.as_ref(),
+                                            parent_messages: parent_msgs,
+                                        })
+                                        .await;
+                                        (result, tool_started.elapsed().as_millis() as u64)
+                                    })
+                                }
+                            })
+                            .collect();
+
+                        let exec_results: Vec<(ToolResult, u64)> = futures::future::join_all(exec_futures).await;
+
+                        let mut tool_results: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
+                        for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter()) {
                             // Run PostToolUse hooks
+                            let hooks = &tool_ctx.config.hooks;
                             let post_ctx = mangocode_core::hooks::HookContext {
                                 event: "PostToolUse".to_string(),
-                                tool_name: Some(tool_name.clone()),
-                                tool_input: Some(tool_input.clone()),
+                                tool_name: Some(p.name.clone()),
+                                tool_input: Some(p.input.clone()),
                                 tool_output: Some(result.content.clone()),
                                 is_error: Some(result.is_error),
                                 session_id: Some(tool_ctx.session_id.clone()),
@@ -1939,12 +2002,11 @@ pub async fn run_query_loop(
                             .await;
                             end_hook_span(post_hook_span);
 
-                            // --- LSP diagnostics injection for file-modifying tools ---
                             let result = if !result.is_error {
                                 maybe_inject_lsp_diagnostics(
                                     result,
-                                    &tool_name,
-                                    &tool_input,
+                                    &p.name,
+                                    &p.input,
                                     &tool_ctx.working_dir,
                                 )
                                 .await
@@ -1952,11 +2014,10 @@ pub async fn run_query_loop(
                                 result
                             };
 
-                            if !result.is_error && tool_invalidates_git_context(tool_name.as_str()) {
+                            if !result.is_error && tool_invalidates_git_context(p.name.as_str()) {
                                 mark_git_context_dirty(&tool_ctx.session_id);
                             }
 
-                            let tool_duration_ms = tool_started.elapsed().as_millis() as u64;
                             if let Some(metrics) = &tool_ctx.session_metrics {
                                 metrics.increment_tool_use();
                                 metrics.add_tool_duration(tool_duration_ms);
@@ -1964,8 +2025,8 @@ pub async fn run_query_loop(
 
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
-                                    tool_name: tool_name.clone(),
-                                    tool_id: tool_id.clone(),
+                                    tool_name: p.name.clone(),
+                                    tool_id: p.id.clone(),
                                     result: result.content.clone(),
                                     is_error: result.is_error,
                                     parent_tool_use_id: None,
@@ -1973,13 +2034,12 @@ pub async fn run_query_loop(
                             }
 
                             tool_results.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_id,
-                                content: mangocode_core::types::ToolResultContent::Text(
-                                    result.content,
-                                ),
+                                tool_use_id: p.id.clone(),
+                                content: mangocode_core::types::ToolResultContent::Text(result.content),
                                 is_error: Some(result.is_error),
                             });
                         }
+
                         messages.push(Message {
                             role: mangocode_core::types::Role::User,
                             content: mangocode_core::types::MessageContent::Blocks(tool_results),
@@ -3381,6 +3441,7 @@ mod tests {
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
+            qwen_preserve_thinking: false,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -3532,6 +3593,7 @@ mod tests {
             "gemini-3-flash-preview",
             Some(mangocode_core::effort::EffortLevel::High),
             None,
+            false,
         );
         assert_eq!(
             options["thinkingConfig"]["thinkingLevel"],
@@ -3550,6 +3612,7 @@ mod tests {
             "gpt-5.4",
             Some(mangocode_core::effort::EffortLevel::Medium),
             None,
+            false,
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
@@ -3563,6 +3626,7 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1",
             Some(mangocode_core::effort::EffortLevel::High),
             Some(10_000),
+            false,
         );
         assert_eq!(
             options["reasoningConfig"]["budgetTokens"],

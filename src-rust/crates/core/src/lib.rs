@@ -28,9 +28,11 @@ pub mod git_utils;
 pub mod auth_store;
 pub use auth_store::{AuthStore, StoredCredential};
 
-// Local encrypted vault and gateway proxy support.
+// Encrypted local credential vault (API keys, gateway token, etc.).
 pub mod vault;
-pub use vault::{clear_vault_passphrase, get_vault_passphrase, GatewayConfig, resolve_api_key_for_provider, set_vault_passphrase, Vault};
+pub use vault::{
+    clear_vault_passphrase, get_vault_passphrase, set_vault_passphrase, GatewayConfig, Vault,
+};
 
 // GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
 pub mod device_code;
@@ -783,6 +785,9 @@ pub mod config {
         /// Model to use for the permission critic (default: claude-3-haiku-20240307).
         #[serde(default)]
         pub critic_model: Option<String>,
+        /// Qwen/DashScope: request reasoning persistence across turns when supported by the model.
+        #[serde(default)]
+        pub qwen_preserve_thinking: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -995,7 +1000,6 @@ pub mod config {
                 Some("azure") => "gpt-4o",
                 Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
                 Some("venice") => "llama-3.3-70b",
-                Some("qwen") => "qwen3.6-plus",
                 _ => crate::constants::DEFAULT_MODEL, // Anthropic default
             }
         }
@@ -1033,13 +1037,11 @@ pub mod config {
                 .filter(|prompt| !prompt.trim().is_empty())
         }
 
-        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY` or the vault.
+        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
         pub fn resolve_api_key(&self) -> Option<String> {
-            crate::vault::resolve_api_key_for_provider(
-                self.api_key.as_deref(),
-                "ANTHROPIC_API_KEY",
-                "anthropic",
-            )
+            self.api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
         }
 
         /// Async variant: also checks `~/.mangocode/oauth_tokens.json`.
@@ -1056,13 +1058,65 @@ pub mod config {
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
             // If expired and we have a refresh token, attempt silent refresh.
-            let tokens = if tokens.is_expired() && tokens.refresh_token.is_some() {
-                match crate::oauth::refresh_oauth_tokens_from_refresh(&tokens).await {
-                    Ok(r) => {
-                        let _ = r.persist_to_disk_with_auth_sync().await;
-                        r
-                    }
-                    Err(_) => tokens,
+            // Clone the refresh token up-front so we don't borrow `tokens` during the async call.
+            let refresh_token_owned = tokens.refresh_token.clone();
+            let tokens = if tokens.is_expired() {
+                if let Some(rt) = refresh_token_owned {
+                    // Inline the refresh HTTP call (cc_core can't depend on cc_cli::oauth_flow).
+                    let body = serde_json::json!({
+                        "grant_type": "refresh_token",
+                        "refresh_token": rt,
+                        "client_id": crate::oauth::CLIENT_ID,
+                        "scope": crate::oauth::ALL_SCOPES.join(" "),
+                    });
+                    let refreshed = 'refresh: {
+                        let Ok(client) = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(30))
+                            .build()
+                        else {
+                            break 'refresh None;
+                        };
+                        let Ok(resp) = client
+                            .post(crate::oauth::TOKEN_URL)
+                            .header("content-type", "application/json")
+                            .json(&body)
+                            .send()
+                            .await
+                        else {
+                            break 'refresh None;
+                        };
+                        if !resp.status().is_success() {
+                            break 'refresh None;
+                        }
+                        let Ok(data) = resp.json::<serde_json::Value>().await else {
+                            break 'refresh None;
+                        };
+                        let new_at = data["access_token"].as_str().unwrap_or("").to_string();
+                        if new_at.is_empty() {
+                            break 'refresh None;
+                        }
+                        let new_rt = data["refresh_token"].as_str().map(String::from);
+                        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
+                        let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+                        let scopes: Vec<String> = data["scope"]
+                            .as_str()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .map(String::from)
+                            .collect();
+                        let mut r = tokens.clone();
+                        r.access_token = new_at;
+                        if let Some(nrt) = new_rt {
+                            r.refresh_token = Some(nrt);
+                        }
+                        r.expires_at_ms = Some(exp_ms);
+                        r.scopes = scopes;
+                        let _ = r.save().await;
+                        Some(r)
+                    };
+                    refreshed.unwrap_or(tokens)
+                } else {
+                    tokens // expired, no refresh token → can't fix
                 }
             } else {
                 tokens
@@ -1330,6 +1384,8 @@ pub mod config {
                 share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
                 critic_mode: over.config.critic_mode || base.config.critic_mode,
                 critic_model: over.config.critic_model.or(base.config.critic_model),
+                qwen_preserve_thinking: over.config.qwen_preserve_thinking
+                    || base.config.qwen_preserve_thinking,
             };
             Self {
                 config: merged_config,
@@ -3239,6 +3295,7 @@ pub mod hooks {
 /// - **Console** (`org:create_api_key` scope): exchanges access token for an API key.
 /// - **Claude.ai** (`user:inference` scope): uses the access token as a Bearer credential.
 pub mod oauth {
+    use anyhow::{anyhow, bail, Context};
     use serde::{Deserialize, Serialize};
 
     // ---- Production OAuth endpoints & constants ----
@@ -3362,54 +3419,38 @@ pub mod oauth {
             Ok(())
         }
 
-        /// Write `oauth_tokens.json` and mirror Claude Max bearer credentials to
-        /// `~/.mangocode/auth.json` so the provider registry stays in sync after refresh.
+        /// Persist `oauth_tokens.json` and mirror Claude Max credentials into `auth.json`.
+        ///
+        /// This is used by `mangocode-api` providers that authenticate via Claude.ai OAuth
+        /// and need the refreshed bearer token to be visible in the auth store as well.
         pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
             self.save().await?;
-            crate::AuthStore::sync_anthropic_max_from_oauth_tokens(self);
+            crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens(self);
             Ok(())
         }
     }
 
-    fn default_oauth_expires_in_secs() -> u64 {
-        3600
-    }
-
-    #[derive(Debug, serde::Deserialize)]
-    struct TokenRefreshResponse {
-        access_token: String,
-        #[serde(default)]
-        refresh_token: Option<String>,
-        /// Anthropic normally sends this; default matches legacy `resolve_auth_async` parsing.
-        #[serde(default = "default_oauth_expires_in_secs")]
-        expires_in: u64,
-        #[serde(default)]
-        scope: Option<String>,
-    }
-
-    /// Exchange the stored refresh token for new OAuth tokens. Does not persist.
-    pub async fn refresh_oauth_tokens_from_refresh(
-        tokens: &OAuthTokens,
-    ) -> anyhow::Result<OAuthTokens> {
-        use anyhow::Context;
-
-        let refresh_token = tokens
+    /// Refresh an expired OAuth access token using the stored refresh token.
+    ///
+    /// This is the shared helper used by the CLI flow and long-lived provider sessions.
+    pub async fn refresh_oauth_tokens_from_refresh(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
+        let refresh = tokens
             .refresh_token
             .as_deref()
             .filter(|s| !s.is_empty())
-            .context("No refresh token available")?;
-
-        let body = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "scope": ALL_SCOPES.join(" "),
-        });
+            .ok_or_else(|| anyhow!("No refresh token available"))?;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .context("Failed to build HTTP client for token refresh")?;
+            .context("Failed to build HTTP client")?;
+
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": CLIENT_ID,
+            "scope": ALL_SCOPES.join(" "),
+        });
 
         let resp = client
             .post(TOKEN_URL)
@@ -3417,38 +3458,47 @@ pub mod oauth {
             .json(&body)
             .send()
             .await
-            .context("Token refresh HTTP request failed")?;
+            .context("OAuth refresh request failed")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Token refresh failed ({}): {}", status, text);
+            bail!("OAuth refresh failed ({}): {}", status, text);
         }
 
-        let token_resp: TokenRefreshResponse = resp
-            .json()
+        let data = resp
+            .json::<serde_json::Value>()
             .await
-            .context("Failed to parse token refresh response")?;
+            .context("Failed to parse OAuth refresh response")?;
 
+        let access_token = data["access_token"].as_str().unwrap_or("").to_string();
+        if access_token.is_empty() {
+            bail!("OAuth refresh response missing access_token");
+        }
+
+        let refresh_token = data["refresh_token"].as_str().map(|s| s.to_string());
+        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
         let expires_at_ms =
-            chrono::Utc::now().timestamp_millis() + (token_resp.expires_in as i64 * 1000);
-
-        let scopes: Vec<String> = token_resp
-            .scope
-            .as_deref()
+            chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+        let scopes: Vec<String> = data["scope"]
+            .as_str()
             .unwrap_or("")
             .split_whitespace()
+            .filter(|s| !s.is_empty())
             .map(String::from)
             .collect();
 
         let mut updated = tokens.clone();
-        updated.access_token = token_resp.access_token;
-        if let Some(new_rt) = token_resp.refresh_token {
-            updated.refresh_token = Some(new_rt);
+        updated.access_token = access_token;
+        if let Some(rt) = refresh_token {
+            if !rt.is_empty() {
+                updated.refresh_token = Some(rt);
+            }
         }
         updated.expires_at_ms = Some(expires_at_ms);
-        updated.scopes = scopes;
-
+        if !scopes.is_empty() {
+            updated.scopes = scopes;
+        }
         Ok(updated)
     }
 
