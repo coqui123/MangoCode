@@ -321,7 +321,7 @@ fn parse_theme(name: &str) -> Option<Theme> {
 }
 
 fn prompt_secure_input(prompt: &str) -> anyhow::Result<String> {
-    let prompt_text = format!("{}", prompt);
+    let prompt_text = prompt.to_string();
     let input = prompt_password(&prompt_text)?;
     Ok(input)
 }

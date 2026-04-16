@@ -1882,9 +1882,7 @@ mod tests {
             let mut buf = vec![0u8; 8192];
             let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
             // Write HTTP response with chunked transfer encoding.
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
-            );
+            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n".to_string();
             socket.write_all(header.as_bytes()).await.unwrap();
 
             // Write body in a single chunk then close.

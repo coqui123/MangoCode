@@ -190,7 +190,7 @@ async fn execute_action(_params: ComputerUseInput) -> ToolResult {
 
 #[cfg(feature = "computer-use")]
 async fn execute_action(params: ComputerUseInput) -> ToolResult {
-    use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+    use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 
     match params.action.as_str() {
         // ── Screenshot ───────────────────────────────────────────────────
@@ -510,7 +510,7 @@ fn press_key_sequence(
     enigo: &mut enigo::Enigo,
     sequence: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use enigo::{Direction, Key, Keyboard};
+    use enigo::{Direction, Keyboard};
 
     let parts: Vec<&str> = sequence
         .split('+')

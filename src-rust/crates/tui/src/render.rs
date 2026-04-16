@@ -1763,7 +1763,7 @@ fn live_staging_tool_block_expandable(block: &crate::app::ToolUseBlock) -> bool 
     block
         .output_preview
         .as_deref()
-        .map_or(false, |p| p.contains("more lines"))
+        .is_some_and(|p| p.contains("more lines"))
 }
 
 fn render_tool_block_lines(

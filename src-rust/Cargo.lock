@@ -3247,6 +3247,7 @@ dependencies = [
  "enigo",
  "futures",
  "glob",
+ "image",
  "mangocode-api",
  "mangocode-core",
  "mangocode-mcp",

@@ -1100,7 +1100,7 @@ pub async fn run_query_loop(
             // Background skill index: append human-readable listing when prefetch is ready.
             if let Some(ref skill_idx) = config.skill_index {
                 let guard = skill_idx.read().await;
-                let listing = format_skill_listing(&*guard);
+                let listing = format_skill_listing(&guard);
                 drop(guard);
                 if !listing.trim().is_empty() {
                     patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
@@ -1130,7 +1130,7 @@ pub async fn run_query_loop(
         let system = if mangocode_core::FeatureFlags::is_enabled(mangocode_core::FLAG_EXECUTION_SCRATCHPAD)
         {
             // Update scratchpad state from message history so next render is fresh.
-            scratchpad.update_from_turn(&messages, turn);
+            scratchpad.update_from_turn(messages, turn);
             if let Some(scratch_block) = scratchpad.render() {
                 match system {
                     mangocode_api::SystemPrompt::Text(existing) => {
@@ -3329,7 +3329,7 @@ fn build_skill_injection_for_turn(
 
     let skill_qa_blocks: Vec<String> = skill_context
         .iter()
-        .filter_map(|s| format_qa_block(s))
+        .filter_map(format_qa_block)
         .collect();
 
     (injected_skills, skill_qa_blocks)
@@ -3490,7 +3490,7 @@ pub async fn run_single_query(
 
     if let Some(ref skill_idx) = config.skill_index {
         let guard = skill_idx.read().await;
-        let listing = format_skill_listing(&*guard);
+        let listing = format_skill_listing(&guard);
         drop(guard);
         if !listing.trim().is_empty() {
             cfg.append_system_prompt = Some(match cfg.append_system_prompt.take() {
@@ -3865,8 +3865,10 @@ mod tests {
     }
 
     fn make_tool_context(provider: &str) -> ToolContext {
-        let mut cfg = CoreConfig::default();
-        cfg.provider = Some(provider.to_string());
+        let cfg = CoreConfig {
+            provider: Some(provider.to_string()),
+            ..Default::default()
+        };
         ToolContext {
             working_dir: std::env::temp_dir(),
             permission_mode: PermissionMode::BypassPermissions,

@@ -2542,7 +2542,7 @@ impl App {
         block
             .output_preview
             .as_deref()
-            .map_or(false, |p| p.contains("more lines"))
+            .is_some_and(|p| p.contains("more lines"))
     }
 
     /// Check current token usage and push token warning notifications as

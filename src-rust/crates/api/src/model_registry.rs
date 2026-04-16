@@ -235,39 +235,37 @@ impl ModelRegistry {
         // DashScope intl endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
         // Recommended agentic temperature: 1.0 (long-horizon), 0.6 (eval tasks).
         // Default temperature override of 0.55 applied in ProviderQuirks.
-        for (id, name, ctx, out, tool_calling, reasoning, vision) in [
-            (
-                // Model ID used in DashScope API calls.
-                "qwen3.6-plus",
-                "Qwen 3.6 Plus",
-                // 1M token context window per official docs.
-                1_000_000u32,
-                // 65,536 max output tokens per official docs (some sources cite 66K).
-                65_536u32,
-                true,
-                true,
-                true,
-            ),
-        ] {
-            self.insert(ModelEntry {
-                info: ModelInfo {
-                    id: ModelId::new(id),
-                    provider_id: pid.clone(),
-                    name: name.to_string(),
-                    context_window: ctx,
-                    max_output_tokens: out,
-                },
-                cost_input: None,
-                cost_output: None,
-                cost_cache_read: None,
-                cost_cache_write: None,
-                tool_calling,
-                reasoning,
-                vision,
-                family: Some("qwen".to_string()),
-                status: "active".to_string(),
-            });
-        }
+        let (id, name, ctx, out, tool_calling, reasoning, vision) = (
+            // Model ID used in DashScope API calls.
+            "qwen3.6-plus",
+            "Qwen 3.6 Plus",
+            // 1M token context window per official docs.
+            1_000_000u32,
+            // 65,536 max output tokens per official docs (some sources cite 66K).
+            65_536u32,
+            true,
+            true,
+            true,
+        );
+
+        self.insert(ModelEntry {
+            info: ModelInfo {
+                id: ModelId::new(id),
+                provider_id: pid.clone(),
+                name: name.to_string(),
+                context_window: ctx,
+                max_output_tokens: out,
+            },
+            cost_input: None,
+            cost_output: None,
+            cost_cache_read: None,
+            cost_cache_write: None,
+            tool_calling,
+            reasoning,
+            vision,
+            family: Some("qwen".to_string()),
+            status: "active".to_string(),
+        });
     }
 
     fn insert(&mut self, entry: ModelEntry) {

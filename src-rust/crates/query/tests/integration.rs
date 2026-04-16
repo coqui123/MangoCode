@@ -79,8 +79,10 @@ fn test_config(registry: std::sync::Arc<ProviderRegistry>) -> QueryConfig {
 }
 
 fn test_tool_ctx(provider: &str) -> ToolContext {
-    let mut cfg = CoreConfig::default();
-    cfg.provider = Some(provider.to_string());
+    let cfg = CoreConfig {
+        provider: Some(provider.to_string()),
+        ..Default::default()
+    };
     ToolContext {
         working_dir: std::env::temp_dir(),
         permission_mode: PermissionMode::BypassPermissions,

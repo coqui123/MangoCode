@@ -35,6 +35,7 @@ base64 = { workspace = true }
 open = { workspace = true }
 enigo = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"], optional = true }
 
 # PTY support — used by PtyBashTool on Unix
@@ -44,5 +45,5 @@ portable-pty = "0.9"
 nix = { workspace = true }
 
 [features]
-computer-use = ["dep:enigo", "dep:xcap"]
+computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
 browser = ["dep:chromiumoxide"]

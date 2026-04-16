@@ -118,6 +118,12 @@ pub struct Vault {
     path: PathBuf,
 }
 
+impl Default for Vault {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Vault {
     pub fn new() -> Self {
         let path = dirs::home_dir()
@@ -308,7 +314,7 @@ pub fn reqwest_client_builder() -> ClientBuilder {
             .or_else(gateway_access_token_from_vault);
         if let Some(token) = token {
             if let Ok(auth) = HeaderValue::from_str(&format!("Bearer {}", token)) {
-                if let Ok(proxy) = Proxy::all(&gw.url).and_then(|p| Ok(p.custom_http_auth(auth))) {
+                if let Ok(proxy) = Proxy::all(&gw.url).map(|p| p.custom_http_auth(auth)) {
                     builder = builder.proxy(proxy);
                 }
             }
