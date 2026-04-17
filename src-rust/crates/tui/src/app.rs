@@ -886,6 +886,9 @@ pub struct App {
     pub paste_burst_until: Option<std::time::Instant>,
     /// Cursor position when the current paste burst started (for collapse).
     pub paste_burst_start_cursor: Option<usize>,
+    /// After a Ctrl+V clipboard paste, some terminals emit the same payload as
+    /// `Event::Paste`. Suppress one matching bracketed-paste within this window.
+    suppress_duplicate_terminal_paste: Option<(std::time::Instant, String)>,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1572,6 +1575,7 @@ impl App {
             paste_burst_last_printable_at: None,
             paste_burst_until: None,
             paste_burst_start_cursor: None,
+            suppress_duplicate_terminal_paste: None,
         }
     }
 
@@ -1721,6 +1725,31 @@ impl App {
         if data.contains('\n') || data.contains('\r') {
             self.activate_paste_burst(now);
         }
+    }
+
+    /// Handle `Event::Paste` from the terminal (bracketed paste). Call this from
+    /// the outer event loop instead of [`PromptInputState::paste`] so suggestions,
+    /// legacy prompt fields, paste-burst timing, and Ctrl+V dedup stay correct.
+    pub fn handle_terminal_paste(&mut self, data: &str) {
+        let now = std::time::Instant::now();
+        self.expire_paste_burst_if_idle(now);
+
+        if self.is_streaming
+            || self.permission_request.is_some()
+            || self.history_search_overlay.visible
+            || self.history_search.is_some()
+        {
+            self.suppress_duplicate_terminal_paste = None;
+            return;
+        }
+
+        if let Some((until, prev)) = self.suppress_duplicate_terminal_paste.take() {
+            if now <= until && prev == data {
+                return;
+            }
+        }
+
+        self.handle_prompt_paste(data, now);
     }
 
     /// Load token budget from environment or model defaults.
@@ -3740,6 +3769,12 @@ impl App {
                     .push(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text() {
                 self.handle_prompt_paste(&text, now);
+                // Many terminals (notably Windows Terminal) also deliver the same
+                // bytes as `Event::Paste` right after Ctrl+V; skip that duplicate.
+                self.suppress_duplicate_terminal_paste = Some((
+                    now + std::time::Duration::from_millis(150),
+                    text,
+                ));
             }
             return false;
         }
@@ -5657,13 +5692,8 @@ impl App {
                             }
                         }
                     }
-                    Event::Paste(data)
-                        if !self.is_streaming
-                            && self.permission_request.is_none()
-                            && !self.history_search_overlay.visible
-                            && self.history_search.is_none() =>
-                    {
-                        self.handle_prompt_paste(&data, std::time::Instant::now());
+                    Event::Paste(data) => {
+                        self.handle_terminal_paste(&data);
                     }
                     Event::Mouse(mouse_event) => {
                         self.handle_mouse_event(mouse_event);

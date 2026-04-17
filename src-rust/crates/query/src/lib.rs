@@ -3776,7 +3776,7 @@ mod tests {
         // both appear in Qwen provider options.
         let options = build_provider_options(
             "qwen",
-            "qwen3.6-plus",
+            "qwen3.6-plus-2026-04-02",
             None,
             Some(10_000),
             0,
@@ -3792,7 +3792,7 @@ mod tests {
         // Without a thinking budget, enable_thinking should not be set.
         let options = build_provider_options(
             "qwen",
-            "qwen3.6-plus",
+            "qwen3.6-plus-2026-04-02",
             None,
             None,
             0,

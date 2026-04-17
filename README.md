@@ -202,7 +202,7 @@ Example: Qwen (DashScope) headless stream output using vault unlock:
 
 ```powershell
 cd src-rust
-.\target\debug\mangocode.exe --provider qwen --model qwen3.6-plus --output-format stream-json --vault-prompt --max-turns 2 -p "Call one tool (Grep for 'openai_compat' in the repo), then stop." |& Tee-Object -FilePath .\qwen-stream.jsonl
+.\target\debug\mangocode.exe --provider qwen --model qwen3.6-plus-2026-04-02 --output-format stream-json --vault-prompt --max-turns 2 -p "Call one tool (Grep for 'openai_compat' in the repo), then stop." |& Tee-Object -FilePath .\qwen-stream.jsonl
 ```
 
 ### Useful CI-Safe Flags

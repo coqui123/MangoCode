@@ -230,15 +230,15 @@ impl ModelRegistry {
         let pid = ProviderId::new("qwen");
 
         // Specs sourced from Alibaba Cloud Model Studio docs (April 2026).
-        // qwen3.6-plus: 1M context, 65,536 max output, native tool calling,
+        // qwen3.6-plus-2026-04-02: 1M context, 65,536 max output, native tool calling,
         // hybrid thinking model (enable_thinking + preserve_thinking for agents).
         // DashScope intl endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
         // Recommended agentic temperature: 1.0 (long-horizon), 0.6 (eval tasks).
         // Default temperature override of 0.55 applied in ProviderQuirks.
         let (id, name, ctx, out, tool_calling, reasoning, vision) = (
             // Model ID used in DashScope API calls.
-            "qwen3.6-plus",
-            "Qwen 3.6 Plus",
+            "qwen3.6-plus-2026-04-02",
+            "Qwen 3.6 Plus (2026-04-02)",
             // 1M token context window per official docs.
             1_000_000u32,
             // 65,536 max output tokens per official docs (some sources cite 66K).

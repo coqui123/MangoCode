@@ -173,7 +173,7 @@ pub fn venice() -> OpenAiCompatProvider {
 /// Qwen / Alibaba DashScope.  Reads `DASHSCOPE_API_KEY`.
 ///
 /// Targets the DashScope international endpoint (Singapore).
-/// Model: qwen3.6-plus — 1M context, 65,536 max output, native tool calling,
+/// Model: qwen3.6-plus-2026-04-02 — 1M context, 65,536 max output, native tool calling,
 /// hybrid thinking (enable_thinking controlled by query layer via provider_options).
 ///
 /// Key agentic parameters:

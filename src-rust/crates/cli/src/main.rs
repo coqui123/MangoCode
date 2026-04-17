@@ -2953,9 +2953,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     }
                 }
                 Event::Paste(data) => {
-                    if !app.is_streaming && app.permission_request.is_none() {
-                        app.prompt_input.paste(&data);
-                    }
+                    app.handle_terminal_paste(&data);
                 }
                 Event::Mouse(mouse) => {
                     app.handle_mouse_event(mouse);
