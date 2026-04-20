@@ -1,6 +1,6 @@
 //! Model picker overlay (/model command).
-//! Mirrors src/components/ModelPicker.tsx — including effort levels and
-//! fast-mode notice.
+//!
+//! Includes effort levels and fast-mode notice.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -14,14 +14,11 @@ use crate::overlays::centered_rect;
 // Effort level
 // ---------------------------------------------------------------------------
 
-/// Mirrors the TS `EffortLevel` enum and `effortLevelToSymbol()` helper.
-///
 /// Effort controls the extended-thinking `budget_tokens` parameter sent to the
 /// API. Only models that support extended thinking honour this; for others it
 /// is silently ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-#[derive(Default)]
 pub enum EffortLevel {
     Low,
     #[default]
@@ -31,7 +28,7 @@ pub enum EffortLevel {
 }
 
 impl EffortLevel {
-    /// Unicode quarter-circle symbol used in the TS UI.
+    /// Unicode symbol shown next to the effort level in the TUI.
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Low => "\u{25cb}",    // ○  empty circle
@@ -653,7 +650,6 @@ impl ModelPickerState {
             None
         };
         // If user chose a model other than the fast-mode model while fast mode is
-        // active, the caller should turn off fast mode (mirrors TS behaviour).
         self.close();
         Some((id, effort))
     }

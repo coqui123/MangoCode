@@ -1,6 +1,5 @@
 // memory_update_notification.rs — MemoryUpdateNotification surface.
 //
-// Mirrors src/components/memory/MemoryUpdateNotification.tsx.
 // Shown briefly in the message area when MangoCode updates a memory file
 // (e.g. ~/.mangocode/AGENTS.md or a project-local AGENTS.md).
 //

@@ -1,7 +1,6 @@
 //! Modular system prompt assembly with caching support.
 //!
-//! Mirrors the TypeScript `systemPromptSections.ts` / `prompts.ts` architecture:
-//! cacheable (static) sections are placed before `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`;
+//! Cacheable (static) sections are placed before `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`;
 //! volatile, session-specific sections follow it.
 
 use serde::{Deserialize, Serialize};
@@ -14,11 +13,11 @@ use std::sync::{Mutex, OnceLock};
 
 /// Marker that splits the cached vs dynamic parts of the system prompt.
 /// Everything before this marker can be prompt-cached by the API.
-/// Matches the TypeScript constant `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`.
+/// Stable marker string used to split cached vs dynamic prompt sections.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
 // ---------------------------------------------------------------------------
-// Section cache (mirrors bootstrap/state.ts systemPromptSectionCache)
+// Section cache (per-section memoization for prompt caching)
 // ---------------------------------------------------------------------------
 
 fn section_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
@@ -146,7 +145,7 @@ pub enum SystemPromptPrefix {
 }
 
 impl SystemPromptPrefix {
-    /// Detect from environment variables, mirroring `getCLISyspromptPrefix`.
+    /// Detect from environment variables (Vertex, Bedrock, remote, SDK vs interactive).
     pub fn detect(is_non_interactive: bool, has_append_system_prompt: bool) -> Self {
         // Vertex: always uses the default "MangoCode" prefix.
         if std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").is_ok()
@@ -163,7 +162,7 @@ impl SystemPromptPrefix {
             return Self::Remote;
         }
 
-        // Non-interactive mode maps to SDK variants (matches TS getCLISyspromptPrefix).
+        // Non-interactive mode maps to SDK variants.
         if is_non_interactive {
             if has_append_system_prompt {
                 return Self::SdkPreset;
@@ -187,6 +186,28 @@ impl SystemPromptPrefix {
             Self::Sdk => "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
         }
     }
+
+    /// Opener used when an Anthropic Claude Max OAuth session is active.
+    ///
+    /// Anthropic's OAuth endpoint validates the first system-prompt block
+    /// against these exact strings; any divergence triggers the
+    /// "OAuth authentication is currently not supported" rejection. Three
+    /// variants are emitted, selected by the active `SystemPromptPrefix`:
+    ///
+    ///   * Default opener        — interactive CLI / Vertex / Bedrock / Remote
+    ///   * SDK preset opener     — non-interactive + `--append-system-prompt`
+    ///   * SDK opener            — non-interactive, no append
+    pub fn claude_code_attribution_text(self) -> &'static str {
+        match self {
+            Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
+                "You are Claude Code, Anthropic's official CLI for Claude."
+            }
+            Self::SdkPreset => {
+                "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+            }
+            Self::Sdk => "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,15 +218,14 @@ impl SystemPromptPrefix {
 ///
 /// When the user authenticates via an OAuth provider (e.g. Claude Max, Codex),
 /// the system prompt attribution line is updated to reflect the official
-/// product identity. This matches how Claude Code identifies itself when
-/// running under its own OAuth credentials.
+/// product identity required by Anthropic when using Claude Max OAuth.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum OAuthProvider {
     /// No OAuth provider active — use default MangoCode identity.
     #[default]
     None,
     /// Anthropic Claude Max (claude.ai OAuth, user:inference scope).
-    /// Uses official Claude Code identity in the system prompt.
+    /// Uses Anthropic's required product identity in the system prompt.
     AnthropicMax,
     /// OpenAI Codex (chatgpt.com OAuth).
     OpenAiCodex,
@@ -217,15 +237,16 @@ impl OAuthProvider {
     /// Returns the system prompt identity/attribution string for this provider.
     ///
     /// When an OAuth provider is active, we use the official product identity
-    /// (e.g. "Claude Code" for Anthropic Max) so the model receives the
-    /// correct persona context matching its training.
+    /// (e.g. Claude Max wording) so the model receives the correct persona context.
     pub fn identity_text(self) -> &'static str {
         match self {
             Self::None => "You are MangoCode, a powerful coding assistant built on Claude.",
-            Self::AnthropicMax => {
-                "You are Claude Code, Anthropic's official CLI for Claude. \
-                You are running through MangoCode with a Claude Max subscription."
-            }
+            // Anthropic's OAuth endpoint requires this exact opener; any extra
+            // wording triggers an "OAuth authentication is currently not
+            // supported" rejection. SDK / non-interactive variants are
+            // selected via `SystemPromptPrefix::claude_code_attribution_text`
+            // inside `build_system_prompt`.
+            Self::AnthropicMax => "You are Claude Code, Anthropic's official CLI for Claude.",
             Self::OpenAiCodex => {
                 "You are MangoCode, running with an OpenAI Codex subscription. \
                 You have access to OpenAI's Codex models for code generation."
@@ -333,13 +354,22 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
 
+    // 1. Attribution header — OAuth provider overrides default prefix.
+    //
+    // Anthropic Claude Max specifically requires its sanctioned opener
+    // (and SDK variants) verbatim, otherwise the OAuth endpoint returns
+    // "OAuth authentication is currently not supported." Route AnthropicMax
+    // through `claude_code_attribution_text` so the SDK / non-interactive
+    // variants are honoured. Other OAuth providers keep using their own
+    // identity strings.
+    let attribution = match opts.oauth_provider {
+        OAuthProvider::None => prefix.attribution_text().to_string(),
+        OAuthProvider::AnthropicMax => prefix.claude_code_attribution_text().to_string(),
+        other => other.identity_text().to_string(),
+    };
+
     let mut parts: Vec<String> = vec![
-        // 1. Attribution header — OAuth provider overrides default prefix
-        if opts.oauth_provider != OAuthProvider::None {
-            opts.oauth_provider.identity_text().to_string()
-        } else {
-            prefix.attribution_text().to_string()
-        },
+        attribution,
         // 2. Core capabilities
         CORE_CAPABILITIES.to_string(),
         // 3. Tool use guidelines
@@ -370,7 +400,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 8.5. Injected skills (cacheable: skill content is static reference material)
     //
     // Skills are injected here — before the dynamic boundary — so the API can
-    // cache them across turns. This mirrors the Perplexity Computer architecture
+    // cache them across turns. This matches the Perplexity Computer architecture
     // where skill context is loaded into the model's working memory before any
     // token is generated.
     for (skill_name, skill_content) in &opts.injected_skills {
@@ -438,7 +468,6 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 }
 
 /// Build the dynamic environment-info section injected after the boundary.
-/// Mirrors `computeEnvInfo()` + `getUnameSR()` from `src/constants/prompts.ts`.
 fn build_env_info_section(working_dir: Option<&str>) -> String {
     // Platform string
     let platform = if cfg!(target_os = "windows") {
@@ -449,7 +478,7 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         "linux"
     };
 
-    // OS version string (mirrors getUnameSR())
+    // OS version string
     let os_version = {
         #[cfg(target_os = "windows")]
         {
@@ -470,7 +499,7 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         }
     };
 
-    // Shell detection (mirrors getShellInfoLine())
+    // Shell detection
     let shell_env = std::env::var("SHELL").unwrap_or_default();
     let shell_name = if shell_env.contains("zsh") {
         "zsh"
@@ -962,6 +991,92 @@ mod tests {
             "QA enforcement block must be in the dynamic section (after boundary)"
         );
         assert!(prompt.contains("Run markitdown output.pptx"));
+    }
+
+    // ---- Claude Max OAuth: reference-exact opener -------------------------
+
+    #[test]
+    fn test_anthropic_max_opener_matches_reference_default() {
+        let opts = SystemPromptOptions {
+            oauth_provider: OAuthProvider::AnthropicMax,
+            prefix: Some(SystemPromptPrefix::Cli),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(
+            prompt.starts_with("You are Claude Code, Anthropic's official CLI for Claude."),
+            "Claude Max CLI opener must match reference DEFAULT_PREFIX byte-for-byte"
+        );
+        assert!(
+            !prompt.contains("MangoCode with a Claude Max subscription"),
+            "Reference opener must not contain the legacy MangoCode subscription line"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_max_opener_matches_reference_sdk_preset() {
+        let opts = SystemPromptOptions {
+            oauth_provider: OAuthProvider::AnthropicMax,
+            prefix: Some(SystemPromptPrefix::SdkPreset),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(
+            prompt.starts_with(
+                "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."
+            ),
+            "Claude Max SDK-preset opener must match reference AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_max_opener_matches_reference_sdk() {
+        let opts = SystemPromptOptions {
+            oauth_provider: OAuthProvider::AnthropicMax,
+            prefix: Some(SystemPromptPrefix::Sdk),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(
+            prompt.starts_with("You are a Claude agent, built on Anthropic's Claude Agent SDK."),
+            "Claude Max SDK opener must match reference AGENT_SDK_PREFIX"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_max_opener_unaffected_by_vertex_or_bedrock_prefix() {
+        // Vertex / Bedrock / remote still use the default Anthropic Max opener.
+        for variant in [
+            SystemPromptPrefix::Vertex,
+            SystemPromptPrefix::Bedrock,
+            SystemPromptPrefix::Remote,
+        ] {
+            let opts = SystemPromptOptions {
+                oauth_provider: OAuthProvider::AnthropicMax,
+                prefix: Some(variant),
+                ..Default::default()
+            };
+            let prompt = build_system_prompt(&opts);
+            assert!(
+                prompt.starts_with("You are Claude Code, Anthropic's official CLI for Claude."),
+                "Claude Max opener for {:?} must collapse to reference DEFAULT_PREFIX",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_other_oauth_providers_still_use_identity_text() {
+        // Codex must keep its dedicated identity string — only AnthropicMax
+        // is pinned to the Anthropic-sanctioned opener.
+        let opts = SystemPromptOptions {
+            oauth_provider: OAuthProvider::OpenAiCodex,
+            prefix: Some(SystemPromptPrefix::Cli),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(prompt.contains("OpenAI Codex"));
+        assert!(!prompt.starts_with("You are Claude Code,"));
     }
 
     #[test]

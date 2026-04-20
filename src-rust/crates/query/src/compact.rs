@@ -1,8 +1,7 @@
 // Auto-compact service for cc-query.
 //
 // When the conversation context window fills up (~90%+), we automatically
-// summarise older messages to free space. This mirrors the TypeScript
-// autoCompact / compact service behaviour.
+// summarise older messages to free space.
 //
 // Strategy:
 //   1. Keep the last KEEP_RECENT_MESSAGES messages verbatim.
@@ -31,7 +30,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
-// Constants (mirrors TypeScript autoCompact.ts)
+// Constants
 // ---------------------------------------------------------------------------
 
 /// We target keeping this many context tokens free after compaction.
@@ -49,7 +48,7 @@ const KEEP_RECENT_MESSAGES: usize = 10;
 /// Max consecutive auto-compact failures before giving up (circuit breaker).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-// Percentage thresholds for token warning states (mirrors TS autoCompact.ts)
+// Percentage thresholds for token warning states
 const WARNING_PCT: f64 = 0.80; // 80 % full → yellow warning
 const CRITICAL_PCT: f64 = 0.95; // 95 % full → red critical
 
@@ -89,7 +88,6 @@ impl AutoCompactState {
 }
 
 /// Token-usage state relative to the context window.
-/// Matches the TypeScript TokenWarningState semantics:
 ///   Ok      = below 80 % of context window
 ///   Warning = 80–95 % ("yellow" in TUI)
 ///   Critical= above 95 % ("red" in TUI)
@@ -104,7 +102,7 @@ pub enum TokenWarningState {
 }
 
 // ---------------------------------------------------------------------------
-// Message grouping (from TypeScript grouping.ts)
+// Message grouping
 // ---------------------------------------------------------------------------
 
 /// A semantically coherent chunk of messages suitable for individual
@@ -187,7 +185,7 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
 }
 
 /// Group messages at API-round boundaries: one group per assistant response.
-/// This mirrors `groupMessagesByApiRound` from TypeScript grouping.ts.
+/// One group per assistant reply (API round).
 ///
 /// Each group represents one complete API round:
 ///   [user_messages..., assistant_response]
@@ -200,7 +198,7 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
 ///   group — i.e. each assistant turn closes its own group.
 ///
 /// The result is that user messages are grouped with the SUBSEQUENT assistant
-/// response that replies to them (matching TypeScript round semantics).
+/// response that replies to them.
 pub fn group_messages_for_compact(messages: &[Message]) -> Vec<MessageGroup> {
     let mut groups: Vec<MessageGroup> = Vec::new();
     let mut current: Vec<Message> = Vec::new();
@@ -303,7 +301,7 @@ pub async fn micro_compact_if_needed(
 }
 
 // ---------------------------------------------------------------------------
-// Compaction prompt (matches TypeScript prompt.ts)
+// Compaction prompt
 // ---------------------------------------------------------------------------
 
 /// The critical preamble that prevents the summariser from making tool calls.
@@ -321,7 +319,7 @@ const NO_TOOLS_TRAILER: &str =
 an <analysis> block followed by a <summary> block. \
 Tool calls will be rejected and you will fail the task.";
 
-/// The base compaction prompt (mirrors BASE_COMPACT_PROMPT from TypeScript prompt.ts).
+/// The base compaction prompt sent to the summarizer model.
 const BASE_COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation \
 so far, paying close attention to the user's explicit requests and your previous actions.\n\
 This summary should be thorough in capturing technical details, code patterns, and architectural \
@@ -433,8 +431,7 @@ pub fn get_compact_prompt(custom_instructions: Option<&str>) -> String {
 }
 
 /// Format the raw compact summary by stripping `<analysis>` and cleaning up
-/// `<summary>` XML tags.  Mirrors `formatCompactSummary` from TypeScript
-/// prompt.ts.
+/// `<summary>` XML tags for compact transcripts.
 pub fn format_compact_summary(raw: &str) -> String {
     // Strip <analysis>…</analysis> block (scratchpad, not useful in context)
     let without_analysis = {
@@ -500,7 +497,7 @@ pub fn context_window_for_model(model: &str) -> u64 {
 
 /// Determine token-warning state given current input token count and model.
 ///
-/// Thresholds (mirrors TypeScript autoCompact.ts):
+/// Thresholds (percent of context window):
 ///   ≥ 95 % → Critical (red warning)
 ///   ≥ 80 % → Warning  (yellow warning)
 ///   <  80 % → Ok
@@ -533,8 +530,8 @@ pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactSt
 // Core compaction logic
 // ---------------------------------------------------------------------------
 
-/// Summarise `messages[..split_at]` using the Anthropic API using the
-/// carefully crafted compaction prompt from TypeScript prompt.ts.
+/// Summarise `messages[..split_at]` using the Anthropic API with the
+/// carefully crafted compaction prompt defined in this module.
 /// Returns a new conversation: [summary user msg] + messages[split_at..].
 async fn summarise_head(
     client: &mangocode_api::AnthropicClient,
@@ -687,7 +684,7 @@ pub async fn compact_conversation(
         "Compacting conversation"
     );
 
-    // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
+    // Generous token budget for the summary (20k output tokens)
     summarise_head(client, messages, split_at, model, 20_000).await
 }
 
@@ -733,12 +730,10 @@ pub async fn auto_compact_if_needed(
 // Reactive Compact (T1-1) — fires on usage data, not after turn end
 // ---------------------------------------------------------------------------
 //
-// The TypeScript source uses a `ReactiveCompact` class with GrowthBook
-// feature flags and a subscription to the streaming API's token-usage
-// events.  In the Rust port we model the same behaviour with plain async
-// functions and an env-var feature gate (`CLAUDE_REACTIVE_COMPACT=1`).
+// Reactive compact: drive compaction from streaming usage instead of only at turn end.
+// Gated by `CLAUDE_REACTIVE_COMPACT=1`.
 //
-// Phase overview (mirrors reactiveCompact.ts):
+// Phase overview:
 //   1. Check usage with `should_compact` / `should_context_collapse`.
 //   2. Strip image blocks from the conversation before compacting
 //      (reduces the size of the prompt sent to the summariser).
@@ -802,7 +797,7 @@ pub fn should_context_collapse(tokens_used: u64, context_limit: u64) -> bool {
 ///
 /// Returns `(new_messages, rough_tokens_freed)`.
 ///
-/// Mirrors `snipCompact` from TypeScript (no API call required — purely local).
+/// Drop trailing tool results from the transcript without calling the model.
 pub fn snip_compact(
     messages: Vec<mangocode_core::types::Message>,
     keep_n_newest: usize,
@@ -865,8 +860,7 @@ pub fn calculate_messages_to_keep_index(
 /// Remove image blocks from a message list before compacting.
 ///
 /// Image tokens are expensive and carry no information that a text summary
-/// needs.  Mirrors the TypeScript `stripImages` helper used inside
-/// `reactiveCompact.ts`.
+/// needs.
 fn strip_images(
     messages: Vec<mangocode_core::types::Message>,
 ) -> Vec<mangocode_core::types::Message> {
@@ -1111,7 +1105,7 @@ const REACTIVE_COMPACT_THRESHOLD: f64 = 0.90;
 const CONTEXT_COLLAPSE_THRESHOLD: f64 = 0.97;
 
 // ---------------------------------------------------------------------------
-// T4-5: Collapse read/search results (mirrors src/utils/collapseReadSearch.ts)
+// T4-5: Collapse read/search results
 // ---------------------------------------------------------------------------
 
 /// Replace repeated reads of the same file with a single summary.

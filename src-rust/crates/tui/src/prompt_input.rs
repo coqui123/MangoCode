@@ -1,5 +1,4 @@
 //! Complete PromptInput — multi-line text editor for the TUI.
-//! Mirrors src/components/PromptInput/ (21 files) and src/vim/ (5 files).
 //!
 //! Features:
 //! - Multi-line editing (Shift+Enter for newlines)
@@ -3261,7 +3260,6 @@ pub fn render_prompt_input(
     }
 
     // Token estimate overlay on the first text row (top-right corner).
-    // Format mirrors TS formatTokens: compact "1.3k" for ≥1000, raw number below that.
     if state.text.len() > 1000 && area.height > 1 {
         let n = state.token_estimate;
         let formatted = if n >= 1000 {

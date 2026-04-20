@@ -1,6 +1,6 @@
 // Prompt history — append-only JSONL log of user prompts.
 //
-// Mirrors the behaviour of `src/history.ts` in the TypeScript codebase:
+// Behaviour:
 //   - Entries are written to `~/.mangocode/history.jsonl` via O_APPEND.
 //   - An advisory lock file (`history.jsonl.lock`) serialises concurrent
 //     writers (up to 20 retries × 50 ms back-off).
@@ -671,11 +671,10 @@ pub fn clear_pending_history_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// Reference formatting helpers (parity with TS)
+// Reference formatting helpers
 // ---------------------------------------------------------------------------
 
 /// Count the number of line-break sequences in `text`.
-/// Matches the TypeScript `getPastedTextRefNumLines` behaviour.
 pub fn get_pasted_text_ref_num_lines(text: &str) -> usize {
     let mut count = 0usize;
     let mut chars = text.chars().peekable();

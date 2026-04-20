@@ -184,7 +184,8 @@ pub struct QueryConfig {
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
     /// history before older results are replaced with a truncation notice.
-    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
+    ///
+    /// Default: 50_000.
     pub tool_result_budget: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
@@ -208,7 +209,7 @@ pub struct QueryConfig {
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
     pub max_budget_usd: Option<f64>,
     /// Fallback model name. Used when the primary model returns overloaded /
-    /// rate-limit errors (mirrors TS `--fallback-model`).
+    /// rate-limit errors (see `--fallback-model`).
     pub fallback_model: Option<String>,
     /// Optional ProviderRegistry for dispatching to non-Anthropic providers.
     /// When `config.provider` is set to something other than "anthropic" and
@@ -223,7 +224,7 @@ pub struct QueryConfig {
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<mangocode_api::ModelRegistry>>,
     /// Active OAuth provider, if any. Drives system-prompt identity text so the
-    /// model receives the correct product branding (e.g. Claude Code / Max wording).
+    /// model receives the correct product branding (e.g. Claude Max OAuth wording).
     /// Set from `app.config.provider` at query-dispatch time — no disk reads needed.
     pub oauth_provider: mangocode_core::system_prompt::OAuthProvider,
     /// Effective skill-discovery config (`settings.json` skills section). Used with
@@ -793,8 +794,8 @@ fn total_tool_result_chars(messages: &[Message]) -> usize {
 /// under budget.  Returns the (possibly modified) message list and the
 /// number of results that were truncated.
 ///
-/// Mirrors the spirit of the TypeScript `applyToolResultBudget` /
-/// `enforceToolResultBudget` logic, simplified to a straightforward
+/// Similar to a tool-result byte budget: walk oldest-first and replace
+/// oversized tool results with placeholders until under budget — a straightforward
 /// oldest-first eviction without the session-persistence layer.
 fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Message>, usize) {
     let total = total_tool_result_chars(&messages);
@@ -851,11 +852,10 @@ fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Messa
 // ---------------------------------------------------------------------------
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
-/// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
+/// partial response.
 const MAX_TOKENS_RECOVERY_LIMIT: u32 = 3;
 
 /// Message injected when the model hits its output-token limit.
-/// Mirrors the TS recovery message in query.ts lines 1224-1228.
 const MAX_TOKENS_RECOVERY_MSG: &str =
     "Output token limit hit. Resume directly — no apology, no recap of what \
      you were doing. Pick up mid-thought if that is where the cut happened. \
@@ -964,7 +964,6 @@ pub async fn run_query_loop(
 
         // Drain any pending user messages that were queued during the previous
         // tool-execution phase (e.g. commands entered while tools ran).
-        // Mirrors the TS `messageQueueManager` drain between turns.
         if let Some(queue) = pending_messages.as_deref_mut() {
             for text in queue.drain(..) {
                 debug!("Injecting pending message: {}", &text);
@@ -974,7 +973,6 @@ pub async fn run_query_loop(
 
         // T1-4: Drain the priority command queue (if wired up) and prepend any
         // resulting messages to the conversation before the API call.
-        // Mirrors the TS `messageQueueManager` priority-queue drain.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
                 let injected = drain_command_queue(cq);
@@ -991,7 +989,6 @@ pub async fn run_query_loop(
         // Apply tool-result budget: if the cumulative size of all tool results
         // in the conversation exceeds the configured threshold, replace the
         // oldest results with a placeholder until we're back under budget.
-        // This mirrors the TS `applyToolResultBudget` call in query.ts.
         if config.tool_result_budget > 0 {
             let (budgeted, truncated) =
                 apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
@@ -1371,6 +1368,15 @@ pub async fn run_query_loop(
                                         )),
                                         "github-copilot" => Some(std::sync::Arc::new(
                                             mangocode_api::CopilotProvider::new(key),
+                                        )),
+                                        // Claude Max uses Bearer auth against api.anthropic.com,
+                                        // NOT the generic OpenAI-compatible fallback below.
+                                        // Without this arm, the sk-ant-oat-* OAuth token would
+                                        // be sent to https://api.openai.com/v1 and rejected.
+                                        "anthropic-max" => Some(std::sync::Arc::new(
+                                            mangocode_api::providers::AnthropicMaxProvider::new(
+                                                key,
+                                            ),
                                         )),
                                         "cohere" => {
                                             if let Some(p) = mangocode_api::CohereProvider::from_env()
@@ -2347,7 +2353,6 @@ pub async fn run_query_loop(
         }
 
         // Emit token warning events when approaching context limits.
-        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
         {
             let warning_state =
                 compact::calculate_token_warning_state(usage.input_tokens, &config.model);
@@ -2591,8 +2596,7 @@ pub async fn run_query_loop(
                 };
             }
             "max_tokens" => {
-                // Mirror the TS recovery loop: inject a continuation nudge and
-                // retry up to MAX_TOKENS_RECOVERY_LIMIT times before surfacing
+                // Inject a continuation nudge and retry up to MAX_TOKENS_RECOVERY_LIMIT times before surfacing
                 // the partial response as QueryOutcome::MaxTokens.
                 if max_tokens_recovery_count < MAX_TOKENS_RECOVERY_LIMIT {
                     max_tokens_recovery_count += 1;
@@ -2647,8 +2651,7 @@ pub async fn run_query_loop(
                 //          futures::future::join_all, preserving original order.
                 // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
                 //
-                // This mirrors the TypeScript StreamingToolExecutor pattern.
-                // ---------------------------------------------------------------------------
+                // This Matches the StreamingToolExecutor pattern.                // ---------------------------------------------------------------------------
 
                 // Intermediate record produced during Phase 1.
                 struct PreparedTool {

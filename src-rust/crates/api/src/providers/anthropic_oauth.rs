@@ -28,6 +28,38 @@ use crate::provider_types::{
 use super::anthropic::AnthropicProvider;
 
 // ---------------------------------------------------------------------------
+// Beta headers required for Claude Max OAuth
+// ---------------------------------------------------------------------------
+
+/// Enables Bearer OAuth on `api.anthropic.com` routes. Without this header,
+/// Anthropic rejects OAuth tokens with:
+///     "Authentication error: OAuth authentication is currently not supported."
+const OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Anthropic expects this beta flag on non-Haiku `/v1/messages` calls so Bearer
+/// OAuth bills against a Claude Max subscription (not console API-key quota)
+/// and server-side Max features stay enabled.
+const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+
+/// Build a [`ClientConfig`] tuned for Claude Max OAuth:
+/// - `use_bearer_auth = true` so the caller sends `Authorization: Bearer …`
+/// - `beta_features` prepended with `oauth-2025-04-20,claude-code-20250219`
+///   so Anthropic actually accepts the Bearer token.
+fn max_client_config(bearer_token: String) -> ClientConfig {
+    let defaults = ClientConfig::default();
+    let combined_betas = format!(
+        "{},{},{}",
+        OAUTH_BETA, CLAUDE_CODE_BETA, defaults.beta_features
+    );
+    ClientConfig {
+        api_key: bearer_token,
+        use_bearer_auth: true,
+        beta_features: combined_betas,
+        ..defaults
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AnthropicMaxProvider
 // ---------------------------------------------------------------------------
 
@@ -58,14 +90,13 @@ impl AnthropicMaxProvider {
     ///
     /// The token is the `access` field from the stored `OAuthToken` credential.
     /// The inner `AnthropicProvider` is configured to use this token as the
-    /// API key with Bearer auth mode.
+    /// API key with Bearer auth mode **and** with the `oauth-2025-04-20` beta
+    /// header — without that beta, Anthropic returns `401 "OAuth
+    /// authentication is currently not supported."`.
     pub fn new(bearer_token: String) -> Self {
-        let config = ClientConfig {
-            api_key: bearer_token,
-            use_bearer_auth: true,
-            ..Default::default()
-        };
-        Self::from_inner(AnthropicProvider::from_config(config))
+        Self::from_inner(AnthropicProvider::from_config(max_client_config(
+            bearer_token,
+        )))
     }
 
     /// Try to create from the auth store. Returns `None` if no valid
@@ -107,11 +138,9 @@ impl AnthropicMaxProvider {
                 if updated.persist_to_disk_with_auth_sync().await.is_err() {
                     tracing::warn!("Claude Max: refreshed tokens but failed to persist to disk");
                 }
-                let new_inner = AnthropicProvider::from_config(ClientConfig {
-                    api_key: updated.access_token.clone(),
-                    use_bearer_auth: true,
-                    ..Default::default()
-                });
+                let new_inner = AnthropicProvider::from_config(max_client_config(
+                    updated.access_token.clone(),
+                ));
                 *self.inner.lock().await = new_inner;
             }
             Err(e) => {
@@ -123,11 +152,8 @@ impl AnthropicMaxProvider {
                     AuthStore::load().get(ProviderId::ANTHROPIC_MAX)
                 {
                     if !access.is_empty() {
-                        *self.inner.lock().await = AnthropicProvider::from_config(ClientConfig {
-                            api_key: access.clone(),
-                            use_bearer_auth: true,
-                            ..Default::default()
-                        });
+                        *self.inner.lock().await =
+                            AnthropicProvider::from_config(max_client_config(access.clone()));
                     }
                 }
             }

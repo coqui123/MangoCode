@@ -1,4 +1,4 @@
-//! Token budget utilities — mirrors src/utils/context/token_budget.ts
+//! Token budget utilities.
 //!
 //! Provides helpers for tracking token usage, computing warning thresholds,
 //! and building thinking budget configs for extended thinking.

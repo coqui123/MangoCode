@@ -1,4 +1,4 @@
-//! Attachment pipeline — mirrors src/utils/attachments.ts
+//! Attachment pipeline.
 //!
 //! Assembles all context attachments for a conversation turn:
 //! IDE context, tasks, plans, skills, agents, MCP, file changes, memory.

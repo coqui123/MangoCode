@@ -2,15 +2,15 @@
 // structured output that gets captured and displayed as the assistant's final
 // response.
 //
-// Tool name: "StructuredOutput" (matches TypeScript SYNTHETIC_OUTPUT_TOOL_NAME)
+// Tool name: "StructuredOutput"
 //
 // Input:  any JSON object (pass-through schema)
 // Output: "Structured output provided successfully" (the real effect is that
 //         the caller captures `input` as the structured result)
 //
 // This tool is only surfaced to the model in non-interactive / SDK sessions.
-// In the Rust port it simply validates that it received a JSON object and
-// echoes back the confirmation string, matching the TS call() behaviour.
+// It validates that it received a JSON object and echoes back the
+// confirmation string.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

@@ -286,7 +286,7 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ]));
     }
 
-    // Home-directory warning: mirrors TS feedConfigs.tsx warningText.
+    // Home-directory warning
     // "Note: You have launched claude in your home directory. For the best
     //  experience, launch it in a project directory instead."
     if app.home_dir_warning {
@@ -1389,7 +1389,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
 
 // â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// Render the two-column orange round-bordered welcome box (matches TS LogoV2).
+/// Render the two-column orange round-bordered welcome box.
 fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     // Shorten cwd: replace $USERPROFILE/$HOME prefix with ~
     let cwd = std::env::current_dir()
@@ -2016,7 +2016,6 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     } else if let (Some(verb), Some(elapsed)) =
         (app.last_turn_verb, app.last_turn_elapsed.as_deref())
     {
-        // "✽ Worked for 2m 5s" — mirrors TS TeammateSpinnerLine idle state
         vec![Span::styled(
             format!("{} {} for {}", figures::TEARDROP_ASTERISK, verb, elapsed),
             Style::default()
@@ -2129,8 +2128,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 Some(state) => format!("PR #{} [{}]", pr_num, state),
                 None => format!("PR #{}", pr_num),
             };
-            // Colors mirror TS PrBadge getPrStatusColor + TS ink color names:
-            //   approved → Green, changes_requested → Red (error),
+            // PR state colors: approved → Green, changes_requested → Red,
             //   pending / review_required → Yellow (warning), merged → Magenta.
             let pr_color = match app.pr_state.as_deref() {
                 Some("approved") => Color::Green,
@@ -2229,7 +2227,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Permission mode badge (left side, mirrors TS bottom-left indicator).
+        // Permission mode badge (left side of status line)
         // Default mode is silent; non-default modes show a badge.
         {
             use mangocode_core::config::PermissionMode;
@@ -2320,7 +2318,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // 1. Context window usage — show "N% until auto-compact" mirroring TS TokenWarning
+        // 1. Context window usage — show "N% until auto-compact"
         if app.context_window_size > 0 {
             let used_pct =
                 (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
@@ -2353,7 +2351,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
+        // 3. Cost — 4 decimal places for costs < $0.50, else 2
         if app.cost_usd > 0.0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));

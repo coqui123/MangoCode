@@ -5464,7 +5464,7 @@ struct UiSettings {
     #[serde(default)]
     pub sandbox_mode: Option<bool>,
     /// Shell command patterns excluded from sandboxing (glob-style strings).
-    /// Mirrors TS `excludedCommands` in settings.local.json.
+    /// Shell command patterns excluded from sandboxing (see `settings.local.json`).
     #[serde(default)]
     pub sandbox_excluded_commands: Vec<String>,
 }

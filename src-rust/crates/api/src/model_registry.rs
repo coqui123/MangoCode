@@ -384,7 +384,7 @@ impl ModelRegistry {
 
         // Priority patterns: models matching these substrings are considered
         // "flagship" quality and are preferred as defaults.
-        // Mirrors OpenCode's: ["gpt-5", "claude-sonnet-4", "big-pickle", "gemini-3-pro"]
+        // Priority list similar to OpenCode defaults ("gpt-5", flagship Claude, etc.)
         let priority_patterns: &[&str] = &[
             "claude-sonnet-4",
             "gpt-5",
@@ -650,7 +650,7 @@ impl Default for ModelRegistry {
 /// Resolve the effective model for a [`Config`], using the model registry to
 /// dynamically pick the best available model for the active provider.
 ///
-/// **Resolution order** (mirrors OpenCode's approach):
+/// **Resolution order** (same general approach as OpenCode):
 ///  1. If the user explicitly set `config.model`, use it verbatim.
 ///  2. Consult the model registry for the configured provider's best model
 ///     (scored by flagship priority → "latest" preference → ID desc).

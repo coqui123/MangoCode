@@ -1,6 +1,5 @@
 // bypass_permissions_dialog.rs — Startup confirmation dialog for --dangerously-skip-permissions.
 //
-// Mirrors TS `BypassPermissionsModeDialog.tsx`:
 // - Displayed at startup when the session was launched with bypass-permissions mode.
 // - Shows a red-bordered warning explaining the risks.
 // - User must explicitly accept ("Yes, I accept") or decline ("No, exit").
@@ -90,7 +89,7 @@ pub fn render_bypass_permissions_dialog(
     frame.render_widget(block, dialog_area);
 
     let mut lines: Vec<Line<'static>> = vec![
-        // Body text (matches TS dialog copy)
+        // Body text
         Line::from(vec![Span::styled(
             "MangoCode running in Bypass Permissions mode",
             Style::default()

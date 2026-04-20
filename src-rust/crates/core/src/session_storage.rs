@@ -3,11 +3,9 @@
 // File layout:  ~/.claude/projects/{sanitized(project_root)}/{session_id}.jsonl
 //
 // Each line is a JSON object ("entry") whose `type` field is the discriminant.
-// The schema is kept compatible with the TypeScript `Entry` union in
-// `src/types/logs.ts` so that files written by the TS CLI can be read here
-// and vice-versa.
+// The schema preserves transcript compatibility across MangoCode versions.
 //
-// Only the entry types that the Rust port generates are implemented here.
+// Only the entry types that MangoCode generates are implemented here.
 // Unknown/future entry types round-trip as `Other(Value)` so they are
 // preserved when rewriting the file (tombstone path).
 
@@ -32,9 +30,9 @@ pub const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 
 /// A single line in a `.jsonl` transcript file.
 ///
-/// Variants are serialised with a `"type"` field that matches the TypeScript
-/// `Entry` union.  Only variants the Rust port actively uses are named; every
-/// other entry type is preserved as a raw `serde_json::Value` via `Other`.
+/// Variants are serialised with a `"type"` field as discriminant. Only variants
+/// MangoCode actively uses are named; every other entry type is preserved as a
+/// raw `serde_json::Value` via `Other`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TranscriptEntry {
@@ -87,8 +85,6 @@ impl TranscriptEntry {
 
 // ---------------------------------------------------------------------------
 // TranscriptMessage — the shape shared by user / assistant / system entries.
-//
-// Fields map to the TypeScript `TranscriptMessage` type in `src/types/logs.ts`.
 // ---------------------------------------------------------------------------
 
 /// A conversation message as stored in the transcript JSONL.
@@ -122,11 +118,11 @@ pub struct TranscriptMessage {
     #[serde(default)]
     pub is_sidechain: bool,
 
-    /// `"external"` | `"internal"` — mirrors TS `getUserType()`.
+    /// `"external"` | `"internal"` — transcript origin hint.
     #[serde(default = "default_user_type")]
     pub user_type: String,
 
-    /// Version of the MangoCode binary, mirrors `MACRO.VERSION`.
+    /// Version of the MangoCode binary that wrote this entry.
     #[serde(default)]
     pub version: String,
 
@@ -134,7 +130,7 @@ pub struct TranscriptMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
 
-    /// Catch-all for any other fields written by the TS CLI that we don't
+    /// Catch-all for any other fields written by older clients that we don't
     /// need to inspect.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, Value>,
@@ -209,8 +205,8 @@ pub struct SessionSummary {
 
 /// Returns the base projects directory: `~/.claude/projects/`.
 ///
-/// Uses the same path as Claude Code so that orchestration platforms
-/// (like Conducctor) and CloudCLI-based UIs can discover MangoCode
+/// Uses a conventional transcript path so orchestration platforms
+/// (like Conductor) and cloud UIs can discover MangoCode
 /// sessions alongside Claude sessions.
 pub fn projects_dir() -> PathBuf {
     dirs::home_dir()
@@ -221,8 +217,8 @@ pub fn projects_dir() -> PathBuf {
 
 /// Returns the per-project transcript directory.
 ///
-/// Uses the same path encoding as Claude Code's TypeScript CLI:
-/// the absolute project path with `/`, `\`, `:`, ` `, `~`, `_` replaced
+/// Path encoding for transcript filenames: the absolute project path with
+/// `/`, `\`, `:`, ` `, `~`, `_` replaced
 /// by `-`.  This produces directory names like `-home-ethan-myproject`
 /// that are compatible with CloudCLI session discovery.
 pub fn transcript_dir(project_root: &Path) -> PathBuf {
@@ -659,7 +655,7 @@ mod tests {
         let dir = transcript_dir(root);
         let encoded_dir = dir.file_name().unwrap().to_str().unwrap();
 
-        // Must match Claude Code path compatibility encoding.
+        // Project directory must be encoded by replacing path separators with dashes.
         assert_eq!(encoded_dir, "-Users-alice-my-project");
 
         let path = transcript_path(root, "test-session");

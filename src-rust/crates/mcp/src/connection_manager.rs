@@ -1,6 +1,5 @@
 // cc-mcp: Connection manager with reconnection and lifecycle management.
 //
-// Mirrors the reconnection logic from the TS useManageMCPConnections hook.
 // Wraps McpClient with:
 //   - per-server status tracking
 //   - exponential-backoff reconnection loops

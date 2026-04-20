@@ -7,7 +7,7 @@ use std::path::PathBuf;
 // Source
 // ---------------------------------------------------------------------------
 
-/// Where a plugin came from (mirrors the TS `source` field on `LoadedPlugin`).
+/// Where a plugin was loaded from (path, marketplace, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PluginSource {
     /// `~/.mangocode/plugins/`

@@ -1,4 +1,4 @@
-/// Plugin hook execution — ported from `loadPluginHooks.ts`.
+/// Plugin hook execution.
 ///
 /// Hooks let plugins run shell commands in response to lifecycle events.
 /// This module defines the data model and the synchronous dispatch helper.
@@ -240,7 +240,6 @@ pub fn event_key(kind: &HookEventKind) -> String {
 
 /// Dispatch PostToolUse hooks for a completed tool call.
 ///
-/// Mirrors the TS plugin hook dispatch path in src/plugins/hooks.ts.
 /// All matching hooks run concurrently; results are collected.
 /// Non-blocking: non-zero exit logs a warning but doesn't fail the tool call.
 pub async fn dispatch_post_tool_hooks(

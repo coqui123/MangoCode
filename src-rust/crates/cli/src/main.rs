@@ -1,7 +1,7 @@
 // mangocode CLI entry point
 //
 // This is the main binary for MangoCode. It:
-// 1. Parses CLI arguments with clap (mirrors cli.tsx + main.tsx flags)
+// 1. Parses CLI arguments with clap
 // 2. Loads configuration from settings.json + env vars
 // 3. Builds system/user context (git status, AGENTS.md)
 // 4. Runs in either:
@@ -110,7 +110,7 @@ impl Tool for McpToolWrapper {
 }
 
 // ---------------------------------------------------------------------------
-// CLI argument definition (matches TypeScript main.tsx flags)
+// CLI argument definition
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
@@ -599,7 +599,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Fast-path: `claude auth <login|logout|status>` — mirrors TypeScript cli.tsx pattern
+    // Fast-path: `claude auth <login|logout|status>`
     if raw_args.get(1).map(|s| s.as_str()) == Some("auth") {
         return handle_auth_command(&raw_args[2..]).await;
     }
@@ -732,7 +732,7 @@ async fn main() -> anyhow::Result<()> {
         config.append_system_prompt = Some(asp);
     }
     if cli.dangerously_skip_permissions {
-        // Mirror TS setup.ts: block bypass mode when running as root/sudo.
+        // Block bypass mode when running as root/sudo.
         #[cfg(unix)]
         if nix::unistd::Uid::effective().is_root() {
             anyhow::bail!(
@@ -1042,8 +1042,11 @@ async fn main() -> anyhow::Result<()> {
     // Anthropic is always the default; additional providers (OpenAI, Google,
     // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
     // their respective environment variables or auth store entries are found.
+    //
+    // Clone the config so the original is available later for rebuilding the
+    // registry when `/connect` adds a new provider at runtime.
     let provider_registry =
-        mangocode_api::ProviderRegistry::from_environment_with_auth_store(client_config);
+        mangocode_api::ProviderRegistry::from_environment_with_auth_store(client_config.clone());
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
     if let Some(cfg) = bridge_config.as_ref() {
@@ -1300,6 +1303,7 @@ async fn main() -> anyhow::Result<()> {
             // request time - we don't want to block TUI startup here).
             has_credentials: !api_key.is_empty() || is_non_anthropic_provider,
             model_registry,
+            client_config,
         })
         .await
     };
@@ -1492,7 +1496,7 @@ async fn run_headless(
 
     // Build new input messages for this invocation.
     // --input-format stream-json: stdin is newline-delimited JSON, each line is
-    //   {"role":"user"|"assistant","content":"..."} (mirrors TS --input-format stream-json).
+    // {"role":"user"|"assistant","content":"..."}.
     // --input-format text (default): read prompt from positional arg or entire stdin as text.
     let mut incoming_messages: Vec<mangocode_core::types::Message> =
         if cli.input_format == CliInputFormat::StreamJson {
@@ -1561,7 +1565,7 @@ async fn run_headless(
         };
 
     // --prefill: inject a partial assistant turn before the query so the model
-    // continues from that text (mirrors TS --prefill flag).
+    // --prefill: partial assistant message before the first user turn
     if let Some(ref prefill_text) = cli.prefill {
         incoming_messages.push(mangocode_core::types::Message::assistant(
             prefill_text.clone(),
@@ -2083,6 +2087,10 @@ struct InteractiveRunArgs {
     bridge_config: Option<mangocode_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<mangocode_api::ModelRegistry>,
+    /// Base client config used to build the Anthropic default provider. Kept
+    /// around so the main loop can rebuild the provider registry after a
+    /// runtime `/connect` flow (see `App::provider_registry_stale`).
+    client_config: mangocode_api::client::ClientConfig,
 }
 
 fn persist_session_usage(
@@ -2118,6 +2126,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         bridge_config,
         has_credentials,
         model_registry,
+        client_config,
     } = args;
 
     use crossterm::event::{self, Event, KeyCode};
@@ -2170,7 +2179,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         session
     };
     let initial_messages = session.messages.clone();
-    let base_query_config = query_config;
+    // `base_query_config` must be mutable so we can swap in a fresh
+    // provider registry after a runtime `/connect` flow (see the
+    // `provider_registry_stale` check inside the main loop below).
+    let mut base_query_config = query_config;
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -2237,7 +2249,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     }
     app.replace_messages(initial_messages.clone());
 
-    // Home directory warning: mirror TS feedConfigs.tsx warningText
     let home_dir = dirs::home_dir();
     if home_dir.as_deref() == Some(tool_ctx.working_dir.as_path()) {
         app.home_dir_warning = true;
@@ -2269,7 +2280,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         app.onboarding_dialog.show();
     }
 
-    // Mirror TS BypassPermissionsModeDialog.tsx startup gate
     use mangocode_core::config::PermissionMode;
     if live_config.permission_mode == PermissionMode::BypassPermissions {
         app.bypass_permissions_dialog.show();
@@ -2421,6 +2431,23 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.notifications.tick();
+
+        // If the user completed a `/connect` flow (OAuth or API key) during this
+        // session, `auth.json` on disk has new credentials but the in-memory
+        // registry was built at startup and is stale. Rebuild it so the next
+        // dispatched query can actually find providers like `anthropic-max`
+        // (otherwise the query dispatcher falls back to the generic OpenAI-
+        // compatible client and sends sk-ant-oat-* tokens to api.openai.com).
+        if app.provider_registry_stale {
+            app.provider_registry_stale = false;
+            let refreshed = std::sync::Arc::new(
+                mangocode_api::ProviderRegistry::from_environment_with_auth_store(
+                    client_config.clone(),
+                ),
+            );
+            base_query_config.provider_registry = Some(refreshed.clone());
+            app.provider_registry = Some(refreshed);
+        }
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
@@ -3455,8 +3482,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 }
                 "anthropic-max" => {
                     let tx2 = device_auth_tx.clone();
-                    // Claude Max (OAuth) — PKCE flow using Claude Code's registered client ID.
-                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
+                    // Claude Max (OAuth) — PKCE flow using the upstream registered client ID.                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
                     tokio::spawn(async move {
                         // Signal the dialog to enter browser-waiting state
                         let placeholder_url = "Opening browser for Claude authentication…".to_string();
@@ -3725,8 +3751,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // `claude auth` subcommand handler
 // ---------------------------------------------------------------------------
-// Mirrors TypeScript cli.tsx `if (args[0] === 'auth') { ... }` fast-path.
-// Called before Cli::parse() so it doesn't conflict with positional `prompt`.
+// Runs before `Cli::parse()` so it does not consume the positional `prompt`.
 //
 // Usage:
 //   claude auth login [--console]   — OAuth PKCE login (claude.ai by default)
@@ -3857,7 +3882,6 @@ async fn auth_status(json_output: bool) {
         },
     );
 
-    // Determine auth method (mirrors TypeScript authStatus())
     let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
         let uses_bearer = tokens.uses_bearer_auth();
         let method = if uses_bearer {

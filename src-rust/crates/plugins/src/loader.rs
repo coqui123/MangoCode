@@ -1,6 +1,6 @@
-/// Plugin discovery and loading — ported from `pluginLoader.ts` / `pluginDirectories.ts`.
+/// Plugin discovery and loading.
 ///
-/// Scan order (matches TS precedence):
+/// Scan order:
 /// 1. `~/.mangocode/plugins/<name>/`  — user-global plugins
 /// 2. `<project>/.mangocode/plugins/<name>/`  — project-local plugins
 /// 3. Extra paths from `settings.plugin_paths` (if the field exists)

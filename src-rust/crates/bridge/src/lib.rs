@@ -11,8 +11,7 @@
 // - Long-polling loop with exponential backoff and cancellation
 // - Public `start_bridge` API that spawns background task and returns channels
 //
-// Architecture mirrors the TypeScript bridge (bridgeMain.ts / bridgeApi.ts),
-// adapted to idiomatic Rust async with tokio channels and reqwest.
+// Async bridge: tokio channels + reqwest, JWT helpers, session lifecycle.
 
 #![warn(clippy::all)]
 
@@ -75,7 +74,7 @@ impl JwtClaims {
     /// Returns `true` if the `exp` claim is in the past.
     ///
     /// When `exp` is absent the token is treated as non-expired (permissive
-    /// default), matching the TypeScript behaviour in `jwtUtils.ts`.
+    /// default).
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.exp {
             let now = chrono::Utc::now().timestamp();
@@ -119,9 +118,7 @@ pub fn jwt_is_expired(token: &str) -> bool {
 /// Compute a stable device fingerprint from machine-local information.
 ///
 /// Combines hostname, login user name, and home directory path, then SHA-256
-/// hashes them and returns the full hex digest. Matching the TypeScript
-/// `trustedDevice.ts` algorithm so fingerprints are consistent across the
-/// two implementations.
+/// hashes them and returns the full hex digest.
 pub fn device_fingerprint() -> String {
     let mut input = String::with_capacity(128);
 
@@ -227,8 +224,6 @@ impl BridgeConfig {
 
     /// Validate that a server-provided ID is safe to interpolate into a URL
     /// path segment. Prevents path traversal (e.g. `../../admin`).
-    ///
-    /// Mirrors `validateBridgeId()` in `bridgeApi.ts`.
     pub fn validate_id<'a>(id: &'a str, label: &str) -> anyhow::Result<&'a str> {
         static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let re = RE.get_or_init(|| {
@@ -444,8 +439,7 @@ impl BridgeSession {
 
     /// Register this bridge session with the CCR server.
     ///
-    /// POST `/api/claude_code/sessions` — mirrors the TypeScript
-    /// `registerBridgeEnvironment` call in `bridgeApi.ts`.
+    /// POST `/api/claude_code/sessions`.
     pub async fn register(&mut self) -> anyhow::Result<()> {
         let token = self
             .config

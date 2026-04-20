@@ -1,7 +1,7 @@
 /// mangocode-buddy: Tamagotchi/Buddy companion system for MangoCode.
 ///
-/// Ported from src/buddy/ (TypeScript). All bones (species, rarity, stats,
-/// eye, hat, shiny) are deterministically derived from the user-ID via a
+/// Buddy companion: bones (species, rarity, stats, eye, hat, shiny) are deterministically
+/// derived from the user-ID via a
 /// seeded PRNG so they can never be edited by hand. The soul (name,
 /// personality, hatched_at) is AI-generated on first hatch and persisted in
 /// `{config_dir}/companion.json`.
@@ -11,7 +11,7 @@ use std::path::Path;
 // Mulberry32 PRNG
 // ---------------------------------------------------------------------------
 
-/// Tiny, fast 32-bit PRNG — identical algorithm to the TypeScript version.
+/// Tiny, fast 32-bit PRNG (Mulberry32).
 /// Good enough for picking ducks.
 pub struct Mulberry32 {
     state: u32,
@@ -39,7 +39,7 @@ impl Mulberry32 {
 /// Derive a deterministic u32 seed from a user-id string.
 ///
 /// Algorithm: FNV-1a 32-bit over the raw bytes of `user_id`.
-/// Matches the TypeScript `hashString` FNV-1a implementation used in Bun.
+/// FNV-1a 32-bit hash of a string (stable across platforms).
 pub fn seed_from_user_id(user_id: &str) -> u32 {
     const FNV_OFFSET_BASIS: u32 = 2_166_136_261;
     const FNV_PRIME: u32 = 16_777_619;
@@ -79,7 +79,7 @@ pub enum Species {
 }
 
 impl Species {
-    /// Display name (lower-case, matches TypeScript SPECIES array).
+    /// Display name (lower-case, canonical species list).
     pub fn as_str(&self) -> &'static str {
         match self {
             Species::Duck => "duck",
@@ -252,7 +252,7 @@ impl CompanionStats {
         // Pick distinct peak and dump stat indices (0-4).
         let peak_idx = (rng.next_f64() * 5.0) as usize % 5;
         let mut dump_idx = (rng.next_f64() * 5.0) as usize % 5;
-        // Ensure dump != peak (mirrors the while loop in TypeScript).
+        // Ensure dump != peak
         if dump_idx == peak_idx {
             dump_idx = (dump_idx + 1) % 5;
         }
@@ -343,7 +343,7 @@ impl CompanionBones {
             eye_list[(rng.next_f64() * eye_list.len() as f64) as usize % eye_list.len()].clone();
 
         // --- hat: common always gets none; others pick from full list ---
-        // The TypeScript source: `hat: rarity === 'common' ? 'none' : pick(rng, HATS)`
+        // Common rarity never wears a hat
         // where HATS includes 'none' — so non-common companions still have a
         // ~12.5 % chance of getting no hat.
         let hat = if rarity == Rarity::Common {
@@ -424,7 +424,7 @@ pub struct SpriteFrame(pub [&'static str; 5]);
 
 /// Return the three animation frames for a given species.
 ///
-/// Frames are literal copies of the TypeScript BODIES table.  Each line is
+/// Sprite frames: each line is
 /// 12 characters wide (after `{E}` substitution).  Line 0 is the "hat slot":
 /// if it is blank in a frame the hat decoration is injected there; if it
 /// contains content (smoke, antenna, etc.) the hat is skipped.
@@ -849,11 +849,7 @@ pub fn get_sprite_frames(species: &Species) -> [SpriteFrame; 3] {
 
 /// Map a clock tick (500 ms steps) to a frame index (0, 1, or 2).
 ///
-/// Mirrors the TypeScript idle-fidget sequence:
-/// `[0,0,0,0,1,0,0,0,-1→2,0,0,2,0,0,0]` cycling at length 15.
-///
-/// The `-1` entry in the TS source is an explicit reference to frame 2; we
-/// represent it directly as 2.
+/// Idle animation frame sequence (`[0,0,0,0,1,0,0,0,2,0,0,2,0,0,0]`, length 15).
 pub fn animation_frame(tick: u64) -> usize {
     const SEQ: [usize; 15] = [0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0];
     SEQ[(tick as usize) % SEQ.len()]
@@ -864,7 +860,7 @@ pub fn animation_frame(tick: u64) -> usize {
 /// - Substitutes the companion's eye glyph into `{E}` placeholders.
 /// - Overlays the hat on line 0 when line 0 is blank in the chosen frame.
 /// - Drops a blank line-0 when *all* three frames have blank line 0 (no hat
-///   and no per-frame animation content), matching the TypeScript behaviour
+///   and no per-frame animation content), matching the reference sprite sheets
 ///   that avoids wasted rows.
 pub fn render(companion: &Companion, tick: u64) -> String {
     let frames = get_sprite_frames(&companion.bones.species);
@@ -893,7 +889,7 @@ pub fn render(companion: &Companion, tick: u64) -> String {
 
 /// Render the face description for a companion (used in speech-bubble context).
 ///
-/// Matches the `renderFace` function in `sprites.ts`.
+/// Face string used in speech-bubble context.
 pub fn render_face(bones: &CompanionBones) -> String {
     let e = bones.eye.glyph();
     match bones.species {
@@ -973,15 +969,14 @@ pub fn save_companion_soul(config_dir: &Path, soul: &CompanionSoul) -> anyhow::R
 // ---------------------------------------------------------------------------
 
 /// Reconstruct a `Companion` from a user-id string and the stored soul (if
-/// any).  This is the main entry point for callers — mirrors `getCompanion()`
-/// in the TypeScript source.
+/// any). Main entry: reconstruct `Companion` from disk + user id.
 pub fn get_companion(user_id: &str, config_dir: &Path) -> Companion {
     let soul = load_companion_soul(config_dir);
     Companion::new(user_id, soul)
 }
 
 // ---------------------------------------------------------------------------
-// Intro / prompt helpers (mirrors prompt.ts)
+// Intro / prompt helpers
 // ---------------------------------------------------------------------------
 
 /// System-prompt fragment injected when a companion is active.

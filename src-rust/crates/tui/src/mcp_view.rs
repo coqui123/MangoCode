@@ -1,5 +1,4 @@
 //! MCP server management UI.
-//! Mirrors src/components/mcp/ (12 files).
 
 use ratatui::{
     buffer::Buffer,
@@ -15,7 +14,7 @@ use crate::overlays::{
 };
 
 // ---------------------------------------------------------------------------
-// Data types (view-level; mirrors cc_mcp types)
+// Data types (view-level)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

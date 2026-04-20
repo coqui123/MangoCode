@@ -752,7 +752,7 @@ pub mod client {
         /// Invoke `prompts/get` with the given name and optional arguments map.
         ///
         /// Returns the expanded prompt messages that should be injected into the
-        /// conversation as-is (mirrors TS `getMCPPrompt`).
+        /// conversation as-is (`prompts/get` MCP).
         pub async fn get_prompt(
             &self,
             name: &str,
@@ -1284,7 +1284,7 @@ impl McpManager {
     /// Get an expanded prompt from a named server by prompt name and arguments.
     ///
     /// Returns the `GetPromptResult` with fully-rendered messages suitable for
-    /// injection into the conversation (mirrors TS `getMCPPrompt`).
+    /// injection into the conversation (`prompts/get` MCP).
     pub async fn get_prompt(
         &self,
         server_name: &str,

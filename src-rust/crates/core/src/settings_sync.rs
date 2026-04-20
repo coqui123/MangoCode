@@ -1,14 +1,12 @@
 // settings_sync.rs — Settings Sync
 //
-// Port of src/services/settingsSync/index.ts
-//
 // Syncs user settings and AGENTS.md memory files between a local MangoCode
 // installation and claude.ai via:
 //   - Upload (interactive CLI, fire-and-forget at startup)
 //   - Download (CCR / MANGOCODE_REMOTE=1, blocking before plugin load)
 //
-// Authentication requires OAuth (Bearer token).  API-key-only users are
-// skipped silently — the TypeScript side gates on `isUsingOAuth()`.
+// Authentication requires OAuth (Bearer token). API-key-only users are
+// skipped silently.
 //
 // The sync API stores a flat key→value map where keys are canonical file paths
 // and values are the UTF-8 file contents (JSON or Markdown).
@@ -32,7 +30,7 @@ const DEFAULT_MAX_RETRIES: u32 = 3;
 const MAX_FILE_SIZE_BYTES: u64 = 500 * 1024;
 
 // ---------------------------------------------------------------------------
-// Sync key helpers (mirrors SYNC_KEYS in types.ts)
+// Sync key helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical sync key for the global user settings file.

@@ -1,7 +1,5 @@
 // elicitation_dialog.rs — MCP Elicitation dialog.
 //
-// Mirrors src/components/mcp/ElicitationDialog.tsx.
-//
 // MCP servers can request structured input from the user via the elicitation
 // protocol.  The server sends a request containing a JSON Schema that describes
 // the form fields; the TUI presents a dialog, the user fills in the values, and

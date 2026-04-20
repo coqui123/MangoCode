@@ -1,5 +1,4 @@
 //! Status notice definitions and priority ordering.
-//! Mirrors src/utils/statusNotices.ts
 
 use serde::{Deserialize, Serialize};
 

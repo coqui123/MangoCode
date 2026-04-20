@@ -4,18 +4,6 @@
 //! A named command is invoked when the *first* CLI argument matches one
 //! of the registered names — before the normal REPL starts.
 //!
-//! Sources consulted while porting:
-//!   src/commands/agents/index.ts
-//!   src/commands/ide/index.ts
-//!   src/commands/branch/index.ts
-//!   src/commands/tag/index.ts
-//!   src/commands/passes/index.ts
-//!   src/commands/pr_comments/index.ts
-//!   src/commands/install-github-app/index.ts
-//!   src/commands/desktop/index.ts  (implied by component structure)
-//!   src/commands/mobile/index.ts   (implied by component structure)
-//!   src/commands/remote-setup/index.ts (implied by component structure)
-
 use crate::{CommandContext, CommandResult};
 use rpassword::prompt_password;
 // `open` crate: used by StickersCommand to launch the browser.

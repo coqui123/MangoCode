@@ -1,7 +1,5 @@
 // remote_settings.rs — Remote Managed Settings
 //
-// Port of src/services/remoteManagedSettings/index.ts
-//
 // Fetches enterprise-managed settings from Anthropic's API, caches them to
 // ~/.mangocode/remote-settings.json, and polls every hour in the background.
 // Fails open — if the fetch fails, the app continues without remote settings.
@@ -27,7 +25,7 @@ use tracing::{debug, warn};
 const SETTINGS_FILENAME: &str = "remote-settings.json";
 const SETTINGS_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_MAX_RETRIES: u32 = 5;
-/// 1-hour polling interval (matches TypeScript POLLING_INTERVAL_MS)
+/// 1-hour polling interval.
 pub const DEFAULT_POLLING_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
@@ -399,7 +397,7 @@ pub fn compute_checksum_from_settings(settings: &Value) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
-/// Recursively sort all object keys (mirrors `sortKeysDeep` in TypeScript).
+/// Recursively sort all object keys for stable checksums.
 fn sort_keys_deep(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -450,7 +448,7 @@ fn claude_config_dir() -> PathBuf {
 }
 
 /// Exponential backoff delay for retry attempt `n` (1-indexed).
-/// Matches the TypeScript `getRetryDelay` pattern: 1s, 2s, 4s, 8s, 16s …
+/// Pattern: 1s, 2s, 4s, 8s, 16s, capped at 30s.
 fn retry_delay(attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(30); // prevent overflow
     let secs: u64 = 1u64.checked_shl(shift).unwrap_or(u64::MAX).min(30);

@@ -22,7 +22,7 @@ use mangocode_core::types::{ContentBlock, UsageInfo};
 /// messages JSON body, and parses the Anthropic JSON response into a
 /// `ProviderResponse`.
 ///
-/// This mirrors the logic in `AnthropicProvider::build_request` and the
+/// This matches the logic in `AnthropicProvider::build_request` and the
 /// `create_message` accumulation code, but works purely as a JSON↔type
 /// mapping without owning an HTTP client.
 pub struct AnthropicTransformer;

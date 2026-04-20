@@ -1,6 +1,6 @@
 // WebSearch tool: search the web using Brave Search API or fallback to DuckDuckGo.
 //
-// Mirrors the TypeScript WebSearch tool behaviour:
+// Behaviour:
 // - Accepts a query string
 // - Returns a list of results with title, url, and snippet
 // - Falls back to DuckDuckGo if no search API key is configured

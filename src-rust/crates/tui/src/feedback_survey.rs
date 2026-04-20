@@ -1,4 +1,4 @@
-// feedback_survey.rs — Session quality survey overlay matching TS FeedbackSurvey.tsx
+// feedback_survey.rs — Session quality survey overlay.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};

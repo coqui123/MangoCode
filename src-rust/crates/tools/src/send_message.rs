@@ -1,8 +1,7 @@
 // SendMessageTool: send a message to another agent or broadcast to all.
 //
-// In the TypeScript version this uses a complex mailbox/swarm system with
-// process-level sockets. The Rust port uses a simpler in-process DashMap
-// inbox that works for sub-agents spawned via AgentTool.
+// Uses a simple in-process DashMap inbox that works for sub-agents spawned
+// via AgentTool.
 //
 // Messages are stored keyed by recipient name. Other agents can check
 // their inbox by calling drain_inbox() or peek_inbox().

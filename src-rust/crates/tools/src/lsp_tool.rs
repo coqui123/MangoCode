@@ -1,8 +1,7 @@
 // LspTool — code intelligence via Language Server Protocol.
 //
 // Supports hover, definition, references, document symbols, and diagnostics.
-// Ported from the TypeScript LSPTool; extended with full action routing.
-
+// Based on the LSPTool; extended with full action routing.
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;

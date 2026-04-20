@@ -1,6 +1,5 @@
 // invalid_config_dialog.rs — Startup dialog for malformed settings.json or AGENTS.md.
 //
-// Mirrors TS `InvalidConfigDialog` / `InvalidSettingsDialog`:
 // - Displayed on startup when config parsing fails.
 // - Shows a red-bordered box with the error message.
 // - Dismissed by pressing Enter or Escape; user can then fix the file and restart.

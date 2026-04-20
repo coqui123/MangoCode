@@ -1,5 +1,4 @@
 //! Session browser overlay (/session, /resume, /rename, /export).
-//! Mirrors TS session management in REPL.tsx
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};

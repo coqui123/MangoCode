@@ -1,6 +1,5 @@
 // onboarding_dialog.rs — First-launch welcome / onboarding dialog.
 //
-// Mirrors the TypeScript first-launch experience:
 // - Shown once on first run (when Settings.has_completed_onboarding == false).
 // - Walks the user through a brief orientation: key bindings, model info, help.
 // - Dismissed by pressing Enter or Esc; sets has_completed_onboarding in settings.

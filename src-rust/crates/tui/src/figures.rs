@@ -1,4 +1,4 @@
-//! Figure/icon constants matching src/constants/figures.ts
+//! Figure/icon constants.
 
 // Platform-aware: on Windows use ● (U+25CF), elsewhere ⏺ (U+23FA)
 pub fn black_circle() -> &'static str {

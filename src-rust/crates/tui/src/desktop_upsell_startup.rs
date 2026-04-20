@@ -1,8 +1,7 @@
 // desktop_upsell_startup.rs — DesktopUpsellStartup surface.
 //
 // Shown at startup on supported platforms (macOS / Windows x64) when the user
-// hasn't yet tried the MangoCode Code Desktop app.  Mirrors the behavior of
-// src/components/DesktopUpsell/DesktopUpsellStartup.tsx:
+// hasn't yet tried the MangoCode Code Desktop app.
 //
 //   - Shown at most 3 times per user (seen_count guard).
 //   - Three choices: "Open in MangoCode Code Desktop" (Try), "Not now", "Don't ask again".

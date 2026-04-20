@@ -1,4 +1,4 @@
-//! Cloud session API — mirrors src/remote/sdkMessageAdapter.ts.
+//! Cloud session API.
 //!
 //! Converts between internal Message types and the cloud API format.
 //! Provides CRUD operations for cloud-hosted sessions.

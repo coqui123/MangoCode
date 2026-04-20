@@ -1,10 +1,9 @@
 // cc-mcp: Official MCP server registry.
 //
-// Mirrors the TS officialRegistry.ts, but instead of fetching the live
-// Anthropic registry at runtime (which requires network access and an API key),
-// we maintain a static list of well-known MCP servers.  The live-registry URL
-// check from TS is replicated by `is_official_mcp_url`, which performs a
-// lazy HTTP fetch and caches the result.
+// Instead of fetching the live Anthropic registry at runtime (which requires
+// network access and an API key), we maintain a static list of well-known MCP
+// servers. The live-registry URL check is provided by `is_official_mcp_url`,
+// which performs a lazy HTTP fetch and caches the result.
 
 use once_cell::sync::OnceCell;
 use std::collections::HashSet;
@@ -157,7 +156,7 @@ pub fn find_server(name: &str) -> Option<&'static OfficialMcpServer> {
 }
 
 // ---------------------------------------------------------------------------
-// Live-registry URL check (mirrors TS isOfficialMcpUrl / prefetchOfficialMcpUrls)
+// Live-registry URL check
 // ---------------------------------------------------------------------------
 
 /// Cached set of normalized URLs fetched from the Anthropic MCP registry.

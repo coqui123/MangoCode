@@ -1,5 +1,4 @@
 //! RemoteTriggerTool — cross-session event dispatch.
-//! Mirrors src/tools/RemoteTriggerTool/.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

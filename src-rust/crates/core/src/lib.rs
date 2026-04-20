@@ -7,7 +7,7 @@
 pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
 
-// Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
+// Session transcript persistence (JSONL).
 pub mod session_storage;
 
 // Session sharing — HTTP upload to a share endpoint + local text export.
@@ -37,7 +37,7 @@ pub use vault::{
 // GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
 pub mod device_code;
 
-// Utility modules ported from src/utils/
+// Utility modules.
 pub mod auto_mode;
 pub mod crypto_utils;
 pub mod format_utils;
@@ -872,7 +872,7 @@ pub mod config {
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
         /// Whether the user has completed the first-launch onboarding flow.
-        /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
+        /// First-launch onboarding / safety acknowledgement flag.
         #[serde(default, rename = "hasCompletedOnboarding")]
         pub has_completed_onboarding: bool,
         /// App version at last launch — used to detect upgrades and show release notes.
@@ -1632,7 +1632,6 @@ pub mod context {
             }
 
             // IDE context — injected when an IDE extension is connected.
-            // Mirrors TS getContextAttachments() → IdeContext attachment.
             if let Some(ide_ctx) = crate::attachments::get_ide_context() {
                 parts.push(format!("# IDE Context\n{}", ide_ctx));
             }
@@ -2030,8 +2029,7 @@ pub mod permissions {
 
     /// Build the explanation paragraph shown in the permission dialog.
     ///
-    /// Mirrors the TS `createPermissionRequestMessage` / `permissionExplainer`
-    /// output style.
+    /// Human-readable copy for the permission dialog.
     pub fn format_permission_reason(
         tool_name: &str,
         description: &str,
@@ -2117,8 +2115,7 @@ pub mod permissions {
         }
 
         // ----------------------------------------------------------------
-        // Evaluation (ported from TS hasPermissionsToUseTool)
-        // ----------------------------------------------------------------
+        // Evaluation (Based on TS hasPermissionsToUseTool)        // ----------------------------------------------------------------
 
         /// Evaluate whether `tool_name` should be allowed to run.
         ///
@@ -2146,7 +2143,7 @@ pub mod permissions {
 
             // Steps 2–3 — evaluate explicit rules (deny has priority over
             // allow; persistent rules evaluated before session rules within
-            // each polarity, matching TS rule-source ordering)
+            // each polarity).
             let all_rules = self
                 .persistent_rules
                 .iter()
@@ -3292,7 +3289,7 @@ pub mod hooks {
 
 /// OAuth 2.0 PKCE authentication support.
 ///
-/// Supports two login paths mirroring the TypeScript implementation:
+/// Supports two login paths:
 /// - **Console** (`org:create_api_key` scope): exchanges access token for an API key.
 /// - **Claude.ai** (`user:inference` scope): uses the access token as a Bearer credential.
 pub mod oauth {
@@ -3301,7 +3298,7 @@ pub mod oauth {
 
     // ---- Production OAuth endpoints & constants ----
 
-    // NOTE: This client ID is registered to Anthropic's official Claude Code CLI.
+    // NOTE: This client ID is registered with Anthropic for their own CLI product.
     // It will NOT work for MangoCode. Users should use an API key from console.anthropic.com.
     pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Anthropic's — will not work for MangoCode
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
@@ -3420,7 +3417,7 @@ pub mod oauth {
             Ok(())
         }
 
-        /// Persist `oauth_tokens.json` and mirror Claude Max credentials into `auth.json`.
+        /// Persist `oauth_tokens.json` and sync Claude Max credentials into `auth.json`.
         ///
         /// This is used by `mangocode-api` providers that authenticate via Claude.ai OAuth
         /// and need the refreshed bearer token to be visible in the auth store as well.

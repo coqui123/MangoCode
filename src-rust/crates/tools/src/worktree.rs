@@ -4,8 +4,6 @@
 //                     switching the session's working directory to it.
 // ExitWorktreeTool  – exit the current worktree, optionally removing it, and
 //                     restore the original working directory.
-//
-// These tools mirror the TypeScript EnterWorktreeTool / ExitWorktreeTool.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

@@ -1,12 +1,7 @@
 //! Settings migration framework
 //! Runs on startup to upgrade settings.json from older versions.
 //!
-//! Migrations are derived from the TypeScript originals:
-//!   - src/migrations/migrateFennecToOpus.ts
-//!   - src/migrations/migrateLegacyOpusToCurrent.ts
-//!   - src/migrations/migrateSonnet45ToSonnet46.ts
-//!   - src/migrations/migrateAutoUpdatesToSettings.ts
-//!   - (and several others without separate TS source files)
+//! Migrations upgrade older `settings.json` shapes on startup.
 //!
 //! Each migration is idempotent: it only touches fields it recognises and
 //! only writes when it actually changes something.
@@ -68,7 +63,6 @@ pub fn run_migrations(settings: &mut Value) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Fennec was an internal alias; map to the current Opus line.
-/// Source: migrateFennecToOpus.ts
 fn migrate_fennec_to_opus(settings: &mut Value) -> bool {
     // fennec-latest[1m] → opus[1m], fennec-latest → opus
     // fennec-fast-latest / opus-4-5-fast → opus[1m]  (fast-mode alias)
@@ -94,7 +88,6 @@ fn migrate_fennec_to_opus(settings: &mut Value) -> bool {
 }
 
 /// Migrate explicit Opus 4.0/4.1 strings to the `opus` alias.
-/// Source: migrateLegacyOpusToCurrent.ts
 fn migrate_legacy_opus_to_current(settings: &mut Value) -> bool {
     const LEGACY_OPUS: &[&str] = &[
         "claude-opus-4-20250514",
@@ -128,7 +121,6 @@ fn migrate_sonnet_1m_to_sonnet_45(settings: &mut Value) -> bool {
 }
 
 /// Migrate Sonnet 4.5 explicit IDs to `sonnet` (which resolves to 4.6).
-/// Source: migrateSonnet45ToSonnet46.ts
 fn migrate_sonnet_45_to_sonnet_46(settings: &mut Value) -> bool {
     const SONNET_45_IDS: &[&str] = &[
         "claude-sonnet-4-5-20250929",
@@ -225,9 +217,7 @@ fn migrate_enable_all_mcp_servers(settings: &mut Value) -> bool {
 }
 
 /// Migrate `autoUpdatesEnabled` → `autoUpdates`.
-/// Source: migrateAutoUpdatesToSettings.ts
-/// The TS version also writes an env-var to settings.json; here we keep the
-/// simpler structural rename and leave env-var injection to the caller.
+/// We keep the simpler structural rename and leave env-var injection to the caller.
 fn migrate_auto_updates(settings: &mut Value) -> bool {
     let old = match settings.get("autoUpdatesEnabled").cloned() {
         Some(v) => v,

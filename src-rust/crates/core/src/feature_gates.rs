@@ -1,9 +1,7 @@
 // feature_gates.rs — Env-var-based feature gates and dynamic config.
 //
-// Replaces the GrowthBook SDK used in the TypeScript source
-// (`src/services/analytics/growthbook.ts`). Feature flags are toggled via
-// environment variables instead of a remote service, which is simpler and
-// dependency-free for the Rust port.
+// Feature flags are toggled via environment variables, dependency-free and
+// suitable for offline runs.
 
 use std::collections::HashMap;
 
@@ -41,8 +39,7 @@ fn normalize_name(name: &str) -> String {
 /// Reads `MANGOCODE_FEATURE_<NORMALIZED_NAME>` and returns `true` when the
 /// value is truthy ("1", "true", "yes", "on" — case-insensitive).
 ///
-/// Mirrors `checkStatsigFeatureGate_CACHED_MAY_BE_STALE` from the TypeScript
-/// GrowthBook integration.
+/// Read a cached Statsig feature gate (may be stale vs live assignment).
 pub fn is_feature_enabled(gate_name: &str) -> bool {
     let key = format!("MANGOCODE_FEATURE_{}", normalize_name(gate_name));
     is_env_truthy(std::env::var(&key).ok().as_deref())
@@ -57,7 +54,7 @@ pub fn is_feature_enabled(gate_name: &str) -> bool {
 /// Reads `MANGOCODE_DYNAMIC_CONFIG_<NORMALIZED_NAME>`.  If the variable is
 /// not set, or parsing fails, `default` is returned unchanged.
 ///
-/// Mirrors `getDynamicConfig_CACHED_MAY_BE_STALE` from the TypeScript source.
+/// Read a cached Statsig dynamic config (may be stale).
 pub fn get_dynamic_config<T: DeserializeOwned>(name: &str, default: T) -> T {
     let key = format!("MANGOCODE_DYNAMIC_CONFIG_{}", normalize_name(name));
     match std::env::var(&key) {

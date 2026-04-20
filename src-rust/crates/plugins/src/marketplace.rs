@@ -1,4 +1,4 @@
-//! Plugin marketplace — mirrors src/commands/plugin/ (17 files).
+//! Plugin marketplace.
 //!
 //! Provides search, install, update, list, and uninstall for plugins
 //! from the Claude registry.

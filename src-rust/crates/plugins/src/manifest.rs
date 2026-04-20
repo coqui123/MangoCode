@@ -1,4 +1,4 @@
-/// Plugin manifest types — ported from the TypeScript `schemas.ts` / `plugin.json` format.
+/// Plugin manifest types (`plugin.json` / `plugin.toml`).
 ///
 /// A plugin directory looks like:
 ///
@@ -162,7 +162,7 @@ impl std::fmt::Display for HookEventKind {
 // Hook definitions (hooks.json / inline hooks in manifest)
 // ---------------------------------------------------------------------------
 
-/// A single hook command entry (mirrors the TS `HookEntry`).
+/// A single hook command entry from `plugin.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginHookEntry {
     /// Shell command to run. Receives the event JSON on stdin.
@@ -229,8 +229,8 @@ pub enum UserConfigValueType {
 
 /// The parsed contents of a `plugin.json` or `plugin.toml` manifest file.
 ///
-/// Unknown fields are silently ignored (matches TS behaviour: `z.object({...})`
-/// strips unknown top-level keys by default).
+/// Unknown fields are silently ignored so older MangoCode versions can read
+/// manifests written by newer ones without failing.
 ///
 /// NOTE: No `rename_all` here — we normalise the raw JSON in `normalize_manifest_json`
 /// before deserializing so that both camelCase (TS source) and snake_case variants

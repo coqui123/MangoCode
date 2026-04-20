@@ -1,4 +1,4 @@
-//! Skill prefetch — mirrors src/services/skillSearch/prefetch.js
+//! Skill prefetch.
 //!
 //! Reads all bundled and user-defined skill definitions in the background
 //! and builds a searchable index. The query loop injects the skill listing

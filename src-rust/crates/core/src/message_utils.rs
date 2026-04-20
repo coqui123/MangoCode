@@ -1,6 +1,4 @@
 //! Message manipulation utilities.
-//! Mirrors key functions from src/utils/messages.ts (5,512 lines).
-
 use crate::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
 
@@ -8,8 +6,7 @@ use serde_json::Value;
 // Token estimation
 // ---------------------------------------------------------------------------
 
-/// Rough token count heuristic (chars / 4 + JSON overhead).
-/// Mirrors the TS `countTokens` approximation.
+/// Rough token estimate for budgeting (chars / 4 + JSON overhead; not an official tokenizer).
 pub fn estimate_tokens(text: &str) -> u64 {
     (text.len() as f64 / 4.0).ceil() as u64
 }

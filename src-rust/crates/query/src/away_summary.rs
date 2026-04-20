@@ -1,7 +1,5 @@
 // away_summary.rs — "While you were away" recap generation.
 //
-// Ported from `src/services/awaySummary.ts`.
-//
 // When the user returns to an idle session the TUI can call
 // `generate_away_summary` to get a short 1-3 sentence recap of what was
 // happening before they left.
@@ -41,7 +39,6 @@ impl Default for AwaySummaryConfig {
 // ---------------------------------------------------------------------------
 
 fn build_away_summary_prompt() -> String {
-    // Mirrors the TypeScript prompt verbatim.
     "The user stepped away and is coming back. Write exactly 1-3 short sentences. \
 Start by stating the high-level task — what they are building or debugging, not \
 implementation details. Next: the concrete next step. Skip status reports and \

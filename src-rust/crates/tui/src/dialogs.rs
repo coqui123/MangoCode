@@ -200,7 +200,7 @@ impl PermissionRequest {
     // Option sets
     // ------------------------------------------------------------------
 
-    /// The four canonical options (matches TS interactive permission dialog).
+    /// The four canonical options for the interactive permission dialog.
     pub fn default_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption {

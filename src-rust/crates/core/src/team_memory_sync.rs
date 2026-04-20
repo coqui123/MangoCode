@@ -73,7 +73,7 @@ pub fn content_checksum(content: &str) -> String {
 
 /// Reject paths that could escape the team-memory directory.
 ///
-/// Checks performed (mirroring the TypeScript `securePath` validation):
+/// Path safety checks (null bytes, traversal, etc.):
 /// - No null bytes
 /// - No URL-encoded traversal sequences (`%2e`, `%2f`, case-insensitive)
 /// - No backslashes
@@ -119,7 +119,7 @@ pub struct TeamMemorySync {
     repo: String,
     /// Bearer token for authentication.
     token: String,
-    /// Local directory that mirrors the server's key namespace.
+    /// Local directory mirroring the server's key namespace.
     team_dir: PathBuf,
 }
 

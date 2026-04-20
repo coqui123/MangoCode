@@ -1,12 +1,10 @@
 // OAuth 2.0 PKCE login flow for the MangoCode CLI (Claude Max provider).
 //
-// Uses the same OAuth client IDs as Claude Code to authenticate with Anthropic's
-// Claude.ai OAuth endpoints. This enables Bearer-token auth for Claude Max
-// subscriptions (user:inference scope) as an alternative to API key auth.
+// Authenticates against Anthropic's Claude.ai OAuth endpoints to enable
+// Bearer-token auth for Claude Max subscriptions (user:inference scope) as
+// an alternative to API key auth.
 //
-// OAuth 2.0 PKCE login flow for the MangoCode CLI.
-//
-// Implements the same flow as the TypeScript OAuthService + authLogin():
+// Flow:
 // 1. Generate PKCE code_verifier / code_challenge / state
 // 2. Start a temporary localhost HTTP server on a random port
 // 3. Build auth URL; print for the user and attempt to open in browser
@@ -371,7 +369,7 @@ async fn create_api_key(access_token: &str) -> anyhow::Result<String> {
 // ---- Refresh token flow -----------------------------------------------------
 
 /// Attempt to refresh an expired access token using the stored refresh token.
-/// Saves updated tokens on success and mirrors Claude Max credentials to `auth.json`.
+/// Saves updated tokens on success and syncs Claude Max credentials to `auth.json`.
 pub async fn refresh_oauth_token(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
     let updated = mangocode_core::oauth::refresh_oauth_tokens_from_refresh(tokens).await?;
     updated.persist_to_disk_with_auth_sync().await?;

@@ -3,9 +3,6 @@
 // Runs a background task after a session to extract key facts worth
 // remembering and persist them to AGENTS.md.
 //
-// This mirrors TypeScript services/SessionMemory/sessionMemory.ts and
-// services/extractMemories/extractMemories.ts.
-//
 // Strategy:
 //   1. After sessions with 20+ messages (or on compact), call the API with a
 //      structured extraction prompt.
@@ -27,7 +24,7 @@ use tokio::fs;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
-// Threshold constants (mirrors TypeScript sessionMemoryUtils.ts defaults)
+// Threshold constants
 // ---------------------------------------------------------------------------
 
 /// Minimum messages before extraction is attempted.
@@ -166,7 +163,7 @@ impl SessionMemoryExtractor {
 
     /// Return `true` if we have enough messages to warrant extraction.
     ///
-    /// Mirrors `shouldExtractMemory` from TypeScript sessionMemory.ts:
+    /// Heuristics:
     /// - At least `MIN_MESSAGES_TO_EXTRACT` messages total
     /// - The last assistant turn must not have pending tool calls (safe extraction point)
     pub fn should_extract(messages: &[Message]) -> bool {
@@ -215,7 +212,6 @@ impl SessionMemoryExtractor {
             return false;
         }
 
-        // Require minimum tool calls between updates (mirrors TS toolCallsBetweenUpdates)
         let tool_calls_since =
             Self::count_tool_calls_since(messages, state.last_extracted_message_uuid.as_deref());
 

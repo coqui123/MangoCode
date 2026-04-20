@@ -1,6 +1,6 @@
 // PowerShell security classifier for MangoCode.
 //
-// Classifies PowerShell commands / scripts by risk level.  Mirrors the
+// Classifies PowerShell commands / scripts by risk level. Shares the
 // structure of `bash_classifier.rs` so that PowerShellTool can gate
 // execution with the same once/session/deny dialog pattern used by BashTool.
 

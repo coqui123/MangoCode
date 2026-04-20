@@ -1,5 +1,4 @@
 //! Diff viewer TUI component.
-//! Mirrors src/components/diff/ and src/components/StructuredDiff.tsx.
 //!
 //! Shows a two-pane diff dialog: file list (left) + unified diff detail (right).
 //! Keyboard: ↑↓ navigate files, Tab switch pane, t toggle diff type, Esc close.

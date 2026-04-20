@@ -1,11 +1,7 @@
 //! Memory directory (memdir) system.
 //!
-//! Provides persistent, file-based memory across sessions.  Mirrors the
-//! TypeScript modules under `src/memdir/`:
-//!   - `memoryScan.ts`   → `scan_memory_dir`, `parse_frontmatter_quick`, `format_memory_manifest`
-//!   - `memoryAge.ts`    → `memory_age_days`, `memory_freshness_text`, `memory_freshness_note`
-//!   - `memdir.ts`       → `build_memory_prompt_content`, `load_memory_index`, `ensure_memory_dir_exists`
-//!   - `paths.ts`        → `auto_memory_path`, `is_auto_memory_enabled`
+//! Persistent, file-based memory across sessions: scan `.md` memory files,
+//! freshness metadata, auto-memory paths, and prompt injection helpers.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -16,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // ---------------------------------------------------------------------------
 
 /// The four canonical memory types.
-/// Matches the TypeScript `MemoryType` union in `memoryTypes.ts`.
+/// Canonical memory categories stored under the memdir.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryType {
@@ -59,7 +55,7 @@ impl MemoryType {
 // ---------------------------------------------------------------------------
 
 /// Scanned metadata for a single memory file (without the full body).
-/// Mirrors `MemoryHeader` in `memoryScan.ts`.
+/// Scanned metadata for one memory file (header fields only).
 #[derive(Debug, Clone)]
 pub struct MemoryFileMeta {
     /// Filename relative to the memory directory (e.g. `user_role.md`).
@@ -88,19 +84,15 @@ pub struct MemoryFile {
 // ---------------------------------------------------------------------------
 
 /// Maximum number of memory files kept after sorting.
-/// Matches `MAX_MEMORY_FILES` in `memoryScan.ts`.
 const MAX_MEMORY_FILES: usize = 200;
 
-/// Number of lines scanned for frontmatter.
-/// Matches `FRONTMATTER_MAX_LINES` in `memoryScan.ts`.
+/// Lines scanned when parsing YAML frontmatter.
 const FRONTMATTER_MAX_LINES: usize = 30;
 
 /// Scan a memory directory, returning metadata for all `.md` files
 /// (excluding `MEMORY.md`), sorted newest-first, capped at `MAX_MEMORY_FILES`.
 ///
 /// This is a synchronous scan used during system-prompt assembly.
-/// Mirrors `scanMemoryFiles` in `memoryScan.ts` (async version; this is the
-/// sync equivalent used at prompt-build time).
 pub fn scan_memory_dir(dir: &Path) -> Vec<MemoryFileMeta> {
     let mut files: Vec<MemoryFileMeta> = Vec::new();
 
@@ -171,7 +163,7 @@ fn collect_md_files(base: &Path, current_dir: &Path, out: &mut Vec<MemoryFileMet
 /// Parse YAML frontmatter from the first `FRONTMATTER_MAX_LINES` lines without
 /// a full YAML parser.  Returns `(name, description, memory_type)`.
 ///
-/// Mirrors `parseFrontmatter` usage in `memoryScan.ts`.
+/// Parse YAML frontmatter from the first lines of a markdown file.
 pub fn parse_frontmatter_quick(
     content: &str,
 ) -> (Option<String>, Option<String>, Option<MemoryType>) {
@@ -205,7 +197,7 @@ pub fn parse_frontmatter_quick(
 /// Format memory headers as a text manifest: one entry per file with
 /// `[type] filename (iso-timestamp): description`.
 ///
-/// Mirrors `formatMemoryManifest` in `memoryScan.ts`.
+/// Render a short manifest listing scanned memory files.
 pub fn format_memory_manifest(memories: &[MemoryFileMeta]) -> String {
     memories
         .iter()
@@ -264,7 +256,7 @@ fn jdn_to_ymd(jdn: u32) -> (u32, u32, u32) {
 /// Days elapsed since `modified_secs`.  Floor-rounded; clamped to 0 for
 /// future mtimes (clock skew).
 ///
-/// Mirrors `memoryAgeDays` in `memoryAge.ts`.
+/// Whole days since the file was modified.
 pub fn memory_age_days(modified_secs: u64) -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -276,7 +268,7 @@ pub fn memory_age_days(modified_secs: u64) -> u64 {
 /// Human-readable age string.  Models are poor at date arithmetic — a raw
 /// ISO timestamp does not trigger staleness reasoning the way "47 days ago" does.
 ///
-/// Mirrors `memoryAge` in `memoryAge.ts`.
+/// Human-readable age string (e.g. "3 days ago").
 pub fn memory_age(modified_secs: u64) -> String {
     let d = memory_age_days(modified_secs);
     match d {
@@ -289,7 +281,7 @@ pub fn memory_age(modified_secs: u64) -> String {
 /// Plain-text staleness caveat for memories > 1 day old.
 /// Returns an empty string for fresh memories (today / yesterday).
 ///
-/// Mirrors `memoryFreshnessText` in `memoryAge.ts`.
+/// Short freshness label for UI (e.g. "stale", "recent").
 pub fn memory_freshness_text(modified_secs: u64) -> String {
     let d = memory_age_days(modified_secs);
     if d <= 1 {
@@ -307,7 +299,7 @@ pub fn memory_freshness_text(modified_secs: u64) -> String {
 /// Per-memory staleness note wrapped in `<system-reminder>` tags.
 /// Returns an empty string for memories ≤ 1 day old.
 ///
-/// Mirrors `memoryFreshnessNote` in `memoryAge.ts`.
+/// Longer freshness sentence for prompts.
 pub fn memory_freshness_note(modified_secs: u64) -> String {
     let text = memory_freshness_text(modified_secs);
     if text.is_empty() {
@@ -324,16 +316,16 @@ pub fn memory_freshness_note(modified_secs: u64) -> String {
 pub const MEMORY_ENTRYPOINT: &str = "MEMORY.md";
 
 /// Maximum number of lines loaded from `MEMORY.md`.
-/// Matches `MAX_ENTRYPOINT_LINES` in `memdir.ts`.
+/// Line cap when loading `MEMORY.md`.
 pub const MAX_ENTRYPOINT_LINES: usize = 200;
 
 /// Maximum bytes loaded from `MEMORY.md`.
-/// Matches `MAX_ENTRYPOINT_BYTES` in `memdir.ts`.
+/// Byte cap when loading `MEMORY.md`.
 pub const MAX_ENTRYPOINT_BYTES: usize = 25_000;
 
 /// Compute the auto-memory directory path for a project root.
 ///
-/// Resolution order (mirrors `getAutoMemPath` in `paths.ts`):
+/// Resolution order for the auto-memory directory:
 /// 1. `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` env var (full-path override).
 /// 2. `<MANGOCODE_REMOTE_MEMORY_DIR>/projects/<sanitized-root>/memory/`
 ///    when `MANGOCODE_REMOTE_MEMORY_DIR` is set.
@@ -362,7 +354,7 @@ pub fn auto_memory_path(project_root: &Path) -> PathBuf {
 }
 
 /// Sanitize an arbitrary string into a directory-name-safe component.
-/// Matches `sanitizePath` used inside `getAutoMemPath` in `paths.ts`.
+/// Sanitize a string for use as a single path component.
 pub fn sanitize_path_component(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -375,9 +367,7 @@ pub fn sanitize_path_component(s: &str) -> String {
         .collect()
 }
 
-/// Whether the auto-memory system is enabled for this session.
-///
-/// Priority chain (mirrors `isAutoMemoryEnabled` in `paths.ts`):
+/// Whether auto-memory is enabled (env + settings precedence):
 /// 1. `MANGOCODE_DISABLE_AUTO_MEMORY` — truthy → OFF, falsy (but defined) → ON.
 /// 2. `MANGOCODE_SIMPLE` (--bare) → OFF.
 /// 3. Remote mode without `MANGOCODE_REMOTE_MEMORY_DIR` → OFF.
@@ -422,7 +412,7 @@ pub struct EntrypointTruncation {
 /// Truncate `MEMORY.md` content to `MAX_ENTRYPOINT_LINES` lines and
 /// `MAX_ENTRYPOINT_BYTES` bytes, appending a warning when either cap fires.
 ///
-/// Mirrors `truncateEntrypointContent` in `memdir.ts`.
+/// Truncate MEMORY.md / entrypoint content to safe prompt limits.
 pub fn truncate_entrypoint_content(raw: &str) -> EntrypointTruncation {
     let trimmed = raw.trim();
     let content_lines: Vec<&str> = trimmed.lines().collect();
@@ -482,7 +472,7 @@ pub fn truncate_entrypoint_content(raw: &str) -> EntrypointTruncation {
 /// Load and truncate the `MEMORY.md` index from `memory_dir`.
 /// Returns `None` when the file does not exist or is empty.
 ///
-/// Mirrors the entrypoint-reading path in `buildMemoryPrompt` / `loadMemoryPrompt`.
+/// Load `MEMORY.md` (or equivalent) from the memory directory.
 pub fn load_memory_index(memory_dir: &Path) -> Option<EntrypointTruncation> {
     let index_path = memory_dir.join(MEMORY_ENTRYPOINT);
     if !index_path.exists() {
@@ -517,7 +507,7 @@ pub fn build_memory_prompt_content(memory_dir: &Path) -> String {
 /// Ensure the memory directory exists, creating it (and any parents) if needed.
 /// Errors are silently swallowed (the Write tool will surface them if needed).
 ///
-/// Mirrors `ensureMemoryDirExists` in `memdir.ts`.
+/// Create the memory directory tree if missing.
 pub fn ensure_memory_dir_exists(memory_dir: &Path) {
     if let Err(e) = std::fs::create_dir_all(memory_dir) {
         // Log at debug level so --debug shows why, but don't abort.
@@ -536,9 +526,9 @@ pub fn ensure_memory_dir_exists(memory_dir: &Path) {
 /// Find and load the most relevant memory files for a query using a
 /// lightweight TF-IDF-style keyword score.
 ///
-/// The full Sonnet side-query (`findRelevantMemories` in TypeScript) lives
-/// in `cc-query`; this function provides a cheaper fallback for contexts
-/// where an API call is not available.
+/// The full Sonnet side-query lives in `cc-query` (`find_relevant_memories`);
+/// this function provides a cheaper fallback for contexts where an API call
+/// is not available.
 pub fn find_relevant_memories_simple(
     memory_dir: &Path,
     query: &str,
@@ -595,7 +585,7 @@ pub fn find_relevant_memories_simple(
 // ---------------------------------------------------------------------------
 
 /// Return the team-memory sub-directory path.
-/// Mirrors `getTeamMemPath` in `teamMemPaths.ts`.
+/// Path to team memory storage under the auto-memory root.
 pub fn team_memory_path(auto_memory_dir: &Path) -> PathBuf {
     auto_memory_dir.join("team")
 }

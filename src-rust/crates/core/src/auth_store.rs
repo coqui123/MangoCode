@@ -31,8 +31,8 @@ pub struct AuthStore {
 }
 
 impl AuthStore {
-    /// Mirror Claude Max bearer credentials from `oauth_tokens.json` into
-    /// `auth.json` after refresh or when the token file is ahead of the auth store.
+    /// Merge Claude Max bearer credentials from `oauth_tokens.json` into `auth.json`
+    /// after refresh or when the token file is ahead of the auth store.
     ///
     /// This keeps [`mangocode_api::providers::AnthropicMaxProvider`] and the
     /// provider registry aligned with the canonical OAuth token file.

@@ -1,4 +1,4 @@
-//! Cryptographic utilities — mirrors src/utils/crypto.ts
+//! Cryptographic utilities.
 //!
 //! Provides SHA-256 hashing, UUID generation, base64url encoding,
 //! and work secret generation.
@@ -19,7 +19,7 @@ pub fn sha256_hex_str(s: &str) -> String {
     sha256_hex(s.as_bytes())
 }
 
-/// Encode bytes as base64url (no padding) — same as `btoa` + replace in TS.
+/// Encode bytes as base64url (no padding).
 pub fn base64url_encode(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
@@ -53,7 +53,6 @@ pub fn generate_work_secret() -> String {
 }
 
 /// Encode a project root path for use as a directory name (base64url of the path).
-/// Mirrors `src/utils/projectRoot.ts`'s `encodeProjectRoot()`.
 pub fn encode_project_root(project_root: &str) -> String {
     base64url_encode(project_root.as_bytes())
 }

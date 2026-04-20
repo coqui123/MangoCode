@@ -1,5 +1,4 @@
 //! Per-session file modification history.
-//! Mirrors src/utils/fileHistory.ts (1,115 lines).
 //!
 //! Tracks which files were modified by tool calls in the current session,
 //! enabling the /rewind command to restore files to earlier states.

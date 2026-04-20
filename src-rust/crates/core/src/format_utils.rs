@@ -1,5 +1,4 @@
 //! Formatting utilities for cost, duration, and token counts.
-//! Mirrors src/utils/formatters.ts and related TS helpers.
 
 /// Format a cost in USD cents as a human-readable string.
 /// 0 → "$0.00", 150 → "$1.50", 0.5 → "$0.01"

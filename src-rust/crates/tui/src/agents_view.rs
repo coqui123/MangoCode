@@ -1,5 +1,4 @@
 //! Agent / coordinator progress views for the TUI.
-//! Mirrors src/components/agents/ (13 files).
 
 use ratatui::{
     buffer::Buffer,

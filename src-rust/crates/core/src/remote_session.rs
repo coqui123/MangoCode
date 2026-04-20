@@ -1,5 +1,4 @@
-//! Remote session sync — mirrors src/remote/RemoteSessionManager.ts
-//! and src/remote/SessionsWebSocket.ts.
+//! Remote session sync.
 //!
 //! Manages background synchronization of local session transcripts
 //! with the Claude.ai cloud API.

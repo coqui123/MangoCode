@@ -11,7 +11,7 @@
 //! ## Modular / folder-based skills
 //!
 //! A skill directory is recognised when a folder contains a `SKILL.md` file.
-//! The directory layout mirrors the Perplexity Computer skill architecture:
+//! The directory layout follows the Perplexity Computer skill architecture:
 //!
 //! ```text
 //! skills/

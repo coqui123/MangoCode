@@ -3,7 +3,6 @@
 pub const COORDINATOR_ENV_VAR: &str = "MANGOCODE_COORDINATOR_MODE";
 
 /// Tools that belong exclusively to the coordinator — not exposed to workers.
-/// Maps to INTERNAL_WORKER_TOOLS in coordinatorMode.ts.
 pub const COORDINATOR_ONLY_TOOLS: &[&str] = &[
     "Agent",
     "SendMessage",
@@ -81,8 +80,7 @@ pub const INTERNAL_COORDINATOR_TOOLS: &[&str] = COORDINATOR_ONLY_TOOLS;
 /// Guards scratchpad-gated tools.  When the unlock signal phrase appears in
 /// model output, the gate opens and those tools become available.
 ///
-/// Mirrors the scratchpad permission model in coordinatorMode.ts /
-/// filesystem.ts (`isScratchpadEnabled` + `tengu_scratch` feature gate).
+/// Scratchpad-gated tools stay disabled until the model emits the unlock phrase.
 pub struct ScratchpadGate {
     unlocked: bool,
     /// The phrase that, when seen in content, opens the gate.

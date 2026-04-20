@@ -1,4 +1,4 @@
-//! Stats dialog — mirrors src/components/Stats.tsx
+//! Stats dialog.
 //!
 //! Four-tab overlay: Overview | Daily Tokens | Cost Heatmap | Models
 //! Data source: ~/.mangocode/stats.jsonl (append-only per-turn usage log)

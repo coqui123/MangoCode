@@ -4,8 +4,6 @@
 //   - replace: modify an existing cell's source
 //   - insert: add a new cell after a given cell (or at the start)
 //   - delete: remove a cell
-//
-// Behaviour mirrors the TypeScript NotebookEditTool.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

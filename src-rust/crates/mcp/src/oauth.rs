@@ -1,5 +1,4 @@
 //! MCP OAuth / XAA IdP login flow.
-//! Mirrors src/services/mcp/xaaIdpLogin.ts and src/services/mcp/auth.ts.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

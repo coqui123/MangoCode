@@ -1,7 +1,6 @@
 /// Plugin registry — holds all loaded plugins and provides queries.
 ///
-/// Ported from the TS "enabled plugins" concept in `pluginLoader.ts` and the
-/// app-state plugin arrays.
+/// Tracks which plugins are enabled (global + per-project lists).
 use crate::hooks::{register_plugin_hooks, HookRegistry};
 use crate::plugin::{LoadedPlugin, PluginCommandDef, PluginError, ReloadDiff};
 use std::collections::HashMap;

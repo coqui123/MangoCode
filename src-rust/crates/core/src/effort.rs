@@ -1,20 +1,12 @@
 // effort.rs — EffortLevel enum and associated helpers.
 //
-// Maps to src/utils/effort.ts in the TypeScript source.  The Rust port
-// retains only the subset of logic that is useful in a non-browser / non-GrowthBook
-// environment: the level → thinking-budget / temperature / glyph mappings.
-//
-// The thinking-budget and temperature values must match the TypeScript source
-// exactly because they are passed to the Anthropic API.
+// Maps effort levels to thinking-budget, temperature, and UI glyphs for the Anthropic API.
 
 // ---------------------------------------------------------------------------
 // EffortLevel enum
 // ---------------------------------------------------------------------------
 
 /// The four named effort levels supported by MangoCode.
-///
-/// Matches the `EffortLevel` type from `src/entrypoints/sdk/runtimeTypes.ts`
-/// / `src/utils/effort.ts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EffortLevel {
     /// Quick, straightforward implementation with minimal overhead.
@@ -57,7 +49,7 @@ impl EffortLevel {
     /// Return the extended-thinking budget in tokens for this effort level,
     /// or `None` if thinking should be disabled.
     ///
-    /// Values mirror the TypeScript `thinkingBudgetForEffort` mapping:
+    /// Thinking-budget mapping:
     ///   Low    → None  (no thinking)
     ///   Medium → 5 000
     ///   High   → 10 000
@@ -74,7 +66,7 @@ impl EffortLevel {
     /// Return the temperature override for this effort level, or `None` to
     /// use the model's default.
     ///
-    /// Values mirror the TypeScript source:
+    /// Temperature mapping:
     ///   Low    → Some(0.0) — deterministic, cheap
     ///   Medium → None      — model default
     ///   High   → None      — model default
@@ -88,7 +80,7 @@ impl EffortLevel {
 
     /// A single Unicode glyph used to represent this effort level in the TUI.
     ///
-    /// Glyphs mirror the TypeScript EffortCallout / status-bar rendering:
+    /// Status-bar glyphs:
     ///   Low    → "○"  (empty circle)
     ///   Medium → "◐"  (half circle)
     ///   High   → "●"  (filled circle)

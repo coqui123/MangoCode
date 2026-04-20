@@ -1,10 +1,9 @@
 //! Bundled skill definitions for the Skill tool.
 //!
-//! Each entry in `BUNDLED_SKILLS` mirrors one of the TypeScript
-//! `registerXxxSkill()` calls under `src/skills/bundled/`.  Only publicly
-//! invocable, user-facing skills are included; internal or ANT-only skills
-//! (stuck, remember, verify) are omitted from the user-visible list but are
-//! still present as documentation stubs so callers can discover them.
+//! Each entry in `BUNDLED_SKILLS` registers one publicly invocable,
+//! user-facing skill. Internal or ANT-only skills (stuck, remember,
+//! verify) are omitted from the user-visible list but are still
+//! present as documentation stubs so callers can discover them.
 //!
 //! The `SkillTool` checks bundled skills *before* scanning disk directories,
 //! so bundled names take precedence over same-named `.md` files.

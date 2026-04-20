@@ -1,5 +1,5 @@
 // FileEdit tool: exact string replacement with old/new strings (like sed but
-// deterministic).  Mirrors the TypeScript Edit tool behaviour.
+// deterministic).
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;

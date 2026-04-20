@@ -1,5 +1,4 @@
 //! AGENTS.md hierarchical memory loading.
-//! Mirrors src/utils/claudemd.ts (1,479 lines).
 //!
 //! Priority order: managed > user > project > local
 //! Supports @include directives, YAML frontmatter, and mtime-based caching.

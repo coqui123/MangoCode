@@ -1,11 +1,6 @@
 // tips.rs — Tip scheduling system for MangoCode.
 //
-// Ported from:
-//   src/services/tips/tipScheduler.ts
-//   src/services/tips/tipRegistry.ts
-//   src/services/tips/tipHistory.ts
-//
-// Tips are shown during the spinner while MangoCode is processing.  Each tip has
+// Tips are shown during the spinner while MangoCode is processing. Each tip has
 // a `cooldown_sessions` field — the tip won't be shown again until that many
 // sessions have passed since the last display.
 //
@@ -33,7 +28,7 @@ pub struct Tip {
 // Tip registry
 // ---------------------------------------------------------------------------
 
-/// All built-in tips, drawn directly from `tipRegistry.ts`.
+/// All built-in tips.
 static ALL_TIPS: Lazy<Vec<Tip>> = Lazy::new(|| {
     vec![
         Tip {
@@ -244,9 +239,9 @@ impl TipHistory {
                 // `current_session - last_session` against `cooldown_sessions`.
                 //
                 // For this reason we don't subtract here; instead we keep the
-                // original TypeScript behaviour of returning "sessions since
-                // last shown" — but we need the current session number from the
-                // scheduler.  The public contract is therefore:
+                // behaviour of returning "sessions since last shown" — but we
+                // need the current session number from the scheduler.
+                // The public contract is therefore:
                 //   sessions_since_last_shown returns u32::MAX when never shown,
                 //   otherwise returns the stored last_session (a raw value).
                 //
@@ -278,8 +273,7 @@ impl TipHistory {
 /// The algorithm picks the eligible tip (cooldown satisfied) that was shown
 /// least recently.  If no tips are eligible, `None` is returned.
 ///
-/// This mirrors `tipScheduler.ts` which sorts by `sessionsSinceLastShown` in
-/// descending order and takes the first eligible result.
+/// Sort tips by `sessionsSinceLastShown` descending and pick the first eligible entry.
 pub fn select_tip(session_num: u64) -> Option<&'static Tip> {
     let history = TipHistory::load();
 

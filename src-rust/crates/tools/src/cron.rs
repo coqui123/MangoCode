@@ -8,7 +8,7 @@
 // Durable tasks are persisted to `~/.mangocode/scheduled_tasks.json`.
 //
 // On first use the store is initialised from the JSON file; tasks older than
-// 7 days are automatically purged on load (matching TypeScript behaviour).
+// 7 days are automatically purged on load.
 //
 // Cron expression format: "M H DoM Mon DoW" (standard 5-field cron in local
 // time). For example:

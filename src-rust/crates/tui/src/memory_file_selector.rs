@@ -1,4 +1,4 @@
-// memory_file_selector.rs — Memory file selector overlay mirroring TS MemoryFileSelector.tsx
+// memory_file_selector.rs — Memory file selector overlay.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};

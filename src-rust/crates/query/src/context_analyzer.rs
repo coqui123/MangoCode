@@ -1,5 +1,4 @@
 //! Context window analysis utilities.
-//! Mirrors src/utils/analyzeContext.ts (1,382 lines).
 //! Used by the /ctx-viz slash command.
 
 use mangocode_core::types::{ContentBlock, Message, MessageContent};
@@ -80,7 +79,7 @@ pub enum CompactionStrategy {
 }
 
 // ---------------------------------------------------------------------------
-// Token estimation (mirrors cc-core::message_utils)
+// Token estimation
 // ---------------------------------------------------------------------------
 
 fn estimate_chars(s: &str) -> u64 {

@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Session-level metrics counters (mirrors TypeScript bootstrap state).
-///
+/// Session-level metrics counters (bootstrap-style tallies).
 /// All counters use `AtomicU64` so they can be shared across threads without
 /// a mutex.  Cost is stored as integer millicents (cost_usd × 100_000) to
 /// avoid floating-point atomic arithmetic.

@@ -1,6 +1,6 @@
 // REPLTool: Executes code in a persistent interpreter session.
 //
-// Tool name: "REPL" (matches TypeScript REPL_TOOL_NAME constant)
+// Tool name: "REPL"
 //
 // The same interpreter process stays alive across multiple tool calls within
 // a session. Supports: python3, node, bash (default).

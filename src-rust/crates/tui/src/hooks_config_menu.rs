@@ -1,12 +1,12 @@
 // hooks_config_menu.rs — 4-screen read-only hooks browser.
 //
-// Mirrors the drill-down navigation of TS HooksConfigMenu.tsx:
+// Drill-down navigation:
 //   Screen 1 SelectEvent   — list of hook events with count badges
 //   Screen 2 SelectMatcher — matchers for the chosen event
 //   Screen 3 SelectHook    — individual hooks for the chosen matcher
 //   Screen 4 ViewHook      — full detail for a single hook
 //
-// The menu is intentionally read-only; as in the TS original, users edit
+// The menu is intentionally read-only; users edit
 // ~/.mangocode/settings.json directly or ask MangoCode to change hooks.
 
 use ratatui::buffer::Buffer;

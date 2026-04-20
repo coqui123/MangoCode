@@ -51,7 +51,7 @@ pub mod elicitation_dialog;
 pub mod export_dialog;
 /// Session quality feedback survey overlay.
 pub mod feedback_survey;
-/// Figure/icon constants matching src/constants/figures.ts
+/// Figure/icon constants.
 pub mod figures;
 /// Read-only hooks configuration browser.
 pub mod hooks_config_menu;
@@ -95,6 +95,8 @@ pub mod prompt_input;
 pub mod render;
 /// Rustle mascot rendering.
 pub mod rustle;
+#[cfg(test)]
+mod test_svg_render;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 /// Session browser overlay (/session, /resume, /rename, /export).

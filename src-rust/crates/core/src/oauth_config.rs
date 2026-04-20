@@ -1,14 +1,11 @@
 //! OAuth configuration for multiple environments.
 //!
-//! This module mirrors the TypeScript `src/constants/oauth.ts` and
-//! `src/services/oauth/crypto.ts` constants.  It is intentionally
-//! *configuration-only* — no live network I/O except for the optional
-//! `fetch_oauth_profile` helper at the bottom.
+//! Configuration-only: constants and URLs, plus optional `fetch_oauth_profile` at the bottom.
 
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Scope constants (mirrors constants/oauth.ts)
+// Scope constants
 // ---------------------------------------------------------------------------
 
 /// The Claude.ai inference scope — required for Bearer-auth API calls.
@@ -20,7 +17,7 @@ pub const CLAUDE_AI_PROFILE_SCOPE: &str = "user:profile";
 /// Console scope — used when creating an API key via the Console flow.
 pub const CONSOLE_SCOPE: &str = "org:create_api_key";
 
-/// All Claude.ai OAuth scopes (mirrors `CLAUDE_AI_OAUTH_SCOPES`).
+/// All Claude.ai OAuth scopes.
 pub const CLAUDE_AI_OAUTH_SCOPES: &[&str] = &[
     CLAUDE_AI_PROFILE_SCOPE,
     CLAUDE_AI_INFERENCE_SCOPE,
@@ -29,10 +26,11 @@ pub const CLAUDE_AI_OAUTH_SCOPES: &[&str] = &[
     "user:file_upload",
 ];
 
-/// Console OAuth scopes (mirrors `CONSOLE_OAUTH_SCOPES`).
+/// Console OAuth scopes.
 pub const CONSOLE_OAUTH_SCOPES: &[&str] = &[CONSOLE_SCOPE, CLAUDE_AI_PROFILE_SCOPE];
 
-/// Union of all scopes used during login (mirrors `ALL_OAUTH_SCOPES`).
+/// Union of all scopes used during login.
+///
 /// Requesting all at once lets a single login satisfy both Console and
 /// claude.ai auth paths.
 pub const ALL_OAUTH_SCOPES: &[&str] = &[
@@ -73,17 +71,17 @@ pub struct OAuthConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Production config (mirrors PROD_OAUTH_CONFIG in oauth.ts)
+// Production config
 // ---------------------------------------------------------------------------
 
-// NOTE: These OAuth client IDs are registered to Anthropic's official Claude Code CLI.
+// NOTE: These OAuth client IDs are registered with Anthropic for their own CLI product.
 // They will NOT work for MangoCode — Anthropic's auth server will reject or misattribute requests.
 // Users should use an API key from console.anthropic.com instead.
 // To use OAuth, MangoCode would need its own registered OAuth application with Anthropic.
 pub const PROD_OAUTH: OAuthConfig = OAuthConfig {
     base_api_url: "https://api.anthropic.com",
     // Routes through claude.com/cai/* for attribution, 307s to claude.ai in
-    // two hops — same behaviour as the TypeScript client.
+    // two hops — same behaviour as Anthropic's published OAuth flow.
     console_authorize_url: "https://platform.claude.com/oauth/authorize",
     claude_ai_authorize_url: "https://claude.com/cai/oauth/authorize",
     claude_ai_origin: "https://claude.ai",
@@ -94,14 +92,14 @@ pub const PROD_OAUTH: OAuthConfig = OAuthConfig {
         "https://platform.claude.com/buy_credits?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code",
     claudeai_success_url: "https://platform.claude.com/oauth/code/success?app=claude-code",
     manual_redirect_url: "https://platform.claude.com/oauth/code/callback",
-    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e", // Anthropic's Claude Code — will not work for MangoCode
+    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e", // Anthropic-registered — not for third-party apps
     oauth_file_suffix: "",
     mcp_proxy_url: "https://mcp-proxy.anthropic.com",
     mcp_proxy_path: "/v1/mcp/{server_id}",
 };
 
 // ---------------------------------------------------------------------------
-// Staging config (mirrors STAGING_OAUTH_CONFIG — ant builds only)
+// Staging config (internal Anthropic staging builds)
 // ---------------------------------------------------------------------------
 
 pub const STAGING_OAUTH: OAuthConfig = OAuthConfig {
@@ -115,7 +113,7 @@ pub const STAGING_OAUTH: OAuthConfig = OAuthConfig {
     console_success_url: "https://platform.staging.ant.dev/buy_credits?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code",
     claudeai_success_url: "https://platform.staging.ant.dev/oauth/code/success?app=claude-code",
     manual_redirect_url: "https://platform.staging.ant.dev/oauth/code/callback",
-    client_id: "22422756-60c9-4084-8eb7-27705fd5cf9a", // Anthropic's Claude Code staging — will not work for MangoCode
+    client_id: "22422756-60c9-4084-8eb7-27705fd5cf9a", // Anthropic staging — not for third-party apps
     oauth_file_suffix: "-staging-oauth",
     mcp_proxy_url: "https://mcp-proxy-staging.anthropic.com",
     mcp_proxy_path: "/v1/mcp/{server_id}",
@@ -137,7 +135,7 @@ pub fn get_oauth_config() -> &'static OAuthConfig {
 }
 
 // ---------------------------------------------------------------------------
-// PKCE helpers (mirrors src/services/oauth/crypto.ts)
+// PKCE helpers
 // ---------------------------------------------------------------------------
 
 /// PKCE code-challenge / code-verifier helpers.
@@ -152,7 +150,7 @@ pub mod pkce {
     /// crate's v4 generator — both already in-tree.  Falls back to a
     /// time+pid mix if the OS RNG is unavailable.
     pub fn generate_code_verifier() -> String {
-        // 32 random bytes → 43-char Base64url string (same as the TS impl).
+        // 32 random bytes → 43-char Base64url string (RFC 7636).
         let bytes = random_bytes_32();
         URL_SAFE_NO_PAD.encode(bytes)
     }
@@ -248,7 +246,7 @@ pub async fn fetch_oauth_profile(
 // Auth URL builder
 // ---------------------------------------------------------------------------
 
-/// Build the OAuth authorization URL (mirrors `buildAuthUrl` in client.ts).
+/// Build the OAuth authorization URL for the configured environment.
 pub fn build_auth_url(
     code_challenge: &str,
     state: &str,

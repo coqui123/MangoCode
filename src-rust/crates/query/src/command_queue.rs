@@ -2,8 +2,6 @@
 //
 // A priority queue shared between the TUI input thread and the query loop.
 // Commands are drained at the start of each turn, before the API call.
-//
-// Mirrors the TypeScript `messageQueueManager.js` behaviour.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

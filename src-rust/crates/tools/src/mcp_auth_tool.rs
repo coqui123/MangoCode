@@ -10,8 +10,7 @@
 //  3. Attempts to open the URL in the system browser (best-effort).
 //  4. For stdio servers, explains env-var based authentication.
 //
-// This mirrors the TypeScript `mcp__<name>__authenticate` dynamic tool.
-
+// This Matches the `mcp__<name>__authenticate` dynamic tool.
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;

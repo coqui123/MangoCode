@@ -1,5 +1,4 @@
 //! Message type renderers for the TUI.
-//! Mirrors src/components/messages/ and src/components/Messages.tsx.
 //!
 //! Each message type has a dedicated render function. The top-level
 //! `render_message()` dispatcher routes to the correct renderer based

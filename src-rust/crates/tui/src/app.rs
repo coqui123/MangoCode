@@ -747,6 +747,13 @@ pub struct App {
     pub device_auth_pending: Option<String>,
     /// Shared provider registry for dynamic model fetching.
     pub provider_registry: Option<std::sync::Arc<mangocode_api::ProviderRegistry>>,
+    /// Set to `true` when the auth store was mutated at runtime (e.g. after a
+    /// successful `/connect` OAuth or API-key entry) so the main event loop
+    /// knows to rebuild the `provider_registry` from disk before the next
+    /// query. Without this, providers added after startup (notably
+    /// `anthropic-max`) are absent from the in-memory registry and queries
+    /// fall through to a generic OpenAI-compatible fallback.
+    pub provider_registry_stale: bool,
     /// Model registry populated from models.dev — single source of truth for
     /// all provider models shown in the `/model` picker.
     pub model_registry: mangocode_api::ModelRegistry,
@@ -1009,7 +1016,7 @@ fn sample_spinner_verb(seed: usize) -> &'static str {
 }
 
 /// Past-tense verbs shown in the status row after a turn completes.
-/// Mirrors `TURN_COMPLETION_VERBS` from `src/constants/turnCompletionVerbs.ts`.
+/// Past-tense verbs shown in the status row after a turn completes.
 const TURN_COMPLETION_VERBS: &[&str] = &[
     "Baked",
     "Brewed",
@@ -1135,6 +1142,7 @@ impl App {
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
+            provider_registry_stale: false,
             model_registry: {
                 let mut reg = mangocode_api::ModelRegistry::new();
                 // Try to load cached models.dev data from disk.
@@ -2893,7 +2901,6 @@ impl App {
         }
 
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
-        // session exits immediately. Mirrors TS BypassPermissionsModeDialog.tsx.
         if self.bypass_permissions_dialog.visible {
             match key.code {
                 KeyCode::Char('1') | KeyCode::Esc => {
@@ -2973,6 +2980,10 @@ impl App {
                         self.set_provider_default(provider_id.clone());
                         self.persist_provider_and_model();
                         self.has_credentials = true;
+                        // Force the event loop to rebuild the provider registry so the
+                        // newly-authenticated provider (e.g. anthropic-max) is actually
+                        // in the registry before the next query is dispatched.
+                        self.provider_registry_stale = true;
                         self.status_message = Some(format!(
                             "Connected to {}! Use /model to pick a model.",
                             provider_name
@@ -3013,6 +3024,9 @@ impl App {
                             self.set_provider_default(provider_id.clone());
                             self.persist_provider_and_model();
                             self.has_credentials = true;
+                            // See note above: rebuild the registry so the newly-added
+                            // API-key provider is dispatchable on the next query.
+                            self.provider_registry_stale = true;
                             self.status_message = Some(format!(
                                 "Step 3/3 complete: connected to {}. Run /providers to verify live health, then /model to choose a model.",
                                 provider_name
@@ -3067,6 +3081,10 @@ impl App {
                                 self.set_provider_default(selected.id.clone());
                                 self.persist_provider_and_model();
                                 self.has_credentials = true;
+                                // Local providers are always registered on startup,
+                                // but flag the registry as stale anyway to keep the
+                                // state-machine consistent (cheap: rebuild is fast).
+                                self.provider_registry_stale = true;
                                 self.status_message = Some(format!(
                                     "Step 3/3 complete: switched to {} (local). Use /model to pick a model.",
                                     selected.title
@@ -3987,7 +4005,6 @@ impl App {
 
             // ---- Shift+Tab: cycle permission mode ----------------------
             // Default → AcceptEdits → BypassPermissions → Default
-            // Mirrors TS bottom-left indicator cycling behaviour.
             KeyCode::BackTab if !self.is_streaming => {
                 use mangocode_core::config::PermissionMode;
                 self.config.permission_mode = match self.config.permission_mode {

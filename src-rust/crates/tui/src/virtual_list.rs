@@ -1,5 +1,4 @@
 //! VirtualMessageList — efficient scrollable list that renders only visible items.
-//! Mirrors src/components/VirtualMessageList.tsx.
 //!
 //! Key idea: each item has a cached height (in terminal rows). We track a
 //! `scroll_offset` (rows from top) and render only items whose row ranges

@@ -1,5 +1,4 @@
 //! Auto-approve mode state and opt-in tracking.
-//! Mirrors src/utils/autoApprove.ts
 
 use serde::{Deserialize, Serialize};
 

@@ -1,5 +1,4 @@
 //! Git utilities for MangoCode.
-//! Mirrors src/utils/git.ts (926 lines) and src/utils/git/ subdirectory.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
