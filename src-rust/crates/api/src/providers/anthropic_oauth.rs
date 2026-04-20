@@ -31,37 +31,29 @@ use super::anthropic::AnthropicProvider;
 // Beta headers required for Claude Max OAuth
 // ---------------------------------------------------------------------------
 
-/// Enables Bearer OAuth on `api.anthropic.com` routes. Without this header,
-/// Anthropic rejects OAuth tokens with:
-///     "Authentication error: OAuth authentication is currently not supported."
-const OAUTH_BETA: &str = "oauth-2025-04-20";
-
-/// Anthropic expects this beta flag on non-Haiku `/v1/messages` calls so Bearer
-/// OAuth bills against a Claude Max subscription (not console API-key quota)
-/// and server-side Max features stay enabled.
-const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+/// Canonical Claude Max beta list from reference implementations (Dario, Meridian, ccproxy).
+/// This is the exact set of betas used by Claude Code for OAuth requests.
+const MAX_BETAS: &str = "claude-code-20250219,oauth-2025-04-20,\
+context-1m-2025-08-07,interleaved-thinking-2025-05-14,\
+context-management-2025-06-27,prompt-caching-scope-2026-01-05,\
+advisor-tool-2026-03-01,effort-2025-11-24";
 
 /// Build a [`ClientConfig`] tuned for Claude Max OAuth:
 /// - `use_bearer_auth = true` so the caller sends `Authorization: Bearer …`
-/// - `beta_features` prepended with `oauth-2025-04-20,claude-code-20250219`
+/// - `beta_features` set to the canonical Claude Max beta list
 ///   so Anthropic actually accepts the Bearer token.
 fn max_client_config(bearer_token: String) -> ClientConfig {
-    let defaults = ClientConfig::default();
-    let combined_betas = format!(
-        "{},{},{}",
-        OAUTH_BETA, CLAUDE_CODE_BETA, defaults.beta_features
-    );
     ClientConfig {
         api_key: bearer_token,
         use_bearer_auth: true,
-        beta_features: combined_betas,
+        beta_features: MAX_BETAS.to_string(),
         // Claude Max OAuth appears to have stricter burst limits than API keys.
         // Use a slightly more patient retry strategy so the first request after
         // OAuth doesn't "fail fast" on transient 429s.
         max_retries: 8,
         initial_retry_delay: std::time::Duration::from_secs(2),
         max_retry_delay: std::time::Duration::from_secs(300),
-        ..defaults
+        ..ClientConfig::default()
     }
 }
 
@@ -114,6 +106,24 @@ impl AnthropicMaxProvider {
                 Some(Self::new(access.clone()))
             }
             _ => None,
+        }
+    }
+
+    /// Try to create from Claude CLI credentials as a fallback.
+    /// This reads from ~/.claude/.credentials.json if MangoCode has no stored token.
+    pub async fn from_claude_cli_fallback() -> Option<Self> {
+        // First check if we already have a stored credential
+        if Self::from_auth_store().is_some() {
+            return None;
+        }
+
+        // Try to load from Claude CLI credentials
+        let tokens = core_oauth::OAuthTokens::load_from_claude_cli().await?;
+        if tokens.uses_bearer_auth() {
+            let access = tokens.effective_credential()?;
+            Some(Self::new(access.to_string()))
+        } else {
+            None
         }
     }
 
@@ -222,5 +232,28 @@ impl LlmProvider for AnthropicMaxProvider {
             structured_output: true,
             system_prompt_style: SystemPromptStyle::TopLevel,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_max_betas_contains_required_features() {
+        // Verify MAX_BETAS contains the essential OAuth and Claude Code betas
+        assert!(MAX_BETAS.contains("oauth-2025-04-20"));
+        assert!(MAX_BETAS.contains("claude-code-20250219"));
+    }
+
+    #[test]
+    fn test_max_client_config_uses_canonical_betas() {
+        let config = max_client_config("test_token".to_string());
+        assert_eq!(config.beta_features, MAX_BETAS);
+        assert!(config.use_bearer_auth);
     }
 }

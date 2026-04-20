@@ -17,8 +17,9 @@ pub const CLAUDE_AI_PROFILE_SCOPE: &str = "user:profile";
 /// Console scope — used when creating an API key via the Console flow.
 pub const CONSOLE_SCOPE: &str = "org:create_api_key";
 
-/// All Claude.ai OAuth scopes.
-pub const CLAUDE_AI_OAUTH_SCOPES: &[&str] = &[
+/// All Claude.ai OAuth scopes (for Claude Max / Bearer auth).
+/// Does NOT include org:create_api_key - that's Console-only.
+pub const CLAUDE_AI_SCOPES: &[&str] = &[
     CLAUDE_AI_PROFILE_SCOPE,
     CLAUDE_AI_INFERENCE_SCOPE,
     "user:sessions:claude_code",
@@ -26,8 +27,14 @@ pub const CLAUDE_AI_OAUTH_SCOPES: &[&str] = &[
     "user:file_upload",
 ];
 
-/// Console OAuth scopes.
-pub const CONSOLE_OAUTH_SCOPES: &[&str] = &[CONSOLE_SCOPE, CLAUDE_AI_PROFILE_SCOPE];
+/// Console OAuth scopes (for API key creation).
+pub const CONSOLE_SCOPES: &[&str] = &[CONSOLE_SCOPE, CLAUDE_AI_PROFILE_SCOPE];
+
+/// Legacy name for CLAUDE_AI_SCOPES.
+pub const CLAUDE_AI_OAUTH_SCOPES: &[&str] = CLAUDE_AI_SCOPES;
+
+/// Legacy name for CONSOLE_SCOPES.
+pub const CONSOLE_OAUTH_SCOPES: &[&str] = CONSOLE_SCOPES;
 
 /// Union of all scopes used during login.
 ///
@@ -415,5 +422,19 @@ mod tests {
         assert!(url.contains("state456"));
         assert!(url.contains("S256"));
         assert!(url.contains("localhost"));
+    }
+
+    #[test]
+    fn test_claude_ai_scopes_excludes_console_scope() {
+        // CLAUDE_AI_SCOPES should NOT include org:create_api_key
+        assert!(!CLAUDE_AI_SCOPES.contains(&CONSOLE_SCOPE));
+        assert!(CLAUDE_AI_SCOPES.contains(&CLAUDE_AI_INFERENCE_SCOPE));
+        assert!(CLAUDE_AI_SCOPES.contains(&CLAUDE_AI_PROFILE_SCOPE));
+    }
+
+    #[test]
+    fn test_console_scopes_includes_console_scope() {
+        // CONSOLE_SCOPES should include org:create_api_key
+        assert!(CONSOLE_SCOPES.contains(&CONSOLE_SCOPE));
     }
 }

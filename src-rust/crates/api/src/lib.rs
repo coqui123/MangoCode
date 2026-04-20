@@ -760,11 +760,29 @@ pub mod client {
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream")
                     .header("x-anthropic-billing-header", billing_header);
-                req = if self.config.use_bearer_auth {
-                    req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+
+                // Add Claude Code fingerprint headers for Bearer auth (Claude Max OAuth).
+                // These headers make the request look like a Claude Code client request,
+                // which is required for the OAuth path to accept Bearer tokens.
+                if self.config.use_bearer_auth {
+                    let session_uuid = uuid::Uuid::new_v4().to_string();
+                    let client_request_id = uuid::Uuid::new_v4().to_string();
+                    req = req
+                        .header("user-agent", "claude-cli/2.1.114 (external, cli)")
+                        .header("x-app", "cli")
+                        .header("anthropic-dangerous-direct-browser-access", "true")
+                        .header("x-stainless-lang", "js")
+                        .header("x-stainless-package-version", "0.81.0")
+                        .header("x-stainless-runtime", "node")
+                        .header("x-stainless-runtime-version", "v24.3.0")
+                        .header("x-stainless-timeout", "600")
+                        .header("x-stainless-retry-count", "0")
+                        .header("x-claude-code-session-id", &session_uuid)
+                        .header("x-client-request-id", &client_request_id)
+                        .header("Authorization", format!("Bearer {}", &self.config.api_key));
                 } else {
-                    req.header("x-api-key", &self.config.api_key)
-                };
+                    req = req.header("x-api-key", &self.config.api_key);
+                }
                 let req = req.body(body_str.clone());
 
                 let resp = req.send().await.map_err(ClaudeError::Http)?;

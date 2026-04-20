@@ -3409,6 +3409,44 @@ pub mod oauth {
             serde_json::from_str(&content).ok()
         }
 
+        /// Try to load OAuth tokens from Claude Code's credentials file.
+        ///
+        /// Claude Code stores credentials at `~/.claude/.credentials.json` with the shape:
+        /// ```json
+        /// {
+        ///   "claudeAiOauth": {
+        ///     "accessToken": "...",
+        ///     "refreshToken": "...",
+        ///     "expiresAt": 1234567890000
+        ///   }
+        /// }
+        /// ```
+        /// This is a fallback for users who already have Claude Code installed and
+        /// want to use their existing OAuth tokens with MangoCode.
+        pub async fn load_from_claude_cli() -> Option<Self> {
+            use crate::oauth_config::CLAUDE_AI_SCOPES;
+            
+            let path = dirs::home_dir()?.join(".claude/.credentials.json");
+            let content = tokio::fs::read_to_string(&path).await.ok()?;
+            let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+            let ca = v.get("claudeAiOauth")?;
+
+            let access_token = ca.get("accessToken")?.as_str()?.to_string();
+            let refresh_token = ca
+                .get("refreshToken")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let expires_at_ms = ca.get("expiresAt").and_then(|v| v.as_i64());
+
+            Some(OAuthTokens {
+                access_token,
+                refresh_token,
+                expires_at_ms,
+                scopes: CLAUDE_AI_SCOPES.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })
+        }
+
         pub async fn clear() -> anyhow::Result<()> {
             let path = Self::token_file_path();
             if path.exists() {
@@ -3443,11 +3481,19 @@ pub mod oauth {
             .build()
             .context("Failed to build HTTP client")?;
 
+        // Use the stored token scopes for refresh, not the hardcoded ALL_SCOPES.
+        // This ensures Claude Max tokens refresh with Claude.ai scopes only.
+        let scope_str = if tokens.scopes.is_empty() {
+            ALL_SCOPES.join(" ")
+        } else {
+            tokens.scopes.join(" ")
+        };
+
         let body = serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh,
             "client_id": CLIENT_ID,
-            "scope": ALL_SCOPES.join(" "),
+            "scope": scope_str,
         });
 
         let resp = client
