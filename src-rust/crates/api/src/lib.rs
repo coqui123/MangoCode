@@ -727,6 +727,20 @@ pub mod client {
                 .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
             let body_bytes = body_str.as_bytes();
 
+            // Add a small amount of jitter to backoff sleeps so multiple concurrent
+            // MangoCode instances don't sync-retry into a fresh 429.
+            fn jittered(d: Duration) -> Duration {
+                let base = d.as_secs_f64();
+                // ±10% jitter derived from current time nanos (no rand dependency).
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|x| x.subsec_nanos())
+                    .unwrap_or(0);
+                let j = (nanos % 100) as f64 / 100.0; // [0,1)
+                let factor = 0.9 + (0.2 * j); // [0.9,1.1)
+                Duration::from_secs_f64((base * factor).max(0.0))
+            }
+
             loop {
                 attempts += 1;
 
@@ -771,7 +785,9 @@ pub mod client {
                         .and_then(|v| v.parse::<u64>().ok())
                         .map(Duration::from_secs);
 
-                    let wait = retry_after.unwrap_or(delay);
+                    let wait = jittered(retry_after.unwrap_or(delay))
+                        .min(self.config.max_retry_delay)
+                        .max(Duration::from_millis(250));
                     warn!(
                         status,
                         attempt = attempts,

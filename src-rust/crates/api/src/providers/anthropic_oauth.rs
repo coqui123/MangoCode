@@ -55,6 +55,12 @@ fn max_client_config(bearer_token: String) -> ClientConfig {
         api_key: bearer_token,
         use_bearer_auth: true,
         beta_features: combined_betas,
+        // Claude Max OAuth appears to have stricter burst limits than API keys.
+        // Use a slightly more patient retry strategy so the first request after
+        // OAuth doesn't "fail fast" on transient 429s.
+        max_retries: 8,
+        initial_retry_delay: std::time::Duration::from_secs(2),
+        max_retry_delay: std::time::Duration::from_secs(300),
         ..defaults
     }
 }
