@@ -74,6 +74,12 @@ fn max_client_config(bearer_token: String) -> ClientConfig {
 pub struct AnthropicMaxProvider {
     inner: Arc<tokio::sync::Mutex<AnthropicProvider>>,
     id: ProviderId,
+    /// Cached expiry timestamp to avoid disk I/O on every request.
+    /// Only refresh from disk if this is None or expired.
+    cached_expiry_ms: Arc<tokio::sync::Mutex<Option<i64>>>,
+    /// Last time we checked the token file from disk (Unix timestamp in ms).
+    /// We only re-read from disk if this is older than 60 seconds.
+    last_disk_check_ms: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl AnthropicMaxProvider {
@@ -81,6 +87,8 @@ impl AnthropicMaxProvider {
         Self {
             inner: Arc::new(tokio::sync::Mutex::new(inner)),
             id: ProviderId::new(ProviderId::ANTHROPIC_MAX),
+            cached_expiry_ms: Arc::new(tokio::sync::Mutex::new(None)),
+            last_disk_check_ms: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -129,13 +137,50 @@ impl AnthropicMaxProvider {
 
     /// If OAuth tokens on disk are Claude Max (Bearer) and near expiry, refresh,
     /// persist, sync `auth.json`, and rebuild the inner Anthropic client.
+    ///
+    /// This method uses in-memory caching to avoid disk I/O on every request:
+    /// - Only reads from disk if last check was >60 seconds ago
+    /// - Only checks expiry if cached expiry is None or expired
     async fn ensure_inner_fresh(&self) {
+        const DISK_CHECK_INTERVAL_MS: i64 = 60 * 1000; // 60 seconds
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        
+        // Check if we need to read from disk (rate limiting)
+        let should_check_disk = {
+            let last_check = self.last_disk_check_ms.lock().await;
+            match *last_check {
+                Some(last) => now_ms - last > DISK_CHECK_INTERVAL_MS,
+                None => true,
+            }
+        };
+
+        if !should_check_disk {
+            // Use cached expiry check instead of disk I/O
+            let cached_expiry = self.cached_expiry_ms.lock().await;
+            if let Some(expiry) = *cached_expiry {
+                let buffer_ms: i64 = 5 * 60 * 1000; // 5 minutes
+                if (now_ms + buffer_ms) < expiry {
+                    // Token is still valid based on cache
+                    return;
+                }
+            }
+            // Cache says expired or missing, fall through to disk check
+        }
+
+        // Read from disk (rate-limited)
         let Some(tokens) = OAuthTokens::load().await else {
             return;
         };
         if !tokens.uses_bearer_auth() {
             return;
         }
+
+        // Update cache
+        if let Some(expiry) = tokens.expires_at_ms {
+            *self.cached_expiry_ms.lock().await = Some(expiry);
+        }
+        *self.last_disk_check_ms.lock().await = Some(now_ms);
 
         if !tokens.is_expired_or_expiring_soon() {
             return;
@@ -154,6 +199,10 @@ impl AnthropicMaxProvider {
                 if updated.persist_to_disk_with_auth_sync().await.is_err() {
                     tracing::warn!("Claude Max: refreshed tokens but failed to persist to disk");
                 }
+                // Update cache with new expiry
+                if let Some(expiry) = updated.expires_at_ms {
+                    *self.cached_expiry_ms.lock().await = Some(expiry);
+                }
                 let new_inner = AnthropicProvider::from_config(max_client_config(
                     updated.access_token.clone(),
                 ));
@@ -164,8 +213,9 @@ impl AnthropicMaxProvider {
                     error = %e,
                     "Claude Max OAuth refresh failed; falling back to auth.json access token if present"
                 );
+                let store = AuthStore::load_async().await;
                 if let Some(StoredCredential::OAuthToken { access, .. }) =
-                    AuthStore::load().get(ProviderId::ANTHROPIC_MAX)
+                    store.get(ProviderId::ANTHROPIC_MAX)
                 {
                     if !access.is_empty() {
                         *self.inner.lock().await =

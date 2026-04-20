@@ -3461,7 +3461,7 @@ pub mod oauth {
         /// and need the refreshed bearer token to be visible in the auth store as well.
         pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
             self.save().await?;
-            crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens(self);
+            crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self).await;
             Ok(())
         }
     }

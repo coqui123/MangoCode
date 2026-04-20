@@ -54,6 +54,26 @@ impl AuthStore {
         );
     }
 
+    /// Async version of sync_anthropic_max_from_oauth_tokens to avoid blocking I/O.
+    pub async fn sync_anthropic_max_from_oauth_tokens_async(tokens: &OAuthTokens) {
+        if !tokens.uses_bearer_auth() || tokens.access_token.is_empty() {
+            return;
+        }
+        let mut store = Self::load_async().await;
+        store.credentials.insert(
+            ProviderId::ANTHROPIC_MAX.to_string(),
+            StoredCredential::OAuthToken {
+                access: tokens.access_token.clone(),
+                refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                expires: tokens
+                    .expires_at_ms
+                    .map(|ms| ms as u64)
+                    .unwrap_or(0),
+            },
+        );
+        store.save_async().await;
+    }
+
     /// Path to the auth store file.
     pub fn path() -> PathBuf {
         let dir = dirs::home_dir()
@@ -75,6 +95,20 @@ impl AuthStore {
         }
     }
 
+    /// Async version of load() to avoid blocking the thread.
+    pub async fn load_async() -> Self {
+        let path = Self::path();
+        if path.exists() {
+            tokio::fs::read_to_string(&path)
+                .await
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
     /// Persist the store to disk (best-effort).
     pub fn save(&self) {
         let path = Self::path();
@@ -83,6 +117,17 @@ impl AuthStore {
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(&path, json);
+        }
+    }
+
+    /// Async version of save() to avoid blocking the thread.
+    pub async fn save_async(&self) {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = tokio::fs::write(&path, json).await;
         }
     }
 
