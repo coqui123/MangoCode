@@ -7,7 +7,7 @@
 pub mod provider_id;
 pub use provider_id::{ModelId, ProviderId};
 
-// Session transcript persistence (JSONL).
+// Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
 // Session sharing — HTTP upload to a share endpoint + local text export.
@@ -28,16 +28,14 @@ pub mod git_utils;
 pub mod auth_store;
 pub use auth_store::{AuthStore, StoredCredential};
 
-// Encrypted local credential vault (API keys, gateway token, etc.).
+// Encrypted local credential vault.
 pub mod vault;
-pub use vault::{
-    clear_vault_passphrase, get_vault_passphrase, set_vault_passphrase, GatewayConfig, Vault,
-};
+pub use vault::{GatewayConfig, Vault, clear_vault_passphrase, get_vault_passphrase, reqwest_client_builder, set_vault_passphrase};
 
 // GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
 pub mod device_code;
 
-// Utility modules.
+// Utility modules ported from src/utils/
 pub mod auto_mode;
 pub mod crypto_utils;
 pub mod format_utils;
@@ -101,7 +99,7 @@ pub use cost::CostTracker;
 pub use feature_flags::{
     FeatureFlagManager, FeatureFlags, FLAG_AUTO_LSP, FLAG_CRITIC_PERMISSIONS,
     FLAG_EXECUTION_SCRATCHPAD, FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION,
-    FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING, FLAG_QWEN_PRESERVE_THINKING,
+    FLAG_PRESERVE_THINKING, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
 };
 pub use history::ConversationSession;
 pub use permissions::{
@@ -786,9 +784,9 @@ pub mod config {
         /// Model to use for the permission critic (default: claude-3-haiku-20240307).
         #[serde(default)]
         pub critic_model: Option<String>,
-        /// Qwen/DashScope: request reasoning persistence across turns when supported by the model.
+        /// Request reasoning persistence across turns when supported by the model.
         #[serde(default)]
-        pub qwen_preserve_thinking: bool,
+        pub preserve_thinking: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -872,7 +870,7 @@ pub mod config {
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
         /// Whether the user has completed the first-launch onboarding flow.
-        /// First-launch onboarding / safety acknowledgement flag.
+        /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
         #[serde(default, rename = "hasCompletedOnboarding")]
         pub has_completed_onboarding: bool,
         /// App version at last launch — used to detect upgrades and show release notes.
@@ -1385,8 +1383,7 @@ pub mod config {
                 share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
                 critic_mode: over.config.critic_mode || base.config.critic_mode,
                 critic_model: over.config.critic_model.or(base.config.critic_model),
-                qwen_preserve_thinking: over.config.qwen_preserve_thinking
-                    || base.config.qwen_preserve_thinking,
+                preserve_thinking: over.config.preserve_thinking || base.config.preserve_thinking,
             };
             Self {
                 config: merged_config,
@@ -1632,6 +1629,7 @@ pub mod context {
             }
 
             // IDE context — injected when an IDE extension is connected.
+            // Mirrors TS getContextAttachments() → IdeContext attachment.
             if let Some(ide_ctx) = crate::attachments::get_ide_context() {
                 parts.push(format!("# IDE Context\n{}", ide_ctx));
             }
@@ -2029,7 +2027,8 @@ pub mod permissions {
 
     /// Build the explanation paragraph shown in the permission dialog.
     ///
-    /// Human-readable copy for the permission dialog.
+    /// Mirrors the TS `createPermissionRequestMessage` / `permissionExplainer`
+    /// output style.
     pub fn format_permission_reason(
         tool_name: &str,
         description: &str,
@@ -2115,7 +2114,8 @@ pub mod permissions {
         }
 
         // ----------------------------------------------------------------
-        // Evaluation (Based on TS hasPermissionsToUseTool)        // ----------------------------------------------------------------
+        // Evaluation (ported from TS hasPermissionsToUseTool)
+        // ----------------------------------------------------------------
 
         /// Evaluate whether `tool_name` should be allowed to run.
         ///
@@ -2143,7 +2143,7 @@ pub mod permissions {
 
             // Steps 2–3 — evaluate explicit rules (deny has priority over
             // allow; persistent rules evaluated before session rules within
-            // each polarity).
+            // each polarity, matching TS rule-source ordering)
             let all_rules = self
                 .persistent_rules
                 .iter()
@@ -3289,16 +3289,15 @@ pub mod hooks {
 
 /// OAuth 2.0 PKCE authentication support.
 ///
-/// Supports two login paths:
+/// Supports two login paths mirroring the TypeScript implementation:
 /// - **Console** (`org:create_api_key` scope): exchanges access token for an API key.
 /// - **Claude.ai** (`user:inference` scope): uses the access token as a Bearer credential.
 pub mod oauth {
-    use anyhow::{anyhow, bail, Context};
     use serde::{Deserialize, Serialize};
 
     // ---- Production OAuth endpoints & constants ----
 
-    // NOTE: This client ID is registered with Anthropic for their own CLI product.
+    // NOTE: This client ID is registered to Anthropic's official Claude Code CLI.
     // It will NOT work for MangoCode. Users should use an API key from console.anthropic.com.
     pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Anthropic's — will not work for MangoCode
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
@@ -3409,6 +3408,14 @@ pub mod oauth {
             serde_json::from_str(&content).ok()
         }
 
+        pub async fn clear() -> anyhow::Result<()> {
+            let path = Self::token_file_path();
+            if path.exists() {
+                tokio::fs::remove_file(path).await?;
+            }
+            Ok(())
+        }
+
         /// Try to load OAuth tokens from Claude Code's credentials file.
         ///
         /// Claude Code stores credentials at `~/.claude/.credentials.json` with the shape:
@@ -3421,13 +3428,34 @@ pub mod oauth {
         ///   }
         /// }
         /// ```
+        /// On macOS, the official Claude CLI stores tokens in the Keychain under the
+        /// service name "Claude Code-credentials". This method attempts to read from
+        /// the Keychain first (on macOS) and falls back to the `.credentials.json` file.
         /// This is a fallback for users who already have Claude Code installed and
         /// want to use their existing OAuth tokens with MangoCode.
         pub async fn load_from_claude_cli() -> Option<Self> {
             use crate::oauth_config::CLAUDE_AI_SCOPES;
-            
-            let path = dirs::home_dir()?.join(".claude/.credentials.json");
-            let content = tokio::fs::read_to_string(&path).await.ok()?;
+
+            // Try macOS Keychain first
+            #[cfg(target_os = "macos")]
+            let content = {
+                let keychain_content = get_macos_keychain_credentials().await;
+                if keychain_content.is_some() {
+                    keychain_content
+                } else {
+                    // Fall back to file
+                    let path = dirs::home_dir()?.join(".claude/.credentials.json");
+                    tokio::fs::read_to_string(&path).await.ok()
+                }
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            let content = {
+                let path = dirs::home_dir()?.join(".claude/.credentials.json");
+                tokio::fs::read_to_string(&path).await.ok()
+            };
+
+            let content = content?;
             let v: serde_json::Value = serde_json::from_str(&content).ok()?;
             let ca = v.get("claudeAiOauth")?;
 
@@ -3447,12 +3475,27 @@ pub mod oauth {
             })
         }
 
-        pub async fn clear() -> anyhow::Result<()> {
-            let path = Self::token_file_path();
-            if path.exists() {
-                tokio::fs::remove_file(&path).await?;
+        #[cfg(target_os = "macos")]
+        async fn get_macos_keychain_credentials() -> Option<String> {
+            // The official Claude CLI uses this service name in the keychain
+            let output = tokio::process::Command::new("security")
+                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+                .output()
+                .await
+                .ok()?;
+
+            if output.status.success() {
+                let json_str = String::from_utf8(output.stdout).ok()?;
+                Some(json_str.trim().to_string())
+            } else {
+                None
             }
-            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[allow(dead_code)]
+        async fn get_macos_keychain_credentials() -> Option<String> {
+            None
         }
 
         /// Persist `oauth_tokens.json` and sync Claude Max credentials into `auth.json`.
@@ -3461,7 +3504,7 @@ pub mod oauth {
         /// and need the refreshed bearer token to be visible in the auth store as well.
         pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
             self.save().await?;
-            crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self).await;
+            let _ = crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self).await;
             Ok(())
         }
     }
@@ -3470,6 +3513,8 @@ pub mod oauth {
     ///
     /// This is the shared helper used by the CLI flow and long-lived provider sessions.
     pub async fn refresh_oauth_tokens_from_refresh(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
+        use anyhow::{anyhow, bail, Context};
+        
         let refresh = tokens
             .refresh_token
             .as_deref()

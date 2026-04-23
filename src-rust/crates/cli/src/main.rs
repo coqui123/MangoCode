@@ -721,7 +721,7 @@ async fn main() -> anyhow::Result<()> {
     }
     config.verbose = cli.verbose;
     if cli.qwen_preserve_thinking {
-        config.qwen_preserve_thinking = true;
+        config.preserve_thinking = true;
     }
     config.output_format = cli.output_format.into();
     config.disable_claude_mds = cli.no_claude_md;

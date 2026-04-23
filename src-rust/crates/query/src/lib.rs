@@ -279,7 +279,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
-            qwen_preserve_thinking: cfg.qwen_preserve_thinking,
+            qwen_preserve_thinking: cfg.preserve_thinking,
             ..Default::default()
         }
     }
@@ -301,7 +301,7 @@ impl QueryConfig {
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
-            qwen_preserve_thinking: cfg.qwen_preserve_thinking,
+            qwen_preserve_thinking: cfg.preserve_thinking,
             ..Default::default()
         }
     }
@@ -404,7 +404,7 @@ fn should_enable_qwen_preserve_thinking(
         return false;
     }
     if !mangocode_core::FeatureFlags::is_enabled(
-        mangocode_core::FLAG_QWEN_PRESERVE_THINKING,
+        mangocode_core::FLAG_PRESERVE_THINKING,
     ) {
         return false;
     }

@@ -21,11 +21,11 @@ pub const FLAG_LLM_COMPACTION: &str = "llm_compaction";
 pub const FLAG_PROMPT_CACHING: &str = "prompt_caching";
 pub const FLAG_AUTO_LSP: &str = "auto_lsp";
 pub const FLAG_HIERARCHICAL_MEMORY: &str = "hierarchical_memory";
-/// Enable Qwen preserve_thinking selectively on long/tool-heavy sessions.
-/// When enabled, preserve_thinking is injected for Qwen agentic runs once
+/// Enable preserve_thinking selectively on long/tool-heavy sessions.
+/// When enabled, preserve_thinking is injected for agentic runs once
 /// heuristic thresholds (turn count ≥ 4 OR tool calls ≥ 3) are met.
-/// Set MANGOCODE_FLAG_QWEN_PRESERVE_THINKING=1 to enable.
-pub const FLAG_QWEN_PRESERVE_THINKING: &str = "qwen_preserve_thinking";
+/// Set MANGOCODE_FLAG_PRESERVE_THINKING=1 to enable.
+pub const FLAG_PRESERVE_THINKING: &str = "preserve_thinking";
 /// Enable the per-turn execution scratchpad injection for all models.
 /// Injects a structured [SCRATCHPAD] block before each API call with
 /// the current plan, last tool result summary, and next action.
@@ -119,7 +119,7 @@ impl FeatureFlags {
             FLAG_PROMPT_CACHING,
             FLAG_AUTO_LSP,
             FLAG_HIERARCHICAL_MEMORY,
-            FLAG_QWEN_PRESERVE_THINKING,
+            FLAG_PRESERVE_THINKING,
             FLAG_EXECUTION_SCRATCHPAD,
             "cached_microcompact",
         ]
@@ -131,7 +131,7 @@ impl FeatureFlags {
         defaults.insert(FLAG_LLM_COMPACTION.to_string(), true);
         // Execution scratchpad on by default; preserve_thinking off (opt-in).
         defaults.insert(FLAG_EXECUTION_SCRATCHPAD.to_string(), true);
-        defaults.insert(FLAG_QWEN_PRESERVE_THINKING.to_string(), false);
+        defaults.insert(FLAG_PRESERVE_THINKING.to_string(), false);
         defaults
     }
 

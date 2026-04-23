@@ -579,7 +579,7 @@ impl Tool for AgentTool {
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
             thinking_budget: None,
-            qwen_preserve_thinking: ctx.config.qwen_preserve_thinking,
+            qwen_preserve_thinking: ctx.config.preserve_thinking,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
