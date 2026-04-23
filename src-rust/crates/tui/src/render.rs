@@ -43,6 +43,7 @@ use crate::theme_screen::render_theme_screen;
 use crate::virtual_list::{VirtualItem, VirtualList};
 use crate::voice_mode_notice::render_voice_mode_notice;
 use mangocode_core::constants::APP_VERSION;
+use chrono;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -137,6 +138,18 @@ fn is_modal_open(app: &App) -> bool {
 // -----------------------------------------------------------------------
 // Text truncation helpers
 // -----------------------------------------------------------------------
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.0}K", n as f64 / 1_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
 
 fn truncate_end(text: &str, max_width: usize) -> String {
     if max_width == 0 {
@@ -1624,10 +1637,38 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
             .fg(CLAUDE_ORANGE)
             .add_modifier(Modifier::BOLD),
     )));
-    right_lines.push(Line::from(Span::styled(
-        "No recent activity",
-        Style::default().fg(Color::DarkGray),
-    )));
+
+    // Load and display recent activity from usage.json
+    let ledger = mangocode_core::usage_ledger::UsageLedger::load();
+    if ledger.sessions.is_empty() {
+        right_lines.push(Line::from(Span::styled(
+            "No recent activity",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        // Group sessions by date and show the last 3 days
+        use std::collections::HashMap;
+        let mut daily_tokens: HashMap<String, u64> = HashMap::new();
+        
+        for session in &ledger.sessions {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&session.timestamp) {
+                let date = dt.format("%Y-%m-%d").to_string();
+                let total = session.input_tokens + session.output_tokens 
+                    + session.cache_creation_tokens + session.cache_read_tokens;
+                *daily_tokens.entry(date).or_insert(0) += total;
+            }
+        }
+        
+        let mut recent_days: Vec<_> = daily_tokens.into_iter().collect();
+        recent_days.sort_by(|a, b| b.0.cmp(&a.0)); // Sort by date descending
+        
+        for (date, tokens) in recent_days.iter().take(3) {
+            right_lines.push(Line::from(Span::styled(
+                format!("  {}: {}", date, format_tokens(*tokens)),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
 
     frame.render_widget(
         Paragraph::new(right_lines).wrap(Wrap { trim: false }),
