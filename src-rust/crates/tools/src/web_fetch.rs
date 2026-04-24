@@ -142,7 +142,10 @@ async fn semantic_extraction(html: &str, ctx: &ToolContext) -> Option<String> {
 
     // Truncate HTML to avoid exceeding token limits
     let html_excerpt = if html.len() > 20000 {
-        format!("{}...", &html[..20000])
+        format!(
+            "{}...",
+            mangocode_core::truncate::truncate_bytes_prefix(html, 20000)
+        )
     } else {
         html.to_string()
     };

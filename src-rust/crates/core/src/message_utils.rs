@@ -1,4 +1,5 @@
 //! Message manipulation utilities.
+use crate::truncate::truncate_string_to_max_bytes;
 use crate::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
 
@@ -122,20 +123,20 @@ pub fn merge_consecutive_text_blocks(blocks: Vec<ContentBlock>) -> Vec<ContentBl
     result
 }
 
-/// Truncate the text content of a message to `max_chars`.
-pub fn truncate_message_content(msg: &mut Message, max_chars: usize) {
+/// Truncate the text content of a message to at most `max_bytes` UTF-8 bytes.
+pub fn truncate_message_content(msg: &mut Message, max_bytes: usize) {
     match &mut msg.content {
         MessageContent::Text(s) => {
-            if s.len() > max_chars {
-                s.truncate(max_chars);
+            if s.len() > max_bytes {
+                truncate_string_to_max_bytes(s, max_bytes);
                 s.push_str("\u{2026}[truncated]");
             }
         }
         MessageContent::Blocks(blocks) => {
             for block in blocks.iter_mut() {
                 if let ContentBlock::Text { text } = block {
-                    if text.len() > max_chars {
-                        text.truncate(max_chars);
+                    if text.len() > max_bytes {
+                        truncate_string_to_max_bytes(text, max_bytes);
                         text.push_str("\u{2026}[truncated]");
                     }
                 }

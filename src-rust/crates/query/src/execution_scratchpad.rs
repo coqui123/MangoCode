@@ -15,6 +15,7 @@
 // Enable/disable via feature flag FLAG_EXECUTION_SCRATCHPAD (default: on).
 // The flag can be toggled at runtime via MANGOCODE_FLAG_EXECUTION_SCRATCHPAD=0.
 
+use mangocode_core::truncate::truncate_bytes_with_ellipsis;
 use mangocode_core::types::{ContentBlock, Message, MessageContent, Role};
 
 /// How many characters of a tool result to include in the one-line summary.
@@ -220,7 +221,7 @@ fn extract_next_action_hint(messages: &[Message]) -> Option<String> {
 
         if let Some(line) = last_line {
             let hint = if line.len() > 150 {
-                format!("{}…", &line[..150])
+                truncate_bytes_with_ellipsis(&line, 150)
             } else {
                 line
             };

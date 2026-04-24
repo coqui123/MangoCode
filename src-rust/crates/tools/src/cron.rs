@@ -17,6 +17,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use mangocode_core::truncate::truncate_bytes_with_ellipsis;
 use chrono::{DateTime, Datelike, Local, Timelike};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -485,7 +486,7 @@ impl Tool for CronListTool {
                     t.recurring,
                     t.durable,
                     if t.prompt.len() > 60 {
-                        format!("{}…", &t.prompt[..60])
+                        truncate_bytes_with_ellipsis(&t.prompt, 60)
                     } else {
                         t.prompt.clone()
                     }

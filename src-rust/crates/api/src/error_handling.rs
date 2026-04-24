@@ -129,6 +129,18 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
         }
     }
 
+    // Some providers return 401/403 with a quota / tier message (e.g. DashScope free tier).
+    let lower = message.to_lowercase();
+    if (status == 401 || status == 403)
+        && lower.contains("free tier")
+        && (lower.contains("exhausted") || lower.contains("quota"))
+    {
+        return ProviderError::QuotaExceeded {
+            provider: provider.clone(),
+            message,
+        };
+    }
+
     // Classify by HTTP status code.
     match status {
         401 | 403 => ProviderError::AuthFailed {
@@ -306,6 +318,14 @@ mod tests {
         let pid = ProviderId::new("anthropic");
         let err = parse_error_response(401, r#"{"error":{"message":"Invalid API key"}}"#, &pid);
         assert!(matches!(err, ProviderError::AuthFailed { .. }));
+    }
+
+    #[test]
+    fn test_parse_error_response_free_tier_as_quota() {
+        let pid = ProviderId::new("qwen");
+        let body = r#"{"error":{"message":"The free tier of the model has been exhausted."}}"#;
+        let err = parse_error_response(401, body, &pid);
+        assert!(matches!(err, ProviderError::QuotaExceeded { .. }));
     }
 
     #[test]

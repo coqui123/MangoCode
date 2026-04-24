@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::truncate::truncate_bytes_prefix;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -316,7 +317,7 @@ fn summarize_input(input: &serde_json::Value) -> String {
     // For bash/powershell, show the command.
     if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
         let truncated = if cmd.len() > 80 {
-            format!("{}...", &cmd[..77])
+            format!("{}...", truncate_bytes_prefix(cmd, 77))
         } else {
             cmd.to_string()
         };
@@ -333,7 +334,7 @@ fn summarize_input(input: &serde_json::Value) -> String {
     // Fallback: first 80 chars of JSON.
     let s = serde_json::to_string(input).unwrap_or_default();
     if s.len() > 80 {
-        format!("{}...", &s[..77])
+        format!("{}...", truncate_bytes_prefix(&s, 77))
     } else {
         s
     }

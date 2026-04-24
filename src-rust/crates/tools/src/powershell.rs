@@ -13,11 +13,13 @@
 //   Medium   → requires approval only when ctx.require_confirmation is set
 //   Low      → executes directly
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{session_shell_state, PermissionLevel, ShellState, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -40,6 +42,91 @@ struct PowerShellInput {
 
 fn default_timeout() -> u64 {
     120_000
+}
+
+/// Sentinel appended to the PowerShell wrapper script. Everything printed after
+/// this marker is metadata (final pwd + env dump) rather than user-visible output.
+const PS_STATE_SENTINEL: &str = "__CC_PS_STATE__";
+
+/// Parse a PowerShell snapshot block (lines after `PS_STATE_SENTINEL`) into
+/// `(new_cwd, env_delta)`.
+///
+/// The block format is:
+/// ```text
+/// __CC_PS_STATE__
+/// C:\some\path          ← final cwd (first line after sentinel)
+/// KEY=value             ← exported env vars (remaining lines)
+/// ```
+fn parse_ps_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String, String>)> {
+    let mut iter = lines.iter();
+    let cwd_line = iter.next()?;
+    let cwd = PathBuf::from(cwd_line.trim());
+
+    let mut env_vars = HashMap::new();
+    for line in iter {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].to_string();
+            let val = line[eq + 1..].to_string();
+            // Filter out internal PowerShell variables we don't want to persist
+            if !key.starts_with('_')
+                && ![
+                    "PSExecutionPolicyPreference",
+                    "PSSessionOption",
+                    "PSDefaultParameterValues",
+                    "ErrorActionPreference",
+                    "VerbosePreference",
+                    "DebugPreference",
+                    "InformationPreference",
+                    "WarningPreference",
+                    "ProgressPreference",
+                    "ConfirmPreference",
+                    "WhatIfPreference",
+                ]
+                .contains(&key.as_str())
+            {
+                env_vars.insert(key, val);
+            }
+        }
+    }
+
+    Some((cwd, env_vars))
+}
+
+/// Build the PowerShell wrapper script that:
+/// 1. Restores saved cwd and env vars.
+/// 2. Runs the user command.
+/// 3. Prints the sentinel + final pwd + env dump so we can persist state.
+fn build_ps_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -> String {
+    let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
+
+    // Escape the cwd for PowerShell embedding
+    let cwd_escaped = effective_cwd.to_string_lossy().replace('\'', "''");
+
+    // Build env variable restoration lines
+    let mut env_lines = String::new();
+    for (k, v) in &state.env_vars {
+        let v_escaped = v.replace('\'', "''");
+        env_lines.push_str(&format!("$env:{} = '{}'\n", k, v_escaped));
+    }
+
+    format!(
+        r#"
+Set-Location '{}'
+{}
+$ErrorActionPreference = 'Continue'
+& {{ {} }}
+if ($LASTEXITCODE) {{ $exitCode = $LASTEXITCODE }} else {{ $exitCode = if ($?) {{ 0 }} else {{ 1 }} }}
+Write-Output '{}'
+Get-Location | Select-Object -ExpandProperty Path
+Get-ChildItem Env: | ForEach-Object {{ "$($_.Name)=$($_.Value)" }}
+exit $exitCode
+"#,
+        cwd_escaped, env_lines, command, PS_STATE_SENTINEL
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +176,11 @@ impl Tool for PowerShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a PowerShell command. Use for Windows-native operations, .NET APIs, \
+        "Execute a PowerShell command. IMPORTANT: Use PowerShell syntax, not bash/shell syntax. \
+         Examples: 'Set-Location C:\\path' (not 'cd'), '$env:VAR = \"value\"' (not 'export VAR=value'), \
+         'Get-ChildItem' (not 'ls'), 'Test-Path' (not 'test -f'). For env vars with special characters \
+         like parentheses, use: Set-Item -Path \"env:VARNAME\" -Value \"value\". The working directory and \
+         environment variables persist between commands. Use for Windows-native operations, .NET APIs, \
          registry access, and Windows-specific system administration."
     }
 
@@ -103,7 +194,7 @@ impl Tool for PowerShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The PowerShell command or script to execute"
+                    "description": "The PowerShell command or script to execute. Must use PowerShell syntax (e.g., 'Set-Location' not 'cd', '$env:VAR=value' not 'export VAR=value', 'Get-ChildItem' not 'ls')"
                 },
                 "description": {
                     "type": "string",
@@ -209,9 +300,18 @@ impl Tool for PowerShellTool {
         let timeout_ms = params.timeout.min(600_000);
         let timeout_dur = Duration::from_millis(timeout_ms);
 
+        // Retrieve the persistent shell state for this session.
+        let shell_state_arc = session_shell_state(&ctx.session_id);
+
+        // Build a wrapper script that restores and then captures shell state.
+        let script = {
+            let state = shell_state_arc.lock();
+            build_ps_wrapper_script(&params.command, &state, &ctx.working_dir)
+        };
+
         let mut child = match Command::new(exe)
             .args(&args)
-            .arg(&params.command)
+            .arg(&script)
             .current_dir(&ctx.working_dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -250,7 +350,30 @@ impl Tool for PowerShellTool {
         match result {
             Ok((stdout_lines, stderr_lines, status)) => {
                 let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                let mut output = stdout_lines.join("\n");
+
+                // Split stdout into user-visible output and the state block.
+                let sentinel_pos = stdout_lines
+                    .iter()
+                    .rposition(|l| l.trim() == PS_STATE_SENTINEL);
+
+                let (user_lines, state_lines) = match sentinel_pos {
+                    Some(pos) => (&stdout_lines[..pos], &stdout_lines[pos + 1..]),
+                    None => (stdout_lines.as_slice(), &[][..]),
+                };
+
+                // Update persistent shell state from the block.
+                if !state_lines.is_empty() {
+                    if let Some((new_cwd, env_delta)) = parse_ps_state_block(state_lines) {
+                        let mut state = shell_state_arc.lock();
+                        state.cwd = Some(new_cwd);
+                        // Merge (not replace) so vars set in earlier calls survive
+                        for (k, v) in env_delta {
+                            state.env_vars.insert(k, v);
+                        }
+                    }
+                }
+
+                let mut output = user_lines.join("\n");
                 if !stderr_lines.is_empty() {
                     if !output.is_empty() {
                         output.push('\n');

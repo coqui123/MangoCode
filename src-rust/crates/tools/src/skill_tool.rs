@@ -21,6 +21,7 @@
 use crate::bundled_skills::{expand_prompt, find_bundled_skill, user_invocable_skills};
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use mangocode_core::truncate::truncate_bytes_prefix;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -316,8 +317,7 @@ async fn read_skill_description(path: &std::path::Path) -> String {
     for line in body.lines() {
         let t = line.trim().trim_start_matches('#').trim();
         if !t.is_empty() {
-            let truncated = if t.len() > 80 { &t[..80] } else { t };
-            return truncated.to_string();
+            return truncate_bytes_prefix(t, 80).to_string();
         }
     }
     "(no description)".to_string()

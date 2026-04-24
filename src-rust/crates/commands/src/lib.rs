@@ -10,6 +10,7 @@ use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
 use mangocode_core::feature_flags::FeatureFlags;
+use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
 use mangocode_core::types::Message;
 use rpassword::prompt_password;
 use std::collections::BTreeMap;
@@ -1618,7 +1619,7 @@ impl SlashCommand for DiffCommand {
                     let display = if text.len() > 8000 {
                         format!(
                             "{}\n… (truncated — {} total bytes; use `git diff` for full output)",
-                            &text[..8000],
+                            truncate_bytes_prefix(text, 8000),
                             text.len()
                         )
                     } else {
@@ -1806,7 +1807,7 @@ impl SlashCommand for MemoryCommand {
                             content = if content.len() > 2000 {
                                 format!(
                                     "{}…\n(truncated — file is {} chars)",
-                                    &content[..2000],
+                                    truncate_bytes_prefix(&content, 2000),
                                     chars
                                 )
                             } else {
@@ -4420,7 +4421,7 @@ impl SlashCommand for SessionCommand {
                 if let Some(ref url) = ctx.remote_session_url {
                     let border = "─".repeat(url.len().min(60) + 4);
                     let display_url = if url.len() > 60 {
-                        format!("{}…", &url[..60])
+                        truncate_bytes_with_ellipsis(url, 60)
                     } else {
                         url.clone()
                     };

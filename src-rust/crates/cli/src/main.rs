@@ -36,6 +36,7 @@ pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{ArgAction, Parser, ValueEnum};
+use mangocode_core::truncate::truncate_bytes_with_ellipsis;
 use mangocode_core::types::ToolDefinition;
 use mangocode_core::{
     config::{Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, Settings},
@@ -3149,7 +3150,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         session_id: conn_sid,
                     }) => {
                         let short = if session_url.len() > 60 {
-                            format!("{}…", &session_url[..60])
+                            truncate_bytes_with_ellipsis(&session_url, 60)
                         } else {
                             session_url.clone()
                         };

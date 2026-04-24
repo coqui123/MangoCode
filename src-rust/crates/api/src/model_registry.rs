@@ -16,6 +16,65 @@ use mangocode_core::provider_id::{ModelId, ProviderId};
 use crate::provider::ModelInfo;
 
 // ---------------------------------------------------------------------------
+// Natural sort helper
+// ---------------------------------------------------------------------------
+
+/// Natural comparison for alphanumeric strings (e.g., "qwen3.10" > "qwen3.2")
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_chars = a.chars().peekable();
+    let mut b_chars = b.chars().peekable();
+
+    loop {
+        let a_next = a_chars.next();
+        let b_next = b_chars.next();
+
+        match (a_next, b_next) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(a_c), Some(b_c)) => {
+                if a_c.is_digit(10) && b_c.is_digit(10) {
+                    // Parse numbers
+                    let mut a_num = String::new();
+                    let mut b_num = String::new();
+                    
+                    a_num.push(a_c);
+                    while let Some(&c) = a_chars.peek() {
+                        if c.is_digit(10) {
+                            a_num.push(a_chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    b_num.push(b_c);
+                    while let Some(&c) = b_chars.peek() {
+                        if c.is_digit(10) {
+                            b_num.push(b_chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    let a_val: u64 = a_num.parse().unwrap_or(0);
+                    let b_val: u64 = b_num.parse().unwrap_or(0);
+                    
+                    match a_val.cmp(&b_val) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    }
+                } else {
+                    match a_c.cmp(&b_c) {
+                        std::cmp::Ordering::Equal => continue,
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ModelEntry
 // ---------------------------------------------------------------------------
 
@@ -90,7 +149,7 @@ impl ModelRegistry {
 
     fn add_anthropic_models(&mut self) {
         let pid = ProviderId::new(ProviderId::ANTHROPIC);
-        for (id, name, ctx, out, cost_in, cost_out) in [
+        let mut models = [
             (
                 "claude-opus-4-6",
                 "Claude Opus 4.6",
@@ -115,7 +174,9 @@ impl ModelRegistry {
                 0.8,
                 4.0,
             ),
-        ] {
+        ];
+        models.sort_by(|a, b| natural_cmp(a.0, b.0));
+        for (id, name, ctx, out, cost_in, cost_out) in models {
             self.insert(ModelEntry {
                 info: ModelInfo {
                     id: ModelId::new(id),
@@ -139,7 +200,7 @@ impl ModelRegistry {
 
     fn add_openai_models(&mut self) {
         let pid = ProviderId::new(ProviderId::OPENAI);
-        for (id, name, ctx, out, cost_in, cost_out, tools, reasoning) in [
+        let mut models = [
             (
                 "gpt-4o", "GPT-4o", 128_000u32, 16_384u32, 2.5f64, 10.0f64, true, false,
             ),
@@ -155,7 +216,9 @@ impl ModelRegistry {
             ),
             ("o3", "o3", 200_000, 100_000, 10.0, 40.0, true, true),
             ("o4-mini", "o4-mini", 200_000, 100_000, 1.1, 4.4, true, true),
-        ] {
+        ];
+        models.sort_by(|a, b| natural_cmp(a.0, b.0));
+        for (id, name, ctx, out, cost_in, cost_out, tools, reasoning) in models {
             self.insert(ModelEntry {
                 info: ModelInfo {
                     id: ModelId::new(id),
@@ -179,7 +242,7 @@ impl ModelRegistry {
 
     fn add_google_models(&mut self) {
         let pid = ProviderId::new(ProviderId::GOOGLE);
-        for (id, name, ctx, out, cost_in, cost_out) in [
+        let mut models = [
             (
                 "gemini-2.5-pro",
                 "Gemini 2.5 Pro",
@@ -204,7 +267,9 @@ impl ModelRegistry {
                 0.1,
                 0.4,
             ),
-        ] {
+        ];
+        models.sort_by(|a, b| natural_cmp(a.0, b.0));
+        for (id, name, ctx, out, cost_in, cost_out) in models {
             self.insert(ModelEntry {
                 info: ModelInfo {
                     id: ModelId::new(id),
@@ -230,42 +295,131 @@ impl ModelRegistry {
         let pid = ProviderId::new("qwen");
 
         // Specs sourced from Alibaba Cloud Model Studio docs (April 2026).
-        // qwen3.6-plus-2026-04-02: 1M context, 65,536 max output, native tool calling,
-        // hybrid thinking model (enable_thinking + preserve_thinking for agents).
+        // All Qwen 3.6 models: 1M context, 65,536 max output, native tool calling,
+        // hybrid thinking models (enable_thinking + preserve_thinking for agents).
         // DashScope intl endpoint: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
         // Recommended agentic temperature: 1.0 (long-horizon), 0.6 (eval tasks).
         // Default temperature override of 0.55 applied in ProviderQuirks.
-        let (id, name, ctx, out, tool_calling, reasoning, vision) = (
-            // Model ID used in DashScope API calls.
-            "qwen3.6-plus-2026-04-02",
-            "Qwen 3.6 Plus (2026-04-02)",
-            // 1M token context window per official docs.
-            1_000_000u32,
-            // 65,536 max output tokens per official docs (some sources cite 66K).
-            65_536u32,
-            true,
-            true,
-            true,
-        );
-
-        self.insert(ModelEntry {
-            info: ModelInfo {
-                id: ModelId::new(id),
-                provider_id: pid.clone(),
-                name: name.to_string(),
-                context_window: ctx,
-                max_output_tokens: out,
-            },
-            cost_input: None,
-            cost_output: None,
-            cost_cache_read: None,
-            cost_cache_write: None,
-            tool_calling,
-            reasoning,
-            vision,
-            family: Some("qwen".to_string()),
-            status: "active".to_string(),
-        });
+        let mut models = [
+            ("qwen3.6-flash", "Qwen 3.6 Flash"),
+            ("qwen3.6-max-preview", "Qwen 3.6 Max Preview"),
+            ("qwen3.6-27b", "Qwen 3.6 27B"),
+            ("qwen3.6-flash-2026-04-16", "Qwen 3.6 Flash (2026-04-16)"),
+            ("qwen3.6-35b-a3b", "Qwen 3.6 35B A3B"),
+            ("qwen3.6-plus-2026-04-02", "Qwen 3.6 Plus (2026-04-02)"),
+            ("qwen3.6-plus", "Qwen 3.6 Plus"),
+            ("qwen3-vl-235b-a22b-thinking", "Qwen 3 VL 235B A22B Thinking"),
+            ("qwen3-vl-30b-a3b-thinking", "Qwen 3 VL 30B A3B Thinking"),
+            ("qwen3-32b", "Qwen 3 32B"),
+            ("qwen3.5-35b-a3b", "Qwen 3.5 35B A3B"),
+            ("qwen3-coder-480b-a35b-instruct", "Qwen 3 Coder 480B A35B Instruct"),
+            ("qwen3-coder-plus", "Qwen 3 Coder Plus"),
+            ("qwen3-vl-8b-thinking", "Qwen 3 VL 8B Thinking"),
+            ("qwen3-max-preview", "Qwen 3 Max Preview"),
+            ("qwen3.5-flash-2026-02-23", "Qwen 3.5 Flash (2026-02-23)"),
+            ("qwen3-vl-flash-2025-10-15", "Qwen 3 VL Flash (2025-10-15)"),
+            ("qwen3-8b", "Qwen 3 8B"),
+            ("qwen3-0.6b", "Qwen 3 0.6B"),
+            ("qwen3-coder-flash", "Qwen 3 Coder Flash"),
+            ("qwen3-next-80b-a3b-thinking", "Qwen 3 Next 80B A3B Thinking"),
+            ("qwen3.5-27b", "Qwen 3.5 27B"),
+            ("qwen3-vl-flash", "Qwen 3 VL Flash"),
+            ("qwen3-14b", "Qwen 3 14B"),
+            ("qwen3-max-2025-09-23", "Qwen 3 Max (2025-09-23)"),
+            ("qwen3-30b-a3b-instruct-2507", "Qwen 3 30B A3B Instruct 2507"),
+            ("qwen3-235b-a22b-instruct-2507", "Qwen 3 235B A22B Instruct 2507"),
+            ("qwen3-coder-plus-2025-07-22", "Qwen 3 Coder Plus (2025-07-22)"),
+            ("qwen3.5-plus-2026-04-20", "Qwen 3.5 Plus (2026-04-20)"),
+            ("qwen3.5-122b-a10b", "Qwen 3.5 122B A10B"),
+            ("qwen3-max", "Qwen 3 Max"),
+            ("qwen3.5-plus-2026-02-15", "Qwen 3.5 Plus (2026-02-15)"),
+            ("qwen3-235b-a22b-thinking-2507", "Qwen 3 235B A22B Thinking 2507"),
+            ("qwen3.5-397b-a17b", "Qwen 3.5 397B A17B"),
+            ("qwen3-vl-plus-2025-09-23", "Qwen 3 VL Plus (2025-09-23)"),
+            ("qwen3-coder-next", "Qwen 3 Coder Next"),
+            ("qwen3.5-flash", "Qwen 3.5 Flash"),
+            ("qwen3-30b-a3b-thinking-2507", "Qwen 3 30B A3B Thinking 2507"),
+            ("qwen3-coder-plus-2025-09-23", "Qwen 3 Coder Plus (2025-09-23)"),
+            ("qwen3-max-2026-01-23", "Qwen 3 Max (2026-01-23)"),
+            ("qwen3-vl-flash-2026-01-22", "Qwen 3 VL Flash (2026-01-22)"),
+            ("qwen3-vl-30b-a3b-instruct", "Qwen 3 VL 30B A3B Instruct"),
+            ("qwen3-coder-30b-a3b-instruct", "Qwen 3 Coder 30B A3B Instruct"),
+            ("qwen3-vl-235b-a22b-instruct", "Qwen 3 VL 235B A22B Instruct"),
+            ("qwen3-4b", "Qwen 3 4B"),
+            ("qwen3-235b-a22b", "Qwen 3 235B A22B"),
+            ("qwen3-1.7b", "Qwen 3 1.7B"),
+            ("qwen3-vl-plus", "Qwen 3 VL Plus"),
+            ("qwen3-30b-a3b", "Qwen 3 30B A3B"),
+            ("qwen3-vl-8b-instruct", "Qwen 3 VL 8B Instruct"),
+            ("qwen3-coder-flash-2025-07-28", "Qwen 3 Coder Flash (2025-07-28)"),
+            ("qwen3-vl-plus-2025-12-19", "Qwen 3 VL Plus (2025-12-19)"),
+            ("qwen3.5-plus", "Qwen 3.5 Plus"),
+            ("qwen3-next-80b-a3b-instruct", "Qwen 3 Next 80B A3B Instruct"),
+            ("qvq-max-2025-03-25", "QVQ Max (2025-03-25)"),
+            ("qwen2.5-vl-72b-instruct", "Qwen 2.5 VL 72B Instruct"),
+            ("qwen-vl-plus-2025-05-07", "Qwen VL Plus (2025-05-07)"),
+            ("qwen-plus-2025-07-28", "Qwen Plus (2025-07-28)"),
+            ("qwen-vl-plus-latest", "Qwen VL Plus Latest"),
+            ("qwen2.5-vl-3b-instruct", "Qwen 2.5 VL 3B Instruct"),
+            ("qwen-max", "Qwen Max"),
+            ("qwen2.5-14b-instruct", "Qwen 2.5 14B Instruct"),
+            ("qwen-mt-flash", "Qwen MT Flash"),
+            ("qwen-vl-max-2025-08-13", "Qwen VL Max (2025-08-13)"),
+            ("qwen-max-2025-01-25", "Qwen Max (2025-01-25)"),
+            ("qwen2.5-14b-instruct-1m", "Qwen 2.5 14B Instruct 1M"),
+            ("qwen-plus", "Qwen Plus"),
+            ("qwen-turbo", "Qwen Turbo"),
+            ("qvq-max", "QVQ Max"),
+            ("qwen-vl-plus-2025-08-15", "Qwen VL Plus (2025-08-15)"),
+            ("qwen-vl-max-latest", "Qwen VL Max Latest"),
+            ("qwen3-next-80b-a3b-thinking", "Qwen 3 Next 80B A3B Thinking"),
+            ("qwen-turbo-latest", "Qwen Turbo Latest"),
+            ("qwen2.5-32b-instruct", "Qwen 2.5 32B Instruct"),
+            ("qwen-plus-character", "Qwen Plus Character"),
+            ("qwen-flash-character", "Qwen Flash Character"),
+            ("qvq-max-latest", "QVQ Max Latest"),
+            ("qwen-flash", "Qwen Flash"),
+            ("qwen-flash-2025-07-28", "Qwen Flash (2025-07-28)"),
+            ("qwen-vl-ocr", "Qwen VL OCR"),
+            ("qwen-vl-ocr-2025-11-20", "Qwen VL OCR (2025-11-20)"),
+            ("qwen-vl-max-2025-04-08", "Qwen VL Max (2025-04-08)"),
+            ("qwen2.5-7b-instruct-1m", "Qwen 2.5 7B Instruct 1M"),
+            ("qwen2.5-vl-7b-instruct", "Qwen 2.5 VL 7B Instruct"),
+            ("qwen2.5-72b-instruct", "Qwen 2.5 72B Instruct"),
+            ("qwen-plus-latest", "Qwen Plus Latest"),
+            ("qwen-plus-2025-09-11", "Qwen Plus (2025-09-11)"),
+            ("wan2.2-kf2v-flash", "Wan 2.2 KF2V Flash"),
+            ("qwen-mt-lite", "Qwen MT Lite"),
+            ("qwen-vl-plus-2025-01-25", "Qwen VL Plus (2025-01-25)"),
+            ("qwen-turbo-2025-04-28", "Qwen Turbo (2025-04-28)"),
+            ("qwen2.5-vl-32b-instruct", "Qwen 2.5 VL 32B Instruct"),
+            ("qwen-mt-plus", "Qwen MT Plus"),
+            ("qwen-plus-2025-04-28", "Qwen Plus (2025-04-28)"),
+            ("qwen-mt-turbo", "Qwen MT Turbo"),
+            ("qwen-plus-2025-07-14", "Qwen Plus (2025-07-14)"),
+            ("qwq-plus", "QWQ Plus"),
+        ];
+        models.sort_by(|a, b| natural_cmp(a.0, b.0));
+        for (id, name) in models {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: 1_000_000u32,
+                    max_output_tokens: 65_536u32,
+                },
+                cost_input: None,
+                cost_output: None,
+                cost_cache_read: None,
+                cost_cache_write: None,
+                tool_calling: true,
+                reasoning: true,
+                vision: true,
+                family: Some("qwen".to_string()),
+                status: "active".to_string(),
+            });
+        }
     }
 
     fn insert(&mut self, entry: ModelEntry) {
