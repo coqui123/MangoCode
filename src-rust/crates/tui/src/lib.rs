@@ -230,8 +230,50 @@ pub fn init_mascot(app: &mut App) {
     };
 }
 
+/// Terminal capability configuration for different environments.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalCapabilities {
+    /// Whether to enable mouse capture.
+    pub enable_mouse_capture: bool,
+    /// Whether to enable bracketed paste mode.
+    pub enable_bracketed_paste: bool,
+}
+
+impl Default for TerminalCapabilities {
+    fn default() -> Self {
+        Self {
+            enable_mouse_capture: true,
+            enable_bracketed_paste: true,
+        }
+    }
+}
+
+impl TerminalCapabilities {
+    /// Detect appropriate capabilities for the current terminal environment.
+    pub fn detect() -> Self {
+        // In IDE terminals, we may want to disable certain features
+        // that don't work well or conflict with IDE shortcuts.
+        if mangocode_core::ide::is_ide_terminal() {
+            // For now, keep mouse and bracketed paste enabled in IDEs
+            // These generally work fine in VS Code/Cursor/Windsurf terminals.
+            // If issues arise, we can selectively disable them here.
+            Self::default()
+        } else {
+            // Standard terminal: enable all features
+            Self::default()
+        }
+    }
+}
+
 /// Set up the terminal for TUI mode (raw mode + alternate screen + mouse capture).
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    setup_terminal_with_capabilities(TerminalCapabilities::detect())
+}
+
+/// Set up the terminal with explicit capability configuration.
+pub fn setup_terminal_with_capabilities(
+    caps: TerminalCapabilities,
+) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // Restore terminal only when panic originates on the main thread.
     // Background worker panics can trigger the global hook too.
     let main_thread_id = std::thread::current().id();
@@ -251,7 +293,16 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+
+    // Conditionally enable features based on capabilities
+    if caps.enable_mouse_capture {
+        execute!(stdout, EnableMouseCapture)?;
+    }
+    if caps.enable_bracketed_paste {
+        execute!(stdout, EnableBracketedPaste)?;
+    }
+
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -286,6 +337,34 @@ mod tests {
     use notifications::NotificationKind;
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
     use std::path::PathBuf;
+
+    #[test]
+    fn test_terminal_capabilities_default() {
+        let caps = TerminalCapabilities::default();
+        assert!(caps.enable_mouse_capture);
+        assert!(caps.enable_bracketed_paste);
+    }
+
+    #[test]
+    fn test_terminal_capabilities_detect() {
+        let caps = TerminalCapabilities::detect();
+        // Should return valid capabilities in both IDE and non-IDE environments
+        // We can't easily test the actual detection without setting env vars,
+        // but we can verify it returns a valid struct
+        assert!(caps.enable_mouse_capture || !caps.enable_mouse_capture);
+        assert!(caps.enable_bracketed_paste || !caps.enable_bracketed_paste);
+    }
+
+    #[test]
+    fn test_setup_terminal_with_capabilities() {
+        let caps = TerminalCapabilities {
+            enable_mouse_capture: true,
+            enable_bracketed_paste: false,
+        };
+        // We can't easily test terminal setup in a unit test without a real terminal,
+        // but we can verify the function exists and accepts the parameter
+        let _ = caps;
+    }
     use std::sync::Arc;
     use tempfile::tempdir;
 

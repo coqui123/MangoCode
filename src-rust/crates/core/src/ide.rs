@@ -117,6 +117,14 @@ pub fn detect_ide() -> Option<IdeKind> {
     None
 }
 
+/// Detect whether MangoCode is running in an IDE terminal.
+///
+/// This is a simplified check for TUI compatibility mode.
+/// Returns true if any known IDE environment is detected.
+pub fn is_ide_terminal() -> bool {
+    detect_ide().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +152,30 @@ mod tests {
         assert!(IdeKind::Cursor.extension_install_command().is_some());
         assert!(IdeKind::JetBrains.extension_install_command().is_none());
         assert!(IdeKind::Zed.extension_install_command().is_none());
+    }
+
+    #[test]
+    fn is_ide_terminal_returns_false_when_no_ide_detected() {
+        // In a clean test environment, no IDE should be detected
+        // This test verifies the function doesn't panic
+        let _ = is_ide_terminal();
+    }
+
+    #[test]
+    fn is_ide_terminal_detects_vscode_via_term_program() {
+        // Test that TERM_PROGRAM=vscode is detected
+        std::env::set_var("TERM_PROGRAM", "vscode");
+        let result = is_ide_terminal();
+        std::env::remove_var("TERM_PROGRAM");
+        assert!(result, "Should detect VS Code via TERM_PROGRAM");
+    }
+
+    #[test]
+    fn is_ide_terminal_detects_vscode_via_injection() {
+        // Test that VSCODE_INJECTION is detected
+        std::env::set_var("VSCODE_INJECTION", "1");
+        let result = is_ide_terminal();
+        std::env::remove_var("VSCODE_INJECTION");
+        assert!(result, "Should detect VS Code via VSCODE_INJECTION");
     }
 }

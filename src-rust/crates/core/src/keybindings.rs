@@ -99,6 +99,7 @@ fn normalize_key(k: &str) -> String {
         "home" => "home".to_string(),
         "end" => "end".to_string(),
         "tab" => "tab".to_string(),
+        "f1" => "f1".to_string(),
         k => k.to_string(),
     }
 }
@@ -116,6 +117,15 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
 
 /// Keys that cannot be rebound
 pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
+
+/// Keybinding profile for different terminal environments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeybindingProfile {
+    /// Standard profile for normal terminals (full keybinding set).
+    Standard,
+    /// IDE-compatible profile with safer fallback chords for IDE terminals.
+    IdeCompatible,
+}
 
 /// Default keybindings with comprehensive coverage of text editing, navigation, vim, and TUI actions
 ///
@@ -272,6 +282,52 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         .collect()
 }
 
+/// IDE-compatible keybindings with safer fallback chords.
+///
+/// These bindings add Ctrl+Q prefix chords for actions that conflict
+/// with IDE shortcuts (Ctrl+R, Alt+H, Ctrl+F, etc.).
+/// The original bindings are kept for compatibility, but the IDE-safe
+/// chords are preferred in help text and documentation.
+pub fn ide_bindings() -> Vec<ParsedBinding> {
+    let ide_fallbacks: &[(&str, &str, KeyContext)] = &[
+        // IDE-safe fallback chords using Ctrl+Q prefix (Ctrl+K conflicts with IDE shortcuts)
+        ("ctrl+q r", "history.overlay.open", KeyContext::Global),
+        ("ctrl+q h", "openHelp", KeyContext::Global),
+        ("ctrl+q f1", "openHelp", KeyContext::Global),
+        ("ctrl+q a", "goLineStart", KeyContext::Chat),
+        ("ctrl+q left", "transcript.jump.prev", KeyContext::Chat),
+        ("ctrl+q right", "transcript.jump.next", KeyContext::Chat),
+        ("ctrl+q f", "search.transcript.open", KeyContext::Chat),
+        ("ctrl+q shift+f", "search.global.open", KeyContext::Chat),
+        ("ctrl+q g", "goToLine", KeyContext::Chat),
+        ("ctrl+q ]", "search.transcript.next", KeyContext::Chat),
+        ("ctrl+q [", "search.transcript.prev", KeyContext::Chat),
+    ];
+
+    ide_fallbacks
+        .iter()
+        .filter_map(|(chord_str, action, context)| {
+            parse_chord(chord_str).map(|chord| ParsedBinding {
+                chord,
+                action: Some(action.to_string()),
+                context: context.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Get bindings for a specific keybinding profile.
+///
+/// - `Standard`: Returns the default bindings only.
+/// - `IdeCompatible`: Returns default bindings plus IDE-safe fallback chords.
+pub fn bindings_for_profile(profile: KeybindingProfile) -> Vec<ParsedBinding> {
+    let mut bindings = default_bindings();
+    if profile == KeybindingProfile::IdeCompatible {
+        bindings.extend(ide_bindings());
+    }
+    bindings
+}
+
 /// User keybindings loaded from ~/.mangocode/keybindings.json
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserKeybindings {
@@ -349,7 +405,11 @@ pub struct KeybindingResolver {
 
 impl KeybindingResolver {
     pub fn new(user: &UserKeybindings) -> Self {
-        let mut bindings = default_bindings();
+        Self::with_profile(user, KeybindingProfile::Standard)
+    }
+
+    pub fn with_profile(user: &UserKeybindings, profile: KeybindingProfile) -> Self {
+        let mut bindings = bindings_for_profile(profile);
 
         // Apply user overrides (user bindings win, last match wins)
         for user_binding in &user.bindings {
@@ -685,6 +745,45 @@ mod tests {
             });
             assert!(found, "Missing critical binding: {} -> {} in {:?}", chord_str, action, ctx);
         }
+    }
+
+    #[test]
+    fn test_ide_bindings_add_fallback_chords() {
+        let ide = ide_bindings();
+        // Check that Ctrl+Q chords are present
+        let has_ctrl_q_r = ide.iter().any(|b| {
+            b.chord.len() == 2 && b.chord[0].key == "q" && b.chord[0].ctrl && b.chord[1].key == "r"
+        });
+        assert!(has_ctrl_q_r, "Ctrl+Q R should be in IDE bindings");
+    }
+
+    #[test]
+    fn test_bindings_for_profile_standard_matches_default() {
+        let standard = bindings_for_profile(KeybindingProfile::Standard);
+        let default = default_bindings();
+        assert_eq!(standard.len(), default.len());
+    }
+
+    #[test]
+    fn test_bindings_for_profile_ide_includes_fallbacks() {
+        let ide = bindings_for_profile(KeybindingProfile::IdeCompatible);
+        let standard = bindings_for_profile(KeybindingProfile::Standard);
+        assert!(ide.len() > standard.len());
+    }
+
+    #[test]
+    fn test_resolver_with_ide_profile_includes_fallbacks() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::with_profile(&user, KeybindingProfile::IdeCompatible);
+
+        // Test that Ctrl+Q R works in IDE profile
+        let ks = parse_keystroke("ctrl+q").unwrap();
+        let result = resolver.process(ks, &KeyContext::Global);
+        assert!(matches!(result, KeybindingResult::Pending));
+
+        let ks2 = parse_keystroke("r").unwrap();
+        let result2 = resolver.process(ks2, &KeyContext::Global);
+        assert!(matches!(result2, KeybindingResult::Action(ref a) if a == "history.overlay.open"));
     }
 
     #[test]

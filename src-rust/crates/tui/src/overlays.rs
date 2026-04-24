@@ -86,6 +86,8 @@ pub struct HelpOverlay {
     pub filter: String,
     /// Dynamically populated entries from the command registry.
     pub commands: Vec<HelpEntry>,
+    /// Whether IDE-compatible shortcuts should be shown.
+    pub ide_mode: bool,
 }
 
 /// A single command entry shown in the help overlay.
@@ -296,10 +298,12 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )));
+    // Show IDE-safe shortcuts in IDE mode
+    let history_shortcut = if overlay.ide_mode { "Ctrl+Q R" } else { "Ctrl+R" };
     for (key, desc) in &[
         ("Enter", "Submit message"),
         ("Up / Down", "Input history"),
-        ("Ctrl+R", "Search history"),
+        (history_shortcut, "Search history"),
         ("Esc", "Cancel / close"),
     ] {
         left_lines.push(kb_line(key, desc));
@@ -313,8 +317,11 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )));
+    let help_shortcut = if overlay.ide_mode { "Ctrl+Q H" } else { "Alt+H" };
+    let f1_shortcut = if overlay.ide_mode { "Ctrl+Q F1" } else { "F1" };
     for (key, desc) in &[
-        ("F1", "Toggle help"),
+        (f1_shortcut, "Toggle help"),
+        (help_shortcut, "Toggle help (alt)"),
         ("Ctrl+C", "Cancel / quit"),
         ("Ctrl+D", "Quit (empty input)"),
         ("Ctrl+L", "Clear screen"),

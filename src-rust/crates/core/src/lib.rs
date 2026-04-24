@@ -75,7 +75,7 @@ pub mod mcp_templates;
 
 // IDE environment detection (VS Code, Cursor, JetBrains, …).
 pub mod ide;
-pub use ide::{detect_ide, IdeKind};
+pub use ide::{detect_ide, is_ide_terminal, IdeKind};
 
 // Background update checker — compares running version against GitHub releases.
 pub mod update_check;
@@ -102,6 +102,9 @@ pub use feature_flags::{
     FLAG_PRESERVE_THINKING, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
 };
 pub use history::ConversationSession;
+pub use keybindings::{
+    KeybindingProfile, KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
+};
 pub use permissions::{
     format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler, PermissionAction,

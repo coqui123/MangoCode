@@ -32,7 +32,7 @@ use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::file_history::FileHistory;
 use mangocode_core::keybindings::{
-    KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
+    KeybindingProfile, KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
 use mangocode_core::types::{ContentBlock, Message, Role};
 use mangocode_query::QueryEvent;
@@ -874,6 +874,15 @@ pub struct App {
     /// word is checked against this set; a match silently auto-approves the request.
     pub bash_prefix_allowlist: std::collections::HashSet<String>,
 
+    // ---- IDE input compatibility state ------------------------------------
+    /// Pending Escape key for Alt-via-Esc translation in IDE terminals.
+    /// When a bare Esc is received in IDE mode, we hold it briefly to see if
+    /// the next key arrives quickly (indicating Alt+key). If no follow-up key
+    /// arrives within the timeout, it's treated as a real Escape.
+    pub pending_esc: Option<std::time::Instant>,
+    /// Timeout window for Alt-via-Esc translation (milliseconds).
+    pub esc_timeout_ms: u64,
+
     // ---- Auto-update notification ----------------------------------------
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
@@ -1083,7 +1092,14 @@ impl App {
             agent_status: Vec::new(),
             history_search: None,
             transcript_search: TranscriptSearchState::default(),
-            keybindings: KeybindingResolver::new(&user_keybindings),
+            keybindings: {
+                let profile = if mangocode_core::ide::is_ide_terminal() {
+                    KeybindingProfile::IdeCompatible
+                } else {
+                    KeybindingProfile::Standard
+                };
+                KeybindingResolver::with_profile(&user_keybindings, profile)
+            },
             cursor_pos: 0,
             auto_scroll: true,
             new_messages_while_scrolled: 0,
@@ -1093,7 +1109,11 @@ impl App {
             last_turn_elapsed: None,
             last_turn_verb: None,
             transcript_version: Cell::new(0),
-            help_overlay: HelpOverlay::new(),
+            help_overlay: {
+                let mut overlay = HelpOverlay::new();
+                overlay.ide_mode = mangocode_core::ide::is_ide_terminal();
+                overlay
+            },
             history_search_overlay: HistorySearchOverlay::new(),
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
@@ -1577,6 +1597,8 @@ impl App {
             scroll_accel: 3.0,
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
+            pending_esc: None,
+            esc_timeout_ms: 80, // 80ms timeout for Alt-via-Esc translation
             update_available: None,
             mascot_sixel: None,
             paste_burst_printable_streak: 0,
@@ -2877,6 +2899,59 @@ impl App {
         let now = std::time::Instant::now();
         self.expire_paste_burst_if_idle(now);
 
+        // ---- IDE Alt-via-Esc translation ----
+        // In IDE terminals, Alt+key is sometimes sent as Esc followed by the key.
+        // We detect this pattern and reconstruct the Alt modifier.
+        let is_ide = mangocode_core::ide::is_ide_terminal();
+        if is_ide {
+            // Check if we have a pending Esc that timed out
+            // If so, process it as a real Escape before handling the current key
+            if let Some(esc_time) = self.pending_esc {
+                if now.duration_since(esc_time).as_millis() as u64 > self.esc_timeout_ms {
+                    // Esc timed out, process it as a real Escape first
+                    self.pending_esc = None;
+                    let esc_key = KeyEvent {
+                        code: KeyCode::Esc,
+                        modifiers: KeyModifiers::NONE,
+                        kind: crossterm::event::KeyEventKind::Press,
+                        state: crossterm::event::KeyEventState::NONE,
+                    };
+                    // Process the timed-out Esc (ignore result, we still process current key)
+                    let _ = self.handle_key_event_internal(esc_key, now);
+                }
+            }
+
+            // If this is a bare Esc and we're not in a modal dialog, hold it briefly
+            if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+                let modal_open = !self.modal_stack().is_empty();
+                if !modal_open {
+                    self.pending_esc = Some(now);
+                    return false; // Don't process Esc yet, wait for potential follow-up key
+                }
+            }
+
+            // If we have a pending Esc and this is a regular key (not another Esc),
+            // convert it to Alt+key
+            if self.pending_esc.is_some() && key.code != KeyCode::Esc {
+                self.pending_esc = None;
+                // Create a new KeyEvent with Alt modifier
+                let alt_key = KeyEvent {
+                    code: key.code,
+                    modifiers: key.modifiers | KeyModifiers::ALT,
+                    kind: key.kind,
+                    state: key.state,
+                };
+                // Process the Alt+key instead
+                return self.handle_key_event_internal(alt_key, now);
+            }
+        }
+
+        self.handle_key_event_internal(key, now)
+    }
+
+    /// Internal key event handler without Alt-via-Esc translation.
+    /// This is called by handle_key_event after any IDE-specific translation.
+    fn handle_key_event_internal(&mut self, key: KeyEvent, now: std::time::Instant) -> bool {
         if self.global_search.open {
             return self.handle_global_search_key(key);
         }
@@ -5817,6 +5892,31 @@ mod tests {
         assert!(app.intercept_slash_command("clear"));
         assert_eq!(app.messages.len(), 0);
     }
+
+    #[test]
+    fn test_ide_detection_at_app_initialization() {
+        // Verify that IDE detection is called during App initialization
+        let config = Config::default();
+        let cost_tracker = mangocode_core::cost::CostTracker::new();
+        let app = App::new(config, cost_tracker);
+        // The app should initialize successfully with either Standard or IdeCompatible profile
+        // We can't easily test the actual detection without setting env vars,
+        // but we can verify the app initializes and has keybindings
+        // The keybindings field is private, so we just verify the app exists
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn test_help_overlay_ide_mode_initialization() {
+        let config = Config::default();
+        let cost_tracker = mangocode_core::cost::CostTracker::new();
+        let app = App::new(config, cost_tracker);
+        // The help overlay should have ide_mode set based on IDE detection
+        // We can't easily test the actual detection without setting env vars,
+        // but we can verify the overlay initializes
+        assert!(!app.help_overlay.visible);
+    }
+
 
     #[test]
     fn test_exit_slash_command_sets_quit_flag() {
