@@ -77,7 +77,11 @@ impl UsageLedger {
     /// Append a session record and recompute totals. Writes atomically.
     pub fn record_session(&mut self, record: SessionCostRecord) {
         // Prevent duplicate writes from multiple exit paths.
-        if self.sessions.iter().any(|s| s.session_id == record.session_id) {
+        if self
+            .sessions
+            .iter()
+            .any(|s| s.session_id == record.session_id)
+        {
             return;
         }
 
@@ -199,11 +203,8 @@ impl UsageLedger {
         };
 
         use std::collections::HashSet;
-        let mut existing_ids: HashSet<String> = self
-            .sessions
-            .iter()
-            .map(|s| s.session_id.clone())
-            .collect();
+        let mut existing_ids: HashSet<String> =
+            self.sessions.iter().map(|s| s.session_id.clone()).collect();
         let mut imported = 0_u64;
 
         for line in content.lines() {
@@ -223,10 +224,7 @@ impl UsageLedger {
                 continue;
             }
 
-            let cost_usd = val
-                .get("cost_usd")
-                .map(parse_f64_field)
-                .unwrap_or(0.0);
+            let cost_usd = val.get("cost_usd").map(parse_f64_field).unwrap_or(0.0);
 
             let timestamp = val
                 .get("timestamp")

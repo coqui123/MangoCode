@@ -66,7 +66,6 @@ pub struct DiscoveredSkill {
     // ------------------------------------------------------------------
     // Extended fields (Phase 1 / 2 / 3 / 4 / 5 additions)
     // ------------------------------------------------------------------
-
     /// Keyword phrases that trigger auto-loading when matched against the
     /// user's message. Populated from `triggers:` / `when_to_use:` frontmatter.
     pub triggers: Vec<String>,
@@ -142,7 +141,12 @@ fn parse_skill_file_with_dir(
 
                     // Detect list-item continuation inside a block
                     if trimmed.starts_with("- ") {
-                        let val = trimmed.trim_start_matches("- ").trim().trim_matches('"').trim_matches('\'').to_string();
+                        let val = trimmed
+                            .trim_start_matches("- ")
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_string();
                         if in_triggers {
                             triggers.push(val);
                             continue;
@@ -165,7 +169,8 @@ fn parse_skill_file_with_dir(
                     if let Some(v) = trimmed.strip_prefix("name:") {
                         name = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
                     } else if let Some(v) = trimmed.strip_prefix("description:") {
-                        description = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+                        description =
+                            Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
                     } else if let Some(v) = trimmed.strip_prefix("when_to_use:") {
                         // `when_to_use:` is a single-value shorthand for triggers
                         let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -211,10 +216,26 @@ fn parse_skill_file_with_dir(
                 )
             } else {
                 // Malformed frontmatter — treat entire content as template.
-                (None, None, content.to_string(), vec![], vec![], false, vec![])
+                (
+                    None,
+                    None,
+                    content.to_string(),
+                    vec![],
+                    vec![],
+                    false,
+                    vec![],
+                )
             }
         } else {
-            (None, None, content.to_string(), vec![], vec![], false, vec![])
+            (
+                None,
+                None,
+                content.to_string(),
+                vec![],
+                vec![],
+                false,
+                vec![],
+            )
         };
 
     let name = name.unwrap_or_else(|| {
@@ -773,7 +794,10 @@ mod tests {
     fn test_parse_triggers_list() {
         let content = "---\nname: code-review\ndescription: Review\ntriggers:\n  - review my code\n  - audit this\n  - check for bugs\n---\nBody.";
         let skill = parse_skill_file(content, &PathBuf::from("code-review.md")).unwrap();
-        assert_eq!(skill.triggers, vec!["review my code", "audit this", "check for bugs"]);
+        assert_eq!(
+            skill.triggers,
+            vec!["review my code", "audit this", "check for bugs"]
+        );
     }
 
     #[test]
@@ -786,8 +810,7 @@ mod tests {
 
     #[test]
     fn test_parse_inline_triggers_list() {
-        let content =
-            "---\nname: foo\ntriggers: [fix bug, broken, not working]\n---\nBody.";
+        let content = "---\nname: foo\ntriggers: [fix bug, broken, not working]\n---\nBody.";
         let skill = parse_skill_file(content, &PathBuf::from("foo.md")).unwrap();
         assert!(skill.triggers.contains(&"fix bug".to_string()));
         assert!(skill.triggers.contains(&"broken".to_string()));
@@ -799,7 +822,10 @@ mod tests {
     fn test_parse_dependencies() {
         let content = "---\nname: pptx\ndescription: Slides\ndependencies:\n  - design-foundations\n  - git-conventions\n---\nBody.";
         let skill = parse_skill_file(content, &PathBuf::from("pptx.md")).unwrap();
-        assert_eq!(skill.dependencies, vec!["design-foundations", "git-conventions"]);
+        assert_eq!(
+            skill.dependencies,
+            vec!["design-foundations", "git-conventions"]
+        );
     }
 
     #[test]
@@ -924,8 +950,14 @@ mod tests {
             qa_required: false,
             qa_steps: vec![],
         };
-        index.insert("code-review".to_string(), make("code-review", vec!["review my code", "audit"]));
-        index.insert("debug".to_string(), make("debug", vec!["bug", "broken", "not working"]));
+        index.insert(
+            "code-review".to_string(),
+            make("code-review", vec!["review my code", "audit"]),
+        );
+        index.insert(
+            "debug".to_string(),
+            make("debug", vec!["bug", "broken", "not working"]),
+        );
 
         let matched = resolve_skills_for_message("can you review my code please", &index);
         assert_eq!(matched.len(), 1);

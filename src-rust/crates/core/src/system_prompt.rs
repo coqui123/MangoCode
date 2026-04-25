@@ -440,7 +440,10 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // 11.5. Git repository context
     if !opts.git_context.is_empty() {
-        parts.push(format!("\n<git_context>\n{}\n</git_context>", opts.git_context));
+        parts.push(format!(
+            "\n<git_context>\n{}\n</git_context>",
+            opts.git_context
+        ));
     }
 
     // 12. Memory injection (from memdir)
@@ -631,9 +634,7 @@ pub fn gather_git_context(working_dir: &str) -> String {
         return String::new();
     }
 
-    let run = |args: &[&str]| -> Option<String> {
-        run_raw(args).filter(|s| !s.is_empty())
-    };
+    let run = |args: &[&str]| -> Option<String> { run_raw(args).filter(|s| !s.is_empty()) };
 
     let mut parts = Vec::new();
 
@@ -937,9 +938,10 @@ mod tests {
     #[test]
     fn test_injected_skills_in_cacheable_section() {
         let opts = SystemPromptOptions {
-            injected_skills: vec![
-                ("rust-review".to_string(), "# Rust Review\nCheck for unwrap() misuse.".to_string()),
-            ],
+            injected_skills: vec![(
+                "rust-review".to_string(),
+                "# Rust Review\nCheck for unwrap() misuse.".to_string(),
+            )],
             ..Default::default()
         };
         let prompt = build_system_prompt(&opts);
@@ -958,7 +960,10 @@ mod tests {
     fn test_multiple_injected_skills_ordered() {
         let opts = SystemPromptOptions {
             injected_skills: vec![
-                ("design-foundations".to_string(), "Color palette rules.".to_string()),
+                (
+                    "design-foundations".to_string(),
+                    "Color palette rules.".to_string(),
+                ),
                 ("pptx".to_string(), "Slide generation steps.".to_string()),
             ],
             ..Default::default()
@@ -971,7 +976,10 @@ mod tests {
         // Both before boundary, and in insertion order
         assert!(design_pos < boundary_pos);
         assert!(pptx_pos < boundary_pos);
-        assert!(design_pos < pptx_pos, "Dependencies should appear before the skill that depends on them");
+        assert!(
+            design_pos < pptx_pos,
+            "Dependencies should appear before the skill that depends on them"
+        );
     }
 
     #[test]
@@ -1086,6 +1094,9 @@ mod tests {
             ..Default::default()
         };
         let prompt = build_system_prompt(&opts);
-        assert!(!prompt.contains("## Skill: empty-skill"), "Empty skill content should not be injected");
+        assert!(
+            !prompt.contains("## Skill: empty-skill"),
+            "Empty skill content should not be injected"
+        );
     }
 }

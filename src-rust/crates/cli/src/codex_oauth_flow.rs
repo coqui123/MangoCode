@@ -5,8 +5,8 @@
 use anyhow::{anyhow, bail, Context};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use mangocode_core::codex_oauth::{
-    CODEX_AUTHORIZE_URL, CODEX_CLIENT_ID, CODEX_OAUTH_PORT, CODEX_REDIRECT_URI, CODEX_SCOPES,
-    CODEX_TOKEN_URL,
+    extract_chatgpt_account_id, CODEX_AUTHORIZE_URL, CODEX_CLIENT_ID, CODEX_OAUTH_PORT,
+    CODEX_REDIRECT_URI, CODEX_SCOPES, CODEX_TOKEN_URL,
 };
 use mangocode_core::oauth_config::CodexTokens;
 use sha2::{Digest, Sha256};
@@ -49,7 +49,7 @@ pub fn generate_state() -> String {
 /// Build the OpenAI authorization URL for Codex OAuth.
 pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
     format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&state={}&id_token_add_organizations=true&codex_cli_simplified_flow=true",
         CODEX_AUTHORIZE_URL,
         CODEX_CLIENT_ID,
         urlencoding::encode(CODEX_REDIRECT_URI),
@@ -216,7 +216,9 @@ pub async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Res
     }
 
     let refresh_token = body["refresh_token"].as_str().map(|s| s.to_string());
-    let expires_in = body["expires_in"].as_u64().or(body["expires_in"].as_i64().map(|v| v as u64));
+    let expires_in = body["expires_in"]
+        .as_u64()
+        .or(body["expires_in"].as_i64().map(|v| v as u64));
     let expires_at = expires_in.map(|secs| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -225,7 +227,7 @@ pub async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Res
         now.saturating_add(secs)
     });
 
-    let account_id = extract_account_id_from_jwt(&access_token);
+    let account_id = extract_chatgpt_account_id(&access_token);
 
     Ok(CodexTokens {
         access_token,
@@ -235,19 +237,10 @@ pub async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Res
     })
 }
 
-/// Extract chatgpt-account-id from the JWT access token payload.
-fn extract_account_id_from_jwt(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    let payload_b64 = parts.get(1)?;
-    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    json["https://api.openai.com/auth"]["account_id"]
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 /// Start local callback server, open browser, exchange code for tokens.
-pub async fn run_oauth_flow(event_tx: mpsc::Sender<DeviceAuthEvent>) -> anyhow::Result<CodexTokens> {
+pub async fn run_oauth_flow(
+    event_tx: mpsc::Sender<DeviceAuthEvent>,
+) -> anyhow::Result<CodexTokens> {
     let verifier = generate_code_verifier();
     let challenge = compute_code_challenge(&verifier);
     let state = generate_state();
@@ -320,6 +313,7 @@ mod tests {
         assert!(url.contains("S256"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("codex_cli_simplified_flow=true"));
     }
 
     #[test]
@@ -339,9 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_account_id_from_valid_jwt() {
+    fn test_extract_account_id_from_invalid_jwt() {
         let invalid_token = "not.a.jwt";
-        let result = extract_account_id_from_jwt(invalid_token);
+        let result = extract_chatgpt_account_id(invalid_token);
         assert!(result.is_none());
     }
 }

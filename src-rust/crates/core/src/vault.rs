@@ -5,14 +5,14 @@
 
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 use rand::RngCore;
 use reqwest::{header::HeaderValue, ClientBuilder, Proxy};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-use once_cell::sync::Lazy;
-use parking_lot::RwLock;
 use zeroize::{Zeroize, Zeroizing};
 
 const VAULT_FILENAME: &str = "vault.enc";
@@ -193,8 +193,8 @@ impl Vault {
 
         let plaintext = Zeroizing::new(
             cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("decryption failed — wrong passphrase?"))?,
+                .decrypt(nonce, ciphertext)
+                .map_err(|_| anyhow::anyhow!("decryption failed — wrong passphrase?"))?,
         );
 
         let data: VaultData = serde_json::from_slice(&plaintext)?;
@@ -295,7 +295,8 @@ pub fn clear_vault_passphrase() {
 fn gateway_access_token_from_vault() -> Option<String> {
     let vault = Vault::new();
     get_vault_passphrase().and_then(|passphrase| {
-        vault.get_secret(GATEWAY_VAULT_KEY, &passphrase)
+        vault
+            .get_secret(GATEWAY_VAULT_KEY, &passphrase)
             .ok()
             .flatten()
             .filter(|t| !t.trim().is_empty())
@@ -337,7 +338,8 @@ pub fn resolve_api_key_for_provider(
         .or_else(|| std::env::var(env_var).ok().filter(|k| !k.is_empty()))
         .or_else(|| {
             let vault = Vault::new();
-            get_vault_passphrase().and_then(|passphrase| vault.get_secret(vault_provider, &passphrase).ok().flatten())
+            get_vault_passphrase()
+                .and_then(|passphrase| vault.get_secret(vault_provider, &passphrase).ok().flatten())
         })
 }
 
@@ -361,8 +363,14 @@ mod tests {
             .set_secret("openai", "sk-openai-yyyyy", passphrase, None)
             .unwrap();
 
-        assert_eq!(vault.get_secret("anthropic", passphrase).unwrap(), Some("sk-ant-xxxxx".to_string()));
-        assert_eq!(vault.get_secret("openai", passphrase).unwrap(), Some("sk-openai-yyyyy".to_string()));
+        assert_eq!(
+            vault.get_secret("anthropic", passphrase).unwrap(),
+            Some("sk-ant-xxxxx".to_string())
+        );
+        assert_eq!(
+            vault.get_secret("openai", passphrase).unwrap(),
+            Some("sk-openai-yyyyy".to_string())
+        );
         assert_eq!(vault.get_secret("nonexistent", passphrase).unwrap(), None);
         assert!(vault.get_secret("anthropic", "wrong-passphrase").is_err());
 

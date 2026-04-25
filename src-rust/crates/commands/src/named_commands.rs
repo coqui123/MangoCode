@@ -202,7 +202,9 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
     use std::io::Write;
     let mut stdout = std::io::stdout();
     print!("{prompt}");
-    stdout.flush().map_err(|e| format!("Failed to write prompt: {e}"))?;
+    stdout
+        .flush()
+        .map_err(|e| format!("Failed to write prompt: {e}"))?;
     let mut s = String::new();
     std::io::stdin()
         .read_line(&mut s)
@@ -214,7 +216,11 @@ fn supported_vault_provider_rows() -> &'static [(&'static str, &'static str, &'s
     &[
         ("anthropic", "ANTHROPIC_API_KEY", ""),
         ("openai", "OPENAI_API_KEY", ""),
-        ("google", "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY", ""),
+        (
+            "google",
+            "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY",
+            "",
+        ),
         ("azure", "AZURE_API_KEY (+ AZURE_RESOURCE_NAME)", ""),
         ("cohere", "COHERE_API_KEY", ""),
         ("github-copilot", "GITHUB_TOKEN", ""),
@@ -223,7 +229,11 @@ fn supported_vault_provider_rows() -> &'static [(&'static str, &'static str, &'s
             "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY",
             "",
         ),
-        ("google-vertex", "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)", ""),
+        (
+            "google-vertex",
+            "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)",
+            "",
+        ),
         ("deepseek", "DEEPSEEK_API_KEY", ""),
         ("groq", "GROQ_API_KEY", ""),
         ("xai", "XAI_API_KEY", ""),
@@ -352,11 +362,16 @@ impl NamedCommand for VaultNamedCommand {
                     Err(e) => return CommandResult::Error(e),
                 };
                 let label = match prompt_line("Label (optional): ") {
-                    Ok(s) => if s.is_empty() { None } else { Some(s) },
+                    Ok(s) => {
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s)
+                        }
+                    }
                     Err(e) => return CommandResult::Error(e),
                 };
-                if let Err(e) = vault.set_secret(provider, &secret, &passphrase, label.as_deref())
-                {
+                if let Err(e) = vault.set_secret(provider, &secret, &passphrase, label.as_deref()) {
                     return CommandResult::Error(format!("Failed to store secret: {e}"));
                 }
                 CommandResult::Message(format!("Stored secret for '{provider}' in vault."))

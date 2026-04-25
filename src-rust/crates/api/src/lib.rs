@@ -389,16 +389,6 @@ pub struct AvailableModel {
 pub mod client {
     use super::*;
 
-    /// Provider selection for API calls.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub enum Provider {
-        /// Use Anthropic's API
-        #[default]
-        Anthropic,
-        /// Use OpenAI Codex via OAuth
-        Codex,
-    }
-
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
     pub struct ClientConfig {
@@ -413,8 +403,6 @@ pub mod client {
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
         pub use_bearer_auth: bool,
-        /// Which provider to use for API calls.
-        pub provider: Provider,
     }
 
     impl Default for ClientConfig {
@@ -429,7 +417,6 @@ pub mod client {
                 max_retry_delay: Duration::from_secs(60),
                 request_timeout: Duration::from_secs(600),
                 use_bearer_auth: false,
-                provider: Provider::Anthropic,
             }
         }
     }
@@ -475,9 +462,8 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
-            // Deferred key validation — fail here rather than at construction
-            // so that non-Anthropic provider setups don't crash on startup.
-            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+            // Deferred key validation - fail here rather than at construction.
+            if self.config.api_key.is_empty() {
                 // Check if this model might belong to another provider, giving
                 // the user a more actionable error message.
                 let model = &request.model;
@@ -530,11 +516,6 @@ pub mod client {
                     hint
                 )));
             }
-            // Route to Codex if configured
-            if self.config.provider == Provider::Codex {
-                return self.create_message_codex(&request).await;
-            }
-
             request.stream = false;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
@@ -549,67 +530,6 @@ pub mod client {
             serde_json::from_str(&text).map_err(ClaudeError::Json)
         }
 
-        /// Send a request to OpenAI Codex API instead of Anthropic.
-        async fn create_message_codex(
-            &self,
-            request: &CreateMessageRequest,
-        ) -> Result<CreateMessageResponse, ClaudeError> {
-            // Convert Anthropic format to Codex Responses format
-            let body = codex_adapter::anthropic_to_codex_responses_request(request);
-
-            // Send to Codex endpoint
-            let client = reqwest::Client::new();
-            let token = self.config.api_key.as_str();
-            let account_id = mangocode_core::codex_oauth::extract_chatgpt_account_id(token);
-
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-                    .map_err(|e| ClaudeError::Other(format!("Codex auth header build failed: {}", e)))?,
-            );
-            headers.insert(
-                reqwest::header::CONTENT_TYPE,
-                reqwest::header::HeaderValue::from_static("application/json"),
-            );
-            if let Some(id) = account_id {
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&id) {
-                    headers.insert("chatgpt-account-id", v);
-                }
-            }
-
-            let resp = client
-                .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
-                .headers(headers)
-                .json(&body)
-                .timeout(self.config.request_timeout)
-                .send()
-                .await
-                .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
-
-            let status = resp.status();
-            let text = resp.text().await.map_err(ClaudeError::Http)?;
-
-            if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
-            }
-
-            // Parse OpenAI response and convert to Anthropic format
-            let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
-            let (content, stop_reason, input_tokens, output_tokens) =
-                codex_adapter::parse_codex_response(&openai_resp);
-
-            let response = codex_adapter::build_anthropic_response(
-                &content,
-                &stop_reason,
-                input_tokens,
-                output_tokens,
-                &request.model,
-            );
-
-            Ok(response)
-        }
-
         // ---- Streaming create message ------------------------------------
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
@@ -621,7 +541,7 @@ pub mod client {
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
             // Deferred key validation
-            if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
+            if self.config.api_key.is_empty() {
                 let model = &request.model;
                 let hint = if model.starts_with("gemini") || model.starts_with("gemma") {
                     format!(
@@ -660,13 +580,6 @@ pub mod client {
                     hint
                 )));
             }
-            // Codex provider doesn't support streaming yet
-            if self.config.provider == Provider::Codex {
-                return Err(ClaudeError::Other(
-                    "Codex provider does not support streaming yet".to_string(),
-                ));
-            }
-
             request.stream = true;
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 

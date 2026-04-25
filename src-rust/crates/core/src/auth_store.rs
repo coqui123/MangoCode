@@ -78,10 +78,7 @@ impl AuthStore {
             StoredCredential::OAuthToken {
                 access: tokens.access_token.clone(),
                 refresh: tokens.refresh_token.clone().unwrap_or_default(),
-                expires: tokens
-                    .expires_at_ms
-                    .map(|ms| ms as u64)
-                    .unwrap_or(0),
+                expires: tokens.expires_at_ms.map(|ms| ms as u64).unwrap_or(0),
             },
         );
     }
@@ -95,10 +92,7 @@ impl AuthStore {
         let cred = StoredCredential::OAuthToken {
             access: tokens.access_token.clone(),
             refresh: tokens.refresh_token.clone().unwrap_or_default(),
-            expires: tokens
-                .expires_at_ms
-                .map(|ms| ms as u64)
-                .unwrap_or(0),
+            expires: tokens.expires_at_ms.map(|ms| ms as u64).unwrap_or(0),
         };
         store
             .credentials
@@ -166,9 +160,7 @@ impl AuthStore {
         if let Ok(c) = serde_json::from_str::<StoredCredential>(t) {
             return Some(c);
         }
-        Some(StoredCredential::ApiKey {
-            key: t.to_string(),
-        })
+        Some(StoredCredential::ApiKey { key: t.to_string() })
     }
 
     fn merge_vault_over_json(store: &mut AuthStore) {
@@ -184,17 +176,12 @@ impl AuthStore {
             Err(_) => return,
         };
         for (pid, entry) in data.entries.iter() {
-            if VAULT_SKIP_MERGE_KEYS
-                .iter()
-                .any(|k| *k == pid.as_str())
-            {
+            if VAULT_SKIP_MERGE_KEYS.iter().any(|k| *k == pid.as_str()) {
                 continue;
             }
             if let Some(cred) = Self::credential_from_vault_secret(&entry.secret) {
                 let storage_key = vault_provider_key_to_storage_key(pid.as_str());
-                store
-                    .credentials
-                    .insert(storage_key.to_string(), cred);
+                store.credentials.insert(storage_key.to_string(), cred);
             }
         }
     }
@@ -253,8 +240,7 @@ impl AuthStore {
 
     /// Get the stored credential for a provider.
     pub fn get(&self, provider_id: &str) -> Option<&StoredCredential> {
-        self.credentials
-            .get(credential_storage_key(provider_id))
+        self.credentials.get(credential_storage_key(provider_id))
     }
 
     /// Remove the credential for a provider (persists immediately).
@@ -300,9 +286,7 @@ impl AuthStore {
                         return Some(access.clone());
                     }
                 }
-                StoredCredential::OAuthToken { access, .. }
-                    if provider_id == "anthropic-max" =>
-                {
+                StoredCredential::OAuthToken { access, .. } if provider_id == "anthropic-max" => {
                     if !access.is_empty() {
                         return Some(access.clone());
                     }
@@ -391,6 +375,9 @@ mod tests {
             super::credential_storage_key("openai-codex"),
             ProviderId::OPENAI_CODEX
         );
-        assert_eq!(super::vault_provider_key_to_storage_key("codex"), ProviderId::OPENAI_CODEX);
+        assert_eq!(
+            super::vault_provider_key_to_storage_key("codex"),
+            ProviderId::OPENAI_CODEX
+        );
     }
 }

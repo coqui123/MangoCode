@@ -370,8 +370,7 @@ mod tests {
 
     #[test]
     fn test_parse_critic_response_deny() {
-        let (allowed, reason) =
-            parse_critic_response("DENY This command deletes system files.");
+        let (allowed, reason) = parse_critic_response("DENY This command deletes system files.");
         assert!(!allowed);
         assert_eq!(reason, "This command deletes system files.");
     }

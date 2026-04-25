@@ -201,7 +201,10 @@ pub async fn llm_summarize_compact(
 
     let mut collapsed = Vec::with_capacity(head.len() + 1 + tail.len());
     collapsed.extend(head);
-    collapsed.push(Message::assistant(format!("[System summary]\n{}", summary.trim())));
+    collapsed.push(Message::assistant(format!(
+        "[System summary]\n{}",
+        summary.trim()
+    )));
     collapsed.extend(tail);
 
     let final_tokens = estimate_message_tokens(&collapsed);
@@ -700,7 +703,11 @@ mod tests {
 
     #[test]
     fn micro_compact_trims_longest_message() {
-        let messages = vec![Message::user("small"), long_code_message(), Message::assistant("ok")];
+        let messages = vec![
+            Message::user("small"),
+            long_code_message(),
+            Message::assistant("ok"),
+        ];
         let before = estimate_message_tokens(&messages);
         let (out, changed) = micro_compact(messages, before.saturating_sub(300));
         assert!(changed > 0);

@@ -85,6 +85,15 @@ impl OpenAiCodexProvider {
             .unwrap_or(false)
     }
 
+    fn truncate_debug_payload(value: &Value) -> String {
+        let mut body = value.to_string();
+        if body.len() > 800 {
+            body.truncate(800);
+            body.push_str("...");
+        }
+        body
+    }
+
     /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
     ///
     /// If `auth.json` has no Codex entry but `~/.mangocode/codex_tokens.json` exists from a
@@ -194,11 +203,7 @@ impl OpenAiCodexProvider {
             ("refresh_token", refresh_token),
             ("client_id", CODEX_CLIENT_ID),
         ];
-        let resp = client
-            .post(CODEX_TOKEN_URL)
-            .form(&params)
-            .send()
-            .await?;
+        let resp = client.post(CODEX_TOKEN_URL).form(&params).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -362,7 +367,12 @@ impl LlmProvider for OpenAiCodexProvider {
                     .get("prompt_cache_key")
                     .and_then(|v| v.as_str())
             })
-            .or_else(|| request.provider_options.get("conversation_id").and_then(|v| v.as_str()))
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("conversation_id")
+                    .and_then(|v| v.as_str())
+            })
             .map(|s| s.to_string());
 
         if let Some(ref key) = prompt_cache_key {
@@ -441,16 +451,34 @@ impl LlmProvider for OpenAiCodexProvider {
                     "Codex request failed"
                 );
             }
+            let message = if text.trim().is_empty() {
+                format!("Codex API error ({})", status)
+            } else {
+                let mut body = text.trim().to_string();
+                if body.len() > 600 {
+                    body.truncate(600);
+                    body.push_str("...");
+                }
+                format!("Codex API error ({}): {}", status, body)
+            };
             return Err(ProviderError::Other {
                 provider: self.id.clone(),
-                message: format!("Codex API error ({})", status),
+                message,
                 status: Some(status.as_u16()),
                 body: Some(text),
             });
         }
 
-        // Codex may respond with SSE (text/event-stream) even for non-streaming requests.
-        let openai_resp: Value = if content_type.to_ascii_lowercase().contains("text/event-stream")
+        // Codex streams responses, and intermediaries do not always preserve
+        // the exact text/event-stream content type. Detect SSE by body shape too.
+        let looks_like_sse = text
+            .lines()
+            .map(str::trim_start)
+            .any(|line| line.starts_with("data:") || line.starts_with("event:"));
+        let openai_resp: Value = if content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+            || looks_like_sse
         {
             codex_adapter::sse_to_last_json_value(&text).map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
@@ -461,16 +489,38 @@ impl LlmProvider for OpenAiCodexProvider {
         } else {
             serde_json::from_str(&text).map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
-                message: format!("Codex JSON parse error: {}", e),
+                message: {
+                    let mut body = text.trim().to_string();
+                    if body.len() > 600 {
+                        body.truncate(600);
+                        body.push_str("...");
+                    }
+                    if body.is_empty() {
+                        format!("Codex JSON parse error: {}", e)
+                    } else {
+                        format!("Codex JSON parse error: {}: {}", e, body)
+                    }
+                },
                 status: None,
-                body: None,
+                body: Some(text.clone()),
             })?
         };
 
-        let (content, stop_reason, input_tokens, output_tokens) =
-            codex_adapter::parse_codex_response(&openai_resp);
-        let cmr = codex_adapter::build_anthropic_response(
-            &content,
+        let (content_blocks, stop_reason, input_tokens, output_tokens) =
+            codex_adapter::parse_codex_response_blocks(&openai_resp);
+        if content_blocks.is_empty() {
+            return Err(ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex response parsed but did not contain assistant content: {}",
+                    Self::truncate_debug_payload(&openai_resp)
+                ),
+                status: None,
+                body: Some(openai_resp.to_string()),
+            });
+        }
+        let cmr = codex_adapter::build_anthropic_response_from_blocks(
+            content_blocks,
             &stop_reason,
             input_tokens,
             output_tokens,
@@ -492,35 +542,52 @@ impl LlmProvider for OpenAiCodexProvider {
         let usage = resp.usage.clone();
         let stop = resp.stop_reason.clone();
 
-        let mut aggregate_text = String::new();
-        for block in &resp.content {
-            if let ContentBlock::Text { text } = block {
-                if !aggregate_text.is_empty() {
-                    aggregate_text.push('\n');
-                }
-                aggregate_text.push_str(text);
-            }
-        }
-
         let s = stream! {
             yield Ok(StreamEvent::MessageStart {
                 id: id.clone(),
                 model: model.clone(),
                 usage: usage.clone(),
             });
-            yield Ok(StreamEvent::ContentBlockStart {
-                index: 0,
-                content_block: ContentBlock::Text {
-                    text: String::new(),
-                },
-            });
-            if !aggregate_text.is_empty() {
-                yield Ok(StreamEvent::TextDelta {
-                    index: 0,
-                    text: aggregate_text,
-                });
+
+            for (index, block) in resp.content.iter().cloned().enumerate() {
+                match block {
+                    ContentBlock::Text { text } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                            },
+                        });
+                        if !text.is_empty() {
+                            yield Ok(StreamEvent::TextDelta { index, text });
+                        }
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input: serde_json::json!({}),
+                            },
+                        });
+                        let partial_json = input.to_string();
+                        if !partial_json.is_empty() {
+                            yield Ok(StreamEvent::InputJsonDelta {
+                                index,
+                                partial_json,
+                            });
+                        }
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        yield Ok(StreamEvent::ReasoningDelta { index, reasoning: thinking });
+                    }
+                    _ => {}
+                }
             }
-            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+
             yield Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(stop.clone()),
                 usage: Some(usage.clone()),
@@ -560,7 +627,7 @@ impl LlmProvider for OpenAiCodexProvider {
             // True SSE from Codex is not implemented; the stream is synthesized in
             // `create_message_stream` so the query engine receives deltas.
             streaming: true,
-            tool_calling: false,
+            tool_calling: true,
             thinking: false,
             image_input: false,
             pdf_input: false,
@@ -580,6 +647,9 @@ mod tests {
     #[test]
     fn openai_codex_provider_uses_openai_codex_id() {
         let p = OpenAiCodexProvider::new("test-token".into());
-        assert_eq!(format!("{}", p.id()), mangocode_core::ProviderId::OPENAI_CODEX);
+        assert_eq!(
+            format!("{}", p.id()),
+            mangocode_core::ProviderId::OPENAI_CODEX
+        );
     }
 }

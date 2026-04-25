@@ -3846,23 +3846,6 @@ impl App {
             return false;
         }
 
-        // ---- Voice PTT: plain V press starts recording when voice is on ----
-        // This is the "hold to talk" variant.  The user presses V to begin
-        // recording; releasing V (handled in the run loop) or pressing Enter
-        // stops the capture and triggers transcription.
-        // Only active when voice mode is enabled (voice_recorder is Some) and
-        // the prompt input is in default (non-vim) mode so 'v' doesn't conflict
-        // with vim keybindings.
-        if key.code == KeyCode::Char('v')
-            && key.modifiers == KeyModifiers::NONE
-            && self.voice_recorder.is_some()
-            && !self.voice_recording
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
-        {
-            self.handle_voice_ptt_start();
-            return false;
-        }
-
         // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).

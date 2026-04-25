@@ -16,8 +16,8 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::io::ErrorKind;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -674,15 +674,9 @@ impl LspClient {
 
     /// Get incoming calls for a `CallHierarchyItem`.
     /// Returns formatted strings: `"file:line — caller_name()"`.
-    pub async fn incoming_calls(
-        &self,
-        item: &serde_json::Value,
-    ) -> anyhow::Result<Vec<String>> {
+    pub async fn incoming_calls(&self, item: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         let result = self
-            .send_request_inner(
-                "callHierarchy/incomingCalls",
-                json!({ "item": item }),
-            )
+            .send_request_inner("callHierarchy/incomingCalls", json!({ "item": item }))
             .await?;
 
         Ok(format_call_hierarchy_results(&result, "from"))
@@ -690,15 +684,9 @@ impl LspClient {
 
     /// Get outgoing calls for a `CallHierarchyItem`.
     /// Returns formatted strings: `"file:line — callee_name()"`.
-    pub async fn outgoing_calls(
-        &self,
-        item: &serde_json::Value,
-    ) -> anyhow::Result<Vec<String>> {
+    pub async fn outgoing_calls(&self, item: &serde_json::Value) -> anyhow::Result<Vec<String>> {
         let result = self
-            .send_request_inner(
-                "callHierarchy/outgoingCalls",
-                json!({ "item": item }),
-            )
+            .send_request_inner("callHierarchy/outgoingCalls", json!({ "item": item }))
             .await?;
 
         Ok(format_call_hierarchy_results(&result, "to"))

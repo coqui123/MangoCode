@@ -27,17 +27,20 @@ pub const CODEX_SCOPES: &str = "openid profile email offline_access";
 
 /// Available Codex models
 pub const CODEX_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.5", "GPT-5.5 (default)"),
+    ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.4-mini", "GPT-5.4 Mini"),
     ("gpt-5.3-codex", "GPT-5.3 Codex"),
-    ("gpt-5.2-codex", "GPT-5.2 Codex (default)"),
+    ("gpt-5.2", "GPT-5.2"),
+    ("gpt-5.2-codex", "GPT-5.2 Codex"),
+    ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
     ("gpt-5.1-codex", "GPT-5.1 Codex"),
     ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
-    ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
-    ("gpt-5.4", "GPT-5.4"),
-    ("gpt-5.2", "GPT-5.2"),
+    ("gpt-5-codex", "GPT-5 Codex"),
 ];
 
 /// Default Codex model to use
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.2-codex";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 
 /// Heuristic for environments where `http://localhost:…` OAuth callbacks are
 /// often unreachable (SSH, Codespaces, Dev Containers, VS Code integrated terminal).
@@ -57,6 +60,82 @@ pub fn likely_headless_or_remote() -> bool {
 pub const HEADLESS_CODEX_OAUTH_HINT: &str = "OpenAI Codex browser login uses a localhost callback, which often fails over SSH, in GitHub Codespaces, or in some remote containers.\n\
 Authenticate on your local machine with MangoCode and `/connect`, or use OpenAI API key mode (`/connect` → OpenAI) for usage-based access.\n\
 Device-code login for Codex will be added when OpenAI documents a supported device authorization endpoint for this client.";
+
+// ---------------------------------------------------------------------------
+// Model normalization (Codex OAuth)
+// ---------------------------------------------------------------------------
+
+/// Normalize user/model-registry facing identifiers into Codex backend model IDs.
+///
+/// Mirrors the OpenCode plugin idea: strip provider prefixes (`openai/...`),
+/// collapse variant suffixes (`-low`, `-medium`, ...), and map legacy labels to
+/// canonical Codex-supported IDs.
+pub fn normalize_codex_model(model: &str) -> String {
+    let raw = model.rsplit('/').next().unwrap_or(model).trim();
+    let lower = raw.to_ascii_lowercase();
+
+    if lower.contains("gpt-5.2-codex") {
+        return "gpt-5.2-codex".into();
+    }
+    if lower.contains("gpt-5.5") {
+        return "gpt-5.5".into();
+    }
+    if lower.contains("gpt-5.4-mini") {
+        return "gpt-5.4-mini".into();
+    }
+    if lower.contains("gpt-5.4") {
+        return "gpt-5.4".into();
+    }
+    if lower.contains("gpt-5.3-codex") {
+        return "gpt-5.3-codex".into();
+    }
+    if lower.contains("gpt-5.1-codex-max") {
+        return "gpt-5.1-codex-max".into();
+    }
+    if lower.contains("gpt-5.1-codex-mini") {
+        return "gpt-5.1-codex-mini".into();
+    }
+    if lower.contains("gpt-5.1-codex") {
+        return "gpt-5.1-codex".into();
+    }
+    if lower.contains("gpt-5-codex") || lower.contains("gpt-5 codex") {
+        return "gpt-5-codex".into();
+    }
+    if lower.contains("codex-mini-latest") {
+        return "gpt-5.1-codex-mini".into();
+    }
+    // Helper: treat known "-variant" suffixes as decoration.
+    fn strip_variant_suffix(s: &str) -> &str {
+        for suf in [
+            "-low", "-medium", "-high", "-xhigh", "-max", "-mini", "-none", "-minimal",
+        ] {
+            if let Some(base) = s.strip_suffix(suf) {
+                return base;
+            }
+        }
+        s
+    }
+
+    let base = strip_variant_suffix(lower.as_str());
+
+    if base == "gpt-5.5" {
+        return "gpt-5.5".into();
+    }
+    if base == "gpt-5.4" {
+        return "gpt-5.4".into();
+    }
+    if base == "gpt-5.2" {
+        return "gpt-5.2".into();
+    }
+    if base == "gpt-5.1" {
+        return "gpt-5.1-codex-max".into();
+    }
+    if base == "gpt-5" {
+        return "gpt-5-codex".into();
+    }
+
+    raw.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // JWT helpers (Codex OAuth)
@@ -162,10 +241,35 @@ mod tests {
 
     #[test]
     fn extract_chatgpt_account_id_from_nested_claim() {
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#,
-        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
         let token = format!("{}.{}.{}", "hdr", payload, "sig");
-        assert_eq!(extract_chatgpt_account_id(&token).as_deref(), Some("acct_123"));
+        assert_eq!(
+            extract_chatgpt_account_id(&token).as_deref(),
+            Some("acct_123")
+        );
+    }
+
+    #[test]
+    fn codex_model_normalization_strips_provider_prefix_and_variants() {
+        assert_eq!(
+            normalize_codex_model("openai/gpt-5.1-codex-low"),
+            "gpt-5.1-codex"
+        );
+        assert_eq!(normalize_codex_model("gpt-5"), "gpt-5-codex");
+        assert_eq!(normalize_codex_model("gpt-5-codex"), "gpt-5-codex");
+        assert_eq!(normalize_codex_model("GPT-5.5"), "gpt-5.5");
+        assert_eq!(normalize_codex_model("GPT-5.4-Mini"), "gpt-5.4-mini");
+        assert_eq!(normalize_codex_model("GPT-5.3-Codex"), "gpt-5.3-codex");
+        assert_eq!(
+            normalize_codex_model("openai/gpt-5.1-codex-mini"),
+            "gpt-5.1-codex-mini"
+        );
+        assert_eq!(normalize_codex_model("gpt-5.2"), "gpt-5.2");
+        assert_eq!(normalize_codex_model("gpt-5.1"), "gpt-5.1-codex-max");
+        assert_eq!(
+            normalize_codex_model("openai/codex-mini-latest"),
+            "gpt-5.1-codex-mini"
+        );
     }
 }

@@ -2885,11 +2885,19 @@ impl SlashCommand for GatewayCommand {
             "setup" => {
                 let url = match parts.next() {
                     Some(u) => u,
-                    None => return CommandResult::Error("Usage: /gateway setup <url> <token>".to_string()),
+                    None => {
+                        return CommandResult::Error(
+                            "Usage: /gateway setup <url> <token>".to_string(),
+                        )
+                    }
                 };
                 let token = match parts.next() {
                     Some(t) => t,
-                    None => return CommandResult::Error("Usage: /gateway setup <url> <token>".to_string()),
+                    None => {
+                        return CommandResult::Error(
+                            "Usage: /gateway setup <url> <token>".to_string(),
+                        )
+                    }
                 };
                 // Prefer storing the gateway token inside the vault (encrypted at rest).
                 // Fall back to gateway.json token storage when the vault is unavailable.
@@ -2927,27 +2935,25 @@ impl SlashCommand for GatewayCommand {
                     "Gateway proxy configured and enabled. Token stored in gateway.json (vault unavailable).".to_string()
                 })
             }
-            "status" => {
-                match mangocode_core::GatewayConfig::load() {
-                    Some(cfg) => CommandResult::Message(format!(
-                        "Gateway status: {}\nURL: {}\nToken: {}",
-                        if cfg.enabled { "enabled" } else { "disabled" },
-                        cfg.url,
-                        match cfg.access_token.as_deref().unwrap_or("") {
-                            t if !t.is_empty() => "(stored in gateway.json)",
-                            _ => {
-                                let vault = mangocode_core::Vault::new();
-                                if vault.exists() {
-                                    "(not in gateway.json; may be in vault as provider \"gateway\")"
-                                } else {
-                                    "(not in gateway.json)"
-                                }
+            "status" => match mangocode_core::GatewayConfig::load() {
+                Some(cfg) => CommandResult::Message(format!(
+                    "Gateway status: {}\nURL: {}\nToken: {}",
+                    if cfg.enabled { "enabled" } else { "disabled" },
+                    cfg.url,
+                    match cfg.access_token.as_deref().unwrap_or("") {
+                        t if !t.is_empty() => "(stored in gateway.json)",
+                        _ => {
+                            let vault = mangocode_core::Vault::new();
+                            if vault.exists() {
+                                "(not in gateway.json; may be in vault as provider \"gateway\")"
+                            } else {
+                                "(not in gateway.json)"
                             }
                         }
-                    )),
-                    None => CommandResult::Message("No gateway configuration found.".to_string()),
-                }
-            }
+                    }
+                )),
+                None => CommandResult::Message("No gateway configuration found.".to_string()),
+            },
             "disable" => {
                 let mut config = mangocode_core::GatewayConfig::load().unwrap_or_default();
                 config.enabled = false;
@@ -2956,25 +2962,22 @@ impl SlashCommand for GatewayCommand {
                 }
                 CommandResult::Message("Gateway proxy disabled.".to_string())
             }
-            "test" => {
-                match mangocode_core::GatewayConfig::load() {
-                    Some(cfg) if cfg.enabled => {
-                        let client = reqwest::Client::new();
-                        match client.get(&cfg.url).send().await {
-                            Ok(resp) => CommandResult::Message(format!(
-                                "Gateway test request succeeded: {}",
-                                resp.status()
-                            )),
-                            Err(e) => CommandResult::Error(format!(
-                                "Gateway test failed: {}",
-                                e
-                            )),
-                        }
+            "test" => match mangocode_core::GatewayConfig::load() {
+                Some(cfg) if cfg.enabled => {
+                    let client = reqwest::Client::new();
+                    match client.get(&cfg.url).send().await {
+                        Ok(resp) => CommandResult::Message(format!(
+                            "Gateway test request succeeded: {}",
+                            resp.status()
+                        )),
+                        Err(e) => CommandResult::Error(format!("Gateway test failed: {}", e)),
                     }
-                    Some(_) => CommandResult::Message("Gateway is configured but disabled.".to_string()),
-                    None => CommandResult::Message("No gateway configuration found.".to_string()),
                 }
-            }
+                Some(_) => {
+                    CommandResult::Message("Gateway is configured but disabled.".to_string())
+                }
+                None => CommandResult::Message("No gateway configuration found.".to_string()),
+            },
             _ => CommandResult::Message(
                 "Usage: /gateway [setup <url> <token>|status|disable|test]".to_string(),
             ),
@@ -4280,7 +4283,10 @@ impl SlashCommand for CriticCommand {
                 critic.set_enabled(true);
                 let mut new_config = ctx.config.clone();
                 new_config.critic_mode = true;
-                CommandResult::ConfigChangeMessage(new_config, "Permission critic enabled.".to_string())
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    "Permission critic enabled.".to_string(),
+                )
             }
             "off" => {
                 critic.set_enabled(false);
@@ -4307,7 +4313,8 @@ impl SlashCommand for CriticCommand {
                 if evals.is_empty() {
                     return CommandResult::Message("No evaluations yet.".to_string());
                 }
-                let mut out = String::from("Recent Critic Evaluations\n─────────────────────────\n");
+                let mut out =
+                    String::from("Recent Critic Evaluations\n─────────────────────────\n");
                 for (i, eval) in evals.iter().enumerate() {
                     out.push_str(&format!(
                         "\n{}. [{}] {} — {}\n   {} | {}{}\n",
@@ -6503,8 +6510,8 @@ impl SlashCommand for VoiceCommand {
     }
     fn help(&self) -> &str {
         "Usage: /voice [on|off]\n\n\
-         Enables or disables voice input (hold-to-talk).\n\
-         Voice requires a Claude.ai subscription with the voice scope enabled.\n\
+         Enables or disables local voice input (hold-to-talk).\n\
+         Voice uses a local whisper.cpp-compatible command and model.\n\
          Setting is persisted to ~/.mangocode/ui-settings.json."
     }
 
@@ -6530,7 +6537,7 @@ impl SlashCommand for VoiceCommand {
                     CommandResult::Message(
                         "Voice recording activated (Alt+V to toggle).\n\
                          Hold the configured hold-to-talk key to record.\n\
-                         Voice mode requires a Claude.ai account with voice scope."
+                         Set MANGOCODE_WHISPER_MODEL and, if needed, MANGOCODE_WHISPER_BIN."
                             .to_string(),
                     )
                 } else {

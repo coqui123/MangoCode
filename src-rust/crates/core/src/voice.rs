@@ -1,5 +1,5 @@
 //! Voice input: availability checks, hold-to-talk recording, and speech-to-text
-//! transcription via the OpenAI Whisper-compatible API.
+//! transcription via a local whisper.cpp-compatible command.
 //!
 //! # Feature flag
 //! Audio capture via `cpal` is gated behind the `voice` feature.  When the
@@ -8,6 +8,8 @@
 
 use crate::oauth::OAuthTokens;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -15,22 +17,19 @@ use std::sync::{
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
-// Availability (OAuth / kill-switch)
+// Availability (kill-switch / compatibility)
 // ---------------------------------------------------------------------------
-
-/// Scopes required for voice mode to function
-const VOICE_REQUIRED_SCOPES: &[&str] = &["user:inference", "user:profile"];
 
 /// Environment variable that disables voice mode when set (any value)
 const KILL_SWITCH_ENV: &str = "MANGOCODE_VOICE_DISABLED";
 
-/// Whether voice mode is available given the current OAuth tokens.
+/// Whether voice mode is available.
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceAvailability {
     Available,
-    /// Not authenticated via first-party OAuth
+    /// Deprecated: local voice no longer requires OAuth.
     RequiresOAuth,
-    /// OAuth token missing required scopes
+    /// Deprecated: local voice no longer requires OAuth scopes.
     MissingScopes {
         required: Vec<String>,
         have: Vec<String>,
@@ -59,10 +58,10 @@ impl VoiceAvailability {
         match self {
             VoiceAvailability::Available => None,
             VoiceAvailability::RequiresOAuth => Some(
-                "Voice mode requires OAuth authentication. Run /login to authenticate.".to_string(),
+                "Voice mode no longer requires OAuth. Check local voice configuration.".to_string(),
             ),
             VoiceAvailability::MissingScopes { required, have } => Some(format!(
-                "Voice mode requires scopes: {}. Your token has: {}",
+                "Voice mode no longer requires OAuth scopes. Legacy required scopes: {}. Your token has: {}",
                 required.join(", "),
                 if have.is_empty() {
                     "none".to_string()
@@ -82,38 +81,14 @@ impl VoiceAvailability {
     }
 }
 
-/// Check whether voice mode is available given the current OAuth tokens.
+/// Check whether voice mode is available.
 ///
-/// Pass `None` when the user is not authenticated via OAuth (API-key-only auth).
-pub fn check_voice_availability(tokens: Option<&OAuthTokens>) -> VoiceAvailability {
+/// The `tokens` argument is retained for compatibility; local voice
+/// transcription no longer requires OAuth or API-key authentication.
+pub fn check_voice_availability(_tokens: Option<&OAuthTokens>) -> VoiceAvailability {
     // Check kill switch first — always wins
     if std::env::var(KILL_SWITCH_ENV).is_ok() {
         return VoiceAvailability::Disabled;
-    }
-
-    // Voice requires first-party OAuth; API key alone is not sufficient
-    let tokens = match tokens {
-        Some(t) => t,
-        None => return VoiceAvailability::RequiresOAuth,
-    };
-
-    // OAuthTokens stores scopes as Vec<String>
-    let have_scopes: &[String] = &tokens.scopes;
-
-    let missing: Vec<String> = VOICE_REQUIRED_SCOPES
-        .iter()
-        .filter(|&&required| !have_scopes.iter().any(|h| h == required))
-        .map(|s| s.to_string())
-        .collect();
-
-    if !missing.is_empty() {
-        return VoiceAvailability::MissingScopes {
-            required: VOICE_REQUIRED_SCOPES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            have: have_scopes.to_vec(),
-        };
     }
 
     VoiceAvailability::Available
@@ -128,17 +103,24 @@ pub fn check_voice_availability(tokens: Option<&OAuthTokens>) -> VoiceAvailabili
 pub struct VoiceConfig {
     /// Whether the user has enabled voice input.
     pub enabled: bool,
-    /// API key for the speech-to-text endpoint.  When `None` the recorder
-    /// will return a helpful error instead of attempting a network request.
+    /// Deprecated: voice transcription is local-only and does not use API keys.
+    /// Kept for backwards-compatible config deserialization.
     pub api_key: Option<String>,
-    /// BCP-47 language hint sent to the transcription API (e.g. `"en"`).
-    /// When `None` the server auto-detects the language.
+    /// BCP-47 language hint sent to the local transcription command (e.g. `"en"`).
+    /// When `None` whisper.cpp auto-detects the language.
     pub language: Option<String>,
-    /// Speech model to request from the transcription API.
+    /// Backwards-compatible model field. If this is set to a filesystem path,
+    /// it is used as the local Whisper model path.
     pub model: String,
-    /// Base URL for the transcription API.
-    /// Defaults to `https://api.openai.com/v1/audio/transcriptions`.
+    /// Deprecated: voice transcription is local-only and does not use endpoints.
+    /// Kept for backwards-compatible config deserialization.
     pub endpoint_url: Option<String>,
+    /// Path to a local whisper.cpp GGML model, such as ggml-tiny.en.bin.
+    /// Can also be supplied with MANGOCODE_WHISPER_MODEL.
+    pub model_path: Option<String>,
+    /// Path to a local whisper.cpp-compatible executable.
+    /// Defaults to MANGOCODE_WHISPER_BIN, then whisper-cli/whisper/main on PATH.
+    pub local_command: Option<String>,
 }
 
 impl Default for VoiceConfig {
@@ -149,6 +131,8 @@ impl Default for VoiceConfig {
             language: None,
             model: "whisper-1".to_string(),
             endpoint_url: None,
+            model_path: None,
+            local_command: None,
         }
     }
 }
@@ -176,7 +160,7 @@ pub enum VoiceEvent {
 // ---------------------------------------------------------------------------
 
 /// Hold-to-talk voice recorder that captures microphone audio and sends it to
-/// a Whisper-compatible speech-to-text API.
+/// a local whisper.cpp-compatible speech-to-text command.
 pub struct VoiceRecorder {
     is_enabled: bool,
     is_recording: Arc<AtomicBool>,
@@ -332,27 +316,7 @@ async fn record_and_transcribe(
             return Ok(());
         }
 
-        let api_key = match &config.api_key {
-            Some(k) if !k.is_empty() => k.clone(),
-            _ => {
-                let msg = "Voice transcription requires an API key. \
-                           Set OPENAI_API_KEY or configure voice.api_key."
-                    .to_string();
-                let _ = event_tx.send(VoiceEvent::Error(msg.clone())).await;
-                return Err(anyhow::anyhow!(msg));
-            }
-        };
-
-        match transcribe_audio(
-            &samples,
-            sample_rate,
-            &api_key,
-            config.language.as_deref(),
-            &config.model,
-            config.endpoint_url.as_deref(),
-        )
-        .await
-        {
+        match transcribe_audio(&samples, sample_rate, &config).await {
             Ok(text) => {
                 let _ = event_tx.send(VoiceEvent::TranscriptReady(text)).await;
             }
@@ -385,6 +349,7 @@ async fn record_audio(
     event_tx: mpsc::Sender<VoiceEvent>,
 ) -> anyhow::Result<(Vec<f32>, u32)> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::SampleFormat;
     use std::time::Duration;
 
     let host = cpal::default_host();
@@ -399,29 +364,49 @@ async fn record_audio(
     let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let samples_clone = samples.clone();
 
-    let stream = {
-        let config: cpal::StreamConfig = supported_config.into();
-        device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Mix down to mono if needed
-                let mut s = samples_clone
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if channels == 1 {
-                    s.extend_from_slice(data);
-                } else {
-                    for chunk in data.chunks(channels) {
-                        let mono = chunk.iter().copied().sum::<f32>() / channels as f32;
-                        s.push(mono);
-                    }
-                }
-            },
-            move |err| {
-                tracing::error!("Audio stream error: {}", err);
-            },
-            None,
-        )?
+    let sample_format = supported_config.sample_format();
+    let config: cpal::StreamConfig = supported_config.into();
+    let stream = match sample_format {
+        SampleFormat::F32 => build_input_stream(&device, &config, channels, samples_clone, |s| s)?,
+        SampleFormat::F64 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: f64| s as f32)?
+        }
+        SampleFormat::I8 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: i8| {
+                s as f32 / i8::MAX as f32
+            })?
+        }
+        SampleFormat::I16 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: i16| {
+                s as f32 / i16::MAX as f32
+            })?
+        }
+        SampleFormat::I32 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: i32| {
+                s as f32 / i32::MAX as f32
+            })?
+        }
+        SampleFormat::U8 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: u8| {
+                (s as f32 - 128.0) / 128.0
+            })?
+        }
+        SampleFormat::U16 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: u16| {
+                (s as f32 - 32768.0) / 32768.0
+            })?
+        }
+        SampleFormat::U32 => {
+            build_input_stream(&device, &config, channels, samples_clone, |s: u32| {
+                (s as f32 - 2147483648.0) / 2147483648.0
+            })?
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unsupported microphone sample format: {:?}",
+                other
+            ));
+        }
     };
 
     stream.play()?;
@@ -437,6 +422,42 @@ async fn record_audio(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     Ok((audio, sample_rate))
+}
+
+#[cfg(feature = "voice")]
+fn build_input_stream<T, F>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    samples: Arc<Mutex<Vec<f32>>>,
+    convert: F,
+) -> anyhow::Result<cpal::Stream>
+where
+    T: cpal::SizedSample,
+    F: Fn(T) -> f32 + Send + Sync + Copy + 'static,
+{
+    use cpal::traits::DeviceTrait;
+
+    Ok(device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let mut s = samples
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if channels == 1 {
+                s.extend(data.iter().copied().map(convert));
+            } else {
+                for chunk in data.chunks(channels) {
+                    let mono = chunk.iter().copied().map(convert).sum::<f32>() / channels as f32;
+                    s.push(mono);
+                }
+            }
+        },
+        move |err| {
+            tracing::error!("Audio stream error: {}", err);
+        },
+        None,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -484,57 +505,212 @@ fn encode_wav(samples: &[f32], sample_rate: u32) -> anyhow::Result<Vec<u8>> {
 // Speech-to-text transcription
 // ---------------------------------------------------------------------------
 
-/// Send `audio_samples` to a Whisper-compatible endpoint and return the
-/// transcript text.
+/// Transcribe `audio_samples` locally with whisper.cpp and return the transcript
+/// text. No network requests are made.
 #[cfg_attr(not(feature = "voice"), allow(dead_code))]
 async fn transcribe_audio(
     audio_samples: &[f32],
     sample_rate: u32,
-    api_key: &str,
-    language: Option<&str>,
-    model: &str,
-    endpoint_url: Option<&str>,
+    config: &VoiceConfig,
 ) -> anyhow::Result<String> {
-    let wav_data = encode_wav(audio_samples, sample_rate)?;
+    #[cfg(feature = "voice")]
+    {
+        let model_path = resolve_whisper_model_path(config)?;
+        let command = resolve_whisper_command(config)?;
+        let language = config.language.clone();
+        let samples = resample_to_16khz(audio_samples, sample_rate);
 
-    let url = endpoint_url.unwrap_or("https://api.openai.com/v1/audio/transcriptions");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    let file_part = reqwest::multipart::Part::bytes(wav_data)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
-
-    let mut form = reqwest::multipart::Form::new()
-        .text("model", model.to_string())
-        .part("file", file_part);
-
-    if let Some(lang) = language {
-        form = form.text("language", lang.to_string());
+        tokio::task::spawn_blocking(move || {
+            transcribe_audio_local(&samples, &model_path, &command, language.as_deref())
+        })
+        .await?
     }
 
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()
-        .await?;
+    #[cfg(not(feature = "voice"))]
+    {
+        let _ = audio_samples;
+        let _ = sample_rate;
+        let _ = config;
+        Err(anyhow::anyhow!(
+            "Local voice transcription is not available in this build (compile with --features voice)."
+        ))
+    }
+}
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+#[cfg(feature = "voice")]
+fn transcribe_audio_local(
+    samples_16khz: &[f32],
+    model_path: &Path,
+    command: &Path,
+    language: Option<&str>,
+) -> anyhow::Result<String> {
+    let wav_path =
+        std::env::temp_dir().join(format!("mangocode-voice-{}.wav", uuid::Uuid::new_v4()));
+    let output_base =
+        std::env::temp_dir().join(format!("mangocode-voice-{}", uuid::Uuid::new_v4()));
+    let output_txt = output_base.with_extension("txt");
+
+    std::fs::write(&wav_path, encode_wav(samples_16khz, 16_000)?)?;
+
+    let mut cmd = Command::new(command);
+    cmd.arg("-m")
+        .arg(model_path)
+        .arg("-f")
+        .arg(&wav_path)
+        .arg("-otxt")
+        .arg("-of")
+        .arg(&output_base)
+        .arg("-nt")
+        .arg("-np");
+
+    if let Some(language) = language.filter(|s| !s.trim().is_empty()) {
+        cmd.arg("-l").arg(language);
+    }
+
+    let output = cmd.output();
+    let _ = std::fs::remove_file(&wav_path);
+
+    let output = output?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&output_txt);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow::anyhow!(
-            "Transcription API returned {}: {}",
-            status,
-            body
+            "Local transcription command failed: {}",
+            stderr.trim()
         ));
     }
 
-    let json: serde_json::Value = response.json().await?;
-    let text = json["text"].as_str().unwrap_or("").trim().to_string();
-    Ok(text)
+    let text = match std::fs::read_to_string(&output_txt) {
+        Ok(text) => {
+            let _ = std::fs::remove_file(&output_txt);
+            text
+        }
+        Err(_) => String::from_utf8_lossy(&output.stdout).to_string(),
+    };
+
+    Ok(clean_whisper_output(&text))
+}
+
+#[cfg(feature = "voice")]
+fn resolve_whisper_model_path(config: &VoiceConfig) -> anyhow::Result<PathBuf> {
+    let configured = config
+        .model_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("MANGOCODE_WHISPER_MODEL")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let model = config.model.trim();
+            if model != "whisper-1"
+                && (model.ends_with(".bin") || model.contains('/') || model.contains('\\'))
+            {
+                Some(PathBuf::from(model))
+            } else {
+                None
+            }
+        });
+
+    let Some(path) = configured else {
+        return Err(anyhow::anyhow!(
+            "Local voice transcription requires a whisper.cpp GGML model file. \
+             Set MANGOCODE_WHISPER_MODEL to a local model path, for example ggml-tiny.en.bin."
+        ));
+    };
+
+    if !path.is_file() {
+        return Err(anyhow::anyhow!(
+            "Whisper model file not found: {}",
+            path.display()
+        ));
+    }
+
+    Ok(path)
+}
+
+#[cfg(feature = "voice")]
+fn resolve_whisper_command(config: &VoiceConfig) -> anyhow::Result<PathBuf> {
+    let configured = config
+        .local_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("MANGOCODE_WHISPER_BIN")
+                .ok()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+        });
+
+    if let Some(path) = configured {
+        return Ok(path);
+    }
+
+    for candidate in ["whisper-cli", "whisper", "main"] {
+        if command_exists(candidate) {
+            return Ok(PathBuf::from(candidate));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Local voice transcription requires whisper.cpp on PATH. \
+         Install whisper.cpp and set MANGOCODE_WHISPER_BIN to whisper-cli.exe."
+    ))
+}
+
+#[cfg(feature = "voice")]
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--help")
+        .output()
+        .map(|output| {
+            output.status.success() || !output.stderr.is_empty() || !output.stdout.is_empty()
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "voice")]
+fn resample_to_16khz(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    const TARGET_RATE: u32 = 16_000;
+    if sample_rate == TARGET_RATE || samples.is_empty() {
+        return samples.to_vec();
+    }
+
+    let output_len = ((samples.len() as u64 * TARGET_RATE as u64) / sample_rate as u64) as usize;
+    let mut out = Vec::with_capacity(output_len);
+    let ratio = sample_rate as f64 / TARGET_RATE as f64;
+
+    for i in 0..output_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = (src_pos - idx as f64) as f32;
+        let a = samples.get(idx).copied().unwrap_or(0.0);
+        let b = samples.get(idx + 1).copied().unwrap_or(a);
+        out.push(a + (b - a) * frac);
+    }
+
+    out
+}
+
+#[cfg(feature = "voice")]
+fn clean_whisper_output(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("whisper_"))
+        .filter(|line| !line.starts_with("system_info:"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -576,15 +752,19 @@ mod tests {
     }
 
     #[test]
-    fn test_no_tokens_requires_oauth() {
+    fn test_no_tokens_available_for_local_voice() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let result = check_voice_availability(None);
-        assert_eq!(result, VoiceAvailability::RequiresOAuth);
-        assert!(!result.is_available());
-        assert!(result.error_message().is_some());
+        assert_eq!(result, VoiceAvailability::Available);
+        assert!(result.is_available());
+        assert!(result.error_message().is_none());
     }
 
     #[test]
     fn test_available_with_all_scopes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec!["user:inference", "user:profile"]);
         let result = check_voice_availability(Some(&tokens));
         assert_eq!(result, VoiceAvailability::Available);
@@ -593,34 +773,33 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_one_scope() {
+    fn test_missing_one_scope_still_available_for_local_voice() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec!["user:inference"]);
         let result = check_voice_availability(Some(&tokens));
-        assert!(matches!(result, VoiceAvailability::MissingScopes { .. }));
-        assert!(!result.is_available());
-        let msg = result.error_message().unwrap();
-        assert!(msg.contains("user:profile"));
+        assert_eq!(result, VoiceAvailability::Available);
+        assert!(result.is_available());
     }
 
     #[test]
-    fn test_missing_all_scopes() {
+    fn test_missing_all_scopes_still_available_for_local_voice() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec!["org:create_api_key"]);
         let result = check_voice_availability(Some(&tokens));
-        assert!(matches!(result, VoiceAvailability::MissingScopes { .. }));
-        assert!(!result.is_available());
+        assert_eq!(result, VoiceAvailability::Available);
+        assert!(result.is_available());
     }
 
     #[test]
-    fn test_empty_scopes_missing() {
+    fn test_empty_scopes_still_available_for_local_voice() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec![]);
         let result = check_voice_availability(Some(&tokens));
-        assert!(
-            matches!(result, VoiceAvailability::MissingScopes { ref have, .. } if have.is_empty())
-        );
-        let msg = result.error_message().unwrap();
-        assert!(msg.contains("none"));
+        assert_eq!(result, VoiceAvailability::Available);
+        assert!(result.is_available());
     }
 
     #[test]
@@ -652,6 +831,8 @@ mod tests {
 
     #[test]
     fn test_extra_scopes_still_available() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec![
             "user:inference",
             "user:profile",
@@ -748,6 +929,8 @@ mod tests {
             language: Some("en".to_string()),
             model: "whisper-1".to_string(),
             endpoint_url: None,
+            model_path: None,
+            local_command: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: VoiceConfig = serde_json::from_str(&json).unwrap();

@@ -61,8 +61,8 @@ pub(crate) mod otel_impl {
     use opentelemetry::trace::{Span as _, Status, Tracer as _};
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::{runtime::Tokio, trace::Config as TraceConfig, Resource};
     use opentelemetry_sdk::trace::TracerProvider as SdkProvider;
+    use opentelemetry_sdk::{runtime::Tokio, trace::Config as TraceConfig, Resource};
     use parking_lot::Mutex;
     use std::sync::OnceLock;
 
@@ -76,13 +76,20 @@ pub(crate) mod otel_impl {
         let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
             .unwrap_or_else(|_| "http://localhost:4317".to_string());
 
-        let trace_config = TraceConfig::default()
-            .with_resource(Resource::new(vec![KeyValue::new("service.name", "mangocode")]));
+        let trace_config =
+            TraceConfig::default().with_resource(Resource::new(vec![KeyValue::new(
+                "service.name",
+                "mangocode",
+            )]));
 
         let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_trace_config(trace_config)
-            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(&endpoint))
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(&endpoint),
+            )
             .install_batch(Tokio)
             .expect("Failed to install OTLP trace pipeline");
 
@@ -116,9 +123,11 @@ pub(crate) mod otel_impl {
 
         fn set_attributes(&self, attrs: &[(&str, &str)]) {
             let mut span = self.span.lock();
-            span.set_attributes(attrs.iter().map(|(key, value)| {
-                KeyValue::new((*key).to_string(), (*value).to_string())
-            }));
+            span.set_attributes(
+                attrs
+                    .iter()
+                    .map(|(key, value)| KeyValue::new((*key).to_string(), (*value).to_string())),
+            );
         }
 
         fn add_event(&self, name: &str) {

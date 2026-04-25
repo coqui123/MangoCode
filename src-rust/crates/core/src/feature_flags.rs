@@ -315,7 +315,8 @@ impl FeatureFlagManager {
                 .await
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        let json = serde_json::to_string(cached).context("Failed to serialize remote flag cache")?;
+        let json =
+            serde_json::to_string(cached).context("Failed to serialize remote flag cache")?;
         fs::write(&path, json)
             .await
             .with_context(|| format!("Failed to write {}", path.display()))?;
@@ -353,7 +354,10 @@ mod tests {
 
     #[test]
     fn test_list_all_includes_predefined() {
-        let names: Vec<String> = FeatureFlags::list_all().into_iter().map(|(n, _)| n).collect();
+        let names: Vec<String> = FeatureFlags::list_all()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
         assert!(names.iter().any(|n| n == FLAG_PROACTIVE_AGENT));
         assert!(names.iter().any(|n| n == FLAG_LLM_COMPACTION));
     }

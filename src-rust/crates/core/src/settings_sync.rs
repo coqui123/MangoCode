@@ -11,8 +11,8 @@
 // The sync API stores a flat key→value map where keys are canonical file paths
 // and values are the UTF-8 file contents (JSON or Markdown).
 
-use anyhow::Result;
 use crate::Settings;
+use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;

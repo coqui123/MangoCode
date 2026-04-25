@@ -702,11 +702,13 @@ mod tests {
             "transcript.jump.next action not found"
         );
         assert!(
-            actions.contains(&"openHelp".to_string()) || actions.contains(&"help.toggle".to_string()),
+            actions.contains(&"openHelp".to_string())
+                || actions.contains(&"help.toggle".to_string()),
             "help toggle action not found"
         );
         assert!(
-            actions.contains(&"deleteCharBefore".to_string()) || actions.contains(&"input.backspace".to_string()),
+            actions.contains(&"deleteCharBefore".to_string())
+                || actions.contains(&"input.backspace".to_string()),
             "backspace action not found"
         );
         assert!(
@@ -739,11 +741,13 @@ mod tests {
         for (chord_str, action, ctx) in required {
             let chord = parse_chord(chord_str).expect("required chord should parse");
             let found = bindings.iter().any(|b| {
-                b.context == *ctx
-                    && b.action.as_deref() == Some(*action)
-                    && b.chord == chord
+                b.context == *ctx && b.action.as_deref() == Some(*action) && b.chord == chord
             });
-            assert!(found, "Missing critical binding: {} -> {} in {:?}", chord_str, action, ctx);
+            assert!(
+                found,
+                "Missing critical binding: {} -> {} in {:?}",
+                chord_str, action, ctx
+            );
         }
     }
 
@@ -774,7 +778,8 @@ mod tests {
     #[test]
     fn test_resolver_with_ide_profile_includes_fallbacks() {
         let user = UserKeybindings::default();
-        let mut resolver = KeybindingResolver::with_profile(&user, KeybindingProfile::IdeCompatible);
+        let mut resolver =
+            KeybindingResolver::with_profile(&user, KeybindingProfile::IdeCompatible);
 
         // Test that Ctrl+Q R works in IDE profile
         let ks = parse_keystroke("ctrl+q").unwrap();

@@ -30,7 +30,10 @@ pub use auth_store::{AuthStore, StoredCredential};
 
 // Encrypted local credential vault.
 pub mod vault;
-pub use vault::{GatewayConfig, Vault, clear_vault_passphrase, get_vault_passphrase, reqwest_client_builder, set_vault_passphrase};
+pub use vault::{
+    clear_vault_passphrase, get_vault_passphrase, reqwest_client_builder, set_vault_passphrase,
+    GatewayConfig, Vault,
+};
 
 // GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
 pub mod device_code;
@@ -103,15 +106,16 @@ pub use feature_flags::{
 };
 pub use history::ConversationSession;
 pub use keybindings::{
-    KeybindingProfile, KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
+    KeyContext, KeybindingProfile, KeybindingResolver, KeybindingResult, ParsedKeystroke,
+    UserKeybindings,
 };
+pub use permission_critic::{global_critic, CriticConfig, CriticEvaluation, PermissionCritic};
 pub use permissions::{
     format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
     ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler, PermissionAction,
     PermissionDecision, PermissionHandler, PermissionLevel, PermissionManager, PermissionRequest,
     PermissionRule, PermissionScope, SerializedPermissionRule,
 };
-pub use permission_critic::{global_critic, CriticConfig, CriticEvaluation, PermissionCritic};
 pub use skill_discovery::{discover_skills, parse_skill_file, DiscoveredSkill};
 pub use snapshot::SnapshotManager;
 
@@ -1673,11 +1677,7 @@ pub mod context {
             let status_lines = String::from_utf8_lossy(&branch_output.stdout);
             let (branch_line, tracking_line) = {
                 let mut lines = status_lines.lines();
-                let raw = lines
-                    .next()
-                    .unwrap_or("")
-                    .trim_start_matches("## ")
-                    .trim();
+                let raw = lines.next().unwrap_or("").trim_start_matches("## ").trim();
                 if let Some((branch, tracking)) = raw.split_once("...") {
                     (
                         branch.trim().to_string(),
@@ -1710,9 +1710,15 @@ pub mod context {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
             if porcelain.is_empty() {
-                parts.push("## Working Tree (git status --porcelain)\nClean - no uncommitted changes.".to_string());
+                parts.push(
+                    "## Working Tree (git status --porcelain)\nClean - no uncommitted changes."
+                        .to_string(),
+                );
             } else {
-                parts.push(format!("## Working Tree (git status --porcelain)\n{}", porcelain));
+                parts.push(format!(
+                    "## Working Tree (git status --porcelain)\n{}",
+                    porcelain
+                ));
             }
 
             let log_output = Command::new("git")
@@ -3483,7 +3489,12 @@ pub mod oauth {
         async fn get_macos_keychain_credentials() -> Option<String> {
             // The official Claude CLI uses this service name in the keychain
             let output = tokio::process::Command::new("security")
-                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                ])
                 .output()
                 .await
                 .ok()?;
@@ -3508,7 +3519,8 @@ pub mod oauth {
         /// and need the refreshed bearer token to be visible in the auth store as well.
         pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
             self.save().await?;
-            let _ = crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self).await;
+            let _ = crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self)
+                .await;
             Ok(())
         }
     }
@@ -3516,9 +3528,11 @@ pub mod oauth {
     /// Refresh an expired OAuth access token using the stored refresh token.
     ///
     /// This is the shared helper used by the CLI flow and long-lived provider sessions.
-    pub async fn refresh_oauth_tokens_from_refresh(tokens: &OAuthTokens) -> anyhow::Result<OAuthTokens> {
+    pub async fn refresh_oauth_tokens_from_refresh(
+        tokens: &OAuthTokens,
+    ) -> anyhow::Result<OAuthTokens> {
         use anyhow::{anyhow, bail, Context};
-        
+
         let refresh = tokens
             .refresh_token
             .as_deref()
@@ -3571,8 +3585,7 @@ pub mod oauth {
 
         let refresh_token = data["refresh_token"].as_str().map(|s| s.to_string());
         let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
-        let expires_at_ms =
-            chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+        let expires_at_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
         let scopes: Vec<String> = data["scope"]
             .as_str()
             .unwrap_or("")
@@ -3677,8 +3690,8 @@ pub mod memdir;
 pub mod migrations;
 pub mod oauth_config;
 pub mod output_styles;
-pub mod prompt_history;
 pub mod permission_critic;
+pub mod prompt_history;
 pub mod ps_classifier;
 pub mod remote_settings;
 pub mod session_tracing;
