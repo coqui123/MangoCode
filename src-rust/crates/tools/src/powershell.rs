@@ -48,6 +48,10 @@ fn default_timeout() -> u64 {
 /// this marker is metadata (final pwd + env dump) rather than user-visible output.
 const PS_STATE_SENTINEL: &str = "__CC_PS_STATE__";
 
+fn ps_single_quoted_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// Parse a PowerShell snapshot block (lines after `PS_STATE_SENTINEL`) into
 /// `(new_cwd, env_delta)`.
 ///
@@ -104,18 +108,22 @@ fn build_ps_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf
     let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
 
     // Escape the cwd for PowerShell embedding
-    let cwd_escaped = effective_cwd.to_string_lossy().replace('\'', "''");
+    let cwd_literal = ps_single_quoted_literal(&effective_cwd.to_string_lossy());
 
     // Build env variable restoration lines
     let mut env_lines = String::new();
     for (k, v) in &state.env_vars {
-        let v_escaped = v.replace('\'', "''");
-        env_lines.push_str(&format!("$env:{} = '{}'\n", k, v_escaped));
+        let env_path = ps_single_quoted_literal(&format!("Env:{}", k));
+        let value = ps_single_quoted_literal(v);
+        env_lines.push_str(&format!(
+            "Set-Item -LiteralPath {} -Value {}\n",
+            env_path, value
+        ));
     }
 
     format!(
         r#"
-Set-Location '{}'
+Set-Location {}
 {}
 $ErrorActionPreference = 'Continue'
 & {{ {} }}
@@ -125,7 +133,7 @@ Get-Location | Select-Object -ExpandProperty Path
 Get-ChildItem Env: | ForEach-Object {{ "$($_.Name)=$($_.Value)" }}
 exit $exitCode
 "#,
-        cwd_escaped, env_lines, command, PS_STATE_SENTINEL
+        cwd_literal, env_lines, command, PS_STATE_SENTINEL
     )
 }
 
@@ -416,5 +424,46 @@ impl Tool for PowerShellTool {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_restores_env_vars_with_parentheses_using_literal_path() {
+        let mut state = ShellState::new();
+        state.env_vars.insert(
+            "ProgramFiles(x86)".to_string(),
+            "C:\\Program Files (x86)".to_string(),
+        );
+
+        let script = build_ps_wrapper_script(
+            "Write-Output 'ok'",
+            &state,
+            &PathBuf::from("C:\\Users\\test"),
+        );
+
+        assert!(script.contains(
+            "Set-Item -LiteralPath 'Env:ProgramFiles(x86)' -Value 'C:\\Program Files (x86)'"
+        ));
+        assert!(!script.contains("$env:ProgramFiles(x86)"));
+    }
+
+    #[test]
+    fn wrapper_escapes_single_quotes_in_env_state() {
+        let mut state = ShellState::new();
+        state
+            .env_vars
+            .insert("MANGO_TEST".to_string(), "it isn't broken".to_string());
+
+        let script = build_ps_wrapper_script(
+            "Write-Output 'ok'",
+            &state,
+            &PathBuf::from("C:\\Users\\test"),
+        );
+
+        assert!(script.contains("Set-Item -LiteralPath 'Env:MANGO_TEST' -Value 'it isn''t broken'"));
     }
 }
