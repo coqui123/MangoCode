@@ -673,6 +673,10 @@ async fn main() -> anyhow::Result<()> {
                         println!("{}", msg);
                         std::process::exit(0);
                     }
+                    mangocode_commands::CommandResult::ReloadAuthStore(msg) => {
+                        println!("{}", msg);
+                        std::process::exit(0);
+                    }
                     mangocode_commands::CommandResult::Error(e) => {
                         eprintln!("Error: {}", e);
                         eprintln!("Usage: {}", named_cmd.usage());
@@ -2712,6 +2716,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     // Suppress text output when TUI already opened an
                                     // overlay for this command (e.g. /stats opens dialog
                                     // AND would push a text message — drop the text).
+                                    if !handled_by_tui {
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
+                                Some(CommandResult::ReloadAuthStore(msg)) => {
+                                    app.auth_store = mangocode_core::AuthStore::load();
+                                    app.provider_registry_stale = true;
+                                    app.status_message = Some(msg.clone());
                                     if !handled_by_tui {
                                         app.push_message(
                                             mangocode_core::types::Message::assistant(msg),

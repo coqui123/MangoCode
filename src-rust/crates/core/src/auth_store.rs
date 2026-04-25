@@ -1,4 +1,6 @@
-// auth_store.rs — JSON-based credential store at ~/.mangocode/auth.json.
+// auth_store.rs — Credential store at ~/.mangocode/auth.json with optional
+// MangoCode vault (`vault.enc`) as the preferred source when the vault exists
+// and this process has an unlocked passphrase.
 //
 // Stores API keys and OAuth tokens for providers so users don't have to rely
 // solely on environment variables.
@@ -8,7 +10,37 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::oauth::OAuthTokens;
+use crate::vault::{get_vault_passphrase, Vault};
 use crate::ProviderId;
+
+/// Vault entry keys that are not merged into [`AuthStore`] (infrastructure secrets).
+const VAULT_SKIP_MERGE_KEYS: &[&str] = &["gateway"];
+
+/// Canonical provider id for in-memory and `auth.json` rows (matches [`AuthStore::api_key_for`]).
+#[inline]
+fn credential_storage_key(provider_id: &str) -> &str {
+    if provider_id == "codex" {
+        ProviderId::OPENAI_CODEX
+    } else {
+        provider_id
+    }
+}
+
+/// Map a vault entry key to the auth-store key (`codex` → `openai-codex`).
+#[inline]
+fn vault_provider_key_to_storage_key(pid: &str) -> &str {
+    credential_storage_key(pid)
+}
+
+/// Collapse legacy `codex` rows into `openai-codex` after loading JSON.
+fn normalize_codex_alias_keys(store: &mut AuthStore) {
+    if let Some(cred) = store.credentials.remove("codex") {
+        store
+            .credentials
+            .entry(ProviderId::OPENAI_CODEX.to_string())
+            .or_insert(cred);
+    }
+}
 
 /// A stored credential for a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,18 +92,19 @@ impl AuthStore {
             return;
         }
         let mut store = Self::load_async().await;
-        store.credentials.insert(
-            ProviderId::ANTHROPIC_MAX.to_string(),
-            StoredCredential::OAuthToken {
-                access: tokens.access_token.clone(),
-                refresh: tokens.refresh_token.clone().unwrap_or_default(),
-                expires: tokens
-                    .expires_at_ms
-                    .map(|ms| ms as u64)
-                    .unwrap_or(0),
-            },
-        );
+        let cred = StoredCredential::OAuthToken {
+            access: tokens.access_token.clone(),
+            refresh: tokens.refresh_token.clone().unwrap_or_default(),
+            expires: tokens
+                .expires_at_ms
+                .map(|ms| ms as u64)
+                .unwrap_or(0),
+        };
+        store
+            .credentials
+            .insert(ProviderId::ANTHROPIC_MAX.to_string(), cred.clone());
         store.save_async().await;
+        Self::mirror_credential_to_vault_if_unlocked(ProviderId::ANTHROPIC_MAX, &cred);
     }
 
     /// Path to the auth store file.
@@ -83,22 +116,30 @@ impl AuthStore {
     }
 
     /// Load the store from disk (returns default if missing or invalid).
+    ///
+    /// When `~/.mangocode/vault.enc` exists and the vault passphrase is cached for
+    /// this session, credentials from the vault override the same provider keys
+    /// in `auth.json` (vault first, JSON fallback).
     pub fn load() -> Self {
         let path = Self::path();
-        if path.exists() {
+        let mut store: AuthStore = if path.exists() {
             std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_default()
         } else {
             Self::default()
-        }
+        };
+        normalize_codex_alias_keys(&mut store);
+        Self::merge_vault_over_json(&mut store);
+        normalize_codex_alias_keys(&mut store);
+        store
     }
 
     /// Async version of load() to avoid blocking the thread.
     pub async fn load_async() -> Self {
         let path = Self::path();
-        if path.exists() {
+        let mut store: AuthStore = if path.exists() {
             tokio::fs::read_to_string(&path)
                 .await
                 .ok()
@@ -106,7 +147,74 @@ impl AuthStore {
                 .unwrap_or_default()
         } else {
             Self::default()
+        };
+        normalize_codex_alias_keys(&mut store);
+        Self::merge_vault_over_json(&mut store);
+        normalize_codex_alias_keys(&mut store);
+        store
+    }
+
+    /// Decode a vault secret string into a [`StoredCredential`].
+    ///
+    /// New writes use JSON-serialized [`StoredCredential`] (supports OAuth).
+    /// Legacy `/vault set` entries are a raw API key string.
+    fn credential_from_vault_secret(secret: &str) -> Option<StoredCredential> {
+        let t = secret.trim();
+        if t.is_empty() {
+            return None;
         }
+        if let Ok(c) = serde_json::from_str::<StoredCredential>(t) {
+            return Some(c);
+        }
+        Some(StoredCredential::ApiKey {
+            key: t.to_string(),
+        })
+    }
+
+    fn merge_vault_over_json(store: &mut AuthStore) {
+        let vault = Vault::new();
+        if !vault.exists() {
+            return;
+        }
+        let Some(pass) = get_vault_passphrase() else {
+            return;
+        };
+        let data = match vault.load(&pass) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for (pid, entry) in data.entries.iter() {
+            if VAULT_SKIP_MERGE_KEYS
+                .iter()
+                .any(|k| *k == pid.as_str())
+            {
+                continue;
+            }
+            if let Some(cred) = Self::credential_from_vault_secret(&entry.secret) {
+                let storage_key = vault_provider_key_to_storage_key(pid.as_str());
+                store
+                    .credentials
+                    .insert(storage_key.to_string(), cred);
+            }
+        }
+    }
+
+    /// When the vault file exists and the session has an unlocked passphrase,
+    /// persist this credential into the vault (encrypted). Always paired with
+    /// `auth.json` writes elsewhere so JSON remains the offline fallback.
+    fn mirror_credential_to_vault_if_unlocked(provider_id: &str, cred: &StoredCredential) {
+        let vault = Vault::new();
+        if !vault.exists() {
+            return;
+        }
+        let Some(pass) = get_vault_passphrase() else {
+            return;
+        };
+        let Ok(secret) = serde_json::to_string(cred) else {
+            return;
+        };
+        let vault_key = credential_storage_key(provider_id);
+        let _ = vault.set_secret(vault_key, &secret, &pass, None);
     }
 
     /// Persist the store to disk (best-effort).
@@ -132,31 +240,47 @@ impl AuthStore {
     }
 
     /// Store a credential for the given provider (persists immediately).
+    ///
+    /// Always writes `~/.mangocode/auth.json`. If the vault exists and this process
+    /// has an unlocked passphrase, also stores an encrypted copy in the vault
+    /// (vault preferred on next [`load`](Self::load) when unlocked).
     pub fn set(&mut self, provider_id: &str, cred: StoredCredential) {
-        self.credentials.insert(provider_id.to_string(), cred);
+        let key = credential_storage_key(provider_id).to_string();
+        self.credentials.insert(key.clone(), cred.clone());
         self.save();
+        Self::mirror_credential_to_vault_if_unlocked(&key, &cred);
     }
 
     /// Get the stored credential for a provider.
     pub fn get(&self, provider_id: &str) -> Option<&StoredCredential> {
-        self.credentials.get(provider_id)
+        self.credentials
+            .get(credential_storage_key(provider_id))
     }
 
     /// Remove the credential for a provider (persists immediately).
+    ///
+    /// Drops the entry from `auth.json` and, when the vault is unlocked, removes
+    /// the matching provider entry from the vault.
     pub fn remove(&mut self, provider_id: &str) {
-        self.credentials.remove(provider_id);
+        let key = credential_storage_key(provider_id);
+        self.credentials.remove(key);
         self.save();
+        if let Some(pass) = get_vault_passphrase() {
+            if Vault::new().exists() {
+                let v = Vault::new();
+                let _ = v.remove_secret(key, &pass);
+                // Legacy vault rows may use the short alias.
+                if key == ProviderId::OPENAI_CODEX {
+                    let _ = v.remove_secret("codex", &pass);
+                }
+            }
+        }
     }
 
     /// Get the API key for a provider, checking stored credentials first then
     /// falling back to the relevant environment variable.
     pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
-        // `codex` is an alias for the canonical OAuth provider `openai-codex`.
-        let storage_key = if provider_id == "codex" {
-            ProviderId::OPENAI_CODEX
-        } else {
-            provider_id
-        };
+        let storage_key = credential_storage_key(provider_id);
 
         // Check stored credentials first
         if let Some(stored) = self.get(storage_key) {
@@ -250,5 +374,23 @@ mod tests {
             store.api_key_for(ProviderId::OPENAI_CODEX).as_deref(),
             Some("oauth-access-test")
         );
+        assert!(store.get("codex").is_some());
+        assert!(std::ptr::eq(
+            store.get("codex").unwrap() as *const StoredCredential,
+            store.get(ProviderId::OPENAI_CODEX).unwrap() as *const StoredCredential
+        ));
+    }
+
+    #[test]
+    fn credential_storage_key_aliases_codex_to_canonical_id() {
+        assert_eq!(
+            super::credential_storage_key("codex"),
+            ProviderId::OPENAI_CODEX
+        );
+        assert_eq!(
+            super::credential_storage_key("openai-codex"),
+            ProviderId::OPENAI_CODEX
+        );
+        assert_eq!(super::vault_provider_key_to_storage_key("codex"), ProviderId::OPENAI_CODEX);
     }
 }

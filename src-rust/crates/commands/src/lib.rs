@@ -68,6 +68,10 @@ pub enum CommandResult {
     Silent,
     /// An error.
     Error(String),
+    /// Reload `AuthStore` from disk (merging vault if unlocked) and refresh the
+    /// provider registry; show the message to the user. Used after `/vault init`
+    /// or `/vault unlock` so credentials stored in the vault are picked up.
+    ReloadAuthStore(String),
     /// Open the rewind/message-selector overlay in the TUI.
     /// The TUI will call SetMessages when the user confirms.
     OpenRewindOverlay,
@@ -2707,7 +2711,10 @@ impl SlashCommand for VaultCommand {
                     return CommandResult::Error(format!("Failed to initialize vault: {}", e));
                 }
                 mangocode_core::set_vault_passphrase(passphrase);
-                CommandResult::Message("Vault created and unlocked for this session.".to_string())
+                CommandResult::ReloadAuthStore(
+                    "Vault created and unlocked for this session. Auth credentials merged from vault where present."
+                        .to_string(),
+                )
             }
             "unlock" => {
                 if !vault.exists() {
@@ -2721,11 +2728,17 @@ impl SlashCommand for VaultCommand {
                     return CommandResult::Error(format!("Vault unlock failed: {}", e));
                 }
                 mangocode_core::set_vault_passphrase(passphrase);
-                CommandResult::Message("Vault unlocked for this session.".to_string())
+                CommandResult::ReloadAuthStore(
+                    "Vault unlocked for this session. Auth credentials merged from vault where present."
+                        .to_string(),
+                )
             }
             "lock" => {
                 mangocode_core::clear_vault_passphrase();
-                CommandResult::Message("Vault locked for this session.".to_string())
+                CommandResult::ReloadAuthStore(
+                    "Vault locked for this session. Using auth.json only until you unlock again."
+                        .to_string(),
+                )
             }
             "set" => {
                 let provider = match parts.next() {
@@ -2750,7 +2763,10 @@ impl SlashCommand for VaultCommand {
                     return CommandResult::Error(format!("Failed to store secret: {}", e));
                 }
                 mangocode_core::set_vault_passphrase(passphrase);
-                CommandResult::Message(format!("Stored key for '{}' in vault.", provider))
+                CommandResult::ReloadAuthStore(format!(
+                    "Stored key for '{}' in vault. Auth store refreshed (vault overrides auth.json for that provider when unlocked).",
+                    provider
+                ))
             }
             "get" => {
                 let provider = match parts.next() {
@@ -2828,7 +2844,10 @@ impl SlashCommand for VaultCommand {
                     return CommandResult::Error(format!("Failed to remove secret: {}", e));
                 }
                 mangocode_core::set_vault_passphrase(passphrase);
-                CommandResult::Message(format!("Removed secret for '{}' from vault.", provider))
+                CommandResult::ReloadAuthStore(format!(
+                    "Removed secret for '{}' from vault. Auth store refreshed.",
+                    provider
+                ))
             }
             "export" => {
                 if vault.exists() {
