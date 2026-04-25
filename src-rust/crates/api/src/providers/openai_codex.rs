@@ -33,6 +33,7 @@ const DISK_CHECK_INTERVAL_MS: i64 = 60_000;
 pub struct OpenAiCodexProvider {
     id: ProviderId,
     http: reqwest::Client,
+    endpoint: String,
     /// Latest Bearer access token used for `Authorization` headers.
     bearer: Arc<Mutex<String>>,
     cached_expiry_ms: Arc<Mutex<Option<i64>>>,
@@ -47,10 +48,17 @@ impl OpenAiCodexProvider {
                 .timeout(std::time::Duration::from_secs(600))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            endpoint: CODEX_API_ENDPOINT.to_string(),
             bearer: Arc::new(Mutex::new(access_token)),
             cached_expiry_ms: Arc::new(Mutex::new(None)),
             last_disk_check_ms: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Override the Codex endpoint URL (used for tests / local mocking).
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
@@ -286,7 +294,7 @@ impl LlmProvider for OpenAiCodexProvider {
 
         let resp = self
             .http
-            .post(CODEX_API_ENDPOINT)
+            .post(&self.endpoint)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json")
             .json(&openai_body)

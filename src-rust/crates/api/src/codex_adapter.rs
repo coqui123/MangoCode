@@ -12,6 +12,37 @@ use serde_json::{json, Value};
 /// OpenAI Codex API endpoint for responses (ChatGPT plan / Codex OAuth).
 pub const CODEX_RESPONSES_ENDPOINT: &str = CODEX_API_ENDPOINT;
 
+/// Strip fields that are specific to SDKs / client-side orchestration and may be
+/// rejected by ChatGPT/Codex backends.
+///
+/// Mirrors the concept described in OpenCode's Codex auth plugin docs: keep the
+/// request payload "AI SDK compatible" by removing keys that are not part of the
+/// backend contract.
+pub fn strip_sdk_only_fields(mut value: serde_json::Value) -> serde_json::Value {
+    fn recurse(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(map) => {
+                map.remove("item_reference");
+                map.remove("parallel_tool_calls");
+                map.remove("previous_response_id");
+                map.remove("response_id");
+                for child in map.values_mut() {
+                    recurse(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    recurse(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    recurse(&mut value);
+    value
+}
+
 /// Convert an Anthropic CreateMessageRequest to OpenAI ChatCompletion request format.
 pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {
     // Convert Anthropic messages to OpenAI format
@@ -54,6 +85,8 @@ pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {
         "messages": openai_messages,
         "max_tokens": request.max_tokens,
         "stream": request.stream,
+        // Codex/ChatGPT backend requires stateless operation.
+        "store": false,
     });
 
     // Add optional parameters
@@ -67,7 +100,7 @@ pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {
     // Note: OpenAI Codex doesn't support thinking blocks or tools in the same way
     // Skip those fields for now — they would need special handling
 
-    openai_req
+    strip_sdk_only_fields(openai_req)
 }
 
 /// Convert an OpenAI ChatCompletion response to Anthropic format fields.
@@ -191,6 +224,26 @@ mod tests {
         assert_eq!(messages.len(), 2); // system + user
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
+
+        // Codex requests must be stateless.
+        assert_eq!(openai_req["store"], json!(false));
+    }
+
+    #[test]
+    fn sdk_only_fields_are_removed() {
+        let input = serde_json::json!({
+            "messages": [],
+            "item_reference": "abc",
+            "nested": {
+                "parallel_tool_calls": true,
+                "previous_response_id": "prev"
+            }
+        });
+
+        let out = strip_sdk_only_fields(input);
+        assert!(out.get("item_reference").is_none());
+        assert!(out["nested"].get("parallel_tool_calls").is_none());
+        assert!(out["nested"].get("previous_response_id").is_none());
     }
 
     #[test]

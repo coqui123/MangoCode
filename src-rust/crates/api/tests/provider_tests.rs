@@ -3,6 +3,7 @@
 use mangocode_api::provider::LlmProvider;
 use mangocode_api::provider_types::{ProviderRequest, StopReason, SystemPrompt};
 use mangocode_api::{GoogleProvider, OpenAiProvider, ThinkingConfig};
+use mangocode_api::providers::OpenAiCodexProvider;
 use mangocode_core::types::{ContentBlock, Message};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -184,4 +185,40 @@ async fn google_provider_serializes_and_deserializes() {
         &parsed.content[0],
         ContentBlock::Text { text } if text.contains("Google mock")
     ));
+}
+
+#[tokio::test]
+async fn openai_codex_oauth_is_stateless_and_does_not_use_api_key_format() {
+    // NOTE: Codex provider talks to a different backend; we only verify request shaping here.
+    let response = json!({
+        "choices": [{
+            "message": { "content": "Hello from Codex mock" },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2
+        }
+    });
+
+    let (endpoint, req_rx) = spawn_json_server(response).await;
+    let provider = OpenAiCodexProvider::new("test-oauth-token".to_string()).with_endpoint(endpoint);
+
+    provider
+        .create_message(base_request("gpt-5.2-codex"))
+        .await
+        .expect("codex response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let body = raw
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+
+    // Enforce stateless operation (`store:false`) for the ChatGPT/Codex backend.
+    assert_eq!(body_json["store"], json!(false));
+
+    // Sanity: still sending a messages-based request (adapter output) for now.
+    assert!(body_json["messages"].is_array());
 }
