@@ -44,3 +44,6 @@ pub use mock::MockProvider;
 
 pub mod anthropic_oauth;
 pub use anthropic_oauth::AnthropicMaxProvider;
+
+pub mod openai_codex;
+pub use openai_codex::OpenAiCodexProvider;

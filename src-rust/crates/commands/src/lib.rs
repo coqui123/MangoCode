@@ -2632,6 +2632,11 @@ impl SlashCommand for VaultCommand {
                 let rows: &[(&str, &str, &str)] = &[
                     ("anthropic", "ANTHROPIC_API_KEY", ""),
                     ("openai", "OPENAI_API_KEY", ""),
+                    (
+                        "openai-codex",
+                        "(no env key — /connect → OpenAI Codex OAuth)",
+                        "ChatGPT-plan Codex; alias: codex",
+                    ),
                     ("google", "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY", ""),
                     ("azure", "AZURE_API_KEY (+ AZURE_RESOURCE_NAME)", ""),
                     ("cohere", "COHERE_API_KEY", ""),

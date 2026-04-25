@@ -95,6 +95,17 @@ $env:OPENAI_API_KEY = "your_key"
 $env:GOOGLE_API_KEY = "your_key"
 ```
 
+### OpenAI Codex (OAuth) vs OpenAI API key
+
+MangoCode treats these as **separate** auth paths:
+
+- **OpenAI Codex (OAuth)** (`openai-codex`, alias `codex`): sign in with your **ChatGPT** account so Codex requests use your ChatGPT plan. Run `/connect`, choose **OpenAI Codex (OAuth)**, complete the browser login (PKCE + `http://localhost:1455/auth/callback`). Tokens are stored under `~/.mangocode/auth.json` (and mirrored to `~/.mangocode/codex_tokens.json`). The app refreshes the access token automatically before expiry when a refresh token is present. The query engine uses a **synthesized** stream over one Codex HTTP response (no live SSE from the Codex endpoint yet).
+- **OpenAI** (`openai`): classic **API key** from [platform.openai.com](https://platform.openai.com/api-keys) — usage-based API billing. Use this for automation/CI or when you want platform billing instead of ChatGPT subscription access.
+
+**Remote / headless:** browser + localhost OAuth often fails over SSH, GitHub Codespaces, or some Dev Containers. MangoCode detects common cases and shows a targeted message; use API-key OpenAI on those hosts, or authenticate on a local machine first.
+
+**Optional:** to migrate tokens from the official Codex CLI, you can use the library helper `mangocode_core::oauth_config::import_codex_cli_auth_json` on a JSON file you export explicitly (MangoCode does not read `~/.codex/auth.json` automatically).
+
 ### Quick Provider Runs
 
 ```powershell

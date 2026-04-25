@@ -1233,7 +1233,10 @@ pub async fn run_query_loop(
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
                     "anthropic",
+                    "anthropic-max",
                     "openai",
+                    "openai-codex",
+                    "codex",
                     "google",
                     "groq",
                     "mistral",
@@ -1375,6 +1378,11 @@ pub async fn run_query_loop(
                                         // be sent to https://api.openai.com/v1 and rejected.
                                         "anthropic-max" => Some(std::sync::Arc::new(
                                             mangocode_api::providers::AnthropicMaxProvider::new(
+                                                key,
+                                            ),
+                                        )),
+                                        "openai-codex" | "codex" => Some(std::sync::Arc::new(
+                                            mangocode_api::providers::OpenAiCodexProvider::new(
                                                 key,
                                             ),
                                         )),
@@ -2190,6 +2198,8 @@ pub async fn run_query_loop(
                     let hint = match provider_id_str.as_str() {
                         "google" => "Set GOOGLE_API_KEY or run `mangocode auth login --provider google`.",
                         "openai" => "Set OPENAI_API_KEY or run `mangocode auth login --provider openai`.",
+                        "openai-codex" | "codex" => "Run /connect and choose OpenAI Codex (OAuth). ChatGPT-plan Codex is separate from OPENAI_API_KEY billing.",
+                        "anthropic-max" => "Run /connect → Claude Max (OAuth) to sign in with your Claude subscription.",
                         "groq" => "Set GROQ_API_KEY.",
                         "mistral" => "Set MISTRAL_API_KEY.",
                         "deepseek" => "Set DEEPSEEK_API_KEY.",

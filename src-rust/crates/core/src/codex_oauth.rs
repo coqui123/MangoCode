@@ -38,6 +38,25 @@ pub const CODEX_MODELS: &[(&str, &str)] = &[
 /// Default Codex model to use
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.2-codex";
 
+/// Heuristic for environments where `http://localhost:…` OAuth callbacks are
+/// often unreachable (SSH, Codespaces, Dev Containers, VS Code integrated terminal).
+pub fn likely_headless_or_remote() -> bool {
+    std::env::var("SSH_CONNECTION").is_ok()
+        || std::env::var("SSH_CLIENT").is_ok()
+        || std::env::var("CODESPACES").is_ok()
+        || std::env::var("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN").is_ok()
+        || std::env::var("REMOTE_CONTAINERS").is_ok()
+        || std::env::var("VSCODE_IPC_HOOK_CLI").is_ok()
+        || std::env::var("TERM_PROGRAM")
+            .map(|v| v.eq_ignore_ascii_case("vscode"))
+            .unwrap_or(false)
+}
+
+/// User-facing guidance when browser+localhost OAuth is unlikely to work.
+pub const HEADLESS_CODEX_OAUTH_HINT: &str = "OpenAI Codex browser login uses a localhost callback, which often fails over SSH, in GitHub Codespaces, or in some remote containers.\n\
+Authenticate on your local machine with MangoCode and `/connect`, or use OpenAI API key mode (`/connect` → OpenAI) for usage-based access.\n\
+Device-code login for Codex will be added when OpenAI documents a supported device authorization endpoint for this client.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +88,11 @@ mod tests {
     #[test]
     fn test_redirect_uri_is_localhost() {
         assert!(CODEX_REDIRECT_URI.contains("localhost:1455"));
+    }
+
+    #[test]
+    fn likely_headless_or_remote_is_boolean() {
+        // Smoke: must not panic regardless of test runner environment.
+        let _ = likely_headless_or_remote();
     }
 }

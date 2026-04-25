@@ -98,7 +98,7 @@ impl AnthropicProvider {
     }
 
     /// Build a [`CreateMessageRequest`] from a [`ProviderRequest`].
-    fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
+    pub(crate) fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
         let normalized_messages = normalize_anthropic_messages(&request.messages);
         let api_messages: Vec<ApiMessage> =
             normalized_messages.iter().map(ApiMessage::from).collect();

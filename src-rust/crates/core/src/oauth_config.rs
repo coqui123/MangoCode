@@ -358,6 +358,43 @@ pub fn is_codex_subscriber() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Optional: import Codex CLI auth file (explicit user action only)
+// ---------------------------------------------------------------------------
+
+/// Shape of `~/.codex/auth.json` produced by the official Codex CLI (subset).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodexCliAuthFile {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Unix seconds when the access token expires, if present.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub token_type: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+/// Read a Codex CLI auth JSON file into [`CodexTokens`].
+///
+/// Intended for explicit opt-in import flows only — MangoCode does not read
+/// this path automatically.
+pub fn import_codex_cli_auth_json(path: &std::path::Path) -> anyhow::Result<CodexTokens> {
+    let text = std::fs::read_to_string(path)?;
+    let parsed: CodexCliAuthFile = serde_json::from_str(&text)?;
+    if parsed.access_token.trim().is_empty() {
+        anyhow::bail!("import_codex_cli_auth_json: empty access_token");
+    }
+    Ok(CodexTokens {
+        access_token: parsed.access_token,
+        refresh_token: parsed.refresh_token,
+        account_id: None,
+        expires_at: parsed.expires_at,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -422,6 +459,21 @@ mod tests {
         assert!(url.contains("state456"));
         assert!(url.contains("S256"));
         assert!(url.contains("localhost"));
+    }
+
+    #[test]
+    fn import_codex_cli_auth_json_parses_minimal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"access_token":"atok","refresh_token":"rtok","expires_at":2000}"#,
+        )
+        .unwrap();
+        let t = import_codex_cli_auth_json(&path).expect("import");
+        assert_eq!(t.access_token, "atok");
+        assert_eq!(t.refresh_token.as_deref(), Some("rtok"));
+        assert_eq!(t.expires_at, Some(2000));
     }
 
     #[test]

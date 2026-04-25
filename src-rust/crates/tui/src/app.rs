@@ -1195,9 +1195,17 @@ impl App {
                     SelectItem {
                         id: "openai".into(),
                         title: "OpenAI".into(),
-                        description: "".into(),
+                        description: "API key — usage-based billing (platform.openai.com)".into(),
                         category: "Recommended".into(),
                         badge: None,
+                    },
+                    SelectItem {
+                        id: "openai-codex".into(),
+                        title: "OpenAI Codex (OAuth)".into(),
+                        description: "ChatGPT plan — Sign in with ChatGPT; not API usage billing"
+                            .into(),
+                        category: "Recommended".into(),
+                        badge: Some("OAUTH".into()),
                     },
                     SelectItem {
                         id: "google".into(),
@@ -1835,6 +1843,7 @@ impl App {
                 "xai",
                 "openrouter",
                 "github-copilot",
+                "openai-codex",
                 "cohere",
                 "perplexity",
                 "togetherai",
@@ -1855,6 +1864,8 @@ impl App {
 
         if model.starts_with("claude") {
             Some("anthropic".to_string())
+        } else if model.contains("-codex") {
+            Some("openai-codex".to_string())
         } else if model.starts_with("gpt-")
             || model.starts_with("o1")
             || model.starts_with("o3")
@@ -3039,19 +3050,24 @@ impl App {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
-                        let credential = if provider_id == "github-copilot"
-                            || provider_id == mangocode_core::ProviderId::ANTHROPIC_MAX
+                        if provider_id != mangocode_core::ProviderId::ANTHROPIC_MAX
+                            && provider_id != "openai-codex"
                         {
-                            // OAuth flows store a Bearer token, not a plain API key.
-                            mangocode_core::StoredCredential::OAuthToken {
-                                access: token.clone(),
-                                refresh: token,
-                                expires: 0,
-                            }
+                            let credential = if provider_id == "github-copilot" {
+                                // OAuth flows store a Bearer token, not a plain API key.
+                                mangocode_core::StoredCredential::OAuthToken {
+                                    access: token.clone(),
+                                    refresh: token,
+                                    expires: 0,
+                                }
+                            } else {
+                                mangocode_core::StoredCredential::ApiKey { key: token }
+                            };
+                            self.auth_store.set(&provider_id, credential);
                         } else {
-                            mangocode_core::StoredCredential::ApiKey { key: token }
-                        };
-                        self.auth_store.set(&provider_id, credential);
+                            // Browser OAuth flows persisted credentials in the background task.
+                            self.auth_store = mangocode_core::AuthStore::load();
+                        }
                         self.set_provider_default(provider_id.clone());
                         self.persist_provider_and_model();
                         self.has_credentials = true;
@@ -3182,6 +3198,17 @@ impl App {
                                 self.device_auth_pending = Some("anthropic-max".to_string());
                                 self.status_message = Some(
                                     "Step 2/3: complete browser OAuth login with your Claude subscription. Step 3/3 will finish automatically."
+                                        .to_string(),
+                                );
+                            }
+                            "openai-codex" => {
+                                self.device_auth_dialog.open(
+                                    "openai-codex".into(),
+                                    "OpenAI Codex (OAuth)".into(),
+                                );
+                                self.device_auth_pending = Some("openai-codex".to_string());
+                                self.status_message = Some(
+                                    "Step 2/3: browser opens for ChatGPT (Codex) sign-in — localhost callback on port 1455. Best for interactive use on your own machine; use OpenAI (API key) for CI. Step 3/3: press any key after success."
                                         .to_string(),
                                 );
                             }

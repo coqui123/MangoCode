@@ -13,7 +13,8 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicMaxProvider, AnthropicProvider, AzureProvider, BedrockProvider, CohereProvider,
-    CopilotProvider, GoogleProvider, MinimaxProvider, OpenAiProvider, VertexOpenAiProvider,
+    CopilotProvider, GoogleProvider, MinimaxProvider, OpenAiCodexProvider, OpenAiProvider,
+    VertexOpenAiProvider,
 };
 
 fn vault_key_aliases(provider_id: &str) -> &'static [&'static str] {
@@ -221,6 +222,17 @@ impl ProviderRegistry {
         self
     }
 
+    /// Register [`OpenAiCodexProvider`] when ChatGPT-plan Codex OAuth tokens are
+    /// stored under `"openai-codex"` in the auth store. If only MangoCode's own
+    /// `~/.mangocode/codex_tokens.json` exists, [`OpenAiCodexProvider::from_auth_store`]
+    /// merges it into `auth.json` on first load.
+    pub fn with_openai_codex_if_configured(&mut self) -> &mut Self {
+        if let Some(p) = OpenAiCodexProvider::from_auth_store() {
+            self.register(Arc::new(p));
+        }
+        self
+    }
+
     /// Build a registry with **all** providers that have credentials configured
     /// in the environment.  Anthropic is always the default provider.
     ///
@@ -236,6 +248,7 @@ impl ProviderRegistry {
             .with_cohere_if_key_set()
             .with_vertex_if_configured()
             .with_anthropic_max_if_configured()
+            .with_openai_codex_if_configured()
             .with_available_providers();
         registry
     }
@@ -273,6 +286,9 @@ impl ProviderRegistry {
                     "anthropic-max" => {
                         // Claude Max uses Bearer auth — create from the OAuth access token
                         Some(Arc::new(AnthropicMaxProvider::new(key)))
+                    }
+                    "openai-codex" | "codex" => {
+                        Some(Arc::new(OpenAiCodexProvider::new(key)))
                     }
                     "openai" => Some(Arc::new(OpenAiProvider::new(key))),
                     "google" => Some(Arc::new(GoogleProvider::new(key))),

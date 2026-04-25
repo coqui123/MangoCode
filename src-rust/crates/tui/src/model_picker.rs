@@ -292,6 +292,16 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
         // Claude Max via OAuth — same model surface as the API provider, but
         // authenticated via Bearer token (user:inference scope).  The models are
         // identical; only the auth path differs.
+        "openai-codex" | "codex" => mangocode_core::codex_oauth::CODEX_MODELS
+            .iter()
+            .map(|(id, title)| {
+                model_entry(
+                    id,
+                    title,
+                    "ChatGPT plan / Codex OAuth — not OpenAI API usage billing",
+                )
+            })
+            .collect(),
         "anthropic-max" => vec![
             model_entry(
                 "claude-opus-4-6",
@@ -483,6 +493,12 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
     match provider_id {
         // Claude Max via OAuth — bare model IDs (no provider prefix), same as anthropic.
         "anthropic-max" => "claude-opus-4-6".to_string(),
+        "openai-codex" | "codex" => {
+            format!(
+                "openai-codex/{}",
+                mangocode_core::codex_oauth::DEFAULT_CODEX_MODEL
+            )
+        }
         "anthropic" => "claude-opus-4-6".to_string(),
         "openai" => "openai/gpt-4o".to_string(),
         "google" => "google/gemini-2.5-flash".to_string(),

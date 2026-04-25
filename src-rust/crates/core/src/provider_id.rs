@@ -71,6 +71,8 @@ impl ProviderId {
     pub const NOVITA: &'static str = "novita";
     pub const MINIMAX: &'static str = "minimax";
     pub const ANTHROPIC_MAX: &'static str = "anthropic-max";
+    /// OpenAI Codex (ChatGPT plan) via OAuth — distinct from API-key `openai`.
+    pub const OPENAI_CODEX: &'static str = "openai-codex";
 }
 
 impl fmt::Display for ProviderId {

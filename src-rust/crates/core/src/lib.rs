@@ -996,6 +996,7 @@ pub mod config {
                 Some("cohere") => "command-r-plus",
                 Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
                 Some("github-copilot") => "gpt-4o",
+                Some("openai-codex") | Some("codex") => crate::codex_oauth::DEFAULT_CODEX_MODEL,
                 Some("ollama") => "llama3.2",
                 Some("lmstudio") => "default",
                 Some("llamacpp") => "default",

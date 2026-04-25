@@ -5,11 +5,12 @@
 //! are translated back to Anthropic's CreateMessageResponse format.
 
 use super::types::{CreateMessageRequest, CreateMessageResponse, SystemPrompt};
+use mangocode_core::codex_oauth::CODEX_API_ENDPOINT;
 use mangocode_core::types::UsageInfo;
 use serde_json::{json, Value};
 
-/// OpenAI Codex API endpoint for responses
-pub const CODEX_RESPONSES_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+/// OpenAI Codex API endpoint for responses (ChatGPT plan / Codex OAuth).
+pub const CODEX_RESPONSES_ENDPOINT: &str = CODEX_API_ENDPOINT;
 
 /// Convert an Anthropic CreateMessageRequest to OpenAI ChatCompletion request format.
 pub fn anthropic_to_openai_request(request: &CreateMessageRequest) -> Value {

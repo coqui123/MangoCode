@@ -293,7 +293,7 @@ struct Cli {
     #[arg(long = "fallback-model")]
     fallback_model: Option<String>,
 
-    /// LLM provider to use (default: anthropic). Examples: openai, google, ollama
+    /// LLM provider to use (default: anthropic). Examples: openai, openai-codex, google, ollama
     #[arg(long, env = "MANGOCODE_PROVIDER")]
     provider: Option<String>,
 
@@ -1013,7 +1013,8 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!(
                     "No API key found. Options:\n\
                      - Set ANTHROPIC_API_KEY for Anthropic\n\
-                     - Set OPENAI_API_KEY for OpenAI\n\
+                     - Set OPENAI_API_KEY for OpenAI (usage-based API; not ChatGPT-plan Codex)\n\
+                     - For OpenAI Codex (ChatGPT plan): run MangoCode interactively once, `/connect` → OpenAI Codex (OAuth), then use `--provider openai-codex` headless with `~/.mangocode/auth.json` populated\n\
                      - Set GOOGLE_API_KEY for Google Gemini\n\
                      - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
                      - Run `mangocode --provider ollama` for local models (no key needed)\n\
@@ -2436,9 +2437,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         // If the user completed a `/connect` flow (OAuth or API key) during this
         // session, `auth.json` on disk has new credentials but the in-memory
         // registry was built at startup and is stale. Rebuild it so the next
-        // dispatched query can actually find providers like `anthropic-max`
-        // (otherwise the query dispatcher falls back to the generic OpenAI-
-        // compatible client and sends sk-ant-oat-* tokens to api.openai.com).
+        // dispatched query can actually find providers like `anthropic-max` or
+        // `openai-codex` (otherwise the query dispatcher may fall back to the
+        // generic OpenAI-compatible client and mis-route credentials).
         if app.provider_registry_stale {
             app.provider_registry_stale = false;
             let refreshed = std::sync::Arc::new(
@@ -3477,6 +3478,50 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             }
                             Err(e) => {
                                 let _ = tx2.send(DeviceAuthEvent::Error(e)).await;
+                            }
+                        }
+                    });
+                }
+                "openai-codex" => {
+                    let tx2 = device_auth_tx.clone();
+                    tokio::spawn(async move {
+                        if mangocode_core::codex_oauth::likely_headless_or_remote() {
+                            let _ = tx2
+                                .send(DeviceAuthEvent::Error(
+                                    mangocode_core::codex_oauth::HEADLESS_CODEX_OAUTH_HINT
+                                        .to_string(),
+                                ))
+                                .await;
+                            return;
+                        }
+
+                        match crate::codex_oauth_flow::run_oauth_flow(tx2.clone()).await {
+                            Ok(tokens) => {
+                                let expires_ms = tokens
+                                    .expires_at
+                                    .map(|sec| sec.saturating_mul(1000))
+                                    .unwrap_or(0);
+                                let mut store = mangocode_core::AuthStore::load();
+                                store.set(
+                                    mangocode_core::ProviderId::OPENAI_CODEX,
+                                    mangocode_core::auth_store::StoredCredential::OAuthToken {
+                                        access: tokens.access_token.clone(),
+                                        refresh: tokens
+                                            .refresh_token
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        expires: expires_ms,
+                                    },
+                                );
+                                let _ = mangocode_core::oauth_config::save_codex_tokens(&tokens);
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(
+                                        "OpenAI Codex (OAuth)".to_string(),
+                                    ))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e.to_string())).await;
                             }
                         }
                     });

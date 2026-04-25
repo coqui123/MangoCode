@@ -151,8 +151,15 @@ impl AuthStore {
     /// Get the API key for a provider, checking stored credentials first then
     /// falling back to the relevant environment variable.
     pub fn api_key_for(&self, provider_id: &str) -> Option<String> {
+        // `codex` is an alias for the canonical OAuth provider `openai-codex`.
+        let storage_key = if provider_id == "codex" {
+            ProviderId::OPENAI_CODEX
+        } else {
+            provider_id
+        };
+
         // Check stored credentials first
-        if let Some(stored) = self.get(provider_id) {
+        if let Some(stored) = self.get(storage_key) {
             match stored {
                 StoredCredential::ApiKey { key } => {
                     if !key.is_empty() {
@@ -171,6 +178,13 @@ impl AuthStore {
                 }
                 StoredCredential::OAuthToken { access, .. }
                     if provider_id == "anthropic-max" =>
+                {
+                    if !access.is_empty() {
+                        return Some(access.clone());
+                    }
+                }
+                StoredCredential::OAuthToken { access, .. }
+                    if storage_key == ProviderId::OPENAI_CODEX =>
                 {
                     if !access.is_empty() {
                         return Some(access.clone());
@@ -210,5 +224,31 @@ impl AuthStore {
             _ => return None,
         };
         std::env::var(env_var).ok().filter(|k| !k.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_for_codex_alias_reads_openai_codex_oauth() {
+        let mut store = AuthStore::default();
+        store.credentials.insert(
+            ProviderId::OPENAI_CODEX.to_string(),
+            StoredCredential::OAuthToken {
+                access: "oauth-access-test".into(),
+                refresh: "".into(),
+                expires: 0,
+            },
+        );
+        assert_eq!(
+            store.api_key_for("codex").as_deref(),
+            Some("oauth-access-test")
+        );
+        assert_eq!(
+            store.api_key_for(ProviderId::OPENAI_CODEX).as_deref(),
+            Some("oauth-access-test")
+        );
     }
 }
