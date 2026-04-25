@@ -554,16 +554,34 @@ pub mod client {
             &self,
             request: &CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
-            // Convert Anthropic format to OpenAI format
-            let openai_req = codex_adapter::anthropic_to_openai_request(request);
+            // Convert Anthropic format to Codex Responses format
+            let body = codex_adapter::anthropic_to_codex_responses_request(request);
 
             // Send to Codex endpoint
             let client = reqwest::Client::new();
+            let token = self.config.api_key.as_str();
+            let account_id = mangocode_core::codex_oauth::extract_chatgpt_account_id(token);
+
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                    .map_err(|e| ClaudeError::Other(format!("Codex auth header build failed: {}", e)))?,
+            );
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            if let Some(id) = account_id {
+                if let Ok(v) = reqwest::header::HeaderValue::from_str(&id) {
+                    headers.insert("chatgpt-account-id", v);
+                }
+            }
+
             let resp = client
                 .post(codex_adapter::CODEX_RESPONSES_ENDPOINT)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .header("Content-Type", "application/json")
-                .json(&openai_req)
+                .headers(headers)
+                .json(&body)
                 .timeout(self.config.request_timeout)
                 .send()
                 .await
@@ -579,7 +597,7 @@ pub mod client {
             // Parse OpenAI response and convert to Anthropic format
             let openai_resp: Value = serde_json::from_str(&text).map_err(ClaudeError::Json)?;
             let (content, stop_reason, input_tokens, output_tokens) =
-                codex_adapter::parse_openai_response(&openai_resp);
+                codex_adapter::parse_codex_response(&openai_resp);
 
             let response = codex_adapter::build_anthropic_response(
                 &content,

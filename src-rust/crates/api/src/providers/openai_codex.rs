@@ -6,7 +6,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
 use mangocode_core::auth_store::{AuthStore, StoredCredential};
-use mangocode_core::codex_oauth::{CODEX_API_ENDPOINT, CODEX_CLIENT_ID, CODEX_TOKEN_URL};
+use mangocode_core::codex_oauth::{
+    extract_chatgpt_account_id, CODEX_API_ENDPOINT, CODEX_CLIENT_ID, CODEX_TOKEN_URL,
+};
 use mangocode_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::ContentBlock;
@@ -27,6 +29,9 @@ use crate::types::CreateMessageResponse;
 
 const REFRESH_SKEW_SECS: i64 = 120;
 const DISK_CHECK_INTERVAL_MS: i64 = 60_000;
+const CODEX_DEBUG_ENV: &str = "MANGOCODE_CODEX_DEBUG";
+const CODEX_OPENAI_BETA_VALUE: &str = "responses=experimental";
+const CODEX_ORIGINATOR_VALUE: &str = "codex_cli_rs";
 
 /// OpenAI Codex using a ChatGPT-plan OAuth access token against the Codex
 /// HTTP API (`chatgpt.com/backend-api/codex/...`).
@@ -34,6 +39,8 @@ pub struct OpenAiCodexProvider {
     id: ProviderId,
     http: reqwest::Client,
     endpoint: String,
+    /// Test-only: skip disk auth store reads in `ensure_fresh`.
+    skip_disk: bool,
     /// Latest Bearer access token used for `Authorization` headers.
     bearer: Arc<Mutex<String>>,
     cached_expiry_ms: Arc<Mutex<Option<i64>>>,
@@ -49,6 +56,7 @@ impl OpenAiCodexProvider {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             endpoint: CODEX_API_ENDPOINT.to_string(),
+            skip_disk: false,
             bearer: Arc::new(Mutex::new(access_token)),
             cached_expiry_ms: Arc::new(Mutex::new(None)),
             last_disk_check_ms: Arc::new(Mutex::new(None)),
@@ -59,6 +67,22 @@ impl OpenAiCodexProvider {
     pub fn with_endpoint(mut self, endpoint: String) -> Self {
         self.endpoint = endpoint;
         self
+    }
+
+    /// Test helper: avoid loading `~/.mangocode/auth.json` during requests.
+    pub fn with_skip_disk(mut self, skip_disk: bool) -> Self {
+        self.skip_disk = skip_disk;
+        self
+    }
+
+    fn debug_enabled() -> bool {
+        std::env::var(CODEX_DEBUG_ENV)
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
     }
 
     /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
@@ -197,6 +221,9 @@ impl OpenAiCodexProvider {
 
     /// Refresh the access token when near expiry; updates disk and in-memory bearer.
     async fn ensure_fresh(&self) {
+        if self.skip_disk {
+            return;
+        }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let should_check_disk = {
             let last = self.last_disk_check_ms.lock().await;
@@ -290,14 +317,90 @@ impl LlmProvider for OpenAiCodexProvider {
         }
 
         let anthropic_req = AnthropicProvider::build_request(&request);
-        let openai_body = codex_adapter::anthropic_to_openai_request(&anthropic_req);
+        let body = codex_adapter::anthropic_to_codex_responses_request(&anthropic_req);
+
+        let account_id = extract_chatgpt_account_id(&token);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
+                ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Codex auth header build failed: {}", e),
+                    status: None,
+                    body: None,
+                }
+            })?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        // Mirror the Codex backend headers used by reference implementations.
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_OPENAI_BETA_VALUE),
+        );
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR_VALUE),
+        );
+        // Plugin behavior: only send conversation/session headers when a promptCacheKey exists.
+        // We look for common spellings in provider_options.
+        let prompt_cache_key = request
+            .provider_options
+            .get("promptCacheKey")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("prompt_cache_key")
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| request.provider_options.get("conversation_id").and_then(|v| v.as_str()))
+            .map(|s| s.to_string());
+
+        if let Some(ref key) = prompt_cache_key {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
+                headers.insert("conversation_id", v);
+            }
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+            {
+                headers.insert("session_id", v);
+            }
+        }
+        if let Some(ref id) = account_id {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(id) {
+                headers.insert("chatgpt-account-id", v);
+            }
+        }
+
+        if Self::debug_enabled() {
+            let header_names = headers
+                .keys()
+                .map(|k| k.as_str().to_string())
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                provider = "openai-codex",
+                url = %self.endpoint,
+                model = %request.model,
+                has_account_id = account_id.is_some(),
+                header_names = ?header_names,
+                top_level_keys = ?body.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                "sending Codex request"
+            );
+        }
 
         let resp = self
             .http
             .post(&self.endpoint)
-            .header("Authorization", format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .json(&openai_body)
+            .headers(headers)
+            .json(&body)
             .send()
             .await
             .map_err(|e| ProviderError::Other {
@@ -308,6 +411,13 @@ impl LlmProvider for OpenAiCodexProvider {
             })?;
 
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
         let text = resp.text().await.map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
             message: e.to_string(),
@@ -322,6 +432,15 @@ impl LlmProvider for OpenAiCodexProvider {
                     message: "OpenAI Codex OAuth token was rejected. Run /connect → OpenAI Codex (OAuth) to sign in again.".to_string(),
                 });
             }
+            if Self::debug_enabled() {
+                tracing::debug!(
+                    provider = "openai-codex",
+                    status = %status,
+                    content_type = %content_type,
+                    body = %text,
+                    "Codex request failed"
+                );
+            }
             return Err(ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Codex API error ({})", status),
@@ -330,15 +449,26 @@ impl LlmProvider for OpenAiCodexProvider {
             });
         }
 
-        let openai_resp: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Codex JSON parse error: {}", e),
-            status: None,
-            body: None,
-        })?;
+        // Codex may respond with SSE (text/event-stream) even for non-streaming requests.
+        let openai_resp: Value = if content_type.to_ascii_lowercase().contains("text/event-stream")
+        {
+            codex_adapter::sse_to_last_json_value(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex SSE parse error: {}", e),
+                status: None,
+                body: None,
+            })?
+        } else {
+            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex JSON parse error: {}", e),
+                status: None,
+                body: None,
+            })?
+        };
 
         let (content, stop_reason, input_tokens, output_tokens) =
-            codex_adapter::parse_openai_response(&openai_resp);
+            codex_adapter::parse_codex_response(&openai_resp);
         let cmr = codex_adapter::build_anthropic_response(
             &content,
             &stop_reason,

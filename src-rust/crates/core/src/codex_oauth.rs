@@ -27,6 +27,7 @@ pub const CODEX_SCOPES: &str = "openid profile email offline_access";
 
 /// Available Codex models
 pub const CODEX_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.3-codex", "GPT-5.3 Codex"),
     ("gpt-5.2-codex", "GPT-5.2 Codex (default)"),
     ("gpt-5.1-codex", "GPT-5.1 Codex"),
     ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
@@ -57,9 +58,62 @@ pub const HEADLESS_CODEX_OAUTH_HINT: &str = "OpenAI Codex browser login uses a l
 Authenticate on your local machine with MangoCode and `/connect`, or use OpenAI API key mode (`/connect` → OpenAI) for usage-based access.\n\
 Device-code login for Codex will be added when OpenAI documents a supported device authorization endpoint for this client.";
 
+// ---------------------------------------------------------------------------
+// JWT helpers (Codex OAuth)
+// ---------------------------------------------------------------------------
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use serde_json::Value;
+
+/// Decode the JWT payload (2nd segment) into JSON.
+///
+/// Codex OAuth access tokens are JWTs. We avoid validating signatures here; we
+/// only need selected claims to build Codex backend headers.
+pub fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let mut parts = token.splitn(3, '.');
+    let _header_b64 = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _sig_b64 = parts.next()?;
+
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    serde_json::from_slice::<Value>(&payload_bytes).ok()
+}
+
+/// Extract a ChatGPT/Codex account id from a Codex OAuth access token.
+///
+/// Different clients have historically used different claim paths. We try the
+/// plugin-documented keys first, then fall back to older MangoCode-derived ones.
+pub fn extract_chatgpt_account_id(token: &str) -> Option<String> {
+    let payload = decode_jwt_payload(token)?;
+
+    // Plugin-described location often appears nested under a key that itself
+    // contains slashes (cannot be accessed via JSON Pointer safely).
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(|v| v.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        // Sometimes flattened.
+        .or_else(|| {
+            payload
+                .get("chatgpt_account_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        // Older MangoCode extraction (account_id).
+        .or_else(|| {
+            payload
+                .get("https://api.openai.com/auth")
+                .and_then(|v| v.get("account_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn test_codex_constants_not_empty() {
@@ -94,5 +148,24 @@ mod tests {
     fn likely_headless_or_remote_is_boolean() {
         // Smoke: must not panic regardless of test runner environment.
         let _ = likely_headless_or_remote();
+    }
+
+    #[test]
+    fn decode_jwt_payload_rejects_non_jwt() {
+        assert!(decode_jwt_payload("not.a.jwt").is_none());
+    }
+
+    #[test]
+    fn extract_chatgpt_account_id_none_for_invalid() {
+        assert!(extract_chatgpt_account_id("not.a.jwt").is_none());
+    }
+
+    #[test]
+    fn extract_chatgpt_account_id_from_nested_claim() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#,
+        );
+        let token = format!("{}.{}.{}", "hdr", payload, "sig");
+        assert_eq!(extract_chatgpt_account_id(&token).as_deref(), Some("acct_123"));
     }
 }
