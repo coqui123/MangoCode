@@ -42,8 +42,8 @@ use crate::tasks_overlay::render_tasks_overlay;
 use crate::theme_screen::render_theme_screen;
 use crate::virtual_list::{VirtualItem, VirtualList};
 use crate::voice_mode_notice::render_voice_mode_notice;
-use mangocode_core::constants::APP_VERSION;
 use chrono;
+use mangocode_core::constants::APP_VERSION;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -56,9 +56,7 @@ use unicode_width::UnicodeWidthStr;
 // Sequence is intentionally asymmetric; `spinner_char` below uses a stepped
 // index progression so motion is less pendulum-like than a mirrored list.
 #[cfg(target_os = "windows")]
-const SPINNER: &[char] = &[
-    '.', '*', '+', 'x', 'o', '*', 'x', '+', 'o', '*',
-];
+const SPINNER: &[char] = &['.', '*', '+', 'x', 'o', '*', 'x', '+', 'o', '*'];
 #[cfg(not(target_os = "windows"))]
 const SPINNER: &[char] = &[
     '\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}', '\u{2736}', '\u{2733}',
@@ -116,7 +114,9 @@ pub fn reset_sixel_blit_state() {
 
 fn spinner_char(frame_count: u64) -> char {
     let len = SPINNER.len() as u64;
-    let stepped = frame_count.saturating_mul(5).saturating_add(frame_count / 3);
+    let stepped = frame_count
+        .saturating_mul(5)
+        .saturating_add(frame_count / 3);
     SPINNER[(stepped % len) as usize]
 }
 
@@ -1091,10 +1091,14 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
                             while let Some(rel) = span_lc[cursor..].find(query_lc.as_str()) {
                                 let abs = cursor + rel;
                                 if abs > cursor {
-                                    result.push(Span::styled(text[cursor..abs].to_string(), original_style));
+                                    result.push(Span::styled(
+                                        text[cursor..abs].to_string(),
+                                        original_style,
+                                    ));
                                 }
 
-                                let is_current = current_match.is_some_and(|idx| idx == match_cursor);
+                                let is_current =
+                                    current_match.is_some_and(|idx| idx == match_cursor);
                                 let style = if is_current {
                                     original_style
                                         .bg(Color::Rgb(255, 176, 32))
@@ -1110,7 +1114,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
                             }
 
                             if cursor < text.len() {
-                                result.push(Span::styled(text[cursor..].to_string(), original_style));
+                                result
+                                    .push(Span::styled(text[cursor..].to_string(), original_style));
                             }
                             result
                         })
@@ -1649,19 +1654,21 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         // Group sessions by date and show the last 3 days
         use std::collections::HashMap;
         let mut daily_tokens: HashMap<String, u64> = HashMap::new();
-        
+
         for session in &ledger.sessions {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&session.timestamp) {
                 let date = dt.format("%Y-%m-%d").to_string();
-                let total = session.input_tokens + session.output_tokens 
-                    + session.cache_creation_tokens + session.cache_read_tokens;
+                let total = session.input_tokens
+                    + session.output_tokens
+                    + session.cache_creation_tokens
+                    + session.cache_read_tokens;
                 *daily_tokens.entry(date).or_insert(0) += total;
             }
         }
-        
+
         let mut recent_days: Vec<_> = daily_tokens.into_iter().collect();
         recent_days.sort_by(|a, b| b.0.cmp(&a.0)); // Sort by date descending
-        
+
         for (date, tokens) in recent_days.iter().take(3) {
             right_lines.push(Line::from(Span::styled(
                 format!("  {}: {}", date, format_tokens(*tokens)),

@@ -145,7 +145,7 @@ impl AnthropicMaxProvider {
         const DISK_CHECK_INTERVAL_MS: i64 = 60 * 1000; // 60 seconds
 
         let now_ms = chrono::Utc::now().timestamp_millis();
-        
+
         // Check if we need to read from disk (rate limiting)
         let should_check_disk = {
             let last_check = self.last_disk_check_ms.lock().await;
@@ -203,9 +203,8 @@ impl AnthropicMaxProvider {
                 if let Some(expiry) = updated.expires_at_ms {
                     *self.cached_expiry_ms.lock().await = Some(expiry);
                 }
-                let new_inner = AnthropicProvider::from_config(max_client_config(
-                    updated.access_token.clone(),
-                ));
+                let new_inner =
+                    AnthropicProvider::from_config(max_client_config(updated.access_token.clone()));
                 *self.inner.lock().await = new_inner;
             }
             Err(e) => {

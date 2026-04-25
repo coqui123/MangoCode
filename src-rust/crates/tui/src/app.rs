@@ -20,6 +20,7 @@ use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
 use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
+use crate::slash_commands::{prompt_slash_commands, SlashCommandSpec};
 use crate::stats_dialog::StatsDialogState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::theme_screen::ThemeScreen;
@@ -32,7 +33,8 @@ use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::file_history::FileHistory;
 use mangocode_core::keybindings::{
-    KeybindingProfile, KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
+    KeyContext, KeybindingProfile, KeybindingResolver, KeybindingResult, ParsedKeystroke,
+    UserKeybindings,
 };
 use mangocode_core::types::{ContentBlock, Message, Role};
 use mangocode_query::QueryEvent;
@@ -44,7 +46,6 @@ use std::io::Stdout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::debug;
-use crate::slash_commands::{prompt_slash_commands, SlashCommandSpec};
 
 const PASTE_BURST_PRINTABLE_GAP: Duration = Duration::from_millis(120);
 const PASTE_BURST_IDLE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -1628,7 +1629,10 @@ impl App {
             };
         }
 
-        push_if!(self.permission_request.is_some(), ModalOwner::PermissionRequest);
+        push_if!(
+            self.permission_request.is_some(),
+            ModalOwner::PermissionRequest
+        );
         push_if!(self.settings_screen.visible, ModalOwner::Settings);
         push_if!(self.theme_screen.visible, ModalOwner::Theme);
         push_if!(self.privacy_screen.visible, ModalOwner::Privacy);
@@ -1636,12 +1640,18 @@ impl App {
         push_if!(self.mcp_view.open, ModalOwner::McpView);
         push_if!(self.agents_menu.open, ModalOwner::AgentsMenu);
         push_if!(self.diff_viewer.open, ModalOwner::DiffViewer);
-        push_if!(self.bypass_permissions_dialog.visible, ModalOwner::BypassPermissions);
+        push_if!(
+            self.bypass_permissions_dialog.visible,
+            ModalOwner::BypassPermissions
+        );
         push_if!(self.onboarding_dialog.visible, ModalOwner::Onboarding);
         push_if!(self.device_auth_dialog.visible, ModalOwner::DeviceAuth);
         push_if!(self.key_input_dialog.visible, ModalOwner::KeyInput);
         push_if!(self.connect_dialog.visible, ModalOwner::Connect);
-        push_if!(self.invalid_config_dialog.visible, ModalOwner::InvalidConfig);
+        push_if!(
+            self.invalid_config_dialog.visible,
+            ModalOwner::InvalidConfig
+        );
         push_if!(self.desktop_upsell.visible, ModalOwner::DesktopUpsell);
         push_if!(
             self.memory_update_notification.visible,
@@ -1650,7 +1660,10 @@ impl App {
         push_if!(self.voice_mode_notice.visible, ModalOwner::VoiceModeNotice);
         push_if!(self.overage_upsell.visible, ModalOwner::OverageUpsell);
         push_if!(self.hooks_config_menu.visible, ModalOwner::HooksConfig);
-        push_if!(self.memory_file_selector.visible, ModalOwner::MemoryFileSelector);
+        push_if!(
+            self.memory_file_selector.visible,
+            ModalOwner::MemoryFileSelector
+        );
         push_if!(self.feedback_survey.visible, ModalOwner::FeedbackSurvey);
         push_if!(self.go_to_line_dialog.active, ModalOwner::GoToLineDialog);
         push_if!(self.mcp_approval.visible, ModalOwner::McpApproval);
@@ -1666,7 +1679,10 @@ impl App {
             self.history_search_overlay.visible || self.history_search.is_some(),
             ModalOwner::HistorySearch
         );
-        push_if!(self.help_overlay.visible || self.show_help, ModalOwner::Help);
+        push_if!(
+            self.help_overlay.visible || self.show_help,
+            ModalOwner::Help
+        );
         push_if!(self.tasks_overlay.visible, ModalOwner::Tasks);
         push_if!(self.rewind_flow.visible, ModalOwner::Rewind);
 
@@ -1678,10 +1694,7 @@ impl App {
     }
 
     fn expire_paste_burst_if_idle(&mut self, now: std::time::Instant) {
-        if self
-            .paste_burst_until
-            .is_some_and(|until| now >= until)
-        {
+        if self.paste_burst_until.is_some_and(|until| now >= until) {
             self.paste_burst_until = None;
             self.paste_burst_printable_streak = 0;
             self.paste_burst_last_printable_at = None;
@@ -1690,8 +1703,7 @@ impl App {
     }
 
     fn is_in_paste_burst(&self, now: std::time::Instant) -> bool {
-        self.paste_burst_until
-            .is_some_and(|until| now < until)
+        self.paste_burst_until.is_some_and(|until| now < until)
     }
 
     fn activate_paste_burst(&mut self, now: std::time::Instant) {
@@ -1732,21 +1744,26 @@ impl App {
                 let burst_len = self.prompt_input.cursor.saturating_sub(start);
                 if burst_len > 1024 {
                     // Extract the burst text, collapse it
-                    let burst_text: String = self.prompt_input.text[start..self.prompt_input.cursor].to_string();
+                    let burst_text: String =
+                        self.prompt_input.text[start..self.prompt_input.cursor].to_string();
                     let line_count = burst_text.lines().count();
                     self.prompt_input.paste_counter += 1;
                     let placeholder = if line_count > 1 {
-                        format!("[Blob:{} lines={}]", self.prompt_input.paste_counter, line_count)
+                        format!(
+                            "[Blob:{} lines={}]",
+                            self.prompt_input.paste_counter, line_count
+                        )
                     } else {
                         format!("[Blob:{}]", self.prompt_input.paste_counter)
                     };
                     // Store the original content for when the message is submitted
-                    self.prompt_input.paste_contents.insert(
-                        self.prompt_input.paste_counter,
-                        burst_text,
-                    );
+                    self.prompt_input
+                        .paste_contents
+                        .insert(self.prompt_input.paste_counter, burst_text);
                     // Replace the burst text with the placeholder
-                    self.prompt_input.text.replace_range(start..self.prompt_input.cursor, &placeholder);
+                    self.prompt_input
+                        .text
+                        .replace_range(start..self.prompt_input.cursor, &placeholder);
                     self.prompt_input.cursor = start + placeholder.len();
                     self.prompt_input.update_token_estimate();
                     // Reset burst tracking for the next paste
@@ -2296,12 +2313,18 @@ impl App {
 
         self.invalidate_transcript();
         let haystack = self.transcript_search_haystack();
-        let total = Self::count_case_insensitive_occurrences(&haystack, &self.transcript_search.query);
+        let total =
+            Self::count_case_insensitive_occurrences(&haystack, &self.transcript_search.query);
         self.transcript_search.total_matches = total;
         self.transcript_search.current_match = if total == 0 {
             None
         } else {
-            Some(self.transcript_search.current_match.unwrap_or(0).min(total - 1))
+            Some(
+                self.transcript_search
+                    .current_match
+                    .unwrap_or(0)
+                    .min(total - 1),
+            )
         };
     }
 
@@ -2734,7 +2757,8 @@ impl App {
 
     fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
-        self.prompt_input.update_suggestions(&self.prompt_slash_commands);
+        self.prompt_input
+            .update_suggestions(&self.prompt_slash_commands);
         self.sync_legacy_prompt_fields();
     }
 
@@ -3202,10 +3226,8 @@ impl App {
                                 );
                             }
                             "openai-codex" => {
-                                self.device_auth_dialog.open(
-                                    "openai-codex".into(),
-                                    "OpenAI Codex (OAuth)".into(),
-                                );
+                                self.device_auth_dialog
+                                    .open("openai-codex".into(), "OpenAI Codex (OAuth)".into());
                                 self.device_auth_pending = Some("openai-codex".to_string());
                                 self.status_message = Some(
                                     "Step 2/3: browser opens for ChatGPT (Codex) sign-in — localhost callback on port 1455. Best for interactive use on your own machine; use OpenAI (API key) for CI. Step 3/3: press any key after success."
@@ -3874,10 +3896,8 @@ impl App {
                 self.handle_prompt_paste(&text, now);
                 // Many terminals (notably Windows Terminal) also deliver the same
                 // bytes as `Event::Paste` right after Ctrl+V; skip that duplicate.
-                self.suppress_duplicate_terminal_paste = Some((
-                    now + std::time::Duration::from_millis(150),
-                    text,
-                ));
+                self.suppress_duplicate_terminal_paste =
+                    Some((now + std::time::Duration::from_millis(150), text));
             }
             return false;
         }
@@ -5290,7 +5310,8 @@ impl App {
                     let now = std::time::Instant::now();
 
                     if mouse_event.modifiers.contains(KeyModifiers::ALT) {
-                        if let Some((start_row, end_row)) = self.find_line_boundaries(current_pos.1) {
+                        if let Some((start_row, end_row)) = self.find_line_boundaries(current_pos.1)
+                        {
                             self.selection_anchor = Some((selectable_area.x, start_row));
                             self.selection_focus = Some((
                                 selectable_area
@@ -5742,8 +5763,11 @@ impl App {
             // Draw the frame
             let render_start = std::time::Instant::now();
             terminal.draw(|f| render::render_app(f, self))?;
-            self.stats_dialog
-                .update_perf_metrics(None, Some(render_start.elapsed().as_micros() as u64), None);
+            self.stats_dialog.update_perf_metrics(
+                None,
+                Some(render_start.elapsed().as_micros() as u64),
+                None,
+            );
 
             // Poll for events with a short timeout so we can redraw for animation
             if event::poll(std::time::Duration::from_millis(50))? {
@@ -5802,8 +5826,11 @@ impl App {
                     }
                     _ => {}
                 }
-                self.stats_dialog
-                    .update_perf_metrics(Some(input_start.elapsed().as_micros() as u64), None, None);
+                self.stats_dialog.update_perf_metrics(
+                    Some(input_start.elapsed().as_micros() as u64),
+                    None,
+                    None,
+                );
             }
 
             self.stats_dialog.update_perf_metrics(
@@ -5926,7 +5953,6 @@ mod tests {
         // but we can verify the overlay initializes
         assert!(!app.help_overlay.visible);
     }
-
 
     #[test]
     fn test_exit_slash_command_sets_quit_flag() {

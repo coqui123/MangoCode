@@ -192,7 +192,14 @@ impl ModelPickerState {
 
         // Define display order
         // anthropic-max appears first so Claude Max is always at the top.
-        let order = ["anthropic-max", "anthropic", "openai", "google", "ollama", "other"];
+        let order = [
+            "anthropic-max",
+            "anthropic",
+            "openai",
+            "google",
+            "ollama",
+            "other",
+        ];
         let mut sections = Vec::new();
         for provider in order {
             if let Some(models) = by_provider.remove(provider) {

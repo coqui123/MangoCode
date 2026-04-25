@@ -132,7 +132,12 @@ async fn create_worktree_with_branch(
 
 async fn branch_exists(git_root: &Path, name: &str) -> bool {
     tokio::process::Command::new("git")
-        .args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{}", name)])
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
         .current_dir(git_root)
         .status()
         .await
@@ -249,7 +254,10 @@ async fn preserve_worktree_changes(
         return Ok(WorktreePreserveResult::DirtyUncommitted);
     }
 
-    if String::from_utf8_lossy(&post_status.stdout).trim().is_empty() {
+    if String::from_utf8_lossy(&post_status.stdout)
+        .trim()
+        .is_empty()
+    {
         Ok(WorktreePreserveResult::NoChanges)
     } else {
         Ok(WorktreePreserveResult::DirtyUncommitted)
@@ -556,9 +564,8 @@ impl Tool for AgentTool {
             _ => (ctx.working_dir.display().to_string(), None, None, None),
         };
 
-        let skill_index = std::sync::Arc::new(tokio::sync::RwLock::new(
-            crate::SkillIndex::default(),
-        ));
+        let skill_index =
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::SkillIndex::default()));
         let prefetch_root = ctx
             .config
             .project_dir
@@ -653,13 +660,12 @@ impl Tool for AgentTool {
             }
         }
 
-        let worktree_summary = if let (Some(ref root), Some(ref branch)) =
-            (&git_root, &worktree_branch)
-        {
-            Some(worktree_diff_summary(root, branch).await)
-        } else {
-            None
-        };
+        let worktree_summary =
+            if let (Some(ref root), Some(ref branch)) = (&git_root, &worktree_branch) {
+                Some(worktree_diff_summary(root, branch).await)
+            } else {
+                None
+            };
 
         // Cleanup worktree if one was created.
         if let (Some(root), Some(wt)) = (git_root, worktree_path) {
@@ -902,64 +908,65 @@ pub async fn execute_with_runtime(
     // -----------------------------------------------------------------------
     // System prompt strategy depends on mode.
     // -----------------------------------------------------------------------
-    let (agent_system_prompt, agent_append_system_prompt) =
-        if let Some(custom) = params.system_prompt.clone() {
-            (Some(custom), None)
-        } else {
-            match effective_mode {
-                AgentExecMode::Fork => {
-                    // Fork mode: preserve parent prompt stack so request shape
-                    // stays aligned with parent context and cache keys.
-                    let fork_nudge = "You are continuing work delegated by a parent agent. \
+    let (agent_system_prompt, agent_append_system_prompt) = if let Some(custom) =
+        params.system_prompt.clone()
+    {
+        (Some(custom), None)
+    } else {
+        match effective_mode {
+            AgentExecMode::Fork => {
+                // Fork mode: preserve parent prompt stack so request shape
+                // stays aligned with parent context and cache keys.
+                let fork_nudge = "You are continuing work delegated by a parent agent. \
                          The conversation history above is your parent's context. \
                          Complete the task thoroughly and return your findings."
-                        .to_string();
+                    .to_string();
 
-                    let append = match parent_query_config.append_system_prompt.clone() {
-                        Some(existing) => format!("{}\n\n{}", existing, fork_nudge),
-                        None => fork_nudge,
-                    };
+                let append = match parent_query_config.append_system_prompt.clone() {
+                    Some(existing) => format!("{}\n\n{}", existing, fork_nudge),
+                    None => fork_nudge,
+                };
 
-                    (parent_query_config.system_prompt.clone(), Some(append))
-                }
-                AgentExecMode::Teammate | AgentExecMode::Worktree => {
-                    // Teammate / Worktree: independent context, build role prompt.
-                    let mut role = "You are a specialized AI agent helping with a specific sub-task. \
+                (parent_query_config.system_prompt.clone(), Some(append))
+            }
+            AgentExecMode::Teammate | AgentExecMode::Worktree => {
+                // Teammate / Worktree: independent context, build role prompt.
+                let mut role = "You are a specialized AI agent helping with a specific sub-task. \
                      Complete the task thoroughly and return your findings."
-                        .to_string();
+                    .to_string();
 
-                    if let Some(registry) = mangocode_plugins::global_plugin_registry() {
-                        let mut agent_defs = String::new();
-                        for agent_dir in registry.all_agent_paths() {
-                            if let Ok(entries) = std::fs::read_dir(&agent_dir) {
-                                for entry in entries.flatten() {
-                                    let p = entry.path();
-                                    if p.extension().is_some_and(|e| e == "md") {
-                                        if let Ok(content) = std::fs::read_to_string(&p) {
-                                            let name = p
-                                                .file_stem()
-                                                .and_then(|s| s.to_str())
-                                                .unwrap_or("agent");
-                                            agent_defs.push_str(&format!(
-                                                "\n\n## Agent: {}\n{}",
-                                                name,
-                                                content.trim()
-                                            ));
-                                        }
+                if let Some(registry) = mangocode_plugins::global_plugin_registry() {
+                    let mut agent_defs = String::new();
+                    for agent_dir in registry.all_agent_paths() {
+                        if let Ok(entries) = std::fs::read_dir(&agent_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                if p.extension().is_some_and(|e| e == "md") {
+                                    if let Ok(content) = std::fs::read_to_string(&p) {
+                                        let name = p
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("agent");
+                                        agent_defs.push_str(&format!(
+                                            "\n\n## Agent: {}\n{}",
+                                            name,
+                                            content.trim()
+                                        ));
                                     }
                                 }
                             }
                         }
-                        if !agent_defs.is_empty() {
-                            role.push_str("\n\nThe following specialized agents are available:");
-                            role.push_str(&agent_defs);
-                        }
                     }
-
-                    (None, Some(role))
+                    if !agent_defs.is_empty() {
+                        role.push_str("\n\nThe following specialized agents are available:");
+                        role.push_str(&agent_defs);
+                    }
                 }
+
+                (None, Some(role))
             }
-        };
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Determine working directory and worktree state.
@@ -1134,8 +1141,7 @@ pub async fn execute_with_runtime(
         }
     }
 
-    let worktree_summary = if let (Some(ref root), Some(ref branch)) =
-        (&git_root, &worktree_branch)
+    let worktree_summary = if let (Some(ref root), Some(ref branch)) = (&git_root, &worktree_branch)
     {
         Some(worktree_diff_summary(root, branch).await)
     } else {

@@ -1223,8 +1223,8 @@ pub fn collapse_search_results(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mangocode_core::types::{ContentBlock, ToolResultContent};
     use mangocode_core::types::Message;
+    use mangocode_core::types::{ContentBlock, ToolResultContent};
 
     fn make_user(text: &str) -> Message {
         Message::user(text)

@@ -171,8 +171,7 @@ pub fn filter_tools_for_mode(
             .filter(|t| {
                 let name = t.name();
                 // Allow everything a Worker can use, plus worktree tools.
-                !COORDINATOR_ONLY_TOOLS.contains(&name)
-                    || WORKTREE_EXTRA_TOOLS.contains(&name)
+                !COORDINATOR_ONLY_TOOLS.contains(&name) || WORKTREE_EXTRA_TOOLS.contains(&name)
             })
             .map(|t| t.as_ref())
             .collect(),
@@ -267,7 +266,10 @@ pub fn match_session_mode_from_agent_mode(session_mode: AgentMode) -> Option<Str
 ///   (`install_skill_scripts`)
 pub fn resolve_skills_for_turn(
     user_message: &str,
-    skill_index: &std::collections::HashMap<String, mangocode_core::skill_discovery::DiscoveredSkill>,
+    skill_index: &std::collections::HashMap<
+        String,
+        mangocode_core::skill_discovery::DiscoveredSkill,
+    >,
 ) -> Vec<String> {
     use mangocode_core::skill_discovery::resolve_skills_for_message;
     resolve_skills_for_message(user_message, skill_index)

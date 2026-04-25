@@ -220,10 +220,7 @@ async fn watch_pr(params: PrWatchInput, _ctx: &ToolContext) -> ToolResult {
         return ToolResult::error(e);
     }
 
-    ToolResult::success(format!(
-        "Watching PR #{} (auto_analyze={}).",
-        pr, auto
-    ))
+    ToolResult::success(format!("Watching PR #{} (auto_analyze={}).", pr, auto))
 }
 
 async fn unwatch_pr(params: PrWatchInput) -> ToolResult {
@@ -387,7 +384,10 @@ fn is_failed(check: &CheckStatus) -> bool {
     .any(|needle| state.contains(needle) || conclusion.contains(needle))
 }
 
-async fn query_check_runs(working_dir: &Path, pr: u64) -> Result<HashMap<String, CheckRun>, String> {
+async fn query_check_runs(
+    working_dir: &Path,
+    pr: u64,
+) -> Result<HashMap<String, CheckRun>, String> {
     let checks_json = run_gh_json(
         working_dir,
         &[
@@ -457,7 +457,10 @@ async fn analyze_failed_checks(
         };
 
         let Some(run_id) = extract_run_id(link) else {
-            analyses.push(format!("- {}: could not parse run ID from {}", run.name, link));
+            analyses.push(format!(
+                "- {}: could not parse run ID from {}",
+                run.name, link
+            ));
             continue;
         };
 

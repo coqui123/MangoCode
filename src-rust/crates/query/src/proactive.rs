@@ -26,14 +26,7 @@ use tracing::{debug, info, warn};
 // Allowed tool names for the proactive agent (observe-only)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_TOOLS: &[&str] = &[
-    "Read",
-    "Grep",
-    "Glob",
-    "Bash",
-    "LSP",
-    "Brief",
-];
+const ALLOWED_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Bash", "LSP", "Brief"];
 
 const DENIED_TOOLS: &[&str] = &[
     "Write",
@@ -358,9 +351,9 @@ impl ProactiveAgent {
                 &tool_ctx,
                 &query_config,
                 cost_tracker,
-                None,  // no UI event channel
+                None, // no UI event channel
                 cancel_child,
-                None,  // no pending message queue
+                None, // no pending message queue
             )
             .await;
 
@@ -411,8 +404,7 @@ impl ProactiveAgent {
             file_changes: self.take_file_changes(),
             ci_status: gather_ci_status(&self.working_dir).await,
             pending_tasks: gather_pending_tasks(&self.session_id),
-            pr_alerts: mangocode_tools::heartbeat_scan_watched_prs(&self.working_dir, config)
-                .await,
+            pr_alerts: mangocode_tools::heartbeat_scan_watched_prs(&self.working_dir, config).await,
             lsp_diagnostics: gather_new_lsp_diagnostics(&self.last_context).await,
             last_error: gather_last_error(&self.session_id),
         }
@@ -467,7 +459,14 @@ fn start_file_watcher(
 
 async fn gather_ci_status(working_dir: &PathBuf) -> Option<CiStatus> {
     let output = tokio::process::Command::new("gh")
-        .args(["run", "list", "--limit", "1", "--json", "status,conclusion,name"])
+        .args([
+            "run",
+            "list",
+            "--limit",
+            "1",
+            "--json",
+            "status,conclusion,name",
+        ])
         .current_dir(working_dir)
         .output()
         .await;
@@ -510,7 +509,10 @@ fn gather_pending_tasks(session_id: &str) -> Vec<String> {
                 return None;
             }
             let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-            let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("(untitled)");
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(untitled)");
             Some(format!("{} ({})", content, id))
         })
         .collect()
@@ -659,7 +661,8 @@ struct ReadOnlyBashTool {
 
 impl ReadOnlyBashTool {
     fn args_contain_any(args: &[&str], needles: &[&str]) -> bool {
-        args.iter().any(|arg| needles.iter().any(|needle| arg == needle))
+        args.iter()
+            .any(|arg| needles.iter().any(|needle| arg == needle))
     }
 
     fn args_start_with_any(args: &[&str], prefixes: &[&str]) -> bool {
@@ -676,8 +679,7 @@ impl ReadOnlyBashTool {
         let args: Vec<&str> = parts.collect();
 
         match cmd {
-            "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "pwd" | "wc" | "stat"
-            | "nl" => true,
+            "ls" | "cat" | "head" | "tail" | "grep" | "rg" | "pwd" | "wc" | "stat" | "nl" => true,
             "find" => {
                 // `find` can mutate via actions like -delete / -exec / -fprint.
                 let forbidden_exact = ["-delete", "-ok", "-okdir", "-fls", "-ls"];
@@ -788,10 +790,16 @@ mod tests {
 
     #[test]
     fn read_only_blocks_common_bypasses() {
-        assert!(!ReadOnlyBashTool::is_read_only("python -c \"open('x','w').write('1')\""));
+        assert!(!ReadOnlyBashTool::is_read_only(
+            "python -c \"open('x','w').write('1')\""
+        ));
         assert!(!ReadOnlyBashTool::is_read_only("git commit -m test"));
-        assert!(!ReadOnlyBashTool::is_read_only("git remote add origin https://example.invalid/repo.git"));
-        assert!(!ReadOnlyBashTool::is_read_only("git diff --output=/tmp/patch.diff"));
+        assert!(!ReadOnlyBashTool::is_read_only(
+            "git remote add origin https://example.invalid/repo.git"
+        ));
+        assert!(!ReadOnlyBashTool::is_read_only(
+            "git diff --output=/tmp/patch.diff"
+        ));
         assert!(!ReadOnlyBashTool::is_read_only("git branch -D old-branch"));
         assert!(!ReadOnlyBashTool::is_read_only("find . -delete"));
         assert!(!ReadOnlyBashTool::is_read_only("find . -exec rm {} +"));

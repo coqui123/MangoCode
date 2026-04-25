@@ -37,7 +37,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                     // Parse numbers
                     let mut a_num = String::new();
                     let mut b_num = String::new();
-                    
+
                     a_num.push(a_c);
                     while let Some(&c) = a_chars.peek() {
                         if c.is_digit(10) {
@@ -46,7 +46,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                             break;
                         }
                     }
-                    
+
                     b_num.push(b_c);
                     while let Some(&c) = b_chars.peek() {
                         if c.is_digit(10) {
@@ -55,10 +55,10 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                             break;
                         }
                     }
-                    
+
                     let a_val: u64 = a_num.parse().unwrap_or(0);
                     let b_val: u64 = b_num.parse().unwrap_or(0);
-                    
+
                     match a_val.cmp(&b_val) {
                         std::cmp::Ordering::Equal => continue,
                         other => return other,
@@ -308,11 +308,17 @@ impl ModelRegistry {
             ("qwen3.6-35b-a3b", "Qwen 3.6 35B A3B"),
             ("qwen3.6-plus-2026-04-02", "Qwen 3.6 Plus (2026-04-02)"),
             ("qwen3.6-plus", "Qwen 3.6 Plus"),
-            ("qwen3-vl-235b-a22b-thinking", "Qwen 3 VL 235B A22B Thinking"),
+            (
+                "qwen3-vl-235b-a22b-thinking",
+                "Qwen 3 VL 235B A22B Thinking",
+            ),
             ("qwen3-vl-30b-a3b-thinking", "Qwen 3 VL 30B A3B Thinking"),
             ("qwen3-32b", "Qwen 3 32B"),
             ("qwen3.5-35b-a3b", "Qwen 3.5 35B A3B"),
-            ("qwen3-coder-480b-a35b-instruct", "Qwen 3 Coder 480B A35B Instruct"),
+            (
+                "qwen3-coder-480b-a35b-instruct",
+                "Qwen 3 Coder 480B A35B Instruct",
+            ),
             ("qwen3-coder-plus", "Qwen 3 Coder Plus"),
             ("qwen3-vl-8b-thinking", "Qwen 3 VL 8B Thinking"),
             ("qwen3-max-preview", "Qwen 3 Max Preview"),
@@ -321,40 +327,73 @@ impl ModelRegistry {
             ("qwen3-8b", "Qwen 3 8B"),
             ("qwen3-0.6b", "Qwen 3 0.6B"),
             ("qwen3-coder-flash", "Qwen 3 Coder Flash"),
-            ("qwen3-next-80b-a3b-thinking", "Qwen 3 Next 80B A3B Thinking"),
+            (
+                "qwen3-next-80b-a3b-thinking",
+                "Qwen 3 Next 80B A3B Thinking",
+            ),
             ("qwen3.5-27b", "Qwen 3.5 27B"),
             ("qwen3-vl-flash", "Qwen 3 VL Flash"),
             ("qwen3-14b", "Qwen 3 14B"),
             ("qwen3-max-2025-09-23", "Qwen 3 Max (2025-09-23)"),
-            ("qwen3-30b-a3b-instruct-2507", "Qwen 3 30B A3B Instruct 2507"),
-            ("qwen3-235b-a22b-instruct-2507", "Qwen 3 235B A22B Instruct 2507"),
-            ("qwen3-coder-plus-2025-07-22", "Qwen 3 Coder Plus (2025-07-22)"),
+            (
+                "qwen3-30b-a3b-instruct-2507",
+                "Qwen 3 30B A3B Instruct 2507",
+            ),
+            (
+                "qwen3-235b-a22b-instruct-2507",
+                "Qwen 3 235B A22B Instruct 2507",
+            ),
+            (
+                "qwen3-coder-plus-2025-07-22",
+                "Qwen 3 Coder Plus (2025-07-22)",
+            ),
             ("qwen3.5-plus-2026-04-20", "Qwen 3.5 Plus (2026-04-20)"),
             ("qwen3.5-122b-a10b", "Qwen 3.5 122B A10B"),
             ("qwen3-max", "Qwen 3 Max"),
             ("qwen3.5-plus-2026-02-15", "Qwen 3.5 Plus (2026-02-15)"),
-            ("qwen3-235b-a22b-thinking-2507", "Qwen 3 235B A22B Thinking 2507"),
+            (
+                "qwen3-235b-a22b-thinking-2507",
+                "Qwen 3 235B A22B Thinking 2507",
+            ),
             ("qwen3.5-397b-a17b", "Qwen 3.5 397B A17B"),
             ("qwen3-vl-plus-2025-09-23", "Qwen 3 VL Plus (2025-09-23)"),
             ("qwen3-coder-next", "Qwen 3 Coder Next"),
             ("qwen3.5-flash", "Qwen 3.5 Flash"),
-            ("qwen3-30b-a3b-thinking-2507", "Qwen 3 30B A3B Thinking 2507"),
-            ("qwen3-coder-plus-2025-09-23", "Qwen 3 Coder Plus (2025-09-23)"),
+            (
+                "qwen3-30b-a3b-thinking-2507",
+                "Qwen 3 30B A3B Thinking 2507",
+            ),
+            (
+                "qwen3-coder-plus-2025-09-23",
+                "Qwen 3 Coder Plus (2025-09-23)",
+            ),
             ("qwen3-max-2026-01-23", "Qwen 3 Max (2026-01-23)"),
             ("qwen3-vl-flash-2026-01-22", "Qwen 3 VL Flash (2026-01-22)"),
             ("qwen3-vl-30b-a3b-instruct", "Qwen 3 VL 30B A3B Instruct"),
-            ("qwen3-coder-30b-a3b-instruct", "Qwen 3 Coder 30B A3B Instruct"),
-            ("qwen3-vl-235b-a22b-instruct", "Qwen 3 VL 235B A22B Instruct"),
+            (
+                "qwen3-coder-30b-a3b-instruct",
+                "Qwen 3 Coder 30B A3B Instruct",
+            ),
+            (
+                "qwen3-vl-235b-a22b-instruct",
+                "Qwen 3 VL 235B A22B Instruct",
+            ),
             ("qwen3-4b", "Qwen 3 4B"),
             ("qwen3-235b-a22b", "Qwen 3 235B A22B"),
             ("qwen3-1.7b", "Qwen 3 1.7B"),
             ("qwen3-vl-plus", "Qwen 3 VL Plus"),
             ("qwen3-30b-a3b", "Qwen 3 30B A3B"),
             ("qwen3-vl-8b-instruct", "Qwen 3 VL 8B Instruct"),
-            ("qwen3-coder-flash-2025-07-28", "Qwen 3 Coder Flash (2025-07-28)"),
+            (
+                "qwen3-coder-flash-2025-07-28",
+                "Qwen 3 Coder Flash (2025-07-28)",
+            ),
             ("qwen3-vl-plus-2025-12-19", "Qwen 3 VL Plus (2025-12-19)"),
             ("qwen3.5-plus", "Qwen 3.5 Plus"),
-            ("qwen3-next-80b-a3b-instruct", "Qwen 3 Next 80B A3B Instruct"),
+            (
+                "qwen3-next-80b-a3b-instruct",
+                "Qwen 3 Next 80B A3B Instruct",
+            ),
             ("qvq-max-2025-03-25", "QVQ Max (2025-03-25)"),
             ("qwen2.5-vl-72b-instruct", "Qwen 2.5 VL 72B Instruct"),
             ("qwen-vl-plus-2025-05-07", "Qwen VL Plus (2025-05-07)"),
@@ -372,7 +411,10 @@ impl ModelRegistry {
             ("qvq-max", "QVQ Max"),
             ("qwen-vl-plus-2025-08-15", "Qwen VL Plus (2025-08-15)"),
             ("qwen-vl-max-latest", "Qwen VL Max Latest"),
-            ("qwen3-next-80b-a3b-thinking", "Qwen 3 Next 80B A3B Thinking"),
+            (
+                "qwen3-next-80b-a3b-thinking",
+                "Qwen 3 Next 80B A3B Thinking",
+            ),
             ("qwen-turbo-latest", "Qwen Turbo Latest"),
             ("qwen2.5-32b-instruct", "Qwen 2.5 32B Instruct"),
             ("qwen-plus-character", "Qwen Plus Character"),

@@ -93,7 +93,10 @@ fn prompt_filter_text(text: &str, prompt: &str) -> String {
 
     for (idx, paragraph) in paragraphs.iter().enumerate() {
         let lower = paragraph.to_lowercase();
-        let score = prompt_terms.iter().filter(|term| lower.contains(term.as_str())).count();
+        let score = prompt_terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .count();
         if score > best_score {
             best_score = score;
             best_idx = idx;
@@ -101,7 +104,12 @@ fn prompt_filter_text(text: &str, prompt: &str) -> String {
     }
 
     if best_score == 0 {
-        paragraphs.iter().take(2).copied().collect::<Vec<_>>().join("\n\n")
+        paragraphs
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n\n")
     } else {
         paragraphs[best_idx].to_string()
     }

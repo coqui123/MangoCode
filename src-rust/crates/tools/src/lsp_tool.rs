@@ -170,9 +170,7 @@ impl Tool for LspTool {
             "symbols" => {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
-                    manager
-                        .document_symbols(&file_path, &ctx.working_dir)
-                        .await
+                    manager.document_symbols(&file_path, &ctx.working_dir).await
                 };
                 match result {
                     Ok(syms) if syms.is_empty() => {
@@ -194,10 +192,7 @@ impl Tool for LspTool {
                 };
 
                 if diagnostics.is_empty() {
-                    return ToolResult::success(format!(
-                        "No diagnostics for '{}'.",
-                        file_path
-                    ));
+                    return ToolResult::success(format!("No diagnostics for '{}'.", file_path));
                 }
 
                 let output = mangocode_core::lsp::LspManager::format_diagnostics(&diagnostics);

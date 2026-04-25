@@ -8,9 +8,110 @@ use super::types::{ApiToolDefinition, CreateMessageRequest, CreateMessageRespons
 use mangocode_core::codex_oauth::{normalize_codex_model, CODEX_API_ENDPOINT};
 use mangocode_core::types::UsageInfo;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
 /// OpenAI Codex API endpoint for responses (ChatGPT plan / Codex OAuth).
 pub const CODEX_RESPONSES_ENDPOINT: &str = CODEX_API_ENDPOINT;
+const CODEX_DEBUG_ENV: &str = "MANGOCODE_CODEX_DEBUG";
+
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    call_id: String,
+    name: String,
+    arguments_json: String,
+}
+
+fn codex_debug_enabled() -> bool {
+    std::env::var(CODEX_DEBUG_ENV)
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+fn debug_codex_event(event_type: &str, tool_call: Option<&PendingToolCall>, accumulated: bool) {
+    if !codex_debug_enabled() {
+        return;
+    }
+    tracing::debug!(
+        event_type = %event_type,
+        has_tool_call = tool_call.is_some(),
+        tool_call_id = tool_call.map(|tc| tc.call_id.as_str()).unwrap_or("<none>"),
+        tool_name = tool_call.map(|tc| tc.name.as_str()).unwrap_or("<none>"),
+        arguments_accumulated = accumulated,
+        "parsed Codex SSE event"
+    );
+}
+
+fn tool_call_key(v: &Value) -> Option<String> {
+    v.get("call_id")
+        .or_else(|| v.get("item").and_then(|i| i.get("call_id")))
+        .or_else(|| v.get("id"))
+        .or_else(|| v.get("item_id"))
+        .or_else(|| v.get("output_item_id"))
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            v.get("output_index")
+                .and_then(|value| value.as_u64())
+                .map(|idx| format!("output_index:{}", idx))
+        })
+}
+
+fn output_item_tool_call_key(item: &Value) -> Option<String> {
+    item.get("id")
+        .or_else(|| item.get("item_id"))
+        .or_else(|| item.get("output_item_id"))
+        .or_else(|| item.get("call_id"))
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+}
+
+fn pending_tool_call_from_item(item: &Value) -> Option<PendingToolCall> {
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(item_type, "function_call" | "tool_call" | "function") {
+        return None;
+    }
+    let name = item
+        .get("name")
+        .or_else(|| item.get("function").and_then(|f| f.get("name")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let arguments_json = item
+        .get("arguments")
+        .or_else(|| item.get("function").and_then(|f| f.get("arguments")))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    Some(PendingToolCall {
+        call_id,
+        name,
+        arguments_json,
+    })
+}
+
+fn pending_tool_call_to_output_item(call: &PendingToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.call_id,
+        "name": call.name,
+        "arguments": call.arguments_json,
+    })
+}
 
 /// Strip fields that are specific to SDKs / client-side orchestration and may be
 /// rejected by ChatGPT/Codex backends.
@@ -51,6 +152,8 @@ pub fn sse_to_last_json_value(sse_body: &str) -> anyhow::Result<serde_json::Valu
     let mut last_with_output: Option<serde_json::Value> = None;
     let mut completed: Option<serde_json::Value> = None;
     let mut output_text = String::new();
+    let mut output_items: Vec<Value> = Vec::new();
+    let mut pending_tool_calls: BTreeMap<String, PendingToolCall> = BTreeMap::new();
 
     for raw_line in sse_body.lines() {
         let line = raw_line.trim();
@@ -67,36 +170,126 @@ pub fn sse_to_last_json_value(sse_body: &str) -> anyhow::Result<serde_json::Valu
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if event_type == "response.output_text.delta" {
-                    if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
-                        output_text.push_str(delta);
-                    }
-                }
-                if event_type == "response.output_text.done" {
-                    if let Some(text) = v.get("text").and_then(|d| d.as_str()) {
-                        output_text.clear();
-                        output_text.push_str(text);
-                    }
-                }
-                if event_type == "response.content_part.done" {
-                    if let Some(text) = collect_content_text(v.get("part").unwrap_or(&v)) {
-                        if output_text.is_empty() {
-                            output_text.push_str(&text);
+                let mut event_tool_call: Option<PendingToolCall> = None;
+                let mut arguments_accumulated = false;
+                match event_type {
+                    "response.output_text.delta" => {
+                        if let Some(delta) = v.get("delta").and_then(|d| d.as_str()) {
+                            output_text.push_str(delta);
                         }
                     }
-                }
-                if event_type == "response.output_item.done" {
-                    if let Some(item) = v.get("item") {
-                        if let Some(text) = collect_output_item_text(item) {
+                    "response.output_text.done" => {
+                        if let Some(text) = v.get("text").and_then(|d| d.as_str()) {
+                            output_text.clear();
+                            output_text.push_str(text);
+                        }
+                    }
+                    "response.content_part.done" => {
+                        if let Some(text) = collect_content_text(v.get("part").unwrap_or(&v)) {
                             if output_text.is_empty() {
                                 output_text.push_str(&text);
                             }
                         }
                     }
+                    "response.output_item.added" => {
+                        if let Some(item) = v.get("item") {
+                            if let Some(call) = pending_tool_call_from_item(item) {
+                                let key = output_item_tool_call_key(item)
+                                    .or_else(|| tool_call_key(&v))
+                                    .unwrap_or_else(|| call.call_id.clone());
+                                pending_tool_calls.insert(key, call.clone());
+                                event_tool_call = Some(call);
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        if let Some(delta) = v
+                            .get("delta")
+                            .or_else(|| v.get("arguments_delta"))
+                            .and_then(|d| d.as_str())
+                        {
+                            if let Some(key) = tool_call_key(&v) {
+                                let call =
+                                    pending_tool_calls.entry(key.clone()).or_insert_with(|| {
+                                        PendingToolCall {
+                                            call_id: v
+                                                .get("call_id")
+                                                .and_then(|id| id.as_str())
+                                                .unwrap_or(&key)
+                                                .to_string(),
+                                            name: v
+                                                .get("name")
+                                                .and_then(|name| name.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            arguments_json: String::new(),
+                                        }
+                                    });
+                                call.arguments_json.push_str(delta);
+                                arguments_accumulated = true;
+                                event_tool_call = Some(call.clone());
+                            }
+                        }
+                    }
+                    "response.function_call_arguments.done" => {
+                        if let Some(key) = tool_call_key(&v) {
+                            let call = pending_tool_calls.entry(key.clone()).or_insert_with(|| {
+                                PendingToolCall {
+                                    call_id: v
+                                        .get("call_id")
+                                        .and_then(|id| id.as_str())
+                                        .unwrap_or(&key)
+                                        .to_string(),
+                                    name: v
+                                        .get("name")
+                                        .and_then(|name| name.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    arguments_json: String::new(),
+                                }
+                            });
+                            if let Some(name) = v.get("name").and_then(|name| name.as_str()) {
+                                if !name.is_empty() {
+                                    call.name = name.to_string();
+                                }
+                            }
+                            if let Some(arguments) = v
+                                .get("arguments")
+                                .or_else(|| v.get("arguments_json"))
+                                .and_then(|args| args.as_str())
+                            {
+                                call.arguments_json.clear();
+                                call.arguments_json.push_str(arguments);
+                            }
+                            arguments_accumulated = !call.arguments_json.is_empty();
+                            event_tool_call = Some(call.clone());
+                        }
+                    }
+                    "response.output_item.done" => {
+                        if let Some(item) = v.get("item") {
+                            if let Some(call) = pending_tool_call_from_item(item) {
+                                let key = output_item_tool_call_key(item)
+                                    .or_else(|| tool_call_key(&v))
+                                    .unwrap_or_else(|| call.call_id.clone());
+                                pending_tool_calls.insert(key, call.clone());
+                                output_items.push(item.clone());
+                                event_tool_call = Some(call);
+                            } else {
+                                if let Some(text) = collect_output_item_text(item) {
+                                    if output_text.is_empty() {
+                                        output_text.push_str(&text);
+                                    }
+                                }
+                                output_items.push(item.clone());
+                            }
+                        }
+                    }
+                    "response.completed" => {
+                        completed = Some(v.clone());
+                    }
+                    _ => {}
                 }
-                if event_type == "response.completed" {
-                    completed = Some(v.clone());
-                }
+                debug_codex_event(event_type, event_tool_call.as_ref(), arguments_accumulated);
                 let response_body = v.get("response").unwrap_or(&v);
                 if response_body.get("output").is_some() || response_body.get("choices").is_some() {
                     last_with_output = Some(v.clone());
@@ -107,18 +300,49 @@ pub fn sse_to_last_json_value(sse_body: &str) -> anyhow::Result<serde_json::Valu
     }
 
     if let Some(v) = &completed {
-        if response_text_from_value(v).is_some() {
+        if response_content_blocks_from_value(v)
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            || response_text_from_value(v).is_some()
+        {
             return Ok(v.clone());
         }
     }
     if let Some(v) = &last_with_output {
-        if response_text_from_value(v).is_some() {
+        if response_content_blocks_from_value(v)
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            || response_text_from_value(v).is_some()
+        {
             return Ok(v.clone());
         }
+    }
+    let mut pending_output_items = pending_tool_calls
+        .values()
+        .filter(|call| !call.name.is_empty())
+        .map(pending_tool_call_to_output_item)
+        .collect::<Vec<_>>();
+    if !pending_output_items.is_empty() {
+        let mut output = Vec::new();
+        if !output_text.is_empty() {
+            output.push(json!({
+                "type": "message",
+                "content": [{ "type": "output_text", "text": output_text }]
+            }));
+        }
+        output.append(&mut pending_output_items);
+        return Ok(json!({ "output": output }));
+    }
+    if output_items
+        .iter()
+        .any(|item| collect_output_item_tool_use(item).is_some())
+    {
+        return Ok(json!({ "output": output_items }));
     }
     if !output_text.is_empty() {
         return Ok(json!({
             "output": [{
+                "type": "message",
                 "content": [{ "type": "output_text", "text": output_text }]
             }]
         }));
@@ -411,7 +635,7 @@ fn collect_output_item_text(item: &Value) -> Option<String> {
 
 fn collect_output_item_tool_use(item: &Value) -> Option<Value> {
     let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(item_type, "function_call" | "tool_call") {
+    if !matches!(item_type, "function_call" | "tool_call" | "function") {
         return None;
     }
 
@@ -456,32 +680,43 @@ fn response_content_blocks_from_value(resp: &Value) -> Vec<Value> {
     let resp = resp.get("response").unwrap_or(resp);
     let mut blocks: Vec<Value> = Vec::new();
 
-    if let Some(text) = response_text_from_value(resp) {
-        if !text.is_empty() {
-            blocks.push(json!({ "type": "text", "text": text }));
-        }
-    }
-
     if let Some(out) = resp.get("output").and_then(|v| v.as_array()) {
         for item in out {
             if let Some(tool_use) = collect_output_item_tool_use(item) {
                 blocks.push(tool_use);
+            } else if let Some(text) = collect_output_item_text(item) {
+                if !text.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": text }));
+                }
             }
         }
     }
 
     if blocks.is_empty() {
-        if let Some(tool_calls) = resp
+        if let Some(message) = resp
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("tool_calls"))
-            .and_then(|t| t.as_array())
         {
-            for tc in tool_calls {
-                if let Some(tool_use) = collect_output_item_tool_use(tc) {
-                    blocks.push(tool_use);
+            if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": text }));
                 }
+            }
+            if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tool_calls {
+                    if let Some(tool_use) = collect_output_item_tool_use(tc) {
+                        blocks.push(tool_use);
+                    }
+                }
+            }
+        }
+    }
+
+    if blocks.is_empty() {
+        if let Some(text) = response_text_from_value(resp) {
+            if !text.is_empty() {
+                blocks.push(json!({ "type": "text", "text": text }));
             }
         }
     }
@@ -902,6 +1137,140 @@ mod tests {
         assert_eq!(blocks[0]["id"], "call_abc");
         assert_eq!(blocks[0]["name"], "Read");
         assert_eq!(blocks[0]["input"]["file_path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn parses_codex_function_call_output_item() {
+        let response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_ls",
+                "name": "Bash",
+                "arguments": "{\"command\":\"ls\"}"
+            }]
+        });
+
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&response);
+
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_ls");
+        assert_eq!(blocks[0]["name"], "Bash");
+        assert_eq!(blocks[0]["input"]["command"], "ls");
+    }
+
+    #[test]
+    fn sse_completed_tool_call_without_text_is_not_downgraded() {
+        let sse = r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"Bash","arguments":"{\"command\":\"ls\"}"}]}}
+"#;
+
+        let value = sse_to_last_json_value(sse).expect("sse parsed");
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&value);
+
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "Bash");
+        assert_eq!(blocks[0]["input"]["command"], "ls");
+    }
+
+    #[test]
+    fn tool_call_beats_plain_text_when_both_exist() {
+        let response = json!({
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "I will check." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"Cargo.toml\"}"
+                }
+            ]
+        });
+
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&response);
+
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["name"], "Read");
+    }
+
+    #[test]
+    fn accumulates_function_call_argument_deltas() {
+        let sse = r#"data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"Bash","arguments":""}}
+data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":"{\"command\""}
+data: {"type":"response.function_call_arguments.delta","item_id":"item_1","delta":":\"ls\"}"}
+data: {"type":"response.function_call_arguments.done","item_id":"item_1","arguments":"{\"command\":\"ls\"}"}
+data: {"type":"response.completed","response":{"status":"completed","output":[]}}
+"#;
+
+        let value = sse_to_last_json_value(sse).expect("sse parsed");
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&value);
+
+        assert_eq!(stop_reason, "tool_use");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "Bash");
+        assert_eq!(blocks[0]["input"]["command"], "ls");
+    }
+
+    #[test]
+    fn plain_text_without_tool_call_stays_text() {
+        let response = json!({
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Nothing to call." }]
+            }]
+        });
+
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&response);
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "Nothing to call.");
+    }
+
+    #[test]
+    fn conversational_text_regression_does_not_fake_tool_call() {
+        let sse = r#"data: {"type":"response.output_text.delta","delta":"can you just ls or whatever the directory youre in to test you can utilize the tools"}
+data: {"type":"response.completed","response":{"status":"completed","output":[]}}
+"#;
+
+        let value = sse_to_last_json_value(sse).expect("sse parsed");
+        let (blocks, stop_reason, _, _) = parse_codex_response_blocks(&value);
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("can you just ls"));
+    }
+
+    #[test]
+    fn tool_call_response_emits_tool_use_stop_reason() {
+        let response = json!({
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Glob",
+                "arguments": "{\"pattern\":\"*.rs\"}"
+            }],
+            "finish_reason": "stop"
+        });
+
+        let (_, stop_reason, _, _) = parse_codex_response_blocks(&response);
+
+        assert_eq!(stop_reason, "tool_use");
     }
 
     #[test]

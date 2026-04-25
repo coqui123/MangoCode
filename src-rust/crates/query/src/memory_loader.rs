@@ -29,7 +29,11 @@ impl MemoryLoader {
 
     /// Given the current user query, decide which topic files are relevant
     /// and load them. Uses keyword matching against the index entries.
-    pub async fn load_relevant_topics(&self, query: &str, index: &str) -> Result<Vec<(String, String)>> {
+    pub async fn load_relevant_topics(
+        &self,
+        query: &str,
+        index: &str,
+    ) -> Result<Vec<(String, String)>> {
         let query_tokens = tokenize(query);
         if query_tokens.is_empty() {
             return Ok(vec![]);
@@ -109,11 +113,7 @@ fn parse_index_line(line: &str) -> Option<(String, String)> {
         .and_then(|s| s.strip_prefix("- ["))
         .unwrap_or("")
         .trim();
-    let hook = line
-        .split('—')
-        .nth(1)
-        .map(str::trim)
-        .unwrap_or("");
+    let hook = line.split('—').nth(1).map(str::trim).unwrap_or("");
 
     Some((link, format!("{} {} {}", title, hook, line)))
 }

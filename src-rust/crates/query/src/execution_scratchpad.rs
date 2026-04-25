@@ -138,7 +138,9 @@ fn extract_last_tool_result_summary(messages: &[Message]) -> Option<String> {
         let mut result_texts: Vec<String> = Vec::new();
         for block in blocks {
             if let ContentBlock::ToolResult {
-                tool_use_id, content, ..
+                tool_use_id,
+                content,
+                ..
             } = block
             {
                 // Use a truncated tool_use_id as the label (first 8 chars) since

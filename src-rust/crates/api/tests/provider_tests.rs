@@ -1,18 +1,20 @@
 //! Provider serialization/deserialization integration tests.
 
+use base64::Engine;
 use mangocode_api::provider::LlmProvider;
 use mangocode_api::provider_types::{ProviderRequest, StopReason, SystemPrompt};
-use mangocode_api::{GoogleProvider, OpenAiProvider, ThinkingConfig};
 use mangocode_api::providers::OpenAiCodexProvider;
+use mangocode_api::{GoogleProvider, OpenAiProvider, ThinkingConfig};
 use mangocode_core::types::{ContentBlock, Message};
-use base64::Engine;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 async fn spawn_json_server(response_body: Value) -> (String, oneshot::Receiver<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = oneshot::channel::<String>();
 
@@ -36,9 +38,7 @@ async fn spawn_json_server(response_body: Value) -> (String, oneshot::Receiver<S
         }
 
         let request = String::from_utf8_lossy(&buf[..n]).to_string();
-        let header_end = request
-            .find("\r\n\r\n")
-            .expect("header terminator");
+        let header_end = request.find("\r\n\r\n").expect("header terminator");
         let headers = &request[..header_end];
         let body_start = header_end + 4;
         let content_length = headers
@@ -56,10 +56,7 @@ async fn spawn_json_server(response_body: Value) -> (String, oneshot::Receiver<S
             .unwrap_or(0);
 
         while n < body_start + content_length {
-            let read = stream
-                .read(&mut buf[n..])
-                .await
-                .expect("read request body");
+            let read = stream.read(&mut buf[n..]).await.expect("read request body");
             if read == 0 {
                 break;
             }
@@ -130,10 +127,7 @@ async fn openai_provider_serializes_and_deserializes() {
         .expect("openai response parsed");
 
     let raw = req_rx.await.expect("captured request");
-    let body = raw
-        .split("\r\n\r\n")
-        .nth(1)
-        .expect("request body present");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
     let body_json: Value = serde_json::from_str(body).expect("json request body");
 
     assert_eq!(body_json["model"], json!("gpt-4o-mini"));
@@ -171,16 +165,17 @@ async fn google_provider_serializes_and_deserializes() {
 
     let raw = req_rx.await.expect("captured request");
     let request_line = raw.lines().next().expect("request line");
-    assert!(request_line.contains("/v1beta/models/gemini-2.5-flash:generateContent?key=google-test-key"));
+    assert!(request_line
+        .contains("/v1beta/models/gemini-2.5-flash:generateContent?key=google-test-key"));
 
-    let body = raw
-        .split("\r\n\r\n")
-        .nth(1)
-        .expect("request body present");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
     let body_json: Value = serde_json::from_str(body).expect("json request body");
 
     assert_eq!(body_json["contents"][0]["role"], json!("user"));
-    assert_eq!(body_json["contents"][0]["parts"][0]["text"], json!("Say hello"));
+    assert_eq!(
+        body_json["contents"][0]["parts"][0]["text"],
+        json!("Say hello")
+    );
     assert_eq!(parsed.stop_reason, StopReason::EndTurn);
     assert!(matches!(
         &parsed.content[0],
@@ -214,7 +209,8 @@ async fn openai_codex_oauth_is_stateless_and_does_not_use_api_key_format() {
 
     let raw = req_rx.await.expect("captured request");
     assert!(
-        raw.to_ascii_lowercase().contains("content-type: application/json"),
+        raw.to_ascii_lowercase()
+            .contains("content-type: application/json"),
         "expected content-type header"
     );
 
@@ -224,15 +220,18 @@ async fn openai_codex_oauth_is_stateless_and_does_not_use_api_key_format() {
         "expected bearer auth header"
     );
     assert!(
-        raw.to_ascii_lowercase().contains("accept: text/event-stream"),
+        raw.to_ascii_lowercase()
+            .contains("accept: text/event-stream"),
         "expected accept: text/event-stream"
     );
     assert!(
-        raw.to_ascii_lowercase().contains("openai-beta: responses=experimental"),
+        raw.to_ascii_lowercase()
+            .contains("openai-beta: responses=experimental"),
         "expected OpenAI-Beta header for responses"
     );
     assert!(
-        raw.to_ascii_lowercase().contains("originator: codex_cli_rs"),
+        raw.to_ascii_lowercase()
+            .contains("originator: codex_cli_rs"),
         "expected originator header"
     );
     assert!(
@@ -244,10 +243,7 @@ async fn openai_codex_oauth_is_stateless_and_does_not_use_api_key_format() {
         "did not expect conversation_id header without promptCacheKey"
     );
 
-    let body = raw
-        .split("\r\n\r\n")
-        .nth(1)
-        .expect("request body present");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
     let body_json: Value = serde_json::from_str(body).expect("json request body");
 
     // Enforce stateless operation (`store:false`) for the ChatGPT/Codex backend.
@@ -275,7 +271,10 @@ async fn openai_codex_includes_conversation_and_session_headers_with_prompt_cach
         .with_endpoint(endpoint)
         .with_skip_disk(true);
 
-    provider.create_message(req).await.expect("codex response parsed");
+    provider
+        .create_message(req)
+        .await
+        .expect("codex response parsed");
 
     let raw = req_rx.await.expect("captured request");
     let lower = raw.to_ascii_lowercase();
@@ -296,9 +295,8 @@ async fn openai_codex_includes_chatgpt_account_id_header_when_present() {
 
     // Minimal JWT with the plugin-style claim:
     // payload: {"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#,
-    );
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_123"}}"#);
     let fake_token = format!("{}.{}.{}", "hdr", payload, "sig");
 
     let provider = OpenAiCodexProvider::new(fake_token)

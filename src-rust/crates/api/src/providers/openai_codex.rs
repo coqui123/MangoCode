@@ -169,6 +169,64 @@ impl OpenAiCodexProvider {
         })
     }
 
+    fn stream_synthetic_response(
+        response: ProviderResponse,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>> {
+        let s = stream! {
+            yield Ok(StreamEvent::MessageStart {
+                id: response.id.clone(),
+                model: response.model.clone(),
+                usage: response.usage.clone(),
+            });
+
+            for (index, block) in response.content.iter().cloned().enumerate() {
+                match block {
+                    ContentBlock::Text { text } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                            },
+                        });
+                        if !text.is_empty() {
+                            yield Ok(StreamEvent::TextDelta { index, text });
+                        }
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input: serde_json::json!({}),
+                            },
+                        });
+                        let partial_json = serde_json::to_string(&input)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(StreamEvent::InputJsonDelta {
+                            index,
+                            partial_json,
+                        });
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        yield Ok(StreamEvent::ReasoningDelta { index, reasoning: thinking });
+                    }
+                    _ => {}
+                }
+            }
+
+            yield Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(response.stop_reason.clone()),
+                usage: Some(response.usage.clone()),
+            });
+            yield Ok(StreamEvent::MessageStop);
+        };
+
+        Box::pin(s)
+    }
+
     async fn persist_oauth(access: &str, refresh: &str, expires_ms: u64) {
         let mut store = AuthStore::load_async().await;
         store.set(
@@ -508,6 +566,22 @@ impl LlmProvider for OpenAiCodexProvider {
 
         let (content_blocks, stop_reason, input_tokens, output_tokens) =
             codex_adapter::parse_codex_response_blocks(&openai_resp);
+        if Self::debug_enabled() {
+            let tool_blocks = content_blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(|value| value.as_str()) == Some("tool_use")
+                })
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                provider = "openai-codex",
+                content_block_count = content_blocks.len(),
+                tool_call_count = tool_blocks.len(),
+                stop_reason = %stop_reason,
+                returned_tool_use_blocks = !tool_blocks.is_empty(),
+                "parsed Codex response"
+            );
+        }
         if content_blocks.is_empty() {
             return Err(ProviderError::Other {
                 provider: self.id.clone(),
@@ -537,65 +611,7 @@ impl LlmProvider for OpenAiCodexProvider {
         // Query loop always uses the streaming path; Codex OAuth is non-streaming over HTTP,
         // so we synthesize a single-turn event sequence from `create_message`.
         let resp = self.create_message(request).await?;
-        let id = resp.id.clone();
-        let model = resp.model.clone();
-        let usage = resp.usage.clone();
-        let stop = resp.stop_reason.clone();
-
-        let s = stream! {
-            yield Ok(StreamEvent::MessageStart {
-                id: id.clone(),
-                model: model.clone(),
-                usage: usage.clone(),
-            });
-
-            for (index, block) in resp.content.iter().cloned().enumerate() {
-                match block {
-                    ContentBlock::Text { text } => {
-                        yield Ok(StreamEvent::ContentBlockStart {
-                            index,
-                            content_block: ContentBlock::Text {
-                                text: String::new(),
-                            },
-                        });
-                        if !text.is_empty() {
-                            yield Ok(StreamEvent::TextDelta { index, text });
-                        }
-                        yield Ok(StreamEvent::ContentBlockStop { index });
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        yield Ok(StreamEvent::ContentBlockStart {
-                            index,
-                            content_block: ContentBlock::ToolUse {
-                                id,
-                                name,
-                                input: serde_json::json!({}),
-                            },
-                        });
-                        let partial_json = input.to_string();
-                        if !partial_json.is_empty() {
-                            yield Ok(StreamEvent::InputJsonDelta {
-                                index,
-                                partial_json,
-                            });
-                        }
-                        yield Ok(StreamEvent::ContentBlockStop { index });
-                    }
-                    ContentBlock::Thinking { thinking, .. } => {
-                        yield Ok(StreamEvent::ReasoningDelta { index, reasoning: thinking });
-                    }
-                    _ => {}
-                }
-            }
-
-            yield Ok(StreamEvent::MessageDelta {
-                stop_reason: Some(stop.clone()),
-                usage: Some(usage.clone()),
-            });
-            yield Ok(StreamEvent::MessageStop);
-        };
-
-        Ok(Box::pin(s))
+        Ok(Self::stream_synthetic_response(resp))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -643,6 +659,8 @@ impl LlmProvider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use mangocode_core::types::UsageInfo;
 
     #[test]
     fn openai_codex_provider_uses_openai_codex_id() {
@@ -651,5 +669,57 @@ mod tests {
             format!("{}", p.id()),
             mangocode_core::ProviderId::OPENAI_CODEX
         );
+    }
+
+    #[tokio::test]
+    async fn synthetic_stream_outputs_valid_tool_call_events() {
+        let response = ProviderResponse {
+            id: "msg_1".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: UsageInfo {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            model: "gpt-5.2-codex".to_string(),
+        };
+
+        let mut stream = OpenAiCodexProvider::stream_synthetic_response(response);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("stream event"));
+        }
+
+        assert!(matches!(events[0], StreamEvent::MessageStart { .. }));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ToolUse { id, name, input }
+            } if id == "call_1" && name == "Bash" && input == &serde_json::json!({})
+        ));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::InputJsonDelta { index: 0, partial_json }
+                if partial_json == "{\"command\":\"ls\"}"
+        ));
+        assert!(matches!(
+            events[3],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+        assert!(matches!(
+            &events[4],
+            StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            }
+        ));
+        assert!(matches!(events[5], StreamEvent::MessageStop));
     }
 }

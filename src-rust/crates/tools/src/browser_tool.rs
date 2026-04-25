@@ -83,9 +83,9 @@ async fn execute_browser_action(params: BrowserInput, ctx: &ToolContext) -> Tool
         Ok(tuple) => tuple,
         Err(e) => {
             return ToolResult::error(format!(
-                "Failed to launch Chromium. Ensure Chrome/Chromium is installed and discoverable: {}",
-                e
-            ))
+            "Failed to launch Chromium. Ensure Chrome/Chromium is installed and discoverable: {}",
+            e
+        ))
         }
     };
 

@@ -12,7 +12,9 @@
 // - Bridge connection status badge
 // - Plugin hint banners
 
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -95,8 +97,6 @@ pub mod prompt_input;
 pub mod render;
 /// Rustle mascot rendering.
 pub mod rustle;
-#[cfg(test)]
-mod test_svg_render;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 /// Session browser overlay (/session, /resume, /rename, /export).
@@ -109,6 +109,8 @@ pub mod slash_commands;
 pub mod stats_dialog;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
 pub mod tasks_overlay;
+#[cfg(test)]
+mod test_svg_render;
 /// Color palette management for different themes and accessibility support.
 pub mod theme_colors;
 /// Theme picker overlay.

@@ -273,7 +273,11 @@ fn render_file_op_result(is_create: bool) -> Vec<Line<'static>> {
 }
 
 /// Render a tool result (success variant) — generic fallback.
-pub fn render_tool_result_success(output: &str, truncated: bool, expanded: bool) -> Vec<Line<'static>> {
+pub fn render_tool_result_success(
+    output: &str,
+    truncated: bool,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let total_lines = output.lines().count();
     let cap = if expanded {
         EXPANDED_TOOL_OUTPUT_MAX_LINES

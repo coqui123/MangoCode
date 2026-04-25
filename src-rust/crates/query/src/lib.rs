@@ -33,7 +33,10 @@ pub use compact::{
 };
 pub use cron_scheduler::start_cron_scheduler;
 pub use memory_loader::MemoryLoader;
-pub use proactive::{build_proactive_tools, get_state as proactive_state, is_enabled as proactive_enabled, is_supported as proactive_supported, set_enabled as set_proactive_enabled, ProactiveAgent};
+pub use proactive::{
+    build_proactive_tools, get_state as proactive_state, is_enabled as proactive_enabled,
+    is_supported as proactive_supported, set_enabled as set_proactive_enabled, ProactiveAgent,
+};
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
@@ -41,26 +44,26 @@ pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
 
-use once_cell::sync::Lazy;
 use mangocode_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use mangocode_core::bash_classifier::{classify_bash_command, BashRiskLevel};
+use mangocode_core::config::Config;
 use mangocode_core::constants::{
     TOOL_NAME_APPLY_PATCH, TOOL_NAME_BASH, TOOL_NAME_FILE_EDIT, TOOL_NAME_FILE_WRITE,
 };
-use mangocode_core::config::Config;
 use mangocode_core::cost::CostTracker;
 use mangocode_core::error::ClaudeError;
-use mangocode_core::session_tracing::{
-    end_hook_span, end_interaction_span, end_llm_request_span, end_permission_span,
-    end_tool_span, start_hook_span, start_interaction_span, start_llm_request_span,
-    start_permission_span, start_tool_span,
-};
 use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
+use mangocode_core::session_tracing::{
+    end_hook_span, end_interaction_span, end_llm_request_span, end_permission_span, end_tool_span,
+    start_hook_span, start_interaction_span, start_llm_request_span, start_permission_span,
+    start_tool_span,
+};
 use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
 use mangocode_tools::{Tool, ToolContext, ToolResult};
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,7 +101,8 @@ pub struct QueryState {
     pub last_access_tick: u64,
 }
 
-static QUERY_STATE: Lazy<Mutex<HashMap<String, QueryState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static QUERY_STATE: Lazy<Mutex<HashMap<String, QueryState>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 static QUERY_STATE_CLOCK: AtomicU64 = AtomicU64::new(1);
 const QUERY_STATE_MAX_ENTRIES: usize = 256;
 
@@ -163,7 +167,11 @@ fn mark_git_context_dirty(session_id: &str) {
 fn tool_invalidates_git_context(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        TOOL_NAME_FILE_WRITE | TOOL_NAME_FILE_EDIT | TOOL_NAME_BASH | "PowerShell" | TOOL_NAME_APPLY_PATCH
+        TOOL_NAME_FILE_WRITE
+            | TOOL_NAME_FILE_EDIT
+            | TOOL_NAME_BASH
+            | "PowerShell"
+            | TOOL_NAME_APPLY_PATCH
     )
 }
 
@@ -403,9 +411,7 @@ fn should_enable_qwen_preserve_thinking(
     if provider_id != "qwen" {
         return false;
     }
-    if !mangocode_core::FeatureFlags::is_enabled(
-        mangocode_core::FLAG_PRESERVE_THINKING,
-    ) {
+    if !mangocode_core::FeatureFlags::is_enabled(mangocode_core::FLAG_PRESERVE_THINKING) {
         return false;
     }
     turn_count >= 4 || tool_call_count >= 3
@@ -1036,7 +1042,10 @@ pub async fn run_query_loop(
                                 let mut out = String::new();
                                 out.push_str("Memory topics loaded for this turn:\n");
                                 for (path, content) in topics {
-                                    out.push_str(&format!("\n<topic path=\"{}\">\n{}\n</topic>\n", path, content));
+                                    out.push_str(&format!(
+                                        "\n<topic path=\"{}\">\n{}\n</topic>\n",
+                                        path, content
+                                    ));
                                 }
                                 out
                             }
@@ -1100,10 +1109,11 @@ pub async fn run_query_loop(
                 let listing = format_skill_listing(&guard);
                 drop(guard);
                 if !listing.trim().is_empty() {
-                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
-                        Some(existing) => format!("{}\n\n{}", existing, listing),
-                        None => listing,
-                    });
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{}\n\n{}", existing, listing),
+                            None => listing,
+                        });
                 }
             }
 
@@ -1124,27 +1134,32 @@ pub async fn run_query_loop(
         // SystemPrompt is an enum (Text | Blocks). We prepend to the text variant;
         // Blocks prompts (e.g. with cache_control) have the block prepended as a
         // plain text block so the cache boundary is preserved.
-        let system = if mangocode_core::FeatureFlags::is_enabled(mangocode_core::FLAG_EXECUTION_SCRATCHPAD)
-        {
+        let system = if mangocode_core::FeatureFlags::is_enabled(
+            mangocode_core::FLAG_EXECUTION_SCRATCHPAD,
+        ) {
             // Update scratchpad state from message history so next render is fresh.
             scratchpad.update_from_turn(messages, turn);
             if let Some(scratch_block) = scratchpad.render() {
                 match system {
                     mangocode_api::SystemPrompt::Text(existing) => {
-                        mangocode_api::SystemPrompt::Text(
-                            format!("{}
+                        mangocode_api::SystemPrompt::Text(format!(
+                            "{}
 
-{}", scratch_block, existing)
-                        )
+{}",
+                            scratch_block, existing
+                        ))
                     }
                     mangocode_api::SystemPrompt::Blocks(mut blocks) => {
                         // Prepend as a plain (non-cached) text block so the
                         // cache boundary on the static portion is unaffected.
-                        blocks.insert(0, mangocode_api::SystemBlock {
-                            block_type: "text".to_string(),
-                            text: scratch_block,
-                            cache_control: None,
-                        });
+                        blocks.insert(
+                            0,
+                            mangocode_api::SystemBlock {
+                                block_type: "text".to_string(),
+                                text: scratch_block,
+                                cache_control: None,
+                            },
+                        );
                         mangocode_api::SystemPrompt::Blocks(blocks)
                     }
                 }
@@ -1382,12 +1397,11 @@ pub async fn run_query_loop(
                                             ),
                                         )),
                                         "openai-codex" | "codex" => Some(std::sync::Arc::new(
-                                            mangocode_api::providers::OpenAiCodexProvider::new(
-                                                key,
-                                            ),
+                                            mangocode_api::providers::OpenAiCodexProvider::new(key),
                                         )),
                                         "cohere" => {
-                                            if let Some(p) = mangocode_api::CohereProvider::from_env()
+                                            if let Some(p) =
+                                                mangocode_api::CohereProvider::from_env()
                                             {
                                                 Some(std::sync::Arc::new(p))
                                             } else {
@@ -1400,114 +1414,91 @@ pub async fn run_query_loop(
                                             // The factory reads an env var for the key, but .with_api_key()
                                             // below replaces it with the runtime-provided key.
                                             use mangocode_api::providers::openai_compat_providers;
-                                            let provider =
-                                                match provider_id_str.as_str() {
-                                                    "groq" => openai_compat_providers::groq()
-                                                        .with_api_key(key),
-                                                    "mistral" => openai_compat_providers::mistral()
-                                                        .with_api_key(key),
-                                                    "deepseek" => openai_compat_providers::deepseek()
-                                                        .with_api_key(key),
-                                                    "xai" => {
-                                                        openai_compat_providers::xai().with_api_key(key)
-                                                    }
-                                                    "openrouter" => {
-                                                        openai_compat_providers::openrouter()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "togetherai" | "together-ai" => {
-                                                        openai_compat_providers::together_ai()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "perplexity" => {
-                                                        openai_compat_providers::perplexity()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "cerebras" => {
-                                                        openai_compat_providers::cerebras()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "deepinfra" => {
-                                                        openai_compat_providers::deepinfra()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "venice" => openai_compat_providers::venice()
-                                                        .with_api_key(key),
-                                                    "huggingface" => {
-                                                        openai_compat_providers::huggingface()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "nvidia" => openai_compat_providers::nvidia()
-                                                        .with_api_key(key),
-                                                    "siliconflow" => {
-                                                        openai_compat_providers::siliconflow()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "sambanova" => {
-                                                        openai_compat_providers::sambanova()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "moonshot" => {
-                                                        openai_compat_providers::moonshot()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "zhipu" => openai_compat_providers::zhipu()
-                                                        .with_api_key(key),
-                                                    "qwen" => openai_compat_providers::qwen()
-                                                        .with_api_key(key),
-                                                    "nebius" => openai_compat_providers::nebius()
-                                                        .with_api_key(key),
-                                                    "novita" => openai_compat_providers::novita()
-                                                        .with_api_key(key),
-                                                    "ovhcloud" => {
-                                                        openai_compat_providers::ovhcloud()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "scaleway" => {
-                                                        openai_compat_providers::scaleway()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "vultr" | "vultr-ai" => {
-                                                        openai_compat_providers::vultr_ai()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "baseten" => {
-                                                        openai_compat_providers::baseten()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "friendli" => {
-                                                        openai_compat_providers::friendli()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "upstage" => {
-                                                        openai_compat_providers::upstage()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "stepfun" => {
-                                                        openai_compat_providers::stepfun()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "fireworks" => {
-                                                        openai_compat_providers::fireworks()
-                                                            .with_api_key(key)
-                                                    }
-                                                    "ollama" => openai_compat_providers::ollama(),
-                                                    "lmstudio" | "lm-studio" => {
-                                                        openai_compat_providers::lm_studio()
-                                                    }
-                                                    "llamacpp" | "llama-cpp" => {
-                                                        openai_compat_providers::llama_cpp()
-                                                    }
-                                                    _ => {
-                                                        // True fallback: unknown provider, generic OpenAI-compatible
-                                                        mangocode_api::OpenAiCompatProvider::new(
-                                                            &provider_id_str,
-                                                            &provider_id_str,
-                                                            "https://api.openai.com/v1",
-                                                        )
+                                            let provider = match provider_id_str.as_str() {
+                                                "groq" => openai_compat_providers::groq()
+                                                    .with_api_key(key),
+                                                "mistral" => openai_compat_providers::mistral()
+                                                    .with_api_key(key),
+                                                "deepseek" => openai_compat_providers::deepseek()
+                                                    .with_api_key(key),
+                                                "xai" => {
+                                                    openai_compat_providers::xai().with_api_key(key)
+                                                }
+                                                "openrouter" => {
+                                                    openai_compat_providers::openrouter()
                                                         .with_api_key(key)
-                                                    }
-                                                };
+                                                }
+                                                "togetherai" | "together-ai" => {
+                                                    openai_compat_providers::together_ai()
+                                                        .with_api_key(key)
+                                                }
+                                                "perplexity" => {
+                                                    openai_compat_providers::perplexity()
+                                                        .with_api_key(key)
+                                                }
+                                                "cerebras" => openai_compat_providers::cerebras()
+                                                    .with_api_key(key),
+                                                "deepinfra" => openai_compat_providers::deepinfra()
+                                                    .with_api_key(key),
+                                                "venice" => openai_compat_providers::venice()
+                                                    .with_api_key(key),
+                                                "huggingface" => {
+                                                    openai_compat_providers::huggingface()
+                                                        .with_api_key(key)
+                                                }
+                                                "nvidia" => openai_compat_providers::nvidia()
+                                                    .with_api_key(key),
+                                                "siliconflow" => {
+                                                    openai_compat_providers::siliconflow()
+                                                        .with_api_key(key)
+                                                }
+                                                "sambanova" => openai_compat_providers::sambanova()
+                                                    .with_api_key(key),
+                                                "moonshot" => openai_compat_providers::moonshot()
+                                                    .with_api_key(key),
+                                                "zhipu" => openai_compat_providers::zhipu()
+                                                    .with_api_key(key),
+                                                "qwen" => openai_compat_providers::qwen()
+                                                    .with_api_key(key),
+                                                "nebius" => openai_compat_providers::nebius()
+                                                    .with_api_key(key),
+                                                "novita" => openai_compat_providers::novita()
+                                                    .with_api_key(key),
+                                                "ovhcloud" => openai_compat_providers::ovhcloud()
+                                                    .with_api_key(key),
+                                                "scaleway" => openai_compat_providers::scaleway()
+                                                    .with_api_key(key),
+                                                "vultr" | "vultr-ai" => {
+                                                    openai_compat_providers::vultr_ai()
+                                                        .with_api_key(key)
+                                                }
+                                                "baseten" => openai_compat_providers::baseten()
+                                                    .with_api_key(key),
+                                                "friendli" => openai_compat_providers::friendli()
+                                                    .with_api_key(key),
+                                                "upstage" => openai_compat_providers::upstage()
+                                                    .with_api_key(key),
+                                                "stepfun" => openai_compat_providers::stepfun()
+                                                    .with_api_key(key),
+                                                "fireworks" => openai_compat_providers::fireworks()
+                                                    .with_api_key(key),
+                                                "ollama" => openai_compat_providers::ollama(),
+                                                "lmstudio" | "lm-studio" => {
+                                                    openai_compat_providers::lm_studio()
+                                                }
+                                                "llamacpp" | "llama-cpp" => {
+                                                    openai_compat_providers::llama_cpp()
+                                                }
+                                                _ => {
+                                                    // True fallback: unknown provider, generic OpenAI-compatible
+                                                    mangocode_api::OpenAiCompatProvider::new(
+                                                        &provider_id_str,
+                                                        &provider_id_str,
+                                                        "https://api.openai.com/v1",
+                                                    )
+                                                    .with_api_key(key)
+                                                }
+                                            };
                                             let provider: std::sync::Arc<
                                                 dyn mangocode_api::LlmProvider,
                                             > = std::sync::Arc::new(provider);
@@ -1663,9 +1654,12 @@ pub async fn run_query_loop(
                             config.effort_level,
                             effective_thinking_budget,
                             turn,
-                            tool_ctx.session_metrics
+                            tool_ctx
+                                .session_metrics
                                 .as_ref()
-                                .map(|m| m.tool_use_count.load(std::sync::atomic::Ordering::Relaxed))
+                                .map(|m| {
+                                    m.tool_use_count.load(std::sync::atomic::Ordering::Relaxed)
+                                })
                                 .unwrap_or(0),
                             config.qwen_preserve_thinking,
                         ),
@@ -2017,7 +2011,8 @@ pub async fn run_query_loop(
                             blocked_result: Option<ToolResult>,
                         }
 
-                        let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_use_blocks.len());
+                        let mut prepared: Vec<PreparedTool> =
+                            Vec::with_capacity(tool_use_blocks.len());
                         for (id, name, input) in tool_use_blocks {
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolStart {
@@ -2047,28 +2042,43 @@ pub async fn run_query_loop(
                             .await;
                             end_hook_span(pre_hook_span);
 
-                            let blocked_result = if let mangocode_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(mangocode_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                check_critic(
-                                    &name,
-                                    &input,
-                                    &tool_ctx.working_dir,
-                                    messages,
-                                    &tool_ctx.config,
-                                )
-                                .await
-                            };
+                            let blocked_result =
+                                if let mangocode_core::hooks::HookOutcome::Blocked(reason) =
+                                    pre_outcome
+                                {
+                                    warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                                    Some(mangocode_tools::ToolResult::error(format!(
+                                        "Blocked by hook: {}",
+                                        reason
+                                    )))
+                                } else {
+                                    check_critic(
+                                        &name,
+                                        &input,
+                                        &tool_ctx.working_dir,
+                                        messages,
+                                        &tool_ctx.config,
+                                    )
+                                    .await
+                                };
 
-                            prepared.push(PreparedTool { id, name, input, blocked_result });
+                            prepared.push(PreparedTool {
+                                id,
+                                name,
+                                input,
+                                blocked_result,
+                            });
                         }
 
-                        let has_agent_tool = prepared.iter().any(|p| p.blocked_result.is_none() && p.name == mangocode_core::constants::TOOL_NAME_AGENT);
-                        let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool { Some(messages.clone()) } else { None };
+                        let has_agent_tool = prepared.iter().any(|p| {
+                            p.blocked_result.is_none()
+                                && p.name == mangocode_core::constants::TOOL_NAME_AGENT
+                        });
+                        let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool {
+                            Some(messages.clone())
+                        } else {
+                            None
+                        };
 
                         let exec_futures: Vec<_> = prepared
                             .iter()
@@ -2080,11 +2090,12 @@ pub async fn run_query_loop(
                                     let id = p.id.clone();
                                     let name = p.name.clone();
                                     let input = p.input.clone();
-                                    let parent_msgs = if name == mangocode_core::constants::TOOL_NAME_AGENT {
-                                        parent_msgs_snapshot.clone()
-                                    } else {
-                                        None
-                                    };
+                                    let parent_msgs =
+                                        if name == mangocode_core::constants::TOOL_NAME_AGENT {
+                                            parent_msgs_snapshot.clone()
+                                        } else {
+                                            None
+                                        };
                                     futures::future::Either::Right(async move {
                                         let tool_started = std::time::Instant::now();
                                         let result = execute_tool(ExecuteToolRequest {
@@ -2105,10 +2116,14 @@ pub async fn run_query_loop(
                             })
                             .collect();
 
-                        let exec_results: Vec<(ToolResult, u64)> = futures::future::join_all(exec_futures).await;
+                        let exec_results: Vec<(ToolResult, u64)> =
+                            futures::future::join_all(exec_futures).await;
 
-                        let mut tool_results: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                        for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter()) {
+                        let mut tool_results: Vec<ContentBlock> =
+                            Vec::with_capacity(prepared.len());
+                        for (p, (result, tool_duration_ms)) in
+                            prepared.iter().zip(exec_results.into_iter())
+                        {
                             // Run PostToolUse hooks
                             let hooks = &tool_ctx.config.hooks;
                             let post_ctx = mangocode_core::hooks::HookContext {
@@ -2162,7 +2177,9 @@ pub async fn run_query_loop(
 
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: p.id.clone(),
-                                content: mangocode_core::types::ToolResultContent::Text(result.content),
+                                content: mangocode_core::types::ToolResultContent::Text(
+                                    result.content,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -2570,33 +2587,31 @@ pub async fn run_query_loop(
                 // its own future (which would make the future !Send).
                 {
                     let memory_dir = memory_dir_for_working_dir(&tool_ctx.working_dir);
-                    let conversations_dir = conversations_dir_for_working_dir(&tool_ctx.working_dir);
+                    let conversations_dir =
+                        conversations_dir_for_working_dir(&tool_ctx.working_dir);
                     let dreamer = crate::auto_dream::AutoDream::new(memory_dir, conversations_dir);
                     if let Ok(Some(task)) = dreamer.maybe_trigger().await {
-                            // Run the consolidation subagent in a background Tokio
-                            // task. We use the AgentTool execute path (via
-                            // poll_background_agent / BACKGROUND_AGENTS) to avoid
-                            // re-entering run_query_loop from within the same
-                            // future graph.
-                            let agent_input = serde_json::json!({
-                                "description": "memory consolidation",
-                                "prompt": task.prompt,
-                                "max_turns": 20,
-                                "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
-                                "run_in_background": true,
-                                "isolation": null
-                            });
-                            let ctx_for_dream = tool_ctx.clone();
-                            tokio::spawn(async move {
-                                let agent = crate::agent_tool::AgentTool;
-                                let _result = mangocode_tools::Tool::execute(
-                                    &agent,
-                                    agent_input,
-                                    &ctx_for_dream,
-                                )
-                                .await;
-                                crate::auto_dream::AutoDream::finish_consolidation(&task).await;
-                            });
+                        // Run the consolidation subagent in a background Tokio
+                        // task. We use the AgentTool execute path (via
+                        // poll_background_agent / BACKGROUND_AGENTS) to avoid
+                        // re-entering run_query_loop from within the same
+                        // future graph.
+                        let agent_input = serde_json::json!({
+                            "description": "memory consolidation",
+                            "prompt": task.prompt,
+                            "max_turns": 20,
+                            "system_prompt": "You are performing automatic memory consolidation. Complete the task and return a brief summary.",
+                            "run_in_background": true,
+                            "isolation": null
+                        });
+                        let ctx_for_dream = tool_ctx.clone();
+                        tokio::spawn(async move {
+                            let agent = crate::agent_tool::AgentTool;
+                            let _result =
+                                mangocode_tools::Tool::execute(&agent, agent_input, &ctx_for_dream)
+                                    .await;
+                            crate::auto_dream::AutoDream::finish_consolidation(&task).await;
+                        });
                     }
                 }
 
@@ -2759,8 +2774,11 @@ pub async fn run_query_loop(
                     p.blocked_result.is_none()
                         && p.name == mangocode_core::constants::TOOL_NAME_AGENT
                 });
-                let parent_msgs_snapshot: Option<Vec<Message>> =
-                    if has_agent_tool { Some(messages.clone()) } else { None };
+                let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool {
+                    Some(messages.clone())
+                } else {
+                    None
+                };
 
                 let exec_futures: Vec<_> = prepared
                     .iter()
@@ -2772,7 +2790,8 @@ pub async fn run_query_loop(
                             let id = p.id.clone();
                             let name = p.name.clone();
                             let input = p.input.clone();
-                            let parent_msgs = if name == mangocode_core::constants::TOOL_NAME_AGENT {
+                            let parent_msgs = if name == mangocode_core::constants::TOOL_NAME_AGENT
+                            {
                                 parent_msgs_snapshot.clone()
                             } else {
                                 None
@@ -2798,11 +2817,13 @@ pub async fn run_query_loop(
                     .collect();
 
                 // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<(ToolResult, u64)> = futures::future::join_all(exec_futures).await;
+                let exec_results: Vec<(ToolResult, u64)> =
+                    futures::future::join_all(exec_futures).await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
                 let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
-                for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter()) {
+                for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter())
+                {
                     if let Some(metrics) = &tool_ctx.session_metrics {
                         metrics.increment_tool_use();
                         metrics.add_tool_duration(tool_duration_ms);
@@ -2908,12 +2929,10 @@ async fn maybe_inject_lsp_diagnostics(
 
     // Determine the file path affected by the tool, if any.
     let file_path = match tool_name {
-        TOOL_NAME_FILE_WRITE | TOOL_NAME_FILE_EDIT => {
-            tool_input
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
+        TOOL_NAME_FILE_WRITE | TOOL_NAME_FILE_EDIT => tool_input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         TOOL_NAME_BASH => {
             // Heuristic: skip for Bash — we can't reliably determine the target file
             None
@@ -2930,10 +2949,7 @@ async fn maybe_inject_lsp_diagnostics(
     let abs_path = if std::path::Path::new(&file_path).is_absolute() {
         file_path
     } else {
-        working_dir
-            .join(&file_path)
-            .to_string_lossy()
-            .into_owned()
+        working_dir.join(&file_path).to_string_lossy().into_owned()
     };
 
     let lsp_mgr = mangocode_core::lsp::global_lsp_manager();
@@ -3068,10 +3084,12 @@ async fn check_critic(
             warn!(error = %e, "Permission critic error");
             end_permission_span(permission_span);
             if critic_cfg.fallback_to_classifier {
-                static_classifier_fallback(tool_name, tool_input).map(|reason| mangocode_tools::ToolResult::error(format!(
-                    "Blocked by permission classifier fallback: {} (critic unavailable: {})",
-                    reason, e
-                )))
+                static_classifier_fallback(tool_name, tool_input).map(|reason| {
+                    mangocode_tools::ToolResult::error(format!(
+                        "Blocked by permission classifier fallback: {} (critic unavailable: {})",
+                        reason, e
+                    ))
+                })
             } else {
                 Some(mangocode_tools::ToolResult::error(format!(
                     "Blocked by permission critic (evaluation error): {}",
@@ -3147,31 +3165,36 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
             parent_msgs,
         ))
         .await;
-        end_tool_span(tool_span, !result.is_error, if result.is_error { Some(result.content.as_str()) } else { None });
+        end_tool_span(
+            tool_span,
+            !result.is_error,
+            if result.is_error {
+                Some(result.content.as_str())
+            } else {
+                None
+            },
+        );
         return result;
     }
 
     if req.name == "LSP" {
         if let Some(tx) = req.event_tx {
-            let file_path = req
-                .input
-                .get("file")
-                .and_then(|v| v.as_str())
-                .map(|file| {
-                    let path = std::path::Path::new(file);
-                    if path.is_absolute() {
-                        path.to_path_buf()
-                    } else {
-                        req.ctx.working_dir.join(path)
-                    }
-                });
+            let file_path = req.input.get("file").and_then(|v| v.as_str()).map(|file| {
+                let path = std::path::Path::new(file);
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    req.ctx.working_dir.join(path)
+                }
+            });
 
             if let Some(file_path) = file_path {
                 let manager_arc = mangocode_core::lsp::global_lsp_manager();
                 let status = {
                     let mut manager = manager_arc.lock().await;
                     manager.seed_from_config(&req.ctx.config.lsp_servers);
-                    let detected = mangocode_core::lsp::detect_project_languages(&req.ctx.working_dir);
+                    let detected =
+                        mangocode_core::lsp::detect_project_languages(&req.ctx.working_dir);
                     manager.seed_from_config(&detected);
 
                     manager
@@ -3199,7 +3222,15 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
         Some(tool) => {
             debug!(tool = req.name, "Executing tool");
             let result = tool.execute(req.input.clone(), req.ctx).await;
-            end_tool_span(tool_span, !result.is_error, if result.is_error { Some(result.content.as_str()) } else { None });
+            end_tool_span(
+                tool_span,
+                !result.is_error,
+                if result.is_error {
+                    Some(result.content.as_str())
+                } else {
+                    None
+                },
+            );
             result
         }
         None => {
@@ -3274,10 +3305,7 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     SystemPrompt::Text(text)
 }
 
-fn build_system_prompt_with_git_context(
-    config: &QueryConfig,
-    git_context: String,
-) -> SystemPrompt {
+fn build_system_prompt_with_git_context(config: &QueryConfig, git_context: String) -> SystemPrompt {
     let opts = mangocode_core::system_prompt::SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
@@ -3340,10 +3368,7 @@ fn build_skill_injection_for_turn(
         .map(|s| (s.name.clone(), s.template.clone()))
         .collect();
 
-    let skill_qa_blocks: Vec<String> = skill_context
-        .iter()
-        .filter_map(format_qa_block)
-        .collect();
+    let skill_qa_blocks: Vec<String> = skill_context.iter().filter_map(format_qa_block).collect();
 
     (injected_skills, skill_qa_blocks)
 }
@@ -3548,13 +3573,13 @@ mod tests {
     use mangocode_api::providers::mock::ToolCall;
     use mangocode_api::providers::MockProvider;
     use mangocode_api::ProviderRegistry;
+    use mangocode_api::SystemPrompt;
     use mangocode_core::config::{Config as CoreConfig, PermissionMode};
     use mangocode_core::permissions::AutoPermissionHandler;
     use mangocode_core::types::{MessageContent, Role};
     use mangocode_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
-    use mangocode_api::SystemPrompt;
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
@@ -3780,7 +3805,10 @@ mod tests {
         // FLAG_QWEN_PRESERVE_THINKING defaults to false in default_flags().
         let result = should_enable_qwen_preserve_thinking("qwen", 10, 10);
         // Flag is off by default, so this should be false.
-        assert!(!result, "preserve_thinking should be off when flag is disabled");
+        assert!(
+            !result,
+            "preserve_thinking should be off when flag is disabled"
+        );
     }
 
     #[test]
@@ -3803,16 +3831,12 @@ mod tests {
     #[test]
     fn test_qwen_no_enable_thinking_without_budget() {
         // Without a thinking budget, enable_thinking should not be set.
-        let options = build_provider_options(
-            "qwen",
-            "qwen3.6-plus-2026-04-02",
-            None,
-            None,
-            0,
-            0,
-            false,
+        let options =
+            build_provider_options("qwen", "qwen3.6-plus-2026-04-02", None, None, 0, 0, false);
+        assert!(
+            options["enable_thinking"].is_null()
+                || !options["enable_thinking"].as_bool().unwrap_or(false)
         );
-        assert!(options["enable_thinking"].is_null() || !options["enable_thinking"].as_bool().unwrap_or(false));
     }
 
     #[test]
@@ -3919,16 +3943,15 @@ mod tests {
 
     fn has_assistant_text(messages: &[mangocode_core::types::Message], needle: &str) -> bool {
         messages.iter().any(|m| {
-            m.role == Role::Assistant
-                && match &m.content {
-                    MessageContent::Text(t) => t.contains(needle),
-                    MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
-                        matches!(
-                            b,
-                            mangocode_core::types::ContentBlock::Text { text } if text.contains(needle)
-                        )
-                    }),
-                }
+            m.role == Role::Assistant && match &m.content {
+                MessageContent::Text(t) => t.contains(needle),
+                MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
+                    matches!(
+                        b,
+                        mangocode_core::types::ContentBlock::Text { text } if text.contains(needle)
+                    )
+                }),
+            }
         })
     }
 
@@ -3960,7 +3983,11 @@ mod tests {
     #[tokio::test]
     async fn query_loop_single_tool_chain() {
         let mock = MockProvider::with_responses(vec!["final answer"]).with_tool_sequence(vec![
-            vec![ToolCall::new("call-1", "echo_tool", json!({ "value": "one" }))],
+            vec![ToolCall::new(
+                "call-1",
+                "echo_tool",
+                json!({ "value": "one" }),
+            )],
             vec![],
         ]);
         let registry = make_registry(mock);
@@ -4012,7 +4039,11 @@ mod tests {
                 ToolCall::new("call-a", "echo_tool", json!({ "value": "a" })),
                 ToolCall::new("call-b", "echo_tool", json!({ "value": "b" })),
             ],
-            vec![ToolCall::new("call-c", "echo_tool", json!({ "value": "c" }))],
+            vec![ToolCall::new(
+                "call-c",
+                "echo_tool",
+                json!({ "value": "c" }),
+            )],
             vec![],
         ]);
         let registry = make_registry(mock);
@@ -4090,16 +4121,17 @@ mod tests {
     #[test]
     fn critic_missing_key_warning_for_noncritical() {
         let input = serde_json::json!({ "command": "ls -la" });
-        let warning = critic_missing_key_warning(mangocode_core::constants::TOOL_NAME_BASH, &input, true);
-        assert!(warning
-            .contains("no API key is configured"));
+        let warning =
+            critic_missing_key_warning(mangocode_core::constants::TOOL_NAME_BASH, &input, true);
+        assert!(warning.contains("no API key is configured"));
         assert!(warning.contains("Warning-only mode"));
     }
 
     #[test]
     fn critic_missing_key_warning_includes_classifier_reason_when_critical() {
         let input = serde_json::json!({ "command": "rm -rf /" });
-        let warning = critic_missing_key_warning(mangocode_core::constants::TOOL_NAME_BASH, &input, true);
+        let warning =
+            critic_missing_key_warning(mangocode_core::constants::TOOL_NAME_BASH, &input, true);
         assert!(warning.contains("critical risk"));
         assert!(warning.contains("Warning-only mode"));
     }

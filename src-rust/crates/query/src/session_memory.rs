@@ -430,7 +430,10 @@ async fn update_memory_index(
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
     for (category, topic_file) in updated_topics {
         let link = format!("memory/{}", topic_file);
-        if !lines.iter().any(|line| line.contains(&format!("({})", link))) {
+        if !lines
+            .iter()
+            .any(|line| line.contains(&format!("({})", link)))
+        {
             lines.push(format!(
                 "- [{}]({}) — {}",
                 category.topic_title(),
@@ -764,7 +767,9 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         let topic = fs::read_to_string(memory_dir.join("project-facts.md"))
             .await
             .unwrap();
-        let index = fs::read_to_string(memory_dir.join("MEMORY.md")).await.unwrap();
+        let index = fs::read_to_string(memory_dir.join("MEMORY.md"))
+            .await
+            .unwrap();
         assert!(topic.contains("Uses async Rust"));
         assert!(index.contains("memory/project-facts.md"));
     }
@@ -776,9 +781,7 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         fs::create_dir_all(&memory_dir).await.unwrap();
         let topic_path = memory_dir.join("user-preferences.md");
 
-        fs::write(&topic_path, "# Existing\n")
-            .await
-            .unwrap();
+        fs::write(&topic_path, "# Existing\n").await.unwrap();
 
         let memories = vec![ExtractedMemory {
             content: "Prefers explicit error handling".to_string(),
@@ -810,7 +813,9 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         let topic = fs::read_to_string(memory_dir.join("project-facts.md"))
             .await
             .unwrap();
-        let index = fs::read_to_string(memory_dir.join("MEMORY.md")).await.unwrap();
+        let index = fs::read_to_string(memory_dir.join("MEMORY.md"))
+            .await
+            .unwrap();
         assert!(topic.contains("Uses serde"));
         assert!(index.contains("memory/project-facts.md"));
         assert!(dot_dir.join("AGENTS.md.bak").exists());
@@ -846,12 +851,11 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         for i in 0..220 {
             let topic = format!("topic-{}.md", i);
             fs::write(memory_dir.join(&topic), "x").await.unwrap();
-            long_index.push_str(&format!(
-                "- [Topic {}](memory/{}) — hook {}\n",
-                i, topic, i
-            ));
+            long_index.push_str(&format!("- [Topic {}](memory/{}) — hook {}\n", i, topic, i));
         }
-        fs::write(memory_dir.join("MEMORY.md"), long_index).await.unwrap();
+        fs::write(memory_dir.join("MEMORY.md"), long_index)
+            .await
+            .unwrap();
 
         let memories = vec![ExtractedMemory {
             content: "constraint here".to_string(),

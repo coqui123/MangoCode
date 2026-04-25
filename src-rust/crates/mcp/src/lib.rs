@@ -912,7 +912,10 @@ pub mod client {
         ) -> anyhow::Result<T> {
             let (_id, resp_rx) = self.send_request(method, params).await?;
             let resp = resp_rx.await.map_err(|_| {
-                anyhow::anyhow!("MCP transport closed while waiting for response to '{}'", method)
+                anyhow::anyhow!(
+                    "MCP transport closed while waiting for response to '{}'",
+                    method
+                )
             })?;
 
             if let Some(err) = resp.error {

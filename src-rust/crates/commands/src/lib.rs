@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use mangocode_core::analytics::SessionMetrics;
 use mangocode_core::config::{Config, Settings, Theme};
-use mangocode_core::cost::CostTracker;
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
+use mangocode_core::cost::CostTracker;
 use mangocode_core::feature_flags::FeatureFlags;
 use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
 use mangocode_core::types::Message;
@@ -440,10 +440,11 @@ fn command_category(name: &str) -> &'static str {
         "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
         | "statusline" | "output-style" | "keybindings" | "privacy-settings" | "flags"
         | "rate-limit-options" | "sandbox-toggle" => "Settings",
-        "cost" | "analytics" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
-        "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade" | "release-notes" => {
-            "System"
+        "cost" | "analytics" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => {
+            "Usage & Cost"
         }
+        "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
+        | "release-notes" => "System",
         "login" | "logout" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
@@ -734,7 +735,11 @@ impl SlashCommand for AnalyticsCommand {
                 return CommandResult::Error("Could not resolve home directory.".to_string());
             };
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let status = if path.exists() { "present" } else { "not found" };
+            let status = if path.exists() {
+                "present"
+            } else {
+                "not found"
+            };
             return CommandResult::Message(format!(
                 "Analytics Export\n\
                  Path: {}\n\
@@ -1501,7 +1506,11 @@ impl SlashCommand for StatusCommand {
                 .config
                 .provider
                 .clone()
-                .or_else(|| registry.find_provider_for_model(model).map(|p| p.to_string()))
+                .or_else(|| {
+                    registry
+                        .find_provider_for_model(model)
+                        .map(|p| p.to_string())
+                })
                 .unwrap_or_else(|| "anthropic".to_string());
             (provider, model.to_string())
         };
@@ -2630,7 +2639,9 @@ impl SlashCommand for VaultCommand {
         match subcommand {
             "providers" | "supported" => {
                 let mut out = String::new();
-                out.push_str("Supported vault provider IDs (use with `/vault set <provider-id>`):\n\n");
+                out.push_str(
+                    "Supported vault provider IDs (use with `/vault set <provider-id>`):\n\n",
+                );
 
                 // Format: provider-id — env var(s) — notes/aliases
                 let rows: &[(&str, &str, &str)] = &[
@@ -2641,12 +2652,24 @@ impl SlashCommand for VaultCommand {
                         "(no env key — /connect → OpenAI Codex OAuth)",
                         "ChatGPT-plan Codex; alias: codex",
                     ),
-                    ("google", "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY", ""),
+                    (
+                        "google",
+                        "GOOGLE_API_KEY / GOOGLE_GENERATIVE_AI_API_KEY",
+                        "",
+                    ),
                     ("azure", "AZURE_API_KEY (+ AZURE_RESOURCE_NAME)", ""),
                     ("cohere", "COHERE_API_KEY", ""),
                     ("github-copilot", "GITHUB_TOKEN", ""),
-                    ("amazon-bedrock", "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY", ""),
-                    ("google-vertex", "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)", ""),
+                    (
+                        "amazon-bedrock",
+                        "AWS_BEARER_TOKEN_BEDROCK or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY",
+                        "",
+                    ),
+                    (
+                        "google-vertex",
+                        "VERTEX_PROJECT_ID (+ optional VERTEX_ACCESS_TOKEN)",
+                        "",
+                    ),
                     ("deepseek", "DEEPSEEK_API_KEY", ""),
                     ("groq", "GROQ_API_KEY", ""),
                     ("xai", "XAI_API_KEY", ""),
@@ -2686,22 +2709,29 @@ impl SlashCommand for VaultCommand {
                     }
                 }
 
-                out.push_str("\nTip: `/vault list` shows what you already stored (no secrets displayed).\n");
+                out.push_str(
+                    "\nTip: `/vault list` shows what you already stored (no secrets displayed).\n",
+                );
                 CommandResult::Message(out)
             }
             "init" => {
                 if vault.exists() {
                     return CommandResult::Message(
-                        "Vault already exists. Use `/vault set <provider>` to add keys.".to_string(),
+                        "Vault already exists. Use `/vault set <provider>` to add keys."
+                            .to_string(),
                     );
                 }
                 let passphrase = match prompt_secure_input("Enter vault passphrase: ") {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 let confirm = match prompt_secure_input("Confirm passphrase: ") {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 if passphrase != confirm {
                     return CommandResult::Error("Passphrases don't match.".to_string());
@@ -2722,7 +2752,9 @@ impl SlashCommand for VaultCommand {
                 }
                 let passphrase = match prompt_secure_input("Vault passphrase: ") {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 if let Err(e) = vault.load(&passphrase) {
                     return CommandResult::Error(format!("Vault unlock failed: {}", e));
@@ -2743,7 +2775,9 @@ impl SlashCommand for VaultCommand {
             "set" => {
                 let provider = match parts.next() {
                     Some(p) => p,
-                    None => return CommandResult::Error("Usage: /vault set <provider>".to_string()),
+                    None => {
+                        return CommandResult::Error("Usage: /vault set <provider>".to_string())
+                    }
                 };
                 if !vault.exists() {
                     return CommandResult::Error(
@@ -2752,11 +2786,16 @@ impl SlashCommand for VaultCommand {
                 }
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
-                let secret = match prompt_secure_input(&format!("Enter API key for {}: ", provider)) {
+                let secret = match prompt_secure_input(&format!("Enter API key for {}: ", provider))
+                {
                     Ok(s) => s,
-                    Err(e) => return CommandResult::Error(format!("Failed to read API key: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read API key: {}", e))
+                    }
                 };
                 let label = parts.next().map(|s| s.to_string());
                 if let Err(e) = vault.set_secret(provider, &secret, &passphrase, label.as_deref()) {
@@ -2771,14 +2810,18 @@ impl SlashCommand for VaultCommand {
             "get" => {
                 let provider = match parts.next() {
                     Some(p) => p,
-                    None => return CommandResult::Error("Usage: /vault get <provider>".to_string()),
+                    None => {
+                        return CommandResult::Error("Usage: /vault get <provider>".to_string())
+                    }
                 };
                 if !vault.exists() {
                     return CommandResult::Error("No vault found.".to_string());
                 }
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 match vault.get_secret(provider, &passphrase) {
                     Ok(has_secret) => {
@@ -2798,7 +2841,9 @@ impl SlashCommand for VaultCommand {
                 }
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 match vault.list_providers(&passphrase) {
                     Ok(entries) => {
@@ -2831,14 +2876,18 @@ impl SlashCommand for VaultCommand {
             "remove" => {
                 let provider = match parts.next() {
                     Some(p) => p,
-                    None => return CommandResult::Error("Usage: /vault remove <provider>".to_string()),
+                    None => {
+                        return CommandResult::Error("Usage: /vault remove <provider>".to_string())
+                    }
                 };
                 if !vault.exists() {
                     return CommandResult::Error("No vault found.".to_string());
                 }
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
-                    Err(e) => return CommandResult::Error(format!("Failed to read passphrase: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                    }
                 };
                 if let Err(e) = vault.remove_secret(provider, &passphrase) {
                     return CommandResult::Error(format!("Failed to remove secret: {}", e));
@@ -2851,10 +2900,7 @@ impl SlashCommand for VaultCommand {
             }
             "export" => {
                 if vault.exists() {
-                    CommandResult::Message(format!(
-                        "Vault path: {}",
-                        vault.path().display()
-                    ))
+                    CommandResult::Message(format!("Vault path: {}", vault.path().display()))
                 } else {
                     CommandResult::Message("No vault exists.".to_string())
                 }

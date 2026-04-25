@@ -90,17 +90,19 @@ impl VertexConfig {
             _ => VertexAuthMode::Adc,
         };
 
-        let access_token = std::env::var("VERTEX_ACCESS_TOKEN")
-            .ok()
-            .or_else(|| {
-                // Vault fallback for CI / headless setups using AccessToken mode.
-                let vault = mangocode_core::Vault::new();
-                mangocode_core::get_vault_passphrase().and_then(|passphrase| {
-                    vault.get_secret(mangocode_core::provider_id::ProviderId::GOOGLE_VERTEX, &passphrase)
-                        .ok()
-                        .flatten()
-                })
-            });
+        let access_token = std::env::var("VERTEX_ACCESS_TOKEN").ok().or_else(|| {
+            // Vault fallback for CI / headless setups using AccessToken mode.
+            let vault = mangocode_core::Vault::new();
+            mangocode_core::get_vault_passphrase().and_then(|passphrase| {
+                vault
+                    .get_secret(
+                        mangocode_core::provider_id::ProviderId::GOOGLE_VERTEX,
+                        &passphrase,
+                    )
+                    .ok()
+                    .flatten()
+            })
+        });
         let base_url_override = std::env::var("VERTEX_BASE_URL").ok();
 
         Some(Self {
@@ -364,21 +366,26 @@ impl VertexOpenAiProvider {
         })?;
         let auth_header = format!("Bearer {}", token);
         let retry_cfg = crate::error_handling::RetryConfig::default();
-        let resp = crate::retry::retry_request(&retry_cfg, "google-vertex", |_attempt| {
-            let client = self.http_client.clone();
-            let u = url.clone();
-            let b = body_str.clone();
-            let a = auth_header.clone();
-            async move {
-                client
-                    .post(&u)
-                    .header("Authorization", a)
-                    .header("Content-Type", "application/json")
-                    .body(b)
-                    .send()
-                    .await
-            }
-        }, |msg| eprintln!("{}", msg))
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            "google-vertex",
+            |_attempt| {
+                let client = self.http_client.clone();
+                let u = url.clone();
+                let b = body_str.clone();
+                let a = auth_header.clone();
+                async move {
+                    client
+                        .post(&u)
+                        .header("Authorization", a)
+                        .header("Content-Type", "application/json")
+                        .body(b)
+                        .send()
+                        .await
+                }
+            },
+            |msg| eprintln!("{}", msg),
+        )
         .await
         .map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
@@ -460,22 +467,27 @@ impl VertexOpenAiProvider {
         })?;
         let auth_header = format!("Bearer {}", token);
         let retry_cfg = crate::error_handling::RetryConfig::default();
-        let resp = crate::retry::retry_request(&retry_cfg, "google-vertex", |_attempt| {
-            let client = self.http_client.clone();
-            let u = url.clone();
-            let b = body_str.clone();
-            let a = auth_header.clone();
-            async move {
-                client
-                    .post(&u)
-                    .header("Authorization", a)
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream")
-                    .body(b)
-                    .send()
-                    .await
-            }
-        }, |msg| eprintln!("{}", msg))
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            "google-vertex",
+            |_attempt| {
+                let client = self.http_client.clone();
+                let u = url.clone();
+                let b = body_str.clone();
+                let a = auth_header.clone();
+                async move {
+                    client
+                        .post(&u)
+                        .header("Authorization", a)
+                        .header("Content-Type", "application/json")
+                        .header("Accept", "text/event-stream")
+                        .body(b)
+                        .send()
+                        .await
+                }
+            },
+            |msg| eprintln!("{}", msg),
+        )
         .await
         .map_err(|e| ProviderError::Other {
             provider: self.id.clone(),

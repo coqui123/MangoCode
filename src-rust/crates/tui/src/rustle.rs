@@ -216,10 +216,7 @@ pub fn rustle_lines_sized(max_rows: u16) -> Vec<Line<'static>> {
         }
     }
 
-    let lines = match std::env::var("MANGOCODE_MASCOT_RENDERER")
-        .ok()
-        .as_deref()
-    {
+    let lines = match std::env::var("MANGOCODE_MASCOT_RENDERER").ok().as_deref() {
         Some("quadrant") => render_svg_quadrants(max_rows),
         _ => render_svg_braille(max_rows),
     };

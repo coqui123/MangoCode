@@ -299,7 +299,11 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             .add_modifier(Modifier::BOLD),
     )));
     // Show IDE-safe shortcuts in IDE mode
-    let history_shortcut = if overlay.ide_mode { "Ctrl+Q R" } else { "Ctrl+R" };
+    let history_shortcut = if overlay.ide_mode {
+        "Ctrl+Q R"
+    } else {
+        "Ctrl+R"
+    };
     for (key, desc) in &[
         ("Enter", "Submit message"),
         ("Up / Down", "Input history"),
@@ -317,7 +321,11 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )));
-    let help_shortcut = if overlay.ide_mode { "Ctrl+Q H" } else { "Alt+H" };
+    let help_shortcut = if overlay.ide_mode {
+        "Ctrl+Q H"
+    } else {
+        "Alt+H"
+    };
     let f1_shortcut = if overlay.ide_mode { "Ctrl+Q F1" } else { "F1" };
     for (key, desc) in &[
         (f1_shortcut, "Toggle help"),

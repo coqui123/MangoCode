@@ -40,7 +40,8 @@ fn env_or_vault(env_var: &str, provider_id: &str) -> Option<String> {
             let vault = mangocode_core::Vault::new();
             mangocode_core::get_vault_passphrase().and_then(|passphrase| {
                 // Canonical provider id first, then known aliases.
-                vault.get_secret(provider_id, &passphrase)
+                vault
+                    .get_secret(provider_id, &passphrase)
                     .ok()
                     .flatten()
                     .or_else(|| {
@@ -287,9 +288,7 @@ impl ProviderRegistry {
                         // Claude Max uses Bearer auth — create from the OAuth access token
                         Some(Arc::new(AnthropicMaxProvider::new(key)))
                     }
-                    "openai-codex" | "codex" => {
-                        Some(Arc::new(OpenAiCodexProvider::new(key)))
-                    }
+                    "openai-codex" | "codex" => Some(Arc::new(OpenAiCodexProvider::new(key))),
                     "openai" => Some(Arc::new(OpenAiProvider::new(key))),
                     "google" => Some(Arc::new(GoogleProvider::new(key))),
                     "minimax" => Some(Arc::new(MinimaxProvider::new(key))),
@@ -371,8 +370,12 @@ impl ProviderRegistry {
     pub fn with_available_providers(&mut self) -> &mut Self {
         use crate::providers::openai_compat_providers as p;
 
-        fn register_if_key_set<F>(registry: &mut ProviderRegistry, env_var: &str, vault_key: &str, f: F)
-        where
+        fn register_if_key_set<F>(
+            registry: &mut ProviderRegistry,
+            env_var: &str,
+            vault_key: &str,
+            f: F,
+        ) where
             F: FnOnce(String) -> Arc<dyn LlmProvider>,
         {
             if let Some(key) = env_or_vault(env_var, vault_key) {
@@ -389,8 +392,12 @@ impl ProviderRegistry {
         register_if_key_set(self, "DEEPSEEK_API_KEY", "deepseek", |key| {
             Arc::new(p::deepseek().with_api_key(key))
         });
-        register_if_key_set(self, "GROQ_API_KEY", "groq", |key| Arc::new(p::groq().with_api_key(key)));
-        register_if_key_set(self, "XAI_API_KEY", "xai", |key| Arc::new(p::xai().with_api_key(key)));
+        register_if_key_set(self, "GROQ_API_KEY", "groq", |key| {
+            Arc::new(p::groq().with_api_key(key))
+        });
+        register_if_key_set(self, "XAI_API_KEY", "xai", |key| {
+            Arc::new(p::xai().with_api_key(key))
+        });
         register_if_key_set(self, "OPENROUTER_API_KEY", "openrouter", |key| {
             Arc::new(p::openrouter().with_api_key(key))
         });
@@ -406,8 +413,12 @@ impl ProviderRegistry {
         register_if_key_set(self, "DEEPINFRA_API_KEY", "deepinfra", |key| {
             Arc::new(p::deepinfra().with_api_key(key))
         });
-        register_if_key_set(self, "VENICE_API_KEY", "venice", |key| Arc::new(p::venice().with_api_key(key)));
-        register_if_key_set(self, "DASHSCOPE_API_KEY", "qwen", |key| Arc::new(p::qwen().with_api_key(key)));
+        register_if_key_set(self, "VENICE_API_KEY", "venice", |key| {
+            Arc::new(p::venice().with_api_key(key))
+        });
+        register_if_key_set(self, "DASHSCOPE_API_KEY", "qwen", |key| {
+            Arc::new(p::qwen().with_api_key(key))
+        });
         register_if_key_set(self, "MISTRAL_API_KEY", "mistral", |key| {
             Arc::new(p::mistral().with_api_key(key))
         });
@@ -417,28 +428,48 @@ impl ProviderRegistry {
         register_if_key_set(self, "HF_TOKEN", "huggingface", |key| {
             Arc::new(p::huggingface().with_api_key(key))
         });
-        register_if_key_set(self, "MINIMAX_API_KEY", "minimax", |key| Arc::new(MinimaxProvider::new(key)));
-        register_if_key_set(self, "NVIDIA_API_KEY", "nvidia", |key| Arc::new(p::nvidia().with_api_key(key)));
+        register_if_key_set(self, "MINIMAX_API_KEY", "minimax", |key| {
+            Arc::new(MinimaxProvider::new(key))
+        });
+        register_if_key_set(self, "NVIDIA_API_KEY", "nvidia", |key| {
+            Arc::new(p::nvidia().with_api_key(key))
+        });
         register_if_key_set(self, "SILICONFLOW_API_KEY", "siliconflow", |key| {
             Arc::new(p::siliconflow().with_api_key(key))
         });
         register_if_key_set(self, "MOONSHOT_API_KEY", "moonshotai", |key| {
             Arc::new(p::moonshot().with_api_key(key))
         });
-        register_if_key_set(self, "ZHIPU_API_KEY", "zhipuai", |key| Arc::new(p::zhipu().with_api_key(key)));
-        register_if_key_set(self, "NEBIUS_API_KEY", "nebius", |key| Arc::new(p::nebius().with_api_key(key)));
-        register_if_key_set(self, "NOVITA_API_KEY", "novita", |key| Arc::new(p::novita().with_api_key(key)));
+        register_if_key_set(self, "ZHIPU_API_KEY", "zhipuai", |key| {
+            Arc::new(p::zhipu().with_api_key(key))
+        });
+        register_if_key_set(self, "NEBIUS_API_KEY", "nebius", |key| {
+            Arc::new(p::nebius().with_api_key(key))
+        });
+        register_if_key_set(self, "NOVITA_API_KEY", "novita", |key| {
+            Arc::new(p::novita().with_api_key(key))
+        });
         register_if_key_set(self, "OVHCLOUD_API_KEY", "ovhcloud", |key| {
             Arc::new(p::ovhcloud().with_api_key(key))
         });
         register_if_key_set(self, "SCALEWAY_API_KEY", "scaleway", |key| {
             Arc::new(p::scaleway().with_api_key(key))
         });
-        register_if_key_set(self, "VULTR_API_KEY", "vultr", |key| Arc::new(p::vultr_ai().with_api_key(key)));
-        register_if_key_set(self, "BASETEN_API_KEY", "baseten", |key| Arc::new(p::baseten().with_api_key(key)));
-        register_if_key_set(self, "FRIENDLI_TOKEN", "friendli", |key| Arc::new(p::friendli().with_api_key(key)));
-        register_if_key_set(self, "UPSTAGE_API_KEY", "upstage", |key| Arc::new(p::upstage().with_api_key(key)));
-        register_if_key_set(self, "STEPFUN_API_KEY", "stepfun", |key| Arc::new(p::stepfun().with_api_key(key)));
+        register_if_key_set(self, "VULTR_API_KEY", "vultr", |key| {
+            Arc::new(p::vultr_ai().with_api_key(key))
+        });
+        register_if_key_set(self, "BASETEN_API_KEY", "baseten", |key| {
+            Arc::new(p::baseten().with_api_key(key))
+        });
+        register_if_key_set(self, "FRIENDLI_TOKEN", "friendli", |key| {
+            Arc::new(p::friendli().with_api_key(key))
+        });
+        register_if_key_set(self, "UPSTAGE_API_KEY", "upstage", |key| {
+            Arc::new(p::upstage().with_api_key(key))
+        });
+        register_if_key_set(self, "STEPFUN_API_KEY", "stepfun", |key| {
+            Arc::new(p::stepfun().with_api_key(key))
+        });
         register_if_key_set(self, "FIREWORKS_API_KEY", "fireworks", |key| {
             Arc::new(p::fireworks().with_api_key(key))
         });

@@ -67,7 +67,8 @@ impl BedrockProvider {
                 // Vault fallback: store the Bedrock bearer token under provider id "amazon-bedrock".
                 let vault = mangocode_core::Vault::new();
                 mangocode_core::get_vault_passphrase().and_then(|passphrase| {
-                    vault.get_secret(ProviderId::AMAZON_BEDROCK, &passphrase)
+                    vault
+                        .get_secret(ProviderId::AMAZON_BEDROCK, &passphrase)
                         .ok()
                         .flatten()
                 })

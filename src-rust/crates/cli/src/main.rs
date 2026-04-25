@@ -1169,7 +1169,10 @@ async fn main() -> anyhow::Result<()> {
     // (Config tool, TUI status bar, init event) report the same model that's
     // actually used for API calls.
     if config.model.is_none() {
-        config.model = Some(mangocode_api::effective_model_for_config(&config, &model_registry));
+        config.model = Some(mangocode_api::effective_model_for_config(
+            &config,
+            &model_registry,
+        ));
     }
     // Update the ToolContext config to match (it was cloned before registry was available)
     tool_ctx.config.model = config.model.clone();
@@ -1209,10 +1212,7 @@ async fn main() -> anyhow::Result<()> {
     let skill_index = std::sync::Arc::new(tokio::sync::RwLock::new(
         mangocode_query::SkillIndex::default(),
     ));
-    let prefetch_root = config
-        .project_dir
-        .clone()
-        .unwrap_or_else(|| cwd.clone());
+    let prefetch_root = config.project_dir.clone().unwrap_or_else(|| cwd.clone());
     let skill_index_bg = skill_index.clone();
     tokio::spawn(async move {
         mangocode_query::prefetch_skills(&prefetch_root, skill_index_bg).await;
@@ -1257,17 +1257,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn proactive monitor loop (feature-gated + opt-in via /proactive on).
     let proactive_cancel = tokio_util::sync::CancellationToken::new();
-    let _proactive_handle = mangocode_query::ProactiveAgent::new(
-        cwd.clone(),
-        tool_ctx.session_id.clone(),
-    )
-    .start(
-        client.clone(),
-        tools.clone(),
-        tool_ctx.clone(),
-        query_config.clone(),
-        proactive_cancel.clone(),
-    );
+    let _proactive_handle =
+        mangocode_query::ProactiveAgent::new(cwd.clone(), tool_ctx.session_id.clone()).start(
+            client.clone(),
+            tools.clone(),
+            tool_ctx.clone(),
+            query_config.clone(),
+            proactive_cancel.clone(),
+        );
 
     // Spawn background remote settings poller.
     let remote_settings_cancel = tokio_util::sync::CancellationToken::new();
@@ -3520,10 +3517,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     mangocode_core::ProviderId::OPENAI_CODEX,
                                     mangocode_core::auth_store::StoredCredential::OAuthToken {
                                         access: tokens.access_token.clone(),
-                                        refresh: tokens
-                                            .refresh_token
-                                            .clone()
-                                            .unwrap_or_default(),
+                                        refresh: tokens.refresh_token.clone().unwrap_or_default(),
                                         expires: expires_ms,
                                     },
                                 );
@@ -3545,7 +3539,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     // Claude Max (OAuth) — PKCE flow using the upstream registered client ID.                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
                     tokio::spawn(async move {
                         // Signal the dialog to enter browser-waiting state
-                        let placeholder_url = "Opening browser for Claude authentication…".to_string();
+                        let placeholder_url =
+                            "Opening browser for Claude authentication…".to_string();
                         let _ = tx2
                             .send(DeviceAuthEvent::GotBrowserUrl {
                                 url: placeholder_url,
@@ -3559,16 +3554,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 // Unwrap tokens: we need refresh + expiry for full storage.
                                 // access_token is in result.credential when use_bearer_auth=true.
                                 let (refresh_tok, expires_u64) = (
-                                    result
-                                        .tokens
-                                        .refresh_token
-                                        .clone()
-                                        .unwrap_or_default(),
-                                    result
-                                        .tokens
-                                        .expires_at_ms
-                                        .map(|ms| ms as u64)
-                                        .unwrap_or(0),
+                                    result.tokens.refresh_token.clone().unwrap_or_default(),
+                                    result.tokens.expires_at_ms.map(|ms| ms as u64).unwrap_or(0),
                                 );
                                 store.set(
                                     mangocode_core::ProviderId::ANTHROPIC_MAX,
@@ -3695,7 +3682,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     // Persist session and search index in background so UI loop stays responsive.
                     let session_clone = session.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = mangocode_core::history::save_session(&session_clone).await {
+                        if let Err(e) = mangocode_core::history::save_session(&session_clone).await
+                        {
                             eprintln!("Session save failed: {e}");
                         }
 

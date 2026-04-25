@@ -60,16 +60,10 @@ impl MockProvider {
     }
 
     pub fn request_count(&self) -> usize {
-        self.request_log
-            .lock()
-            .expect("request_log lock")
-            .len()
+        self.request_log.lock().expect("request_log lock").len()
     }
 
-    fn next_turn(
-        &self,
-        request: ProviderRequest,
-    ) -> (String, Vec<ToolCall>, String, UsageInfo) {
+    fn next_turn(&self, request: ProviderRequest) -> (String, Vec<ToolCall>, String, UsageInfo) {
         self.request_log
             .lock()
             .expect("request_log lock")
@@ -164,10 +158,7 @@ impl LlmProvider for MockProvider {
         }));
 
         if tools.is_empty() {
-            events.push(Ok(StreamEvent::TextDelta {
-                index: 0,
-                text,
-            }));
+            events.push(Ok(StreamEvent::TextDelta { index: 0, text }));
             events.push(Ok(StreamEvent::MessageDelta {
                 stop_reason: Some(StopReason::EndTurn),
                 usage: Some(usage),

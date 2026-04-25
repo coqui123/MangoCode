@@ -693,18 +693,18 @@ impl BridgeSession {
                             return;
                         }
 
-                    if self
-                        .time_since_last_ping()
-                        .is_some_and(|elapsed| elapsed > Duration::from_secs(60))
-                    {
-                        warn!(
-                            session_id = %self.session_id,
-                            stale_for_secs = 60,
-                            "Bridge inactive; reconnecting"
-                        );
-                        self.reconnect_count += 1;
-                        continue;
-                    }
+                        if self
+                            .time_since_last_ping()
+                            .is_some_and(|elapsed| elapsed > Duration::from_secs(60))
+                        {
+                            warn!(
+                                session_id = %self.session_id,
+                                stale_for_secs = 60,
+                                "Bridge inactive; reconnecting"
+                            );
+                            self.reconnect_count += 1;
+                            continue;
+                        }
                     }
                 }
                 Err(e) => {

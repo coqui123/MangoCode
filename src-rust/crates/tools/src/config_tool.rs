@@ -180,10 +180,9 @@ impl Tool for ConfigTool {
         } else {
             // GET operation
             match key {
-                "model" => ToolResult::success(format!(
-                    "model = \"{}\"",
-                    ctx.config.effective_model()
-                )),
+                "model" => {
+                    ToolResult::success(format!("model = \"{}\"", ctx.config.effective_model()))
+                }
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",
                     settings.config.effective_max_tokens()

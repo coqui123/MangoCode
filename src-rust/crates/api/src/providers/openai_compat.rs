@@ -265,7 +265,12 @@ impl OpenAiCompatProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let dump_http = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_HTTP")
             .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
             .unwrap_or(false);
 
         let messages = self.build_messages(request);
@@ -319,7 +324,11 @@ impl OpenAiCompatProvider {
 
         if dump_http {
             const MAX: usize = 8192;
-            let truncated = if body_str.len() > MAX { &body_str[..MAX] } else { &body_str };
+            let truncated = if body_str.len() > MAX {
+                &body_str[..MAX]
+            } else {
+                &body_str
+            };
             // Use stderr directly to avoid any logger filtering/compilation issues.
             eprintln!("[openai_compat wire] request_json={}", truncated);
             trace!(target: "mangocode_api::providers::openai_compat::wire", request_json = %truncated);
@@ -327,16 +336,21 @@ impl OpenAiCompatProvider {
 
         let retry_cfg = crate::error_handling::RetryConfig::default();
         let provider_name = self.name.clone();
-        let resp = crate::retry::retry_request(&retry_cfg, &provider_name, |_attempt| {
-            let mut builder = self
-                .http_client
-                .post(&url)
-                .header("Content-Type", "application/json");
-            builder = self.apply_auth(builder);
-            builder = self.apply_extra_headers(builder);
-            let b = body_str.clone();
-            async move { builder.body(b).send().await }
-        }, |msg| eprintln!("{}", msg))
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            &provider_name,
+            |_attempt| {
+                let mut builder = self
+                    .http_client
+                    .post(&url)
+                    .header("Content-Type", "application/json");
+                builder = self.apply_auth(builder);
+                builder = self.apply_extra_headers(builder);
+                let b = body_str.clone();
+                async move { builder.body(b).send().await }
+            },
+            |msg| eprintln!("{}", msg),
+        )
         .await
         .map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
@@ -355,9 +369,16 @@ impl OpenAiCompatProvider {
 
         if dump_http {
             const MAX: usize = 16384;
-            let truncated = if text.len() > MAX { &text[..MAX] } else { &text };
+            let truncated = if text.len() > MAX {
+                &text[..MAX]
+            } else {
+                &text
+            };
             // Use stderr directly to avoid any logger filtering/compilation issues.
-            eprintln!("[openai_compat wire] status={} response_json={}", status, truncated);
+            eprintln!(
+                "[openai_compat wire] status={} response_json={}",
+                status, truncated
+            );
             trace!(target: "mangocode_api::providers::openai_compat::wire", status = status, response_json = %truncated);
         }
 
@@ -435,17 +456,22 @@ impl OpenAiCompatProvider {
         })?;
         let retry_cfg = crate::error_handling::RetryConfig::default();
         let provider_name = self.name.clone();
-        let resp = crate::retry::retry_request(&retry_cfg, &provider_name, |_attempt| {
-            let mut builder = self
-                .http_client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            builder = self.apply_auth(builder);
-            builder = self.apply_extra_headers(builder);
-            let b = body_str.clone();
-            async move { builder.body(b).send().await }
-        }, |msg| eprintln!("{}", msg))
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            &provider_name,
+            |_attempt| {
+                let mut builder = self
+                    .http_client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream");
+                builder = self.apply_auth(builder);
+                builder = self.apply_extra_headers(builder);
+                let b = body_str.clone();
+                async move { builder.body(b).send().await }
+            },
+            |msg| eprintln!("{}", msg),
+        )
         .await
         .map_err(|e| ProviderError::Other {
             provider: self.id.clone(),
@@ -501,7 +527,12 @@ impl LlmProvider for OpenAiCompatProvider {
         let reasoning_field = self.quirks.reasoning_field.clone();
         let dump_sse = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_SSE")
             .ok()
-            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .map(|v| {
+                matches!(
+                    v.as_str(),
+                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+                )
+            })
             .unwrap_or(false);
 
         let s = stream! {

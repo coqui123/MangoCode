@@ -107,9 +107,9 @@ fn has_assistant_text(messages: &[Message], needle: &str) -> bool {
         m.role == Role::Assistant
             && match &m.content {
                 MessageContent::Text(t) => t.contains(needle),
-                MessageContent::Blocks(blocks) => blocks.iter().any(|b| {
-                    matches!(b, ContentBlock::Text { text } if text.contains(needle))
-                }),
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains(needle))),
             }
     })
 }
@@ -144,12 +144,15 @@ async fn simple_text_response() {
 
 #[tokio::test]
 async fn single_tool_call_chain() {
-    let provider = MockProvider::with_responses(vec!["Done reading the file."]).with_tool_sequence(
-        vec![
-            vec![ToolCall::new("tool-1", "echo_tool", json!({ "value": "one" }))],
+    let provider =
+        MockProvider::with_responses(vec!["Done reading the file."]).with_tool_sequence(vec![
+            vec![ToolCall::new(
+                "tool-1",
+                "echo_tool",
+                json!({ "value": "one" }),
+            )],
             vec![],
-        ],
-    );
+        ]);
 
     let config = test_config(make_registry(provider.clone()));
     let ctx = test_tool_ctx("mock");
@@ -240,13 +243,12 @@ async fn context_overflow_triggers_compaction() {
 
 #[tokio::test]
 async fn multi_step_tool_chain() {
-    let provider = MockProvider::with_responses(vec!["Found and read the file."]).with_tool_sequence(
-        vec![
+    let provider = MockProvider::with_responses(vec!["Found and read the file."])
+        .with_tool_sequence(vec![
             vec![ToolCall::new("t1", "echo_tool", json!({ "value": "a" }))],
             vec![ToolCall::new("t2", "echo_tool", json!({ "value": "b" }))],
             vec![],
-        ],
-    );
+        ]);
 
     let config = test_config(make_registry(provider.clone()));
     let ctx = test_tool_ctx("mock");
