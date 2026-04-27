@@ -80,6 +80,17 @@ thread_local! {
 /// Call this **after** `terminal.draw()` so ratatui's buffer flush doesn't
 /// overwrite the image.  Pass the same `App` that was used for rendering.
 pub fn flush_sixel_blit(app: &App) {
+    flush_sixel_blit_with_cursor(app, None);
+}
+
+/// Write any pending inline mascot image, then optionally restore the cursor.
+///
+/// The classic ratatui backend gets a follow-up draw soon enough that cursor
+/// restoration is mostly cosmetic. The hybrid backend writes cells manually,
+/// then blits the image into the alternate screen; restoring the cursor keeps
+/// subsequent diff rendering and input placement from being anchored at the
+/// end of the image escape.
+pub fn flush_sixel_blit_with_cursor(app: &App, restore_cursor: Option<(u16, u16)>) {
     if app.is_streaming {
         SIXEL_BLIT.with(|cell| {
             cell.borrow_mut().take();
@@ -99,6 +110,9 @@ pub fn flush_sixel_blit(app: &App) {
                 let mut stdout = std::io::stdout();
                 // ANSI cursor position is 1-indexed.
                 let _ = write!(stdout, "\x1b[{};{}H{}", row + 1, col + 1, image_escape);
+                if let Some((restore_row, restore_col)) = restore_cursor {
+                    let _ = write!(stdout, "\x1b[{};{}H", restore_row + 1, restore_col + 1);
+                }
                 let _ = stdout.flush();
                 *last.borrow_mut() = Some((row, col));
             });
@@ -107,6 +121,9 @@ pub fn flush_sixel_blit(app: &App) {
 }
 
 pub fn reset_sixel_blit_state() {
+    SIXEL_BLIT.with(|cell| {
+        cell.borrow_mut().take();
+    });
     LAST_SIXEL_POS.with(|cell| {
         *cell.borrow_mut() = None;
     });

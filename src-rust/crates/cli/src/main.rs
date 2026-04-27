@@ -2137,12 +2137,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     use mangocode_commands::{execute_command, CommandContext, CommandResult};
     use mangocode_query::{QueryEvent, QueryOutcome};
     use mangocode_tui::{
-        bridge_state::BridgeConnectionState,
-        device_auth_dialog::DeviceAuthEvent,
-        init_mascot,
-        notifications::NotificationKind,
-        render::{flush_sixel_blit, render_app, reset_sixel_blit_state},
-        restore_terminal, setup_terminal, App,
+        bridge_state::BridgeConnectionState, device_auth_dialog::DeviceAuthEvent,
+        hybrid::HybridTerminal, init_mascot, notifications::NotificationKind, App,
     };
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -2192,8 +2188,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     }
     tool_ctx.config = live_config.clone();
 
-    // Set up terminal
-    let mut terminal = setup_terminal()?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     init_mascot(&mut app);
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
@@ -2431,6 +2425,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     // so the main loop can update the device_auth_dialog state.
     let (device_auth_tx, mut device_auth_rx) = mpsc::channel::<DeviceAuthEvent>(8);
 
+    let mut terminal = HybridTerminal::setup(&app)?;
+    terminal.print_initial_messages(&app, &messages)?;
+
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.notifications.tick();
@@ -2452,10 +2449,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             app.provider_registry = Some(refreshed);
         }
 
-        // Draw the UI
-        terminal.draw(|f| render_app(f, &app))?;
-        // Flush any pending Sixel mascot blit after ratatui finishes drawing.
-        flush_sixel_blit(&app);
+        terminal.render_live(&app)?;
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         if crossterm::event::poll(Duration::from_millis(16))? {
@@ -2555,7 +2549,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             // Fall through to submit — no second Enter needed
                         }
 
-                        let input = app.take_input();
+                        let mut input = app.take_input();
                         if input.is_empty() {
                             continue;
                         }
@@ -2585,6 +2579,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         | "theme"
                                         | "resume"
                                         | "session"
+                                        | "rewind"
                                         | "vim"
                                         | "vi"
                                         | "voice"
@@ -2596,6 +2591,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             } else {
                                 app.intercept_slash_command(&cmd_name)
                             };
+                            if handled_by_tui {
+                                terminal.render_live(&app)?;
+                            }
 
                             // Sync effort level when TUI cycled the visual indicator
                             // (no-args /effort → cycle Low→Med→High→Max→Low).
@@ -2641,6 +2639,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message = Some("Conversation cleared.".to_string());
+                                    terminal.reset_transcript(&app, &messages)?;
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed = messages.len().saturating_sub(new_msgs.len());
@@ -2653,6 +2652,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         removed,
                                         if removed == 1 { "" } else { "s" }
                                     ));
+                                    terminal.reset_transcript(&app, &messages)?;
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
@@ -2661,11 +2661,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         Some("Select a message to rewind to.".to_string());
                                 }
                                 Some(CommandResult::OpenHooksOverlay) => {
-                                    // Open the 4-screen hooks configuration browser.
-                                    // intercept_slash_command("hooks") already does this
-                                    // when the user types /hooks in the TUI prompt, so
-                                    // this branch only triggers when the command returns
-                                    // the variant explicitly (e.g. from a non-prompt context).
                                     app.hooks_config_menu.open();
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
@@ -2700,6 +2695,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     );
                                     app.status_message =
                                         Some(format!("Resumed session {}.", &session.id[..8]));
+                                    terminal.reset_transcript(&app, &messages)?;
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
                                     session.title = Some(title.clone());
@@ -2714,6 +2710,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     // overlay for this command (e.g. /stats opens dialog
                                     // AND would push a text message — drop the text).
                                     if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
                                         app.push_message(
                                             mangocode_core::types::Message::assistant(msg),
                                         );
@@ -2724,6 +2721,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.provider_registry_stale = true;
                                     app.status_message = Some(msg.clone());
                                     if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
                                         app.push_message(
                                             mangocode_core::types::Message::assistant(msg),
                                         );
@@ -2769,7 +2767,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     submit_user_msg = Some(msg);
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
-                                    mangocode_tui::restore_terminal(&mut terminal).ok();
+                                    terminal.suspend().ok();
                                     match oauth_flow::run_oauth_login_flow(with_claude_ai).await {
                                         Ok(result) => {
                                             debug!(
@@ -2789,7 +2787,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                             eprintln!("\nLogin failed: {}", e);
                                         }
                                     }
-                                    terminal = mangocode_tui::setup_terminal()?;
+                                    terminal = HybridTerminal::resume(&app, &messages)?;
                                 }
                                 Some(CommandResult::Error(e)) => {
                                     app.status_message = Some(format!("Error: {}", e));
@@ -2844,9 +2842,11 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
                             // If a UserMessage was queued (e.g. /compact), submit it.
                             if let Some(msg) = submit_user_msg {
-                                messages.push(mangocode_core::types::Message::user(msg.clone()));
-                                app.push_message(mangocode_core::types::Message::user(msg));
-                                // Fall through to the send path below.
+                                // Fall through to the normal send path using
+                                // the generated prompt, not the original slash
+                                // command. Printing/pushing here would duplicate
+                                // the chat turn below.
+                                input = msg;
                             } else {
                                 continue;
                             }
@@ -2909,6 +2909,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             });
                             mangocode_core::types::Message::user_blocks(blocks)
                         };
+                        terminal.print_user_input(&app, &input)?;
                         messages.push(user_msg.clone());
                         app.push_message(user_msg);
                         session.messages = messages.clone();
@@ -2980,7 +2981,11 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    let expanded_before = app.expanded_tool_outputs.clone();
                     app.handle_key_event(key);
+                    if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
+                        terminal.reset_transcript(&app, &messages)?;
+                    }
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
                     if !app.model_name.is_empty() {
@@ -2996,16 +3001,22 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     app.handle_terminal_paste(&data);
                 }
                 Event::Mouse(mouse) => {
+                    let expanded_before = app.expanded_tool_outputs.clone();
+                    let hovered_before = app.hovered_tool_output_id.clone();
                     app.handle_mouse_event(mouse);
+                    if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
+                        terminal.reset_transcript(&app, &messages)?;
+                    } else if app.hovered_tool_output_id != hovered_before {
+                        terminal.render_live(&app)?;
+                    }
                 }
                 Event::Resize(_, _) => {
-                    let _ = terminal.clear();
-                    reset_sixel_blit_state();
-                    // Regenerate the mascot image at a bounded size for the new viewport.
                     init_mascot(&mut app);
+                    terminal.render_live(&app)?;
                 }
                 _ => {}
             }
+            terminal.render_live(&app)?;
         }
 
         // Drain query events in bounded batches so a misbehaving provider
@@ -3142,7 +3153,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     let _ = relay_ev_tx.try_send(payload);
                 }
             }
-            app.handle_query_event(evt);
+            app.handle_query_event(evt.clone());
+            terminal.handle_query_event(&app, &evt)?;
         }
         if drained_query_events == MAX_QUERY_EVENTS_PER_FRAME {
             // Keep responsive and continue draining on the next frame.
@@ -3264,6 +3276,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         // trigger submission automatically.
                         app.set_prompt_text(content.clone());
                         // Push as a user message and fire a query immediately.
+                        terminal.print_user_input(&app, &content)?;
                         messages.push(mangocode_core::types::Message::user(content.clone()));
                         app.push_message(mangocode_core::types::Message::user(content.clone()));
                         session.messages = messages.clone();
@@ -3382,6 +3395,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         while let Ok(content) = remote_prompt_rx.try_recv() {
             if !app.is_streaming {
                 app.set_prompt_text(content.clone());
+                terminal.print_user_input(&app, &content)?;
                 messages.push(mangocode_core::types::Message::user(content.clone()));
                 app.push_message(mangocode_core::types::Message::user(content.clone()));
                 session.messages = messages.clone();
@@ -3678,6 +3692,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     app.replace_messages(messages.clone());
                     app.tool_use_blocks.clear();
                     app.status_message = None;
+                    terminal.print_new_messages(&app)?;
 
                     // Persist session and search index in background so UI loop stays responsive.
                     let session_clone = session.clone();
@@ -3792,7 +3807,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     let duration_ms = session_start.elapsed().as_millis() as u64;
     persist_session_usage(&cost_tracker, &session, duration_ms);
 
-    restore_terminal(&mut terminal)?;
+    terminal.restore()?;
     Ok(())
 }
 

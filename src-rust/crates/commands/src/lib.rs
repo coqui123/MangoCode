@@ -3417,15 +3417,7 @@ impl SlashCommand for HooksCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // In TUI mode this command is intercepted by intercept_slash_command("hooks")
-        // before execute() is ever called, so this path only runs in non-TUI
-        // contexts (e.g., `claude hooks` on the CLI, pipes, or tests).
-        //
-        // Signal to the CLI driver that it should open the TUI overlay if possible;
-        // the CLI will fall back to the text listing when no TUI is active.
         if ctx.config.hooks.is_empty() {
-            // If there is nothing to show in the overlay, emit a helpful message
-            // so the user knows what to do.
             return CommandResult::Message(
                 "No hooks configured.\n\
                  Add hooks to ~/.mangocode/settings.json under the 'hooks' key.\n\
@@ -3436,11 +3428,10 @@ impl SlashCommand for HooksCommand {
                     .to_string(),
             );
         }
-
-        // Return the overlay-open signal; the CLI driver will call
-        // app.hooks_config_menu.open() or fall back to text output if running
-        // without a TUI.
-        CommandResult::OpenHooksOverlay
+        match serde_json::to_string_pretty(&ctx.config.hooks) {
+            Ok(json) => CommandResult::Message(format!("Configured hooks:\n\n{}", json)),
+            Err(err) => CommandResult::Error(format!("Failed to render hooks: {}", err)),
+        }
     }
 }
 
@@ -5137,13 +5128,51 @@ impl SlashCommand for RewindCommand {
          Use ↑↓ to navigate, Enter to select, y/n to confirm."
     }
 
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if ctx.messages.is_empty() {
             return CommandResult::Message(
                 "Nothing to rewind — conversation is empty.".to_string(),
             );
         }
-        CommandResult::OpenRewindOverlay
+
+        let arg = args.trim();
+        if arg.is_empty() {
+            let mut output =
+                String::from("Rewind the conversation to an earlier point.\n\nRecent messages:\n");
+            let total = ctx.messages.len();
+            let start = total.saturating_sub(12);
+            for (idx, message) in ctx.messages.iter().enumerate().skip(start) {
+                let preview = message
+                    .get_all_text()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(72)
+                    .collect::<String>();
+                output.push_str(&format!(
+                    "  {:>3}. {:<9} {}\n",
+                    idx + 1,
+                    format!("{:?}", message.role).to_lowercase(),
+                    preview
+                ));
+            }
+            output
+                .push_str("\nUse /rewind <message-number> to keep everything up to that message.");
+            return CommandResult::Message(output);
+        }
+
+        let Ok(message_number) = arg.parse::<usize>() else {
+            return CommandResult::Error("Usage: /rewind <message-number>".to_string());
+        };
+        if message_number == 0 || message_number > ctx.messages.len() {
+            return CommandResult::Error(format!(
+                "Message number must be between 1 and {}.",
+                ctx.messages.len()
+            ));
+        }
+
+        CommandResult::SetMessages(ctx.messages[..message_number].to_vec())
     }
 }
 
@@ -9612,6 +9641,50 @@ mod tests {
             matches!(result, CommandResult::Message(_) | CommandResult::Silent),
             "help should return Message or Silent"
         );
+    }
+
+    #[tokio::test]
+    async fn test_hooks_command_renders_text_output() {
+        let mut ctx = make_ctx();
+        ctx.config.hooks = serde_json::from_str(
+            r#"{
+                "PreToolUse": [
+                    {
+                        "command": "echo hi"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let cmd = find_command("hooks").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Configured hooks"));
+                assert!(msg.contains("PreToolUse"));
+            }
+            other => panic!("expected text hooks output, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rewind_command_can_trim_messages() {
+        let mut ctx = make_ctx();
+        ctx.messages = vec![
+            mangocode_core::types::Message::user("first".to_string()),
+            mangocode_core::types::Message::assistant("second".to_string()),
+            mangocode_core::types::Message::user("third".to_string()),
+        ];
+        let cmd = find_command("rewind").unwrap();
+        let result = cmd.execute("2", &mut ctx).await;
+        match result {
+            CommandResult::SetMessages(messages) => {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].get_all_text(), "first");
+                assert_eq!(messages[1].get_all_text(), "second");
+            }
+            other => panic!("expected rewound messages, got {:?}", other),
+        }
     }
 
     #[tokio::test]

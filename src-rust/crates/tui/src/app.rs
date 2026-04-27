@@ -837,6 +837,10 @@ pub struct App {
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
     /// Maps screen row → transcript message index for right-click hit testing.
     pub message_row_map: RefCell<std::collections::HashMap<u16, usize>>,
+    /// Maps screen row → expandable tool output id for hover/click hit testing.
+    pub tool_row_map: RefCell<std::collections::HashMap<u16, String>>,
+    /// Hovered expandable tool output id from latest mouse-move event.
+    pub hovered_tool_output_id: Option<String>,
     /// Hovered transcript message index from latest mouse-move event.
     pub hovered_message_index: Option<usize>,
     /// Total message lines from the last render (used for virtual row mapping).
@@ -1593,6 +1597,8 @@ impl App {
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
+            tool_row_map: RefCell::new(std::collections::HashMap::new()),
+            hovered_tool_output_id: None,
             hovered_message_index: None,
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
@@ -5045,6 +5051,20 @@ impl App {
         self.message_row_map.borrow().get(&row).copied()
     }
 
+    pub fn tool_output_id_at_row(&self, row: u16) -> Option<String> {
+        self.tool_row_map.borrow().get(&row).cloned()
+    }
+
+    pub fn toggle_tool_output_id(&mut self, id: &str) -> bool {
+        if self.expanded_tool_outputs.contains(id) {
+            self.expanded_tool_outputs.remove(id);
+        } else {
+            self.expanded_tool_outputs.insert(id.to_string());
+        }
+        self.invalidate_transcript();
+        true
+    }
+
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
@@ -5156,6 +5176,11 @@ impl App {
                 && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
                 && mouse_event.row >= msg_area.y
                 && mouse_event.row < msg_area.y.saturating_add(msg_area.height);
+            self.hovered_tool_output_id = if in_msg_area {
+                self.tool_output_id_at_row(mouse_event.row)
+            } else {
+                None
+            };
             self.hovered_message_index = if in_msg_area {
                 self.message_index_at_row(mouse_event.row)
             } else {
@@ -5283,6 +5308,7 @@ impl App {
 
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
+                let msg_area = self.last_msg_area.get();
 
                 let in_input = input_area.width > 0
                     && input_area.height > 0
@@ -5290,6 +5316,21 @@ impl App {
                     && mouse_event.row < input_area.y.saturating_add(input_area.height)
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
+
+                let in_msg_area = msg_area.width > 0
+                    && msg_area.height > 0
+                    && mouse_event.row >= msg_area.y
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height)
+                    && mouse_event.column >= msg_area.x
+                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width);
+
+                if in_msg_area {
+                    if let Some(id) = self.tool_output_id_at_row(mouse_event.row) {
+                        self.toggle_tool_output_id(&id);
+                        self.clear_selection();
+                        return;
+                    }
+                }
 
                 let in_selectable = selectable_area.width > 0
                     && selectable_area.height > 0
@@ -6078,6 +6119,46 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         });
         assert_eq!(app.hovered_message_index, None);
+    }
+
+    #[test]
+    fn test_left_click_toggles_tool_output_for_row() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.tool_row_map
+            .borrow_mut()
+            .insert(5, "tool-1".to_string());
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.hovered_tool_output_id.as_deref(), Some("tool-1"));
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert!(app.expanded_tool_outputs.contains("tool-1"));
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 120,
+            row: 40,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(app.hovered_tool_output_id, None);
     }
 
     // ---- Help overlay -------------------------------------------------------

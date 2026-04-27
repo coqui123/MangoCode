@@ -57,6 +57,8 @@ pub mod feedback_survey;
 pub mod figures;
 /// Read-only hooks configuration browser.
 pub mod hooks_config_menu;
+/// Main-buffer hybrid renderer with native terminal scrollback.
+pub mod hybrid;
 /// Clipboard image paste and Ctrl+V text paste.
 pub mod image_paste;
 /// Input helpers: slash command parsing.
