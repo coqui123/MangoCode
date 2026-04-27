@@ -41,7 +41,10 @@ use crate::{
     app::App,
     messages::{render_message, RenderContext},
     prompt_input::{input_height, render_prompt_input, InputMode},
-    render::{build_tool_names, flush_sixel_blit_with_cursor, render_app, reset_sixel_blit_state},
+    render::{
+        build_tool_names, flush_sixel_blit_with_cursor, render_app, reset_last_sixel_position,
+        reset_sixel_blit_state,
+    },
 };
 
 const MANGO: RtColor = RtColor::Rgb(255, 176, 32);
@@ -647,10 +650,16 @@ impl HybridTerminal {
         let cursor = terminal.get_cursor_position()?;
         let buffer = terminal.backend().buffer().clone();
         let previous = self.fullscreen_buffer.clone();
+        let needs_full_flush = previous
+            .as_ref()
+            .is_none_or(|prev| prev.area != buffer.area);
         self.flush_buffer_diff(0, &buffer, previous.as_ref())?;
         self.fullscreen_buffer = Some(buffer);
         queue!(self.stdout, MoveTo(cursor.x, cursor.y))?;
         self.stdout.flush()?;
+        if needs_full_flush {
+            reset_last_sixel_position();
+        }
         flush_sixel_blit_with_cursor(app, Some((cursor.y, cursor.x)));
         Ok(())
     }

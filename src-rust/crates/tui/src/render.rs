@@ -124,6 +124,10 @@ pub fn reset_sixel_blit_state() {
     SIXEL_BLIT.with(|cell| {
         cell.borrow_mut().take();
     });
+    reset_last_sixel_position();
+}
+
+pub fn reset_last_sixel_position() {
     LAST_SIXEL_POS.with(|cell| {
         *cell.borrow_mut() = None;
     });
