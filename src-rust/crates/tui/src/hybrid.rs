@@ -60,7 +60,6 @@ pub struct HybridTerminal {
     fullscreen_buffer: Option<Buffer>,
     screen_lines: HashMap<u16, (Line<'static>, Option<String>)>,
     expansion_fingerprint: u64,
-    hovered_tool_output_id: Option<String>,
     deferred_new_messages: bool,
     restored: bool,
 }
@@ -86,7 +85,6 @@ impl HybridTerminal {
             fullscreen_buffer: None,
             screen_lines: HashMap::new(),
             expansion_fingerprint: expansion_fingerprint(app),
-            hovered_tool_output_id: app.hovered_tool_output_id.clone(),
             deferred_new_messages: false,
             restored: false,
         };
@@ -177,18 +175,8 @@ impl HybridTerminal {
             } else {
                 self.reset_transcript(app, &app.messages)?;
                 self.expansion_fingerprint = expansion_fingerprint;
-                self.hovered_tool_output_id = app.hovered_tool_output_id.clone();
                 return Ok(());
             }
-        }
-        if app.hovered_tool_output_id != self.hovered_tool_output_id {
-            let previous_hover = self.hovered_tool_output_id.clone();
-            self.hovered_tool_output_id = app.hovered_tool_output_id.clone();
-            self.repaint_hover_rows(
-                app,
-                previous_hover.as_deref(),
-                app.hovered_tool_output_id.as_deref(),
-            )?;
         }
         let height = composer_height(app).min(rows.saturating_sub(1)).max(3);
         app.last_msg_area
@@ -232,7 +220,6 @@ impl HybridTerminal {
         }
         self.printed_messages = messages.len();
         self.expansion_fingerprint = expansion_fingerprint(app);
-        self.hovered_tool_output_id = app.hovered_tool_output_id.clone();
         self.deferred_new_messages = false;
         self.render_live(app)
     }
@@ -568,16 +555,7 @@ impl HybridTerminal {
             (clone_line_static(line), tool_output_id.map(str::to_string)),
         );
         for span in &line.spans {
-            let mut style = span.style;
-            if let Some(app) = app {
-                if tool_output_id.is_some()
-                    && tool_output_id == app.hovered_tool_output_id.as_deref()
-                    && style.bg.is_none()
-                {
-                    style = style.bg(RtColor::Rgb(40, 35, 24));
-                }
-            }
-            queue_transcript_style(&mut self.stdout, style)?;
+            queue_transcript_style(&mut self.stdout, span.style)?;
             let text = span.content.as_ref();
             write!(self.stdout, "{}", text)?;
         }
@@ -657,59 +635,6 @@ impl HybridTerminal {
             shift_row_map(&mut app.message_row_map.borrow_mut(), bottom);
             shift_row_map(&mut app.tool_row_map.borrow_mut(), bottom);
         }
-    }
-
-    fn repaint_hover_rows(
-        &mut self,
-        app: &App,
-        previous_hover: Option<&str>,
-        current_hover: Option<&str>,
-    ) -> io::Result<()> {
-        let mut rows = self
-            .screen_lines
-            .iter()
-            .filter_map(|(row, (_line, tool_id))| {
-                let id = tool_id.as_deref()?;
-                if Some(id) == previous_hover || Some(id) == current_hover {
-                    Some(*row)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        rows.sort_unstable();
-        rows.dedup();
-
-        for row in rows {
-            if let Some((line, tool_id)) = self.screen_lines.get(&row).cloned() {
-                self.repaint_screen_line(row, &line, tool_id.as_deref(), app)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn repaint_screen_line(
-        &mut self,
-        row: u16,
-        line: &Line<'_>,
-        tool_output_id: Option<&str>,
-        app: &App,
-    ) -> io::Result<()> {
-        queue_base_style(&mut self.stdout)?;
-        queue!(self.stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        for span in &line.spans {
-            let mut style = span.style;
-            if tool_output_id.is_some()
-                && tool_output_id == app.hovered_tool_output_id.as_deref()
-                && style.bg.is_none()
-            {
-                style = style.bg(RtColor::Rgb(40, 35, 24));
-            }
-            queue_transcript_style(&mut self.stdout, style)?;
-            write!(self.stdout, "{}", span.content.as_ref())?;
-        }
-        queue!(self.stdout, ResetColor, SetAttribute(CtAttribute::Reset))?;
-        self.stdout.flush()
     }
 
     fn render_fullscreen_app(&mut self, app: &App, cols: u16, rows: u16) -> io::Result<()> {

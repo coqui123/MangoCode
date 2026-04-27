@@ -3002,12 +3002,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 }
                 Event::Mouse(mouse) => {
                     let expanded_before = app.expanded_tool_outputs.clone();
-                    let hovered_before = app.hovered_tool_output_id.clone();
                     app.handle_mouse_event(mouse);
                     if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
                         terminal.reset_transcript(&app, &messages)?;
-                    } else if app.hovered_tool_output_id != hovered_before {
-                        terminal.render_live(&app)?;
                     }
                 }
                 Event::Resize(_, _) => {
