@@ -352,11 +352,11 @@ mod tests {
     #[test]
     fn test_terminal_capabilities_detect() {
         let caps = TerminalCapabilities::detect();
-        // Should return valid capabilities in both IDE and non-IDE environments
-        // We can't easily test the actual detection without setting env vars,
-        // but we can verify it returns a valid struct
-        assert!(caps.enable_mouse_capture || !caps.enable_mouse_capture);
-        assert!(caps.enable_bracketed_paste || !caps.enable_bracketed_paste);
+        let defaults = TerminalCapabilities::default();
+        // The current detection path preserves the default feature set in both
+        // IDE and standard terminals.
+        assert_eq!(caps.enable_mouse_capture, defaults.enable_mouse_capture);
+        assert_eq!(caps.enable_bracketed_paste, defaults.enable_bracketed_paste);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::path::PathBuf;
 use tracing::debug;
 
@@ -13,18 +14,29 @@ use tracing::debug;
 
 /// Returns the path to the persisted todo list for `session_id`.
 pub fn todos_path(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".mangocode")
-        .join("todos")
-        .join(format!("{}.json", session_id))
+    todos_path_in_dir(&todos_dir(), session_id)
+}
+
+fn todos_dir() -> PathBuf {
+    todos_dir_from_home(&dirs::home_dir().unwrap_or_default())
+}
+
+fn todos_dir_from_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".mangocode").join("todos")
+}
+
+fn todos_path_in_dir(todos_dir: &Path, session_id: &str) -> PathBuf {
+    todos_dir.join(format!("{}.json", session_id))
 }
 
 /// Load the persisted todo list for `session_id`. Returns an empty vec if the
 /// file does not exist or cannot be parsed.
 pub fn load_todos(session_id: &str) -> Vec<Value> {
-    let path = todos_path(session_id);
-    std::fs::read_to_string(&path)
+    load_todos_from_path(&todos_path(session_id))
+}
+
+fn load_todos_from_path(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
         .unwrap_or_default()
@@ -32,12 +44,15 @@ pub fn load_todos(session_id: &str) -> Vec<Value> {
 
 /// Persist `todos` to `~/.mangocode/todos/<session_id>.json`.
 pub fn save_todos(session_id: &str, todos: &[Value]) {
-    let path = todos_path(session_id);
+    save_todos_to_path(&todos_path(session_id), todos);
+}
+
+fn save_todos_to_path(path: &Path, todos: &[Value]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(serialized) = serde_json::to_string_pretty(todos) {
-        let _ = std::fs::write(&path, serialized);
+        let _ = std::fs::write(path, serialized);
     }
 }
 
@@ -388,13 +403,15 @@ mod tests {
             json!({"id": "1", "content": "Task one", "status": "pending"}),
             json!({"id": "2", "content": "Task two", "status": "completed"}),
         ];
-        save_todos(&session_id, &todos);
-        let loaded = load_todos(&session_id);
+        let tmp = tempfile::tempdir().unwrap();
+        let path = todos_path_in_dir(&tmp.path().join("todos"), &session_id);
+        save_todos_to_path(&path, &todos);
+        let loaded = load_todos_from_path(&path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0]["id"].as_str(), Some("1"));
         assert_eq!(loaded[1]["status"].as_str(), Some("completed"));
         // Clean up.
-        let _ = std::fs::remove_file(todos_path(&session_id));
+        let _ = std::fs::remove_file(path);
     }
 
     // --- Status parsing ------------------------------------------------------

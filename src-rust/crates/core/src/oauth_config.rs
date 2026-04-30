@@ -312,6 +312,29 @@ pub struct CodexTokens {
     pub expires_at: Option<u64>,
 }
 
+pub fn codex_auth_is_usable(
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_secs: Option<u64>,
+) -> bool {
+    if access_token.trim().is_empty() {
+        return false;
+    }
+
+    let has_refresh = refresh_token
+        .map(|token| !token.trim().is_empty())
+        .unwrap_or(false);
+
+    match expires_at_secs {
+        Some(expiry) => {
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let refresh_skew_secs = 120;
+            expiry > now.saturating_add(refresh_skew_secs) || has_refresh
+        }
+        None => true,
+    }
+}
+
 /// Path to the Codex tokens file (~/.mangocode/codex_tokens.json)
 fn codex_tokens_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".mangocode").join("codex_tokens.json"))
@@ -354,6 +377,39 @@ pub fn clear_codex_tokens() -> anyhow::Result<()> {
 pub fn is_codex_subscriber() -> bool {
     get_codex_tokens()
         .map(|t| !t.access_token.is_empty())
+        .unwrap_or(false)
+}
+
+/// Returns true when MangoCode already has a reusable OpenAI Codex OAuth session.
+///
+/// Reusable means we have a non-empty access token and either:
+/// - it is still valid, or
+/// - we have a refresh token and can refresh it silently.
+pub fn has_usable_codex_oauth() -> bool {
+    if let Some(crate::auth_store::StoredCredential::OAuthToken {
+        access,
+        refresh,
+        expires,
+    }) = crate::auth_store::AuthStore::load().get(crate::ProviderId::OPENAI_CODEX)
+    {
+        let expires_at_secs = if *expires > 0 {
+            Some(*expires / 1000)
+        } else {
+            None
+        };
+        if codex_auth_is_usable(access, Some(refresh.as_str()), expires_at_secs) {
+            return true;
+        }
+    }
+
+    get_codex_tokens()
+        .map(|tokens| {
+            codex_auth_is_usable(
+                &tokens.access_token,
+                tokens.refresh_token.as_deref(),
+                tokens.expires_at,
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -474,6 +530,29 @@ mod tests {
         assert_eq!(t.access_token, "atok");
         assert_eq!(t.refresh_token.as_deref(), Some("rtok"));
         assert_eq!(t.expires_at, Some(2000));
+    }
+
+    #[test]
+    fn usable_codex_auth_requires_access_token() {
+        assert!(!codex_auth_is_usable("", None, None));
+    }
+
+    #[test]
+    fn usable_codex_auth_accepts_unexpired_access_token() {
+        let future = (chrono::Utc::now().timestamp() + 3600) as u64;
+        assert!(codex_auth_is_usable("token", None, Some(future)));
+    }
+
+    #[test]
+    fn usable_codex_auth_accepts_expired_token_with_refresh() {
+        let past = chrono::Utc::now().timestamp().saturating_sub(60) as u64;
+        assert!(codex_auth_is_usable("token", Some("refresh"), Some(past)));
+    }
+
+    #[test]
+    fn usable_codex_auth_rejects_expired_token_without_refresh() {
+        let past = chrono::Utc::now().timestamp().saturating_sub(60) as u64;
+        assert!(!codex_auth_is_usable("token", None, Some(past)));
     }
 
     #[test]

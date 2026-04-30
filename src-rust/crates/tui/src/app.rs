@@ -542,6 +542,7 @@ pub enum ModalOwner {
     DeviceAuth,
     KeyInput,
     Connect,
+    CodexAccountChoice,
     InvalidConfig,
     DesktopUpsell,
     MemoryUpdateNotification,
@@ -765,6 +766,8 @@ pub struct App {
     pub auth_store: mangocode_core::AuthStore,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// OpenAI Codex account-choice dialog shown when an existing OAuth session is present.
+    pub codex_account_dialog: DialogSelectState,
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
     /// Slash-command metadata used by prompt typeahead and the command palette.
@@ -1529,6 +1532,28 @@ impl App {
                 ];
                 DialogSelectState::new("Connect a Provider", items)
             },
+            codex_account_dialog: {
+                let items = vec![
+                    SelectItem {
+                        id: "reuse".into(),
+                        title: "Use Existing Session".into(),
+                        description: "Keep the saved OpenAI Codex login and switch MangoCode to it"
+                            .into(),
+                        category: "OpenAI Codex".into(),
+                        badge: Some("RECOMMENDED".into()),
+                    },
+                    SelectItem {
+                        id: "switch".into(),
+                        title: "Sign In With Different Account".into(),
+                        description:
+                            "Open browser login and replace the saved Codex session after success"
+                                .into(),
+                        category: "OpenAI Codex".into(),
+                        badge: Some("OAUTH".into()),
+                    },
+                ];
+                DialogSelectState::new("OpenAI Codex Account", items)
+            },
             command_palette: {
                 let items: Vec<SelectItem> = prompt_slash_commands
                     .iter()
@@ -1654,6 +1679,10 @@ impl App {
         push_if!(self.device_auth_dialog.visible, ModalOwner::DeviceAuth);
         push_if!(self.key_input_dialog.visible, ModalOwner::KeyInput);
         push_if!(self.connect_dialog.visible, ModalOwner::Connect);
+        push_if!(
+            self.codex_account_dialog.visible,
+            ModalOwner::CodexAccountChoice
+        );
         push_if!(
             self.invalid_config_dialog.visible,
             ModalOwner::InvalidConfig
@@ -1996,6 +2025,28 @@ impl App {
         }
     }
 
+    fn complete_existing_codex_oauth_connect(&mut self) {
+        self.auth_store = mangocode_core::AuthStore::load();
+        self.set_provider_default("openai-codex".to_string());
+        self.persist_provider_and_model();
+        self.has_credentials = true;
+        self.provider_registry_stale = true;
+        self.status_message = Some(
+            "Step 2/3 skipped: existing OpenAI Codex OAuth session found. Step 3/3 complete — switched to OpenAI Codex. Use /model to pick a model."
+                .to_string(),
+        );
+    }
+
+    fn begin_codex_oauth_connect(&mut self) {
+        self.device_auth_dialog
+            .open("openai-codex".into(), "OpenAI Codex (OAuth)".into());
+        self.device_auth_pending = Some("openai-codex".to_string());
+        self.status_message = Some(
+            "Step 2/3: browser opens for ChatGPT (Codex) sign-in — localhost callback on port 1455. Best for interactive use on your own machine; use OpenAI (API key) for CI. Step 3/3: press any key after success."
+                .to_string(),
+        );
+    }
+
     /// Apply a theme by name, persisting it to config.
     pub fn apply_theme(&mut self, theme_name: &str) {
         let theme = match theme_name {
@@ -2316,6 +2367,7 @@ impl App {
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.connect_dialog.close();
+        self.codex_account_dialog.close();
         self.command_palette.close();
         self.key_input_dialog.close();
         self.device_auth_dialog.close();
@@ -3304,13 +3356,15 @@ impl App {
                                 );
                             }
                             "openai-codex" => {
-                                self.device_auth_dialog
-                                    .open("openai-codex".into(), "OpenAI Codex (OAuth)".into());
-                                self.device_auth_pending = Some("openai-codex".to_string());
-                                self.status_message = Some(
-                                    "Step 2/3: browser opens for ChatGPT (Codex) sign-in — localhost callback on port 1455. Best for interactive use on your own machine; use OpenAI (API key) for CI. Step 3/3: press any key after success."
-                                        .to_string(),
-                                );
+                                if mangocode_core::oauth_config::has_usable_codex_oauth() {
+                                    self.codex_account_dialog.open();
+                                    self.status_message = Some(
+                                        "Step 2/3: choose whether to reuse the saved OpenAI Codex session or sign in with a different account."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    self.begin_codex_oauth_connect();
+                                }
                             }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow with MangoCode's registered OAuth app
@@ -3370,6 +3424,44 @@ impl App {
                 }
                 KeyCode::Char(c) => {
                     self.connect_dialog.filter_push(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        if self.codex_account_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.codex_account_dialog.close();
+                }
+                KeyCode::Up => {
+                    self.codex_account_dialog.move_up();
+                }
+                KeyCode::Down => {
+                    self.codex_account_dialog.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.codex_account_dialog.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.codex_account_dialog.page_down();
+                }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.codex_account_dialog.selected().cloned() {
+                        self.codex_account_dialog.close();
+                        match selected.id.as_str() {
+                            "reuse" => self.complete_existing_codex_oauth_connect(),
+                            "switch" => self.begin_codex_oauth_connect(),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.codex_account_dialog.filter_pop();
+                }
+                KeyCode::Char(c) => {
+                    self.codex_account_dialog.filter_push(c);
                 }
                 _ => {}
             }
@@ -5267,6 +5359,7 @@ impl App {
         // Key-input and device-auth stay outside this gate so their visible text
         // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
+            || self.codex_account_dialog.visible
             || self.command_palette.visible
             || self.model_picker.visible
             || self.export_dialog.visible
@@ -5282,6 +5375,9 @@ impl App {
                     let in_dialog = if self.connect_dialog.visible {
                         self.connect_dialog
                             .contains(mouse_event.column, mouse_event.row)
+                    } else if self.codex_account_dialog.visible {
+                        self.codex_account_dialog
+                            .contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
                         self.command_palette
                             .contains(mouse_event.column, mouse_event.row)
@@ -5296,6 +5392,9 @@ impl App {
                         // Click inside a DialogSelect — select the clicked item
                         if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.codex_account_dialog.visible {
+                            self.codex_account_dialog
+                                .handle_mouse_click(mouse_event.row);
                         } else if self.command_palette.visible {
                             self.command_palette.handle_mouse_click(mouse_event.row);
                         }
@@ -5310,6 +5409,8 @@ impl App {
                     // Scroll through dialog items
                     if self.connect_dialog.visible {
                         self.connect_dialog.move_up();
+                    } else if self.codex_account_dialog.visible {
+                        self.codex_account_dialog.move_up();
                     } else if self.command_palette.visible {
                         self.command_palette.move_up();
                     }
@@ -5317,6 +5418,8 @@ impl App {
                 MouseEventKind::ScrollDown => {
                     if self.connect_dialog.visible {
                         self.connect_dialog.move_down();
+                    } else if self.codex_account_dialog.visible {
+                        self.codex_account_dialog.move_down();
                     } else if self.command_palette.visible {
                         self.command_palette.move_down();
                     }

@@ -57,6 +57,15 @@ use std::{
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
+fn tui_effort_to_core(effort: mangocode_tui::EffortLevel) -> mangocode_core::effort::EffortLevel {
+    match effort {
+        mangocode_tui::EffortLevel::Low => mangocode_core::effort::EffortLevel::Low,
+        mangocode_tui::EffortLevel::Normal => mangocode_core::effort::EffortLevel::Medium,
+        mangocode_tui::EffortLevel::High => mangocode_core::effort::EffortLevel::High,
+        mangocode_tui::EffortLevel::Max => mangocode_core::effort::EffortLevel::Max,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MCP tool wrapper: makes MCP server tools look like native cc-tools.
 // ---------------------------------------------------------------------------
@@ -2599,6 +2608,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.connect_dialog.visible
+                        || app.codex_account_dialog.visible
                         || app.key_input_dialog.visible
                         || app.device_auth_dialog.visible
                         || app.command_palette.visible
@@ -2696,20 +2706,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             // Sync effort level when TUI cycled the visual indicator
                             // (no-args /effort → cycle Low→Med→High→Max→Low).
                             if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
-                                current_effort = Some(match app.effort_level {
-                                    mangocode_tui::EffortLevel::Low => {
-                                        mangocode_core::effort::EffortLevel::Low
-                                    }
-                                    mangocode_tui::EffortLevel::Normal => {
-                                        mangocode_core::effort::EffortLevel::Medium
-                                    }
-                                    mangocode_tui::EffortLevel::High => {
-                                        mangocode_core::effort::EffortLevel::High
-                                    }
-                                    mangocode_tui::EffortLevel::Max => {
-                                        mangocode_core::effort::EffortLevel::Max
-                                    }
-                                });
+                                current_effort = Some(tui_effort_to_core(app.effort_level));
                             }
 
                             // Honour exit/quit triggered by TUI intercept immediately.
@@ -3132,7 +3129,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     }
 
                     let expanded_before = app.expanded_tool_outputs.clone();
+                    let model_picker_was_visible = app.model_picker.visible;
                     app.handle_key_event(key);
+                    if model_picker_was_visible
+                        && !app.model_picker.visible
+                        && key.code == KeyCode::Enter
+                    {
+                        current_effort = Some(tui_effort_to_core(app.effort_level));
+                    }
                     if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
                         terminal.reset_transcript(&app, &messages)?;
                     }

@@ -542,7 +542,7 @@ fn extract_duckduckgo_html_results(
         };
         let url_start = cursor + href_rel + "uddg=".len();
         let url_end = html[url_start..]
-            .find(|c| c == '&' || c == '"' || c == '\'')
+            .find(['&', '"', '\''])
             .map(|rel| url_start + rel)
             .unwrap_or(html.len());
         let url = percent_decode(&html[url_start..url_end]);

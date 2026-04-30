@@ -209,10 +209,26 @@ pub struct SessionSummary {
 /// (like Conductor) and cloud UIs can discover MangoCode
 /// sessions alongside Claude sessions.
 pub fn projects_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-        .join("projects")
+    projects_dir_from_home(&dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+}
+
+fn projects_dir_from_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".claude").join("projects")
+}
+
+fn encode_project_root(project_root: &Path) -> String {
+    let path_str = project_root.to_string_lossy();
+    path_str
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | ' ' | '~' | '_' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
+fn transcript_dir_with_projects_dir(projects_dir: &Path, project_root: &Path) -> PathBuf {
+    projects_dir.join(encode_project_root(project_root))
 }
 
 /// Returns the per-project transcript directory.
@@ -222,15 +238,7 @@ pub fn projects_dir() -> PathBuf {
 /// by `-`.  This produces directory names like `-home-ethan-myproject`
 /// that are compatible with CloudCLI session discovery.
 pub fn transcript_dir(project_root: &Path) -> PathBuf {
-    let path_str = project_root.to_string_lossy();
-    let encoded: String = path_str
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | ' ' | '~' | '_' => '-',
-            _ => c,
-        })
-        .collect();
-    projects_dir().join(encoded)
+    transcript_dir_with_projects_dir(&projects_dir(), project_root)
 }
 
 /// Returns the full path to a session's JSONL transcript file.
@@ -361,9 +369,11 @@ pub async fn load_transcript(path: &Path) -> crate::Result<Vec<TranscriptEntry>>
 /// For each file, a cheap tail-read extracts the `last-prompt` and
 /// `custom-title` metadata without loading the full transcript.
 pub async fn list_sessions(project_root: &Path) -> crate::Result<Vec<SessionSummary>> {
-    let dir = transcript_dir(project_root);
+    list_sessions_in_dir(&transcript_dir(project_root)).await
+}
 
-    let mut dir_entries = match tokio::fs::read_dir(&dir).await {
+async fn list_sessions_in_dir(dir: &Path) -> crate::Result<Vec<SessionSummary>> {
+    let mut dir_entries = match tokio::fs::read_dir(dir).await {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(vec![]);
@@ -629,7 +639,8 @@ mod tests {
         let project_root = tmp.path().join("myproject");
         tokio::fs::create_dir_all(&project_root).await.unwrap();
 
-        let tdir = transcript_dir(&project_root);
+        let tdir =
+            transcript_dir_with_projects_dir(&tmp.path().join("claude-projects"), &project_root);
         tokio::fs::create_dir_all(&tdir).await.unwrap();
 
         for id in ["aaaa", "bbbb"] {
@@ -642,7 +653,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
-        let sessions = list_sessions(&project_root).await.unwrap();
+        let sessions = list_sessions_in_dir(&tdir).await.unwrap();
         assert_eq!(sessions.len(), 2);
         // Newest first.
         assert_eq!(sessions[0].session_id, "bbbb");
@@ -657,6 +668,9 @@ mod tests {
 
         // Project directory must be encoded by replacing path separators with dashes.
         assert_eq!(encoded_dir, "-Users-alice-my-project");
+
+        let base = projects_dir_from_home(Path::new("/Users/alice"));
+        assert_eq!(base, Path::new("/Users/alice/.claude/projects"));
 
         let path = transcript_path(root, "test-session");
         assert!(path.starts_with(projects_dir()));

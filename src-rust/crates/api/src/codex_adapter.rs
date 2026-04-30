@@ -449,6 +449,49 @@ fn codex_tool_definition(tool: &ApiToolDefinition) -> Value {
     })
 }
 
+fn merge_codex_include(body: &mut Value, value: &Value) {
+    let Some(items) = value.as_array() else {
+        return;
+    };
+
+    if !body["include"].is_array() {
+        body["include"] = json!([]);
+    }
+
+    let Some(existing) = body["include"].as_array_mut() else {
+        return;
+    };
+
+    for item in items {
+        if !existing.iter().any(|candidate| candidate == item) {
+            existing.push(item.clone());
+        }
+    }
+}
+
+fn merge_codex_provider_options(body: &mut Value, provider_options: &Value) {
+    let Some(options_obj) = provider_options.as_object() else {
+        return;
+    };
+
+    for (key, value) in options_obj {
+        match key.as_str() {
+            "reasoningEffort" => {
+                body["reasoning"]["effort"] = value.clone();
+                merge_codex_include(body, &json!(["reasoning.encrypted_content"]));
+            }
+            "reasoningSummary" => {
+                body["reasoning"]["summary"] = value.clone();
+            }
+            "textVerbosity" => {
+                body["text"]["verbosity"] = value.clone();
+            }
+            "include" => merge_codex_include(body, value),
+            _ => body[key] = value.clone(),
+        }
+    }
+}
+
 fn codex_image_source_to_url(source: &Value) -> Option<String> {
     if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
         if !url.is_empty() {
@@ -551,7 +594,10 @@ fn append_codex_input_items_for_message(input_items: &mut Vec<Value>, role: &str
 /// MangoCode previously sent ChatCompletions-shaped payloads to the Codex
 /// responses endpoint, which can produce HTTP 400. The Codex backend expects a
 /// Responses-style body with `input` instead of `messages`.
-pub fn anthropic_to_codex_responses_request(request: &CreateMessageRequest) -> Value {
+pub fn anthropic_to_codex_responses_request(
+    request: &CreateMessageRequest,
+    provider_options: Option<&Value>,
+) -> Value {
     let mut input_items: Vec<Value> = Vec::new();
 
     if let Some(system) = &request.system {
@@ -616,6 +662,10 @@ pub fn anthropic_to_codex_responses_request(request: &CreateMessageRequest) -> V
     // If thinking is enabled, request encrypted reasoning continuity (plugin style).
     if request.thinking.is_some() {
         body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+
+    if let Some(options) = provider_options {
+        merge_codex_provider_options(&mut body, options);
     }
 
     strip_sdk_only_fields(body)
@@ -939,7 +989,7 @@ mod tests {
             thinking: None,
         };
 
-        let codex_req = anthropic_to_codex_responses_request(&request);
+        let codex_req = anthropic_to_codex_responses_request(&request, None);
 
         // Verify structure
         assert_eq!(codex_req["model"], "gpt-5.2-codex");
@@ -988,7 +1038,7 @@ mod tests {
             thinking: None,
         };
 
-        let codex_req = anthropic_to_codex_responses_request(&request);
+        let codex_req = anthropic_to_codex_responses_request(&request, None);
         let input = codex_req["input"].as_array().unwrap();
 
         assert_eq!(input[0]["content"][0]["type"], "input_text");
@@ -1025,7 +1075,7 @@ mod tests {
             thinking: None,
         };
 
-        let codex_req = anthropic_to_codex_responses_request(&request);
+        let codex_req = anthropic_to_codex_responses_request(&request, None);
         let tools = codex_req["tools"].as_array().expect("tools present");
 
         assert_eq!(tools.len(), 1);
@@ -1068,7 +1118,7 @@ mod tests {
             thinking: None,
         };
 
-        let codex_req = anthropic_to_codex_responses_request(&request);
+        let codex_req = anthropic_to_codex_responses_request(&request, None);
         let input = codex_req["input"].as_array().unwrap();
 
         assert_eq!(input[0]["type"], "function_call");
@@ -1077,6 +1127,68 @@ mod tests {
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["output"], "file contents");
+    }
+
+    #[test]
+    fn codex_request_merges_reasoning_effort_from_provider_options() {
+        let request = CreateMessageRequest {
+            model: "gpt-5.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![ApiMessage {
+                role: "user".to_string(),
+                content: json!("think hard"),
+            }],
+            system: None,
+            tools: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            thinking: None,
+        };
+
+        let codex_req = anthropic_to_codex_responses_request(
+            &request,
+            Some(&json!({
+                "reasoningEffort": "xhigh",
+                "reasoningSummary": "auto"
+            })),
+        );
+
+        assert_eq!(codex_req["reasoning"]["effort"], json!("xhigh"));
+        assert_eq!(codex_req["reasoning"]["summary"], json!("auto"));
+        assert_eq!(codex_req["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn codex_request_maps_text_verbosity_to_responses_text_shape() {
+        let request = CreateMessageRequest {
+            model: "gpt-5.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![ApiMessage {
+                role: "user".to_string(),
+                content: json!("be concise"),
+            }],
+            system: None,
+            tools: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: false,
+            thinking: None,
+        };
+
+        let codex_req = anthropic_to_codex_responses_request(
+            &request,
+            Some(&json!({
+                "textVerbosity": "low"
+            })),
+        );
+
+        assert_eq!(codex_req["text"]["verbosity"], json!("low"));
+        assert!(codex_req.get("textVerbosity").is_none());
     }
 
     #[test]

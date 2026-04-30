@@ -101,15 +101,31 @@ impl OpenAiCodexProvider {
     /// stays consistent (this is not the separate `~/.codex/auth.json` CLI file).
     pub fn from_auth_store() -> Option<Self> {
         let mut store = AuthStore::load();
-        if let Some(StoredCredential::OAuthToken { access, .. }) =
-            store.get(ProviderId::OPENAI_CODEX)
+        if let Some(StoredCredential::OAuthToken {
+            access,
+            refresh,
+            expires,
+        }) = store.get(ProviderId::OPENAI_CODEX)
         {
-            if !access.is_empty() {
+            let expires_at_secs = if *expires > 0 {
+                Some(*expires / 1000)
+            } else {
+                None
+            };
+            if mangocode_core::oauth_config::codex_auth_is_usable(
+                access,
+                Some(refresh.as_str()),
+                expires_at_secs,
+            ) {
                 return Some(Self::new(access.clone()));
             }
         }
         let tokens = get_codex_tokens()?;
-        if tokens.access_token.is_empty() {
+        if !mangocode_core::oauth_config::codex_auth_is_usable(
+            &tokens.access_token,
+            tokens.refresh_token.as_deref(),
+            tokens.expires_at,
+        ) {
             return None;
         }
         let expires_ms = tokens
@@ -380,7 +396,10 @@ impl LlmProvider for OpenAiCodexProvider {
         }
 
         let anthropic_req = AnthropicProvider::build_request(&request);
-        let body = codex_adapter::anthropic_to_codex_responses_request(&anthropic_req);
+        let body = codex_adapter::anthropic_to_codex_responses_request(
+            &anthropic_req,
+            Some(&request.provider_options),
+        );
 
         let account_id = extract_chatgpt_account_id(&token);
 

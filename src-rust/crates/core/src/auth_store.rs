@@ -299,10 +299,21 @@ impl AuthStore {
                         return Some(access.clone());
                     }
                 }
-                StoredCredential::OAuthToken { access, .. }
-                    if storage_key == ProviderId::OPENAI_CODEX =>
-                {
-                    if !access.is_empty() {
+                StoredCredential::OAuthToken {
+                    access,
+                    refresh,
+                    expires,
+                } if storage_key == ProviderId::OPENAI_CODEX => {
+                    let expires_at_secs = if *expires > 0 {
+                        Some(*expires / 1000)
+                    } else {
+                        None
+                    };
+                    if crate::oauth_config::codex_auth_is_usable(
+                        access,
+                        Some(refresh.as_str()),
+                        expires_at_secs,
+                    ) {
                         return Some(access.clone());
                     }
                 }
@@ -371,6 +382,44 @@ mod tests {
             store.get("codex").unwrap() as *const StoredCredential,
             store.get(ProviderId::OPENAI_CODEX).unwrap() as *const StoredCredential
         ));
+    }
+
+    #[test]
+    fn api_key_for_codex_rejects_expired_token_without_refresh() {
+        let mut store = AuthStore::default();
+        let past_ms = chrono::Utc::now().timestamp_millis().saturating_sub(60_000) as u64;
+        store.credentials.insert(
+            ProviderId::OPENAI_CODEX.to_string(),
+            StoredCredential::OAuthToken {
+                access: "oauth-access-test".into(),
+                refresh: "".into(),
+                expires: past_ms,
+            },
+        );
+        assert_eq!(store.api_key_for("codex"), None);
+        assert_eq!(store.api_key_for(ProviderId::OPENAI_CODEX), None);
+    }
+
+    #[test]
+    fn api_key_for_codex_accepts_expired_token_with_refresh() {
+        let mut store = AuthStore::default();
+        let past_ms = chrono::Utc::now().timestamp_millis().saturating_sub(60_000) as u64;
+        store.credentials.insert(
+            ProviderId::OPENAI_CODEX.to_string(),
+            StoredCredential::OAuthToken {
+                access: "oauth-access-test".into(),
+                refresh: "refresh-token".into(),
+                expires: past_ms,
+            },
+        );
+        assert_eq!(
+            store.api_key_for("codex").as_deref(),
+            Some("oauth-access-test")
+        );
+        assert_eq!(
+            store.api_key_for(ProviderId::OPENAI_CODEX).as_deref(),
+            Some("oauth-access-test")
+        );
     }
 
     #[test]

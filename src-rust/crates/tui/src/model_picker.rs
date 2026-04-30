@@ -101,11 +101,26 @@ pub fn model_supports_effort(id: &str) -> bool {
     id.starts_with("claude-3-7")
         || id.starts_with("claude-opus-4")
         || id.starts_with("claude-sonnet-4")
+        || id.to_ascii_lowercase().starts_with("gpt-5")
 }
 
 /// Returns `true` for models that support the maximum effort tier.
 pub fn model_supports_max_effort(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
     id.starts_with("claude-opus-4")
+        || lower.starts_with("gpt-5.5")
+        || lower.starts_with("gpt-5.4")
+        || lower.starts_with("gpt-5.3")
+        || lower.starts_with("gpt-5.2")
+        || lower.starts_with("gpt-5.1-codex-max")
+}
+
+fn effort_control_name(id: &str) -> &'static str {
+    if id.to_ascii_lowercase().starts_with("gpt-5") {
+        "intelligence"
+    } else {
+        "effort"
+    }
 }
 
 /// The model ID that fast-mode locks to.
@@ -1019,6 +1034,19 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         }
     }
 
+    if let Some(selected) = filtered.get(state.selected_idx) {
+        if model_supports_effort(&selected.id) {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    " Enter to confirm  •  ←/→ {}",
+                    effort_control_name(&selected.id)
+                ),
+                Style::default().fg(dim),
+            )]));
+        }
+    }
+
     // ── Scroll ──
     let total_lines = lines.len() as u16;
     let visible = inner.height;
@@ -1194,6 +1222,14 @@ mod tests {
         assert!(model_supports_max_effort("claude-opus-4-6"));
         assert!(!model_supports_max_effort("claude-sonnet-4-6"));
         assert!(!model_supports_max_effort("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn codex_models_support_intelligence_controls() {
+        assert!(model_supports_effort("gpt-5.5"));
+        assert!(model_supports_max_effort("gpt-5.5"));
+        assert!(model_supports_max_effort("gpt-5.1-codex-max"));
+        assert!(!model_supports_max_effort("gpt-5.1-codex"));
     }
 
     // 13. Non-effort models return None from effective_effort.

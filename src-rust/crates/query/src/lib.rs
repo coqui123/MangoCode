@@ -527,6 +527,30 @@ fn reasoning_effort_for_level(effort_level: mangocode_core::effort::EffortLevel)
     }
 }
 
+fn codex_supports_xhigh_reasoning(model_id: &str) -> bool {
+    let model_id = model_id.to_ascii_lowercase();
+    model_id.starts_with("gpt-5.5")
+        || model_id.starts_with("gpt-5.4")
+        || model_id.starts_with("gpt-5.3")
+        || model_id.starts_with("gpt-5.2")
+        || model_id.starts_with("gpt-5.1-codex-max")
+}
+
+fn openai_reasoning_effort_for_provider(
+    provider_id: &str,
+    model_id: &str,
+    effort_level: mangocode_core::effort::EffortLevel,
+) -> &'static str {
+    match effort_level {
+        mangocode_core::effort::EffortLevel::Max
+            if provider_id == "openai-codex" && codex_supports_xhigh_reasoning(model_id) =>
+        {
+            "xhigh"
+        }
+        _ => reasoning_effort_for_level(effort_level),
+    }
+}
+
 fn google_thinking_level_for_effort(
     effort_level: Option<mangocode_core::effort::EffortLevel>,
 ) -> &'static str {
@@ -551,6 +575,7 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
     matches!(
         provider_id,
         "openai"
+            | "openai-codex"
             | "azure"
             | "groq"
             | "mistral"
@@ -639,7 +664,7 @@ fn build_provider_options(
             );
         } else if model_id.starts_with("gpt-5") && !model_id.contains("gpt-5-pro") {
             let reasoning_effort = effort_level
-                .map(reasoning_effort_for_level)
+                .map(|level| openai_reasoning_effort_for_provider(provider_id, &model_id, level))
                 .unwrap_or("medium");
             options.insert(
                 "reasoningEffort".to_string(),
@@ -706,7 +731,7 @@ fn build_provider_options(
 
     if is_openaiish_provider(provider_id) && is_openai_reasoning_model(&model_id) {
         let reasoning_effort = effort_level
-            .map(reasoning_effort_for_level)
+            .map(|level| openai_reasoning_effort_for_provider(provider_id, &model_id, level))
             .unwrap_or("medium");
         options.insert(
             "reasoningEffort".to_string(),
@@ -1286,7 +1311,7 @@ pub async fn run_query_loop(
 
             if tool_ctx.config.memory.layered_retrieval {
                 if let Some(user_query) = latest_user_query(messages) {
-                    configure_layered_memory_embeddings(&tool_ctx);
+                    configure_layered_memory_embeddings(tool_ctx);
                     let db_path = mangocode_core::layered_memory::project_memory_db_path(
                         &tool_ctx.working_dir,
                     );
@@ -4108,6 +4133,20 @@ mod tests {
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
         assert_eq!(options["usage"]["include"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_build_provider_options_for_openai_codex_max_maps_to_xhigh() {
+        let options = build_provider_options(
+            "openai-codex",
+            "gpt-5.5",
+            Some(mangocode_core::effort::EffortLevel::Max),
+            None,
+            0,
+            0,
+            false,
+        );
+        assert_eq!(options["reasoningEffort"], serde_json::json!("xhigh"));
     }
 
     #[test]
