@@ -14,6 +14,7 @@ This repo began from the Claurst clean-room effort and has since been heavily mo
 - Rust workspace architecture: modular crates for CLI, core runtime, query engine, tools, MCP, and TUI.
 - Practical operator workflows: built-in commands for setup, health checks, permissions, tasks, and diagnostics.
 - Persistent developer state: settings, auth, and session history live in local config for repeatable workflows.
+- Native intelligence layer: Smart Attachments, Mango Research, output compression, and layered memory are documented in [docs/mango-intelligence.md](docs/mango-intelligence.md).
 
 ## Current Status
 
@@ -252,6 +253,55 @@ Project-level overrides are supported via:
 
 - `.mangocode/settings.json`
 - `.mangocode/settings.jsonc`
+
+## MCP Configuration
+
+MangoCode can connect to both local `stdio` MCP servers and hosted remote MCP servers at the same time.
+
+Example `~/.mangocode/settings.json`:
+
+```json
+{
+  "config": {
+    "mcp_servers": [
+      {
+        "name": "filesystem",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+        "type": "stdio"
+      },
+      {
+        "name": "pipedream",
+        "url": "https://remote.mcp.pipedream.net/v3",
+        "type": "pipedream",
+        "pipedream": {
+          "client_id": "${PIPEDREAM_CLIENT_ID}",
+          "client_secret": "${PIPEDREAM_CLIENT_SECRET}",
+          "project_id": "${PIPEDREAM_PROJECT_ID}",
+          "environment": "${PIPEDREAM_ENVIRONMENT:-development}",
+          "external_user_id": "${PIPEDREAM_EXTERNAL_USER_ID:-local-dev}",
+          "app_slug": "${PIPEDREAM_APP_SLUG:-github}",
+          "tool_mode": "${PIPEDREAM_TOOL_MODE:-sub-agent}"
+        }
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- Use `env` for `stdio` server environment variables.
+- Use `headers` for remote HTTP/SSE MCP servers such as Pipedream.
+- Use `type: "pipedream"` when you want MangoCode to mint and refresh the Pipedream access token from client credentials automatically.
+- `${VAR}` and `${VAR:-default}` expansion works in `command`, `args`, `env`, `url`, `headers`, and the `pipedream` block.
+- Optional Pipedream fields include `tool_mode`, `conversation_id`, `account_id`, `scope`, `app_discovery`, and `token_url`.
+- Per-server MCP config overrides global defaults. Otherwise MangoCode prefers the encrypted vault, then environment variables, then `~/.mangocode/pipedream.json`.
+- Recommended vault keys are `pipedream-client-id`, `pipedream-client-secret`, `pipedream-project-id`, `pipedream-environment`, `pipedream-external-user-id`, `pipedream-app-slug`, `pipedream-app-discovery`, `pipedream-tool-mode`, `pipedream-conversation-id`, `pipedream-account-id`, `pipedream-scope`, `pipedream-mcp-url`, and `pipedream-token-url`.
+- `/pipedream setup` stores the collected Pipedream values in the encrypted MangoCode vault and saves non-secret fallback defaults to `~/.mangocode/pipedream.json`.
+- The Pipedream CLI (`pd`) is optional. MangoCode does not require it, invoke it, or auto-install it at runtime.
+- If you use `pd init connect`, treat it as a credential/bootstrap helper only. Copy the resulting values into your shell environment or MangoCode settings because MangoCode does not automatically load another project's `.env` file.
+- Hosted Pipedream MCP is a good fit as a second MCP backend for SaaS integrations while keeping your existing local/custom MCP servers in place. If no `app_slug` is set, MangoCode enables Pipedream app discovery by default.
 
 ## Repository Layout
 

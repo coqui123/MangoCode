@@ -39,7 +39,9 @@ use clap::{ArgAction, Parser, ValueEnum};
 use mangocode_core::truncate::truncate_bytes_with_ellipsis;
 use mangocode_core::types::ToolDefinition;
 use mangocode_core::{
-    config::{Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, Settings},
+    config::{
+        Config, HookEntry, HookEvent, McpServerConfig, PermissionMode, PipedreamMcpConfig, Settings,
+    },
     context::ContextBuilder,
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
@@ -397,10 +399,14 @@ fn normalize_tool_list(raw_values: &[String]) -> Vec<String> {
 fn parse_hook_event(name: &str) -> Option<HookEvent> {
     let normalized = name.replace(['-', '_'], "").to_ascii_lowercase();
     match normalized.as_str() {
+        "sessionstart" => Some(HookEvent::SessionStart),
         "pretooluse" => Some(HookEvent::PreToolUse),
         "posttooluse" => Some(HookEvent::PostToolUse),
+        "precompact" => Some(HookEvent::PreCompact),
+        "postcompact" => Some(HookEvent::PostCompact),
         "postmodelturn" => Some(HookEvent::PostModelTurn),
         "userpromptsubmit" => Some(HookEvent::UserPromptSubmit),
+        "sessionend" => Some(HookEvent::SessionEnd),
         "notification" => Some(HookEvent::Notification),
         "stop" => Some(HookEvent::Stop),
         _ => None,
@@ -482,6 +488,18 @@ fn parse_mcp_server_from_value(name: &str, value: &serde_json::Value) -> Option<
         .get("url")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let headers = obj
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let pipedream = obj
+        .get("pipedream")
+        .and_then(|v| serde_json::from_value::<PipedreamMcpConfig>(v.clone()).ok());
     let server_type = obj
         .get("type")
         .and_then(|v| v.as_str())
@@ -500,6 +518,8 @@ fn parse_mcp_server_from_value(name: &str, value: &serde_json::Value) -> Option<
         args,
         env,
         url,
+        headers,
+        pipedream,
         server_type,
     })
 }
@@ -967,6 +987,58 @@ async fn main() -> anyhow::Result<()> {
                     }
                 },
                 _ => info!("Vault skipped — using env vars only"),
+            }
+        }
+    } else if !vault.exists() && !is_headless {
+        // No vault exists and we're in interactive mode - offer to initialize
+        eprintln!(
+            "No vault found. The vault securely stores API keys encrypted with a passphrase."
+        );
+        eprint!("Would you like to create a vault? [Y/n]: ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let mut response = String::new();
+        if std::io::stdin().read_line(&mut response).is_ok() {
+            let response = response.trim().to_lowercase();
+            if response.is_empty() || response == "y" || response == "yes" {
+                // Prompt for passphrase
+                match prompt_password("Enter vault passphrase: ") {
+                    Ok(pass1) if !pass1.is_empty() => {
+                        match prompt_password("Confirm vault passphrase: ") {
+                            Ok(pass2) if pass1 == pass2 => {
+                                let data = mangocode_core::vault::VaultData::default();
+                                match vault.save(&data, &pass1) {
+                                    Ok(_) => {
+                                        mangocode_core::set_vault_passphrase(pass1);
+                                        eprintln!("Vault created and unlocked successfully.");
+                                        info!("Vault initialized");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to initialize vault: {}", e);
+                                        warn!(error = %e, "Vault initialization failed: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                eprintln!("Passphrases do not match. Vault creation cancelled.");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read confirmation: {}", e);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("No passphrase entered. Vault creation cancelled.");
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read passphrase: {}", e);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Vault creation skipped. You can create one later with: mangocode vault init"
+                );
             }
         }
     }
@@ -1878,6 +1950,18 @@ async fn run_headless(
     }
 
     persist_session_usage(&cost_tracker, &session, duration_ms);
+    mangocode_query::finish_session_lifecycle(
+        &tool_ctx,
+        format!(
+            "Session ended in {} after {} turns and {:.4} USD of tracked cost.",
+            tool_ctx.working_dir.display(),
+            tool_ctx
+                .current_turn
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cost_tracker.total_cost_usd()
+        ),
+    )
+    .await;
 
     // Final output
     match cli.output_format {
@@ -2114,6 +2198,18 @@ fn persist_session_usage(
         duration_ms,
         working_dir: session.working_dir.clone().unwrap_or_default(),
     });
+}
+
+fn escape_attachment_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_attachment_body(markdown: &str) -> String {
+    markdown.replace("</attachment>", "</ attachment>")
 }
 
 async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
@@ -2549,8 +2645,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             // Fall through to submit — no second Enter needed
                         }
 
+                        let has_pending_attachments = !app.prompt_input.pending_images.is_empty()
+                            || !app.prompt_input.pending_documents.is_empty();
                         let mut input = app.take_input();
-                        if input.is_empty() {
+                        if input.is_empty() && !has_pending_attachments {
                             continue;
                         }
 
@@ -2884,26 +2982,78 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             None
                         };
 
-                        // Regular user message (with optional image attachments)
+                        // Regular user message (with optional image/document attachments)
                         let pending_imgs = app.prompt_input.clear_images();
-                        let user_msg = if pending_imgs.is_empty() {
+                        let pending_docs = app.prompt_input.clear_documents();
+                        let user_msg = if pending_imgs.is_empty() && pending_docs.is_empty() {
                             mangocode_core::types::Message::user(input.clone())
                         } else {
-                            let mut blocks: Vec<mangocode_core::types::ContentBlock> = pending_imgs
-                                .iter()
-                                .filter_map(|img| {
-                                    mangocode_tui::image_paste::encode_image_base64(&img.path).map(
-                                        |b64| mangocode_core::types::ContentBlock::Image {
+                            let attachment_caps =
+                                mangocode_core::smart_attachments::model_attachment_capabilities(
+                                    app.config.provider.as_deref(),
+                                    app.config.effective_model(),
+                                );
+                            let mut blocks: Vec<mangocode_core::types::ContentBlock> = Vec::new();
+                            for img in &pending_imgs {
+                                if attachment_caps.image_input {
+                                    if let Some(b64) =
+                                        mangocode_tui::image_paste::encode_image_base64(&img.path)
+                                    {
+                                        blocks.push(mangocode_core::types::ContentBlock::Image {
                                             source: mangocode_core::types::ImageSource {
                                                 source_type: "base64".to_string(),
                                                 media_type: Some("image/png".to_string()),
                                                 data: Some(b64),
                                                 url: None,
                                             },
-                                        },
+                                        });
+                                    } else {
+                                        blocks.push(mangocode_core::types::ContentBlock::Text {
+                                            text: format!(
+                                                "[Attachment warning: image '{}' could not be read from {}.]",
+                                                img.label,
+                                                img.path.display()
+                                            ),
+                                        });
+                                    }
+                                } else {
+                                    let fallback = mangocode_core::smart_attachments::image_markdown_with_ocr_fallback(
+                                        &img.path,
+                                        Some(&img.label),
+                                        Some(&app.config.attachments),
                                     )
-                                })
-                                .collect();
+                                    .unwrap_or_else(|e| {
+                                            format!(
+                                                "# Image Attachment: {}\n\n\
+                                                 > The selected provider/model does not support raw image input, and MangoCode could not build the Markdown image fallback: {}\n\n\
+                                                 - Source path: `{}`\n",
+                                                img.label,
+                                                e,
+                                                img.path.display()
+                                            )
+                                    });
+                                    blocks.push(mangocode_core::types::ContentBlock::Text {
+                                        text: fallback,
+                                    });
+                                }
+                            }
+                            for doc in pending_docs {
+                                let name = escape_attachment_attr(&doc.label);
+                                let media_type = escape_attachment_attr(
+                                    doc.media_type.as_deref().unwrap_or("text/markdown"),
+                                );
+                                let source =
+                                    escape_attachment_attr(&doc.path.display().to_string());
+                                let cache =
+                                    escape_attachment_attr(&doc.cache_path.display().to_string());
+                                let markdown = escape_attachment_body(&doc.markdown);
+                                blocks.push(mangocode_core::types::ContentBlock::Text {
+                                    text: format!(
+                                        "<attachment name=\"{}\" media_type=\"{}\" source=\"{}\" cache=\"{}\">\n{}\n</attachment>",
+                                        name, media_type, source, cache, markdown
+                                    ),
+                                });
+                            }
                             blocks.push(mangocode_core::types::ContentBlock::Text {
                                 text: input.clone(),
                             });
@@ -3803,6 +3953,18 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     let _ = mangocode_core::history::save_session(&session).await;
     let duration_ms = session_start.elapsed().as_millis() as u64;
     persist_session_usage(&cost_tracker, &session, duration_ms);
+    mangocode_query::finish_session_lifecycle(
+        &tool_ctx,
+        format!(
+            "Session ended in {} after {} turns and {:.4} USD of tracked cost.",
+            tool_ctx.working_dir.display(),
+            tool_ctx
+                .current_turn
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cost_tracker.total_cost_usd()
+        ),
+    )
+    .await;
 
     terminal.restore()?;
     Ok(())

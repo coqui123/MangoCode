@@ -34,7 +34,7 @@ pub struct CommandContext {
     /// Remote session URL set when a bridge connection is active.
     pub remote_session_url: Option<String>,
     // Note: config already contains hooks, mcp_servers, etc.
-    /// Live MCP manager — present when servers are connected.
+    /// Live MCP manager â€” present when servers are connected.
     pub mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
     /// Model registry for validating model names.
     pub model_registry: Option<Arc<mangocode_api::ModelRegistry>>,
@@ -130,6 +130,7 @@ pub struct LogoutCommand;
 pub struct InitCommand;
 pub struct VaultCommand;
 pub struct GatewayCommand;
+pub struct PipedreamCommand;
 pub struct ReviewCommand;
 pub struct HooksCommand;
 pub struct McpCommand;
@@ -331,11 +332,54 @@ fn prompt_secure_input(prompt: &str) -> anyhow::Result<String> {
     Ok(input)
 }
 
+pub fn prompt_input(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
 fn get_or_prompt_passphrase() -> anyhow::Result<String> {
     if let Some(passphrase) = mangocode_core::get_vault_passphrase() {
         return Ok(passphrase);
     }
     prompt_secure_input("Vault passphrase: ")
+}
+
+fn ensure_vault_unlocked() -> anyhow::Result<String> {
+    let vault = mangocode_core::Vault::new();
+    if vault.exists() {
+        let passphrase = get_or_prompt_passphrase()?;
+        vault.load(&passphrase)?;
+        mangocode_core::set_vault_passphrase(passphrase.clone());
+        return Ok(passphrase);
+    }
+
+    let passphrase = prompt_secure_input("Create vault passphrase: ")?;
+    if passphrase.is_empty() {
+        anyhow::bail!("Vault passphrase cannot be empty");
+    }
+    let confirm = prompt_secure_input("Confirm vault passphrase: ")?;
+    if passphrase != confirm {
+        anyhow::bail!("Vault passphrases do not match");
+    }
+
+    let data = mangocode_core::vault::VaultData::default();
+    vault.save(&data, &passphrase)?;
+    mangocode_core::set_vault_passphrase(passphrase.clone());
+    Ok(passphrase)
+}
+
+fn pipedream_vault_secret(key: &str) -> Option<String> {
+    let passphrase = mangocode_core::get_vault_passphrase()?;
+    mangocode_core::Vault::new()
+        .get_secret(key, &passphrase)
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn current_output_style_name(config: &Config) -> &str {
@@ -546,8 +590,8 @@ impl SlashCommand for HelpCommand {
             ));
         }
 
-        let mut output = String::from("MangoCode — Slash Commands\n");
-        output.push_str("════════════════════════════\n");
+        let mut output = String::from("MangoCode â€” Slash Commands\n");
+        output.push_str("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n");
 
         for cat in &category_order {
             if let Some(entries) = by_cat.get(cat) {
@@ -683,17 +727,17 @@ impl SlashCommand for CostCommand {
         };
 
         CommandResult::Message(format!(
-            "Session Cost — {model}\n\
-             ──────────────────────────────\n\
+            "Session Cost â€” {model}\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {pricing_line}\n\n\
                Input tokens:   {input:>10}   ${input_cost:.4}\n\
                Output tokens:  {output:>10}   ${output_cost:.4}\n\
                Cache write:    {cache_create:>10}   ${cc_cost:.4}\n\
                Cache read:     {cache_read:>10}   ${cr_cost:.4}\n\
-             ─────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                Total tokens:   {total:>10}\n\
                Total cost:              ${cost:.4}{savings}\n\n\
-             Use /usage for quota info · /extra-usage for per-call breakdown",
+             Use /usage for quota info Â· /extra-usage for per-call breakdown",
             model = model,
             pricing_line = pricing_line,
             input = input,
@@ -760,7 +804,7 @@ impl SlashCommand for AnalyticsCommand {
 
         let summary = metrics.summary();
         CommandResult::Message(format!(
-            "📊 Session Analytics\n\
+            "ðŸ“Š Session Analytics\n\
              Cost: {}\n\
              Tokens: {} ({} in / {} out)\n\
              API time: {}\n\
@@ -820,10 +864,10 @@ impl SlashCommand for ModelCommand {
          names (e.g. claude-sonnet-4-6) and provider-prefixed format\n\
          (e.g. openai/gpt-4o, google/gemini-2.0-flash).\n\n\
          Examples:\n\
-           /model                        — show current model\n\
-           /model claude-opus-4-6        — switch to Claude Opus 4.6\n\
-           /model openai/gpt-4o          — switch to GPT-4o via OpenAI\n\
-           /model google/gemini-2.0-flash — switch to Gemini 2.0 Flash"
+           /model                        â€” show current model\n\
+           /model claude-opus-4-6        â€” switch to Claude Opus 4.6\n\
+           /model openai/gpt-4o          â€” switch to GPT-4o via OpenAI\n\
+           /model google/gemini-2.0-flash â€” switch to Gemini 2.0 Flash"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -1072,7 +1116,7 @@ impl SlashCommand for FlagsCommand {
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
-            let mut out = String::from("Runtime feature flags\n─────────────────────\n");
+            let mut out = String::from("Runtime feature flags\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n");
             for (name, enabled) in FeatureFlags::list_all() {
                 out.push_str(&format!(
                     "{}: {}\n",
@@ -1150,7 +1194,7 @@ impl SlashCommand for ColorCommand {
                 && color[1..].chars().all(|c| c.is_ascii_hexdigit());
             if !is_hex && !known_colors.contains(&color.to_lowercase().as_str()) {
                 return CommandResult::Error(format!(
-                    "Unknown color '{}'. Use a color name (red, green, …) or a hex code (#RGB or #RRGGBB).",
+                    "Unknown color '{}'. Use a color name (red, green, â€¦) or a hex code (#RGB or #RRGGBB).",
                     color
                 ));
             }
@@ -1529,31 +1573,31 @@ impl SlashCommand for StatusCommand {
 
         CommandResult::Message(format!(
             "MangoCode Status\n\
-             ══════════════════\n\
+             â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n\
              Auth:           {auth_status}\n\
              Model:          {model}\n\
              Permission mode: {perm:?}\n\
              Fast mode:      {fast}\n\
              Editor mode:    {editor}\n\n\
              Session\n\
-             ───────\n\
+             â”€â”€â”€â”€â”€â”€â”€\n\
              Session ID:     {sid}\n\
              Title:          {title}\n\
              Messages:       {msgs}\n\
              Working dir:    {wd}\n\
              Git branch:     {branch}\n\n\
-             📊 Token Usage\n\
+             ðŸ“Š Token Usage\n\
              Estimated:      {tokens_used} / {max_tokens} ({pct:.1}%)\n\
              Messages:       {msgs}\n\
              Compacted:      {compacted}\n\
              Cache write:    {cache_write}\n\
              Cache read:     {cache_read_stat}\n\n\
              Integrations\n\
-             ────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              MCP servers:    {mcp}\n\
              Hooks:          {hooks} configured\n\n\
              Usage\n\
-             ─────\n\
+             â”€â”€â”€â”€â”€\n\
              {summary}",
             auth_status = auth_status,
             model = model,
@@ -1592,10 +1636,10 @@ impl SlashCommand for DiffCommand {
         "Usage: /diff [--stat|--staged|<ref>]\n\n\
          Shows git diff output for the current working directory.\n\n\
          Options:\n\
-           /diff           — diff of all unstaged changes (git diff)\n\
-           /diff --stat    — summary of changed files\n\
-           /diff --staged  — diff of staged changes (git diff --cached)\n\
-           /diff <ref>     — diff against a branch, tag, or commit"
+           /diff           â€” diff of all unstaged changes (git diff)\n\
+           /diff --stat    â€” summary of changed files\n\
+           /diff --staged  â€” diff of staged changes (git diff --cached)\n\
+           /diff <ref>     â€” diff against a branch, tag, or commit"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -1631,7 +1675,7 @@ impl SlashCommand for DiffCommand {
                     let text = stdout.as_ref();
                     let display = if text.len() > 8000 {
                         format!(
-                            "{}\n… (truncated — {} total bytes; use `git diff` for full output)",
+                            "{}\nâ€¦ (truncated â€” {} total bytes; use `git diff` for full output)",
                             truncate_bytes_prefix(text, 8000),
                             text.len()
                         )
@@ -1662,18 +1706,20 @@ impl SlashCommand for MemoryCommand {
         "memory"
     }
     fn description(&self) -> &str {
-        "View, edit, or clear AGENTS.md memory files"
+        "View, edit, review, or clear MangoCode memory"
     }
     fn help(&self) -> &str {
-        "Usage: /memory [edit|clear] [global]\n\n\
-         Shows the content of AGENTS.md files that provide project context to MangoCode.\n\
-         MangoCode reads these files automatically at session start.\n\n\
+        "Usage: /memory [review|delete|edit|clear] [args]\n\n\
+         Shows AGENTS.md memory files and manages MangoCode layered project memory.\n\
+         MangoCode reads AGENTS.md files automatically and retrieves layered memories on demand.\n\n\
          Subcommands:\n\
-           /memory              — show all AGENTS.md files\n\
-           /memory edit         — open project AGENTS.md in your editor\n\
-           /memory edit global  — open global ~/.mangocode/AGENTS.md in your editor\n\
-           /memory clear        — clear the project AGENTS.md\n\
-           /memory clear global — clear the global ~/.mangocode/AGENTS.md\n\n\
+           /memory               - show all AGENTS.md files\n\
+           /memory review [n]    - review layered project memories\n\
+           /memory delete <id>   - delete one layered memory by reviewed id\n\
+           /memory edit          - open project AGENTS.md in your editor\n\
+           /memory edit global   - open global ~/.mangocode/AGENTS.md in your editor\n\
+           /memory clear         - clear the project AGENTS.md\n\
+           /memory clear global  - clear the global ~/.mangocode/AGENTS.md\n\n\
          Locations checked (in priority order):\n\
            1. <project>/.mangocode/AGENTS.md\n\
            2. <project>/AGENTS.md\n\
@@ -1696,6 +1742,84 @@ impl SlashCommand for MemoryCommand {
         ];
 
         let cmd = args.trim();
+
+        // ---- /memory review ---------------------------------------------------
+        if cmd == "review" || cmd.starts_with("review ") {
+            let limit = cmd
+                .strip_prefix("review")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(25)
+                .clamp(1, 100);
+            let db_path = mangocode_core::layered_memory::project_memory_db_path(&ctx.working_dir);
+            let store = match mangocode_core::layered_memory::LayeredMemoryStore::open(&db_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    return CommandResult::Error(format!(
+                        "Failed to open layered memory DB at {}: {}",
+                        db_path.display(),
+                        e
+                    ))
+                }
+            };
+            let records = match store.review(limit) {
+                Ok(records) => records,
+                Err(e) => return CommandResult::Error(format!("Failed to read memories: {}", e)),
+            };
+            if records.is_empty() {
+                return CommandResult::Message(format!(
+                    "Layered memory is enabled, but no project memories are stored yet.\nDB: {}",
+                    db_path.display()
+                ));
+            }
+            return CommandResult::Message(format!(
+                "Layered Memory Review\nDB: {}\n\n{}",
+                db_path.display(),
+                mangocode_core::layered_memory::format_memory_records(&records)
+            ));
+        }
+
+        // ---- /memory delete <id> ------------------------------------------
+        if cmd == "delete" || cmd.starts_with("delete ") {
+            let raw_id = cmd
+                .strip_prefix("delete")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(id) = raw_id.and_then(|s| s.parse::<i64>().ok()) else {
+                return CommandResult::Error(
+                    "Usage: /memory delete <id>\nRun /memory review first to see ids.".to_string(),
+                );
+            };
+            let db_path = mangocode_core::layered_memory::project_memory_db_path(&ctx.working_dir);
+            let store = match mangocode_core::layered_memory::LayeredMemoryStore::open(&db_path) {
+                Ok(store) => store,
+                Err(e) => {
+                    return CommandResult::Error(format!(
+                        "Failed to open layered memory DB at {}: {}",
+                        db_path.display(),
+                        e
+                    ))
+                }
+            };
+            let reviewed = store.review(1000).unwrap_or_default();
+            let deleted_record = reviewed.into_iter().find(|record| record.id == id);
+            return match store.delete(id) {
+                Ok(true) => CommandResult::Message(format!(
+                    "Deleted layered memory #{}{}.\nDB: {}",
+                    id,
+                    deleted_record
+                        .map(|record| format!(" [{}] {}", record.class.as_str(), record.content))
+                        .unwrap_or_default(),
+                    db_path.display()
+                )),
+                Ok(false) => CommandResult::Message(format!(
+                    "No layered memory #{} exists.\nRun /memory review to inspect current memories.",
+                    id
+                )),
+                Err(e) => CommandResult::Error(format!("Failed to delete memory #{}: {}", id, e)),
+            };
+        }
 
         // ---- /memory edit [global|project] ------------------------------------
         if cmd == "edit" || cmd.starts_with("edit ") {
@@ -1799,7 +1923,7 @@ impl SlashCommand for MemoryCommand {
         }
 
         // ---- /memory (show all) -----------------------------------------------
-        let mut output = String::from("AGENTS.md Memory Files\n══════════════════════\n");
+        let mut output = String::from("AGENTS.md Memory Files\nâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n");
         let mut found_any = false;
 
         for (label, path) in &locations {
@@ -1811,7 +1935,7 @@ impl SlashCommand for MemoryCommand {
                         let chars = content.len();
                         output.push_str(&format!(
                             "\n[{label}]\nPath: {path}\nSize: {lines} lines, {chars} chars\n\
-                             ─────────────────────────────────\n\
+                             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                              {content}\n",
                             label = label,
                             path = path.display(),
@@ -1819,7 +1943,7 @@ impl SlashCommand for MemoryCommand {
                             chars = chars,
                             content = if content.len() > 2000 {
                                 format!(
-                                    "{}…\n(truncated — file is {} chars)",
+                                    "{}â€¦\n(truncated â€” file is {} chars)",
                                     truncate_bytes_prefix(&content, 2000),
                                     chars
                                 )
@@ -1829,7 +1953,7 @@ impl SlashCommand for MemoryCommand {
                         ));
                     }
                     Err(e) => output.push_str(&format!(
-                        "\n[{label}] — Error reading {}: {}\n",
+                        "\n[{label}] â€” Error reading {}: {}\n",
                         path.display(),
                         e,
                         label = label
@@ -1847,10 +1971,10 @@ impl SlashCommand for MemoryCommand {
         } else {
             output.push_str(
                 "\nSubcommands:\n\
-                 /memory edit          — edit project AGENTS.md\n\
-                 /memory edit global   — edit global ~/.mangocode/AGENTS.md\n\
-                 /memory clear         — clear project AGENTS.md\n\
-                 /memory clear global  — clear global AGENTS.md",
+                 /memory edit          â€” edit project AGENTS.md\n\
+                 /memory edit global   â€” edit global ~/.mangocode/AGENTS.md\n\
+                 /memory clear         â€” clear project AGENTS.md\n\
+                 /memory clear global  â€” clear global AGENTS.md",
             );
         }
 
@@ -1926,14 +2050,14 @@ impl SlashCommand for UsageCommand {
                 if ctx.config.resolve_api_key().is_some() {
                     "Plan: API key (Console billing)".to_string()
                 } else {
-                    "Plan: not authenticated — run /login".to_string()
+                    "Plan: not authenticated â€” run /login".to_string()
                 }
             }
         };
 
         CommandResult::Message(format!(
-            "API Usage — Current Session\n\
-             ────────────────────────────\n\
+            "API Usage â€” Current Session\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {account_info}\n\
              Model:          {model}\n\n\
              Tokens used this session:\n\
@@ -1974,13 +2098,13 @@ impl SlashCommand for PluginCommand {
         "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|reload]\n\
          Manage MangoCode plugins.\n\n\
          Subcommands:\n\
-           /plugin              — list all installed plugins\n\
-           /plugin list         — list all installed plugins\n\
-           /plugin info <name>  — show detailed info about a plugin\n\
-           /plugin enable <name>   — enable a plugin (persisted to settings)\n\
-           /plugin disable <name>  — disable a plugin (persisted to settings)\n\
-           /plugin install <path>  — install a plugin from a local directory\n\
-           /plugin reload       — reload plugins from disk"
+           /plugin              â€” list all installed plugins\n\
+           /plugin list         â€” list all installed plugins\n\
+           /plugin info <name>  â€” show detailed info about a plugin\n\
+           /plugin enable <name>   â€” enable a plugin (persisted to settings)\n\
+           /plugin disable <name>  â€” disable a plugin (persisted to settings)\n\
+           /plugin install <path>  â€” install a plugin from a local directory\n\
+           /plugin reload       â€” reload plugins from disk"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -2092,13 +2216,13 @@ impl SlashCommand for PluginCommand {
             }
             mangocode_plugins::PluginSubCommand::Help => CommandResult::Message(
                 "Plugin commands:\n\
-                     /plugin              — list all installed plugins\n\
-                     /plugin list         — list all installed plugins\n\
-                     /plugin info <name>  — show plugin details\n\
-                     /plugin enable <name>   — enable a plugin\n\
-                     /plugin disable <name>  — disable a plugin\n\
-                     /plugin install <path>  — install plugin from local path\n\
-                     /plugin reload       — reload plugins from disk"
+                     /plugin              â€” list all installed plugins\n\
+                     /plugin list         â€” list all installed plugins\n\
+                     /plugin info <name>  â€” show plugin details\n\
+                     /plugin enable <name>   â€” enable a plugin\n\
+                     /plugin disable <name>  â€” disable a plugin\n\
+                     /plugin install <path>  â€” install plugin from local path\n\
+                     /plugin reload       â€” reload plugins from disk"
                     .to_string(),
             ),
         }
@@ -2243,7 +2367,7 @@ impl SlashCommand for DoctorCommand {
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut lines: Vec<String> = Vec::new();
 
-        // ── Header ─────────────────────────────────────────────────────────
+        // â”€â”€ Header â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push(format!(
             "MangoCode v{}  |  {}",
             env!("CARGO_PKG_VERSION"),
@@ -2251,7 +2375,7 @@ impl SlashCommand for DoctorCommand {
         ));
         lines.push(String::new());
 
-        // ── API / Auth ──────────────────────────────────────────────────────
+        // â”€â”€ API / Auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Authentication".to_string());
         // Try a real live call to GET /v1/models to validate the key.
         let auth = ctx.config.resolve_auth_async().await;
@@ -2274,38 +2398,54 @@ impl SlashCommand for DoctorCommand {
                 };
                 match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        lines.push("  ✓ API key valid (GET /v1/models returned 200)".to_string());
+                        lines.push("  âœ“ API key valid (GET /v1/models returned 200)".to_string());
                     }
                     Ok(resp) if resp.status() == 401 || resp.status() == 403 => {
                         lines.push(format!(
-                            "  ✗ API key rejected ({}) — check ANTHROPIC_API_KEY or run /login",
+                            "  âœ— API key rejected ({}) â€” check ANTHROPIC_API_KEY or run /login",
                             resp.status()
                         ));
                     }
                     Ok(resp) => {
                         lines.push(format!(
-                            "  ⚠ API reachable but returned {} — key may still be valid",
+                            "  âš  API reachable but returned {} â€” key may still be valid",
                             resp.status()
                         ));
                     }
                     Err(e) => {
-                        lines.push(format!("  ⚠ Could not reach API: {}", e));
+                        lines.push(format!("  âš  Could not reach API: {}", e));
                     }
                 }
             }
             None => {
-                lines.push("  ✗ No Anthropic API key found — set ANTHROPIC_API_KEY, run /login, or use a different provider".to_string());
+                lines.push("  âœ— No Anthropic API key found â€” set ANTHROPIC_API_KEY, run /login, or use a different provider".to_string());
             }
         }
         // Show which model is active
         lines.push(format!(
-            "  • Active model: {}",
+            "  â€¢ Active model: {}",
             ctx.config.effective_model()
         ));
         lines.push(String::new());
 
-        // ── Git ─────────────────────────────────────────────────────────────
+        // â”€â”€ Git â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Tools".to_string());
+        let (ocr_ok, ocr_status) = mangocode_core::smart_attachments::tesseract_health(
+            ctx.config.attachments.tesseract_path.as_deref(),
+        );
+        lines.push(format!(
+            "  {} OCR/Tesseract: {}",
+            if ocr_ok { "ok" } else { "warn" },
+            ocr_status
+        ));
+        lines.push(
+            "  ok WebSearch fallback: DuckDuckGo instant/html/lite parser (no API key required)"
+                .to_string(),
+        );
+        lines.push(format!(
+            "  ok Memory embeddings: {} / {}",
+            ctx.config.memory.embedding_provider, ctx.config.memory.embedding_model
+        ));
         let git_out = tokio::process::Command::new("git")
             .arg("--version")
             .output()
@@ -2313,9 +2453,9 @@ impl SlashCommand for DoctorCommand {
         match git_out {
             Ok(o) if o.status.success() => {
                 let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                lines.push(format!("  ✓ {ver}"));
+                lines.push(format!("  ok git: {ver}"));
             }
-            _ => lines.push("  ✗ git not found — many features require git".to_string()),
+            _ => lines.push("  warn git not found - many features require git".to_string()),
         }
 
         // Ripgrep
@@ -2331,15 +2471,74 @@ impl SlashCommand for DoctorCommand {
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                lines.push(format!("  ✓ ripgrep: {first}"));
+                lines.push(format!("  ok ripgrep: {first}"));
             }
             _ => lines.push(
-                "  ⚠ ripgrep (rg) not found — Grep tool will fall back to built-in".to_string(),
+                "  warn ripgrep (rg) not found - Grep tool will fall back to built-in".to_string(),
             ),
+        }
+
+        lines.push("  ok native document Markdown extraction: built in".to_string());
+
+        lines.push(
+            "  info Rendered browser fallback: native persistent Chromium backend when built with tools/browser; HTTP/script extraction otherwise"
+                .to_string(),
+        );
+
+        lines.push(format!(
+            "  info Tool output reduction: {}",
+            ctx.config.tool_output.reduction
+        ));
+        lines.push(format!(
+            "  info Research rendered fallback: {}",
+            if ctx.config.research.enable_rendered_fallback {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ));
+
+        if let Some(home) = dirs::home_dir() {
+            let attachment_cache = home.join(".mangocode").join("attachments");
+            let tool_log_cache = home.join(".mangocode").join("tool-logs");
+            let research_cache = home.join(".mangocode").join("research");
+            let research_index = research_cache.join("research-v1").join("source-index.json");
+            lines.push(format!(
+                "  ok Research source index: {} ({})",
+                research_index.display(),
+                if research_index.exists() {
+                    "present"
+                } else {
+                    "not created yet"
+                }
+            ));
+            let memory_db =
+                mangocode_core::layered_memory::project_memory_db_path(&ctx.working_dir);
+            lines.push(format!(
+                "  info Attachment cache: {}",
+                attachment_cache.display()
+            ));
+            lines.push(format!(
+                "  info Tool log cache: {}",
+                tool_log_cache.display()
+            ));
+            lines.push(format!(
+                "  info Research cache: {}",
+                research_cache.display()
+            ));
+            lines.push(format!(
+                "  info Layered memory DB: {} ({})",
+                memory_db.display(),
+                if memory_db.exists() {
+                    "present"
+                } else {
+                    "not created yet"
+                }
+            ));
         }
         lines.push(String::new());
 
-        // ── Disk space ──────────────────────────────────────────────────────
+        // â”€â”€ Disk space â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Disk Space".to_string());
         #[cfg(windows)]
         {
@@ -2355,14 +2554,14 @@ impl SlashCommand for DoctorCommand {
                 Ok(o) if o.status.success() => {
                     let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     if out.is_empty() {
-                        lines.push("  • Disk info unavailable".to_string());
+                        lines.push("  â€¢ Disk info unavailable".to_string());
                     } else {
                         for l in out.lines().take(3) {
-                            lines.push(format!("  • {}", l.trim()));
+                            lines.push(format!("  â€¢ {}", l.trim()));
                         }
                     }
                 }
-                _ => lines.push("  ⚠ Could not query disk space".to_string()),
+                _ => lines.push("  âš  Could not query disk space".to_string()),
             }
         }
         #[cfg(not(windows))]
@@ -2377,34 +2576,37 @@ impl SlashCommand for DoctorCommand {
                     // Print the header + the first data line (current filesystem)
                     for (i, l) in out.lines().enumerate().take(2) {
                         if i == 0 {
-                            lines.push(format!("  • {}", l));
+                            lines.push(format!("  â€¢ {}", l));
                         } else {
-                            lines.push(format!("  ✓ {}", l));
+                            lines.push(format!("  âœ“ {}", l));
                         }
                     }
                 }
-                _ => lines.push("  ⚠ Could not query disk space (`df -h .` failed)".to_string()),
+                _ => lines.push("  âš  Could not query disk space (`df -h .` failed)".to_string()),
             }
         }
         lines.push(String::new());
 
-        // ── Config directory ────────────────────────────────────────────────
+        // â”€â”€ Config directory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Configuration".to_string());
         let config_dir = mangocode_core::config::Settings::config_dir();
         if config_dir.exists() {
-            lines.push(format!("  ✓ Config dir: {}", config_dir.display()));
+            lines.push(format!("  âœ“ Config dir: {}", config_dir.display()));
         } else {
-            lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
+            lines.push(format!(
+                "  âœ— Config dir missing: {}",
+                config_dir.display()
+            ));
         }
 
-        // Settings validation — try loading ~/.mangocode/settings.json
+        // Settings validation â€” try loading ~/.mangocode/settings.json
         let settings_path = config_dir.join("settings.json");
         if settings_path.exists() {
             match std::fs::read_to_string(&settings_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<mangocode_core::config::Settings>(&s).ok())
             {
-                Some(_) => lines.push("  ✓ settings.json valid".to_string()),
+                Some(_) => lines.push("  âœ“ settings.json valid".to_string()),
                 None => {
                     // Try as raw JSON to distinguish missing vs invalid
                     match std::fs::read_to_string(&settings_path)
@@ -2412,34 +2614,35 @@ impl SlashCommand for DoctorCommand {
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     {
                         Some(_) => lines.push(
-                            "  ⚠ settings.json is JSON but has unexpected structure".to_string(),
+                            "  âš  settings.json is JSON but has unexpected structure".to_string(),
                         ),
                         None => lines.push(
-                            "  ✗ settings.json is invalid JSON — run /config to repair".to_string(),
+                            "  âœ— settings.json is invalid JSON â€” run /config to repair"
+                                .to_string(),
                         ),
                     }
                 }
             }
         } else {
-            lines.push("  • settings.json not found (defaults will be used)".to_string());
+            lines.push("  â€¢ settings.json not found (defaults will be used)".to_string());
         }
 
         // AGENTS.md
         let claude_md = ctx.working_dir.join("AGENTS.md");
         if claude_md.exists() {
-            lines.push("  ✓ AGENTS.md present in working directory".to_string());
+            lines.push("  âœ“ AGENTS.md present in working directory".to_string());
         } else {
             lines.push(
-                "  • No AGENTS.md in working directory (run /init to create one)".to_string(),
+                "  â€¢ No AGENTS.md in working directory (run /init to create one)".to_string(),
             );
         }
         lines.push(String::new());
 
-        // ── MCP servers ─────────────────────────────────────────────────────
+        // â”€â”€ MCP servers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("MCP Servers".to_string());
         let mcp_count = ctx.config.mcp_servers.len();
         if mcp_count == 0 {
-            lines.push("  • No MCP servers configured".to_string());
+            lines.push("  â€¢ No MCP servers configured".to_string());
         } else if let Some(mgr) = ctx.mcp_manager.as_ref() {
             // Report live connection status from the manager
             let statuses = mgr.all_statuses();
@@ -2447,61 +2650,61 @@ impl SlashCommand for DoctorCommand {
                 let status_str = match statuses.get(&srv.name) {
                     Some(mangocode_mcp::McpServerStatus::Connected { tool_count }) => {
                         format!(
-                            "  ✓ {} — connected ({} tool{})",
+                            "  âœ“ {} â€” connected ({} tool{})",
                             srv.name,
                             tool_count,
                             if *tool_count == 1 { "" } else { "s" }
                         )
                     }
                     Some(mangocode_mcp::McpServerStatus::Connecting) => {
-                        format!("  ⚠ {} — connecting…", srv.name)
+                        format!("  âš  {} â€” connectingâ€¦", srv.name)
                     }
                     Some(mangocode_mcp::McpServerStatus::Disconnected {
                         last_error: Some(e),
                     }) => {
-                        format!("  ✗ {} — failed: {}", srv.name, e)
+                        format!("  âœ— {} â€” failed: {}", srv.name, e)
                     }
                     Some(mangocode_mcp::McpServerStatus::Disconnected { last_error: None }) => {
-                        format!("  ✗ {} — disconnected", srv.name)
+                        format!("  âœ— {} â€” disconnected", srv.name)
                     }
                     Some(mangocode_mcp::McpServerStatus::Failed { error, .. }) => {
-                        format!("  ✗ {} — failed: {}", srv.name, error)
+                        format!("  âœ— {} â€” failed: {}", srv.name, error)
                     }
-                    None => format!("  ⚠ {} — not started", srv.name),
+                    None => format!("  âš  {} â€” not started", srv.name),
                 };
                 lines.push(status_str);
             }
             if mcp_count > 12 {
-                lines.push(format!("    … and {} more", mcp_count - 12));
+                lines.push(format!("    â€¦ and {} more", mcp_count - 12));
             }
         } else {
-            // No live manager — just show configured names
+            // No live manager â€” just show configured names
             lines.push(format!(
-                "  ✓ {mcp_count} MCP server(s) configured (not yet connected):"
+                "  âœ“ {mcp_count} MCP server(s) configured (not yet connected):"
             ));
             for srv in ctx.config.mcp_servers.iter().take(8) {
                 lines.push(format!("    - {}", srv.name));
             }
             if mcp_count > 8 {
-                lines.push(format!("    … and {} more", mcp_count - 8));
+                lines.push(format!("    â€¦ and {} more", mcp_count - 8));
             }
         }
         lines.push(String::new());
 
-        // ── Hooks ───────────────────────────────────────────────────────────
+        // â”€â”€ Hooks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Hooks".to_string());
         let hook_count: usize = ctx.config.hooks.values().map(|v| v.len()).sum();
         if hook_count == 0 {
-            lines.push("  • No hooks configured".to_string());
+            lines.push("  â€¢ No hooks configured".to_string());
         } else {
             lines.push(format!(
-                "  ✓ {hook_count} hook(s) configured across {} event(s)",
+                "  âœ“ {hook_count} hook(s) configured across {} event(s)",
                 ctx.config.hooks.len()
             ));
         }
         lines.push(String::new());
 
-        // ── Tool permissions ─────────────────────────────────────────────────
+        // â”€â”€ Tool permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Tool Permissions".to_string());
         let all_tool_names: Vec<String> = mangocode_tools::all_tools()
             .iter()
@@ -2532,40 +2735,40 @@ impl SlashCommand for DoctorCommand {
             mangocode_core::PermissionMode::Plan => "plan (read-only, no writes)",
             mangocode_core::PermissionMode::Default => "default (confirm destructive actions)",
         };
-        lines.push(format!("  • Mode: {mode_label}"));
-        lines.push(format!("  • Total built-in tools: {total_tools}"));
+        lines.push(format!("  â€¢ Mode: {mode_label}"));
+        lines.push(format!("  â€¢ Total built-in tools: {total_tools}"));
         if allowed_count > 0 {
             lines.push(format!(
-                "  ✓ Always allowed: {} tool(s) — {}",
+                "  âœ“ Always allowed: {} tool(s) â€” {}",
                 allowed_count,
                 ctx.config.allowed_tools.join(", ")
             ));
         }
         if denied_count > 0 {
             lines.push(format!(
-                "  ✗ Always denied: {} tool(s) — {}",
+                "  âœ— Always denied: {} tool(s) â€” {}",
                 denied_count,
                 ctx.config.disallowed_tools.join(", ")
             ));
         }
         if ctx.config.permission_mode == mangocode_core::PermissionMode::Default {
             lines.push(format!(
-                "  ⚠ Require confirmation: {} tool(s)",
+                "  âš  Require confirmation: {} tool(s)",
                 confirm_count
             ));
         }
         lines.push(String::new());
 
-        // ── Session / lock ──────────────────────────────────────────────────
+        // â”€â”€ Session / lock â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines.push("Session".to_string());
         let lock_path = config_dir.join("claude.lock");
         if lock_path.exists() {
-            lines.push("  ⚠ Lock file exists — another instance may be running".to_string());
+            lines.push("  âš  Lock file exists â€” another instance may be running".to_string());
         } else {
-            lines.push("  ✓ No stale lock file".to_string());
+            lines.push("  âœ“ No stale lock file".to_string());
         }
-        lines.push(format!("  • Session ID: {}", ctx.session_id));
-        lines.push(format!("  • Working dir: {}", ctx.working_dir.display()));
+        lines.push(format!("  â€¢ Session ID: {}", ctx.session_id));
+        lines.push(format!("  â€¢ Working dir: {}", ctx.working_dir.display()));
 
         CommandResult::Message(lines.join("\n"))
     }
@@ -2583,7 +2786,7 @@ impl SlashCommand for LoginCommand {
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        // `--console` flag → Console/API-key auth; default → Claude.ai subscription auth
+        // `--console` flag â†’ Console/API-key auth; default â†’ Claude.ai subscription auth
         let login_with_claude_ai = !args.contains("--console");
         CommandResult::StartOAuthFlow(login_with_claude_ai)
     }
@@ -2643,13 +2846,13 @@ impl SlashCommand for VaultCommand {
                     "Supported vault provider IDs (use with `/vault set <provider-id>`):\n\n",
                 );
 
-                // Format: provider-id — env var(s) — notes/aliases
+                // Format: provider-id â€” env var(s) â€” notes/aliases
                 let rows: &[(&str, &str, &str)] = &[
                     ("anthropic", "ANTHROPIC_API_KEY", ""),
                     ("openai", "OPENAI_API_KEY", ""),
                     (
                         "openai-codex",
-                        "(no env key — /connect → OpenAI Codex OAuth)",
+                        "(no env key â€” /connect â†’ OpenAI Codex OAuth)",
                         "ChatGPT-plan Codex; alias: codex",
                     ),
                     (
@@ -2703,9 +2906,9 @@ impl SlashCommand for VaultCommand {
 
                 for (id, env, note) in rows {
                     if note.is_empty() {
-                        out.push_str(&format!("- {} — {}\n", id, env));
+                        out.push_str(&format!("- {} â€” {}\n", id, env));
                     } else {
-                        out.push_str(&format!("- {} — {} — {}\n", id, env, note));
+                        out.push_str(&format!("- {} â€” {} â€” {}\n", id, env, note));
                     }
                 }
 
@@ -2857,7 +3060,7 @@ impl SlashCommand for VaultCommand {
                                 .into_iter()
                                 .map(|(provider, label, updated_at)| {
                                     format!(
-                                        "{}{} — updated {}",
+                                        "{}{} â€” updated {}",
                                         provider,
                                         label
                                             .as_ref()
@@ -3031,6 +3234,248 @@ impl SlashCommand for GatewayCommand {
     }
 }
 
+// ---- /pipedream ---------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for PipedreamCommand {
+    fn name(&self) -> &str {
+        "pipedream"
+    }
+
+    fn description(&self) -> &str {
+        "Configure Pipedream MCP OAuth credentials"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        use mangocode_core::vault::PipedreamConfig;
+
+        let mut parts = args.split_whitespace();
+        let subcommand = parts.next().unwrap_or_default();
+        match subcommand {
+            "setup" => {
+                let passphrase = match ensure_vault_unlocked() {
+                    Ok(passphrase) => passphrase,
+                    Err(e) => return CommandResult::Error(format!("Failed to unlock vault: {}", e)),
+                };
+
+                let vault = mangocode_core::Vault::new();
+
+                let client_id: String = match prompt_input("Pipedream Client ID: ") {
+                    Ok(id) if !id.is_empty() => id,
+                    Ok(_) => return CommandResult::Error("Client ID cannot be empty.".to_string()),
+                    Err(e) => return CommandResult::Error(format!("Failed to read Client ID: {}", e)),
+                };
+
+                let client_secret: String =
+                    match prompt_secure_input("Pipedream Client Secret: ") {
+                        Ok(secret) if !secret.is_empty() => secret,
+                        Ok(_) => {
+                            return CommandResult::Error(
+                                "Client Secret cannot be empty.".to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            return CommandResult::Error(format!(
+                                "Failed to read Client Secret: {}",
+                                e
+                            ));
+                        }
+                    };
+
+                let project_id: String = match prompt_input("Pipedream Project ID: ") {
+                    Ok(id) if !id.is_empty() => id,
+                    Ok(_) => return CommandResult::Error("Project ID cannot be empty.".to_string()),
+                    Err(e) => return CommandResult::Error(format!("Failed to read Project ID: {}", e)),
+                };
+
+                let environment: String =
+                    match prompt_input("Environment (default: development): ") {
+                        Ok(env) if !env.is_empty() => env,
+                        _ => "development".to_string(),
+                    };
+
+                let account_id: Option<String> = match prompt_input(
+                    "Account/Workspace ID (optional, press Enter to skip): ",
+                ) {
+                    Ok(id) if !id.is_empty() => Some(id),
+                    _ => None,
+                };
+
+                let mcp_url: Option<String> = match prompt_input(
+                    "MCP Server URL (optional, press Enter for https://remote.mcp.pipedream.net/v3): ",
+                ) {
+                    Ok(url) if !url.is_empty() => Some(url),
+                    _ => None,
+                };
+
+                let token_url: Option<String> = match prompt_input(
+                    "OAuth Token URL (optional, press Enter for https://api.pipedream.com/v1/oauth/token): ",
+                ) {
+                    Ok(url) if !url.is_empty() => Some(url),
+                    _ => None,
+                };
+
+                let writes = [
+                    ("pipedream-client-id", client_id.as_str(), Some("Pipedream Client ID")),
+                    (
+                        "pipedream-client-secret",
+                        client_secret.as_str(),
+                        Some("Pipedream Client Secret"),
+                    ),
+                    (
+                        "pipedream-project-id",
+                        project_id.as_str(),
+                        Some("Pipedream Project ID"),
+                    ),
+                    (
+                        "pipedream-environment",
+                        environment.as_str(),
+                        Some("Pipedream Environment"),
+                    ),
+                ];
+
+                for (key, value, label) in writes {
+                    if let Err(e) = vault.set_secret(key, value, &passphrase, label) {
+                        return CommandResult::Error(format!(
+                            "Failed to store '{}' in vault: {}",
+                            key, e
+                        ));
+                    }
+                }
+
+                let optional_writes = [
+                    (
+                        "pipedream-account-id",
+                        account_id.as_deref(),
+                        Some("Pipedream Account ID"),
+                    ),
+                    ("pipedream-mcp-url", mcp_url.as_deref(), Some("Pipedream MCP URL")),
+                    (
+                        "pipedream-token-url",
+                        token_url.as_deref(),
+                        Some("Pipedream Token URL"),
+                    ),
+                ];
+
+                for (key, value, label) in optional_writes {
+                    let result = if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                        vault.set_secret(key, value, &passphrase, label)
+                    } else {
+                        vault.remove_secret(key, &passphrase)
+                    };
+
+                    if let Err(e) = result {
+                        return CommandResult::Error(format!(
+                            "Failed to update '{}' in vault: {}",
+                            key, e
+                        ));
+                    }
+                }
+
+                let config = PipedreamConfig {
+                    client_id: None,
+                    client_secret: None,
+                    project_id: None,
+                    environment,
+                    account_id,
+                    mcp_url,
+                    token_url,
+                };
+
+                if let Err(e) = config.save() {
+                    return CommandResult::Error(format!("Failed to save Pipedream config: {}", e));
+                }
+
+                CommandResult::Message(
+                    "Pipedream settings saved.\nSensitive values were stored in the encrypted vault, and non-secret defaults were saved to ~/.mangocode/pipedream.json.\nConfigure an MCP server with type: pipedream to use them.".to_string(),
+                )
+            }
+            "status" => {
+                let file_config = PipedreamConfig::load().unwrap_or_default();
+                let vault_exists = mangocode_core::Vault::new().exists();
+                let vault_unlocked = mangocode_core::get_vault_passphrase().is_some();
+
+                let client_id = pipedream_vault_secret("pipedream-client-id")
+                    .or_else(|| std::env::var("PIPEDREAM_CLIENT_ID").ok().filter(|v| !v.is_empty()))
+                    .or_else(|| file_config.client_id.clone().filter(|v| !v.is_empty()));
+                let client_secret = pipedream_vault_secret("pipedream-client-secret")
+                    .or_else(|| {
+                        std::env::var("PIPEDREAM_CLIENT_SECRET")
+                            .ok()
+                            .filter(|v| !v.is_empty())
+                    })
+                    .or_else(|| file_config.client_secret.clone().filter(|v| !v.is_empty()));
+                let project_id = pipedream_vault_secret("pipedream-project-id")
+                    .or_else(|| std::env::var("PIPEDREAM_PROJECT_ID").ok().filter(|v| !v.is_empty()))
+                    .or_else(|| file_config.project_id.clone().filter(|v| !v.is_empty()));
+                let account_id = pipedream_vault_secret("pipedream-account-id")
+                    .or_else(|| std::env::var("PIPEDREAM_ACCOUNT_ID").ok().filter(|v| !v.is_empty()))
+                    .or_else(|| file_config.account_id.clone().filter(|v| !v.is_empty()));
+
+                let mut status = String::from("Pipedream MCP status:\n\n");
+                status.push_str(&format!(
+                    "Vault: {}\n",
+                    if vault_exists {
+                        if vault_unlocked {
+                            "present and unlocked"
+                        } else {
+                            "present but locked"
+                        }
+                    } else {
+                        "not created"
+                    }
+                ));
+                status.push_str(&format!(
+                    "Client ID: {}\n",
+                    if client_id.is_some() {
+                        "configured"
+                    } else {
+                        "not set"
+                    }
+                ));
+                status.push_str(&format!(
+                    "Client Secret: {}\n",
+                    if client_secret.is_some() {
+                        "configured"
+                    } else {
+                        "not set"
+                    }
+                ));
+                status.push_str(&format!(
+                    "Project ID: {}\n",
+                    if project_id.is_some() {
+                        "configured"
+                    } else {
+                        "not set"
+                    }
+                ));
+                status.push_str(&format!("Environment: {}\n", file_config.environment));
+                status.push_str(&format!(
+                    "Account ID: {}\n",
+                    account_id.unwrap_or_else(|| "(not set)".to_string())
+                ));
+                status.push_str(&format!("MCP Server URL: {}\n", file_config.mcp_url()));
+                status.push_str(&format!("OAuth Token URL: {}\n", file_config.token_url()));
+                status.push_str(&format!(
+                    "\nReady: {}\n",
+                    if client_id.is_some() && client_secret.is_some() && project_id.is_some() {
+                        "Yes"
+                    } else {
+                        "No"
+                    }
+                ));
+                status.push_str(
+                    "\nResolution order:\nper-server MCP config override, then vault, then environment, then ~/.mangocode/pipedream.json.",
+                );
+                CommandResult::Message(status)
+            }
+            _ => CommandResult::Message(
+                "Usage: /pipedream [setup|status]\n\n  setup  - Store Pipedream settings in the vault and optional fallback file\n  status - Show which Pipedream settings are currently available".to_string(),
+            ),
+        }
+    }
+}
+
 // ---- /init ---------------------------------------------------------------
 
 #[async_trait]
@@ -3081,8 +3526,8 @@ impl SlashCommand for ReviewCommand {
          sends the diff to the LLM for a structured review, then optionally posts the\n\
          review as a comment to the associated GitHub PR.\n\n\
          GitHub posting requires:\n\
-           GITHUB_TOKEN  — a personal access token with repo scope\n\
-           CLAUDE_PR_NUMBER — the PR number (auto-detected from `git remote` if absent)\n\n\
+           GITHUB_TOKEN  â€” a personal access token with repo scope\n\
+           CLAUDE_PR_NUMBER â€” the PR number (auto-detected from `git remote` if absent)\n\n\
          Examples:\n\
            /review            # diff of staged changes\n\
            /review main       # diff from main..HEAD\n\
@@ -3099,7 +3544,7 @@ impl SlashCommand for ReviewCommand {
             .unwrap_or_else(|| ctx.working_dir.clone());
 
         let diff = if base.is_empty() {
-            // No base given — use staged changes; fall back to unstaged if empty.
+            // No base given â€” use staged changes; fall back to unstaged if empty.
             let staged = mangocode_core::git_utils::get_staged_diff(&repo_root);
             if staged.is_empty() {
                 mangocode_core::git_utils::get_unstaged_diff(&repo_root)
@@ -3158,7 +3603,7 @@ impl SlashCommand for ReviewCommand {
             )
         };
 
-        // Truncate diff to a sensible size for the LLM (≈ 100 k chars).
+        // Truncate diff to a sensible size for the LLM (â‰ˆ 100 k chars).
         const MAX_DIFF_CHARS: usize = 100_000;
         let diff_for_llm = if diff.len() > MAX_DIFF_CHARS {
             format!(
@@ -3192,12 +3637,12 @@ impl SlashCommand for ReviewCommand {
              ## Summary\n\
              (1-3 sentences describing what changed)\n\n\
              ## Issues\n\
-             (bulleted list: [CRITICAL|MAJOR|MINOR] file:line — description; \
+             (bulleted list: [CRITICAL|MAJOR|MINOR] file:line â€” description; \
              omit section if none)\n\n\
              ## Suggestions\n\
              (bulleted list of optional improvements; omit section if none)\n\n\
              ## Verdict\n\
-             APPROVE / REQUEST_CHANGES / COMMENT — one line with brief rationale\n\n\
+             APPROVE / REQUEST_CHANGES / COMMENT â€” one line with brief rationale\n\n\
              ---\n\
              {}\n\n\
              ```diff\n\
@@ -3297,7 +3742,7 @@ impl SlashCommand for ReviewCommand {
                     }
                 } else {
                     github_post_result = Some(
-                        "\n(Could not detect GitHub owner/repo from git remote — \
+                        "\n(Could not detect GitHub owner/repo from git remote â€” \
                          review not posted.)"
                             .to_string(),
                     );
@@ -3450,15 +3895,15 @@ impl SlashCommand for McpCommand {
          Manages Model Context Protocol (MCP) servers.\n\
          MCP servers extend MangoCode with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
-           /mcp                        — list configured servers with live status\n\
-           /mcp list                   — same as above\n\
-           /mcp status                 — detailed connection status for all servers\n\
-           /mcp auth <server>          — show OAuth auth instructions for a server\n\
-           /mcp connect <server>       — reconnect a disconnected server\n\
-           /mcp logs <server>          — show recent errors/logs for a server\n\
-           /mcp resources [server]     — list resources from connected servers\n\
-           /mcp prompts [server]       — list prompt templates from connected servers\n\
-           /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template\n\n\
+           /mcp                        â€” list configured servers with live status\n\
+           /mcp list                   â€” same as above\n\
+           /mcp status                 â€” detailed connection status for all servers\n\
+           /mcp auth <server>          â€” show OAuth auth instructions for a server\n\
+           /mcp connect <server>       â€” reconnect a disconnected server\n\
+           /mcp logs <server>          â€” show recent errors/logs for a server\n\
+           /mcp resources [server]     â€” list resources from connected servers\n\
+           /mcp prompts [server]       â€” list prompt templates from connected servers\n\
+           /mcp get-prompt <server> <prompt> [key=value ...]  â€” expand a prompt template\n\n\
          To add/remove MCP servers, edit ~/.mangocode/settings.json\n\
          under the 'mcpServers' key.\n\
          Docs: https://docs.anthropic.com/claude-code/mcp"
@@ -3473,7 +3918,7 @@ impl SlashCommand for McpCommand {
             if let Some(result) = McpCommand::handle_live_subcommand(sub, ctx).await {
                 return result;
             }
-            // Manager not available — fall through to show configured servers
+            // Manager not available â€” fall through to show configured servers
         }
 
         // /mcp auth <server-name>
@@ -3540,13 +3985,16 @@ impl SlashCommand for McpCommand {
             );
         }
 
-        // /mcp status — detailed status table
+        // /mcp status â€” detailed status table
         if sub == "status" {
-            let mut output = String::from("MCP Server Status\n─────────────────\n");
+            let mut output = String::from(
+                "MCP Server Status\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
+            );
             for srv in &ctx.config.mcp_servers {
                 let kind = match srv.server_type.as_str() {
                     "stdio" => "stdio",
                     "sse" | "http" => "HTTP/SSE",
+                    "pipedream" => "Pipedream",
                     other => other,
                 };
                 let endpoint = srv
@@ -3580,10 +4028,10 @@ impl SlashCommand for McpCommand {
             return CommandResult::Message(output);
         }
 
-        // Default: /mcp or /mcp list — show configured servers with live status inline
+        // Default: /mcp or /mcp list â€” show configured servers with live status inline
         let manager = ctx.mcp_manager.as_ref();
         let mut output = format!(
-            "Configured MCP Servers ({})\n──────────────────────────\n",
+            "Configured MCP Servers ({})\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
             ctx.config.mcp_servers.len()
         );
         for srv in &ctx.config.mcp_servers {
@@ -3604,12 +4052,19 @@ impl SlashCommand for McpCommand {
                 .map(|m| m.server_status(&srv.name).display())
                 .unwrap_or_else(|| "not running".to_string());
 
+            let header_note = if srv.headers.is_empty() {
+                String::new()
+            } else {
+                format!("  |  headers: {}", srv.headers.len())
+            };
+
             output.push_str(&format!(
-                "  {name}  [{status}]\n    type: {type_}  |  {cmd}\n",
+                "  {name}  [{status}]\n    type: {type_}  |  {cmd}{header_note}\n",
                 name = srv.name,
                 status = status_str,
                 type_ = srv.server_type,
                 cmd = cmd_display,
+                header_note = header_note,
             ));
         }
         output.push_str(
@@ -3621,7 +4076,7 @@ impl SlashCommand for McpCommand {
 }
 
 impl McpCommand {
-    /// Handle `/mcp auth <server>` — initiate OAuth or show auth instructions.
+    /// Handle `/mcp auth <server>` â€” initiate OAuth or show auth instructions.
     ///
     /// For HTTP/SSE servers: calls `McpManager::initiate_auth()` to fetch OAuth
     /// metadata, constructs the PKCE authorization URL, attempts to open it in
@@ -3671,7 +4126,7 @@ impl McpCommand {
                 }
                 McpServerStatus::Connecting => {
                     return CommandResult::Message(format!(
-                        "MCP server '{}' is currently connecting — try again shortly.",
+                        "MCP server '{}' is currently connecting â€” try again shortly.",
                         server_name
                     ));
                 }
@@ -3679,10 +4134,14 @@ impl McpCommand {
             }
         }
 
-        let is_http = matches!(srv.server_type.as_str(), "sse" | "http" | "sse+oauth");
+        let is_http = matches!(
+            srv.server_type.as_str(),
+            "sse" | "http" | "sse+oauth" | "pipedream"
+        );
+        let header_keys: Vec<&str> = srv.headers.keys().map(|k| k.as_str()).collect();
 
         if !is_http {
-            // stdio — env-var / API-key auth
+            // stdio â€” env-var / API-key auth
             let env_keys: Vec<&str> = srv.env.keys().map(|k| k.as_str()).collect();
             let env_note = if env_keys.is_empty() {
                 "No environment variables configured.".to_string()
@@ -3704,14 +4163,48 @@ impl McpCommand {
             ));
         }
 
-        // HTTP/SSE — use initiate_auth() when the manager is available.
+        if srv.server_type == "pipedream" {
+            return CommandResult::Message(format!(
+                "MCP Server '{}' (Pipedream)\n\
+                 Authentication uses Pipedream client credentials and automatic token refresh.\n\n\
+                 Per-server MCP config overrides global defaults.\n\
+                 Otherwise MangoCode prefers the encrypted vault, then environment variables, then ~/.mangocode/pipedream.json.\n\
+                 Recommended vault keys use the hyphenated form, for example: pipedream-client-id, pipedream-client-secret, pipedream-project-id, pipedream-external-user-id, pipedream-app-slug, pipedream-mcp-url, and pipedream-token-url.\n\
+                 Environment fallbacks use these variables:\n\
+                 PIPEDREAM_CLIENT_ID, PIPEDREAM_CLIENT_SECRET, PIPEDREAM_PROJECT_ID,\n\
+                 PIPEDREAM_ENVIRONMENT, PIPEDREAM_EXTERNAL_USER_ID, optionally PIPEDREAM_APP_SLUG,\n\
+                 and for self-hosted setups PIPEDREAM_MCP_URL / PIPEDREAM_TOKEN_URL.\n\
+                 Optional controls: PIPEDREAM_APP_DISCOVERY, PIPEDREAM_TOOL_MODE, PIPEDREAM_CONVERSATION_ID,\n\
+                 PIPEDREAM_ACCOUNT_ID, PIPEDREAM_SCOPE, and PIPEDREAM_TOKEN_URL.\n\
+                 The Pipedream CLI is optional and is not required by MangoCode at runtime.\n\
+                 `/pipedream setup` stores sensitive values in the encrypted vault.\n\n\
+                 After changing credentials, run /mcp connect {} to reconnect.",
+                server_name, server_name
+            ));
+        }
+
+        // HTTP/SSE â€” use initiate_auth() when the manager is available.
+        if !header_keys.is_empty() {
+            return CommandResult::Message(format!(
+                "MCP Server '{}' ({})\n\
+                 Configured HTTP headers: {}\n\n\
+                 This remote server uses header-based authentication.\n\
+                 Update the 'headers' block in ~/.mangocode/settings.json if you need to rotate credentials,\n\
+                 then run /mcp connect {} to reconnect.",
+                server_name,
+                srv.server_type,
+                header_keys.join(", "),
+                server_name
+            ));
+        }
+
         if let Some(manager) = &ctx.mcp_manager {
             match manager.initiate_auth(server_name).await {
                 Ok(auth_url) => {
                     // Best-effort browser open.
                     let _ = open::that(&auth_url);
                     return CommandResult::Message(format!(
-                        "MCP OAuth — '{}'\n\
+                        "MCP OAuth â€” '{}'\n\
                          Opening browser for authentication...\n\
                          If the browser did not open, visit:\n\n  {}\n\n\
                          After authorizing, the token will be saved to:\n  ~/.mangocode/mcp-tokens/{}.json\n\n\
@@ -3722,7 +4215,7 @@ impl McpCommand {
                 Err(e) => {
                     let server_url = srv.url.as_deref().unwrap_or("(URL not configured)");
                     return CommandResult::Message(format!(
-                        "MCP OAuth — '{}'\n\
+                        "MCP OAuth â€” '{}'\n\
                          Could not fetch OAuth metadata: {}\n\n\
                          Manual authentication:\n  Open {} in your browser and complete the OAuth flow.\n\
                          Then run /mcp connect {} to reconnect.",
@@ -3732,7 +4225,7 @@ impl McpCommand {
             }
         }
 
-        // No live manager — static instructions.
+        // No live manager â€” static instructions.
         let server_url = srv.url.as_deref().unwrap_or("(URL not configured)");
         let token_note = match mangocode_mcp::oauth::get_mcp_token(server_name) {
             Some(tok) if !tok.is_expired(60) => " (valid token stored)".to_string(),
@@ -3740,18 +4233,18 @@ impl McpCommand {
             None => " (no token stored)".to_string(),
         };
         CommandResult::Message(format!(
-            "MCP OAuth Authentication — '{}'{}\n\
+            "MCP OAuth Authentication â€” '{}'{}\n\
              Server URL: {}\n\n\
              To authenticate:\n\
              1. Open the server URL in your browser and complete OAuth\n\
              2. The token is saved to ~/.mangocode/mcp-tokens/{}.json\n\
-             3. Restart MangoCode — the token will be used automatically\n\n\
+             3. Restart MangoCode â€” the token will be used automatically\n\n\
              Token storage: ~/.mangocode/mcp-tokens/{}.json",
             server_name, token_note, server_url, server_name, server_name
         ))
     }
 
-    /// Handle `/mcp tools [server]` — list available tools.
+    /// Handle `/mcp tools [server]` â€” list available tools.
     fn handle_tools(server_filter: Option<&str>, ctx: &CommandContext) -> CommandResult {
         let manager = match ctx.mcp_manager.as_ref() {
             Some(m) => m,
@@ -3786,11 +4279,11 @@ impl McpCommand {
         }
 
         let title = if let Some(filter) = server_filter {
-            format!("MCP Tools — '{}' ({})", filter, tools.len())
+            format!("MCP Tools â€” '{}' ({})", filter, tools.len())
         } else {
-            format!("MCP Tools — all servers ({})", tools.len())
+            format!("MCP Tools â€” all servers ({})", tools.len())
         };
-        let mut out = format!("{}\n{}\n", title, "─".repeat(title.len()));
+        let mut out = format!("{}\n{}\n", title, "â”€".repeat(title.len()));
         let mut last_server = "";
         for (server, tool) in &tools {
             if server.as_str() != last_server && server_filter.is_none() {
@@ -3804,7 +4297,7 @@ impl McpCommand {
                 .unwrap_or(&tool.name);
             let preview: String = tool.description.chars().take(80).collect();
             let ellipsis = if tool.description.len() > 80 {
-                "…"
+                "â€¦"
             } else {
                 ""
             };
@@ -3813,7 +4306,7 @@ impl McpCommand {
         CommandResult::Message(out)
     }
 
-    /// Handle `/mcp connect <server>` — attempt to reconnect a server.
+    /// Handle `/mcp connect <server>` â€” attempt to reconnect a server.
     async fn handle_connect(server_name: &str, ctx: &CommandContext) -> CommandResult {
         // Validate that the server is configured.
         if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
@@ -3837,10 +4330,10 @@ impl McpCommand {
 
         match &ctx.mcp_manager {
             None => {
-                // No live manager — give useful instructions.
+                // No live manager â€” give useful instructions.
                 CommandResult::Message(format!(
                     "The MCP manager is not running in this session.\n\
-                     To connect '{}', restart MangoCode — servers connect automatically\n\
+                     To connect '{}', restart MangoCode â€” servers connect automatically\n\
                      on startup using the configuration in ~/.mangocode/settings.json.\n\
                      \n\
                      If the server requires authentication, run /mcp auth {} first.",
@@ -3863,7 +4356,7 @@ impl McpCommand {
                         server_name
                     )),
                     McpServerStatus::Disconnected { .. } | McpServerStatus::Failed { .. } => {
-                        // The McpManager doesn't expose a reconnect method — it's built at
+                        // The McpManager doesn't expose a reconnect method â€” it's built at
                         // startup.  Inform the user and suggest a restart.
                         CommandResult::Message(format!(
                             "MCP server '{}' is currently disconnected.\n\
@@ -3884,7 +4377,7 @@ impl McpCommand {
         }
     }
 
-    /// Handle `/mcp logs <server>` — show recent error/log information.
+    /// Handle `/mcp logs <server>` â€” show recent error/log information.
     fn handle_logs(server_name: &str, ctx: &CommandContext) -> CommandResult {
         // Validate server name.
         if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
@@ -3907,7 +4400,7 @@ impl McpCommand {
         }
 
         let mut lines = vec![format!(
-            "MCP Server Logs — '{}'\n──────────────────────",
+            "MCP Server Logs â€” '{}'\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€",
             server_name
         )];
 
@@ -3924,11 +4417,11 @@ impl McpCommand {
                     lines.push(String::new());
                     lines.push("Troubleshooting:".to_string());
                     lines.push(format!(
-                        "  /mcp auth {}    — check authentication",
+                        "  /mcp auth {}    â€” check authentication",
                         server_name
                     ));
                     lines.push(format!(
-                        "  /mcp connect {} — attempt reconnect",
+                        "  /mcp connect {} â€” attempt reconnect",
                         server_name
                     ));
                 }
@@ -3944,7 +4437,7 @@ impl McpCommand {
                 }
                 McpServerStatus::Connected { tool_count } => {
                     lines.push(format!(
-                        "\nServer is healthy — {} tool{} available.",
+                        "\nServer is healthy â€” {} tool{} available.",
                         tool_count,
                         if *tool_count == 1 { "" } else { "s" }
                     ));
@@ -3971,7 +4464,7 @@ impl McpCommand {
                     lines.push(format!("Run /mcp connect {} to reconnect.", server_name));
                 }
                 McpServerStatus::Connecting => {
-                    lines.push("\nConnection in progress…".to_string());
+                    lines.push("\nConnection in progressâ€¦".to_string());
                 }
             }
 
@@ -4016,7 +4509,10 @@ impl McpCommand {
                             .to_string(),
                     ));
                 }
-                let mut out = format!("MCP Resources ({})\n──────────────────\n", resources.len());
+                let mut out = format!(
+                    "MCP Resources ({})\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
+                    resources.len()
+                );
                 for r in &resources {
                     let server = r.get("server").and_then(|v| v.as_str()).unwrap_or("?");
                     let uri = r.get("uri").and_then(|v| v.as_str()).unwrap_or("?");
@@ -4025,7 +4521,7 @@ impl McpCommand {
                     if desc.is_empty() {
                         out.push_str(&format!("  [{server}] {name}\n    {uri}\n"));
                     } else {
-                        out.push_str(&format!("  [{server}] {name} — {desc}\n    {uri}\n"));
+                        out.push_str(&format!("  [{server}] {name} â€” {desc}\n    {uri}\n"));
                     }
                 }
                 Some(CommandResult::Message(out))
@@ -4040,7 +4536,7 @@ impl McpCommand {
                     ));
                 }
                 let mut out = format!(
-                    "MCP Prompt Templates ({})\n─────────────────────────\n",
+                    "MCP Prompt Templates ({})\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
                     prompts.len()
                 );
                 for p in &prompts {
@@ -4068,7 +4564,7 @@ impl McpCommand {
                     if desc.is_empty() {
                         out.push_str(&format!("  [{server}] {name}{args_display}\n"));
                     } else {
-                        out.push_str(&format!("  [{server}] {name}{args_display} — {desc}\n"));
+                        out.push_str(&format!("  [{server}] {name}{args_display} â€” {desc}\n"));
                     }
                 }
                 out.push_str("\nUse: /mcp get-prompt <server> <prompt> [key=value ...]\n");
@@ -4144,11 +4640,11 @@ impl SlashCommand for PermissionsCommand {
         "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset]\n\n\
          Modes: default, accept-edits, bypass-permissions, plan\n\n\
          Examples:\n\
-           /permissions                    — show current permissions\n\
-           /permissions set accept-edits   — auto-accept file edits\n\
-           /permissions allow Bash         — allow a specific tool\n\
-           /permissions deny Write         — deny a specific tool\n\
-           /permissions reset              — clear overrides"
+           /permissions                    â€” show current permissions\n\
+           /permissions set accept-edits   â€” auto-accept file edits\n\
+           /permissions allow Bash         â€” allow a specific tool\n\
+           /permissions deny Write         â€” deny a specific tool\n\
+           /permissions reset              â€” clear overrides"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -4167,7 +4663,7 @@ impl SlashCommand for PermissionsCommand {
             };
             return CommandResult::Message(format!(
                 "Permission Settings\n\
-                 ───────────────────\n\
+                 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                  Mode:          {:?}\n\
                  Allowed tools: {}\n\
                  Denied tools:  {}\n\n\
@@ -4291,12 +4787,12 @@ impl SlashCommand for CriticCommand {
          The permission critic uses a lightweight LLM call to evaluate\n\
          whether each tool invocation is safe before executing it.\n\n\
          Examples:\n\
-           /critic           — toggle on/off\n\
-           /critic on        — enable the critic\n\
-           /critic off       — disable the critic\n\
-           /critic status    — show current configuration\n\
-           /critic history   — show last 5 evaluations\n\
-           /critic model haiku — change the evaluation model"
+           /critic           â€” toggle on/off\n\
+           /critic on        â€” enable the critic\n\
+           /critic off       â€” disable the critic\n\
+           /critic status    â€” show current configuration\n\
+           /critic history   â€” show last 5 evaluations\n\
+           /critic model haiku â€” change the evaluation model"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -4338,7 +4834,7 @@ impl SlashCommand for CriticCommand {
                 let cfg = critic.get_config();
                 CommandResult::Message(format!(
                     "Permission Critic\n\
-                     ─────────────────\n\
+                     â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                      Enabled:  {}\n\
                      Model:    {}\n\
                      Fallback: {}",
@@ -4351,10 +4847,10 @@ impl SlashCommand for CriticCommand {
                     return CommandResult::Message("No evaluations yet.".to_string());
                 }
                 let mut out =
-                    String::from("Recent Critic Evaluations\n─────────────────────────\n");
+                    String::from("Recent Critic Evaluations\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n");
                 for (i, eval) in evals.iter().enumerate() {
                     out.push_str(&format!(
-                        "\n{}. [{}] {} — {}\n   {} | {}{}\n",
+                        "\n{}. [{}] {} â€” {}\n   {} | {}{}\n",
                         i + 1,
                         if eval.allowed { "ALLOW" } else { "DENY" },
                         eval.tool_name,
@@ -4396,7 +4892,7 @@ impl SlashCommand for PlanCommand {
         "plan"
     }
     fn description(&self) -> &str {
-        "Enter plan mode – model outputs a plan for approval before acting"
+        "Enter plan mode â€“ model outputs a plan for approval before acting"
     }
     fn help(&self) -> &str {
         "Usage: /plan [description]\n\n\
@@ -4487,7 +4983,7 @@ impl SlashCommand for SessionCommand {
             "" => {
                 // If a bridge remote URL is active, show it prominently.
                 if let Some(ref url) = ctx.remote_session_url {
-                    let border = "─".repeat(url.len().min(60) + 4);
+                    let border = "â”€".repeat(url.len().min(60) + 4);
                     let display_url = if url.len() > 60 {
                         truncate_bytes_with_ellipsis(url, 60)
                     } else {
@@ -4495,9 +4991,9 @@ impl SlashCommand for SessionCommand {
                     };
                     CommandResult::Message(format!(
                         "Remote session active\n\
-                         ┌{border}┐\n\
-                         │  {display_url}  │\n\
-                         └{border}┘\n\n\
+                         â”Œ{border}â”\n\
+                         â”‚  {display_url}  â”‚\n\
+                         â””{border}â”˜\n\n\
                          Open the URL above on any device to connect remotely.\n\
                          Session ID: {}",
                         ctx.session_id,
@@ -4507,7 +5003,7 @@ impl SlashCommand for SessionCommand {
                     let sessions = mangocode_core::history::list_sessions().await;
                     let mut output = format!(
                         "Current session\n\
-                         ───────────────\n\
+                         â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                          ID:       {}\n\
                          Title:    {}\n\
                          Messages: {}\n\
@@ -4524,7 +5020,7 @@ impl SlashCommand for SessionCommand {
                             let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
                             let id_short = &sess.id[..sess.id.len().min(8)];
                             let marker = if sess.id == ctx.session_id {
-                                " ◀ current"
+                                " â—€ current"
                             } else {
                                 ""
                             };
@@ -4701,7 +5197,7 @@ impl SlashCommand for ProactiveCommand {
 ///
 /// User messages render as `## User\n<text>`.
 /// Assistant messages render as `## Assistant\n<text>` followed by
-/// `### Tool: <name>\n**Input:** …\n**Output:** …` for each tool call pair.
+/// `### Tool: <name>\n**Input:** â€¦\n**Output:** â€¦` for each tool call pair.
 fn export_message_to_markdown(
     msg: &mangocode_core::types::Message,
     all_messages: &[mangocode_core::types::Message],
@@ -4875,7 +5371,7 @@ impl SlashCommand for ExportCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // ── Parse flags ────────────────────────────────────────────────────
+        // â”€â”€ Parse flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let args = args.trim();
         let mut format: Option<&str> = None; // "markdown" | "json"
         let mut output_path: Option<String> = None;
@@ -4916,7 +5412,7 @@ impl SlashCommand for ExportCommand {
             }
         }
 
-        // ── Determine format from output path extension if not explicit ─────
+        // â”€â”€ Determine format from output path extension if not explicit â”€â”€â”€â”€â”€
         let resolved_format = match format {
             Some("markdown") | Some("md") => "markdown",
             Some("json") => "json",
@@ -4940,7 +5436,7 @@ impl SlashCommand for ExportCommand {
             }
         };
 
-        // ── Build content ───────────────────────────────────────────────────
+        // â”€â”€ Build content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         let content: String = match resolved_format {
             "markdown" => build_markdown_export(ctx),
             _ => {
@@ -4952,7 +5448,7 @@ impl SlashCommand for ExportCommand {
             }
         };
 
-        // ── Write or return ─────────────────────────────────────────────────
+        // â”€â”€ Write or return â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         match output_path {
             Some(ref filename) => {
                 // Default extension if the user didn't provide one
@@ -5100,7 +5596,7 @@ impl SlashCommand for SkillsCommand {
             output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
             for (name, skill) in disc_list {
                 output.push_str(&format!(
-                    "  /{} — {} ({})\n",
+                    "  /{} â€” {} ({})\n",
                     name,
                     skill.description,
                     skill.source_path.display()
@@ -5125,13 +5621,13 @@ impl SlashCommand for RewindCommand {
     fn help(&self) -> &str {
         "Usage: /rewind\n\
          Opens an interactive overlay to select the message to rewind to.\n\
-         Use ↑↓ to navigate, Enter to select, y/n to confirm."
+         Use â†‘â†“ to navigate, Enter to select, y/n to confirm."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if ctx.messages.is_empty() {
             return CommandResult::Message(
-                "Nothing to rewind — conversation is empty.".to_string(),
+                "Nothing to rewind â€” conversation is empty.".to_string(),
             );
         }
 
@@ -5235,7 +5731,7 @@ impl SlashCommand for StatsCommand {
 
         CommandResult::Message(format!(
             "Session Statistics\n\
-             ══════════════════\n\
+             â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n\
              Model:          {model}\n\
              \n\
              Conversation:\n\
@@ -5250,7 +5746,7 @@ impl SlashCommand for StatsCommand {
              \n\
              Estimated cost:   ${cost:.4}\n\
              \n\
-             Use /usage for quota info · /cost for quick cost · /extra-usage for per-call breakdown",
+             Use /usage for quota info Â· /cost for quick cost Â· /extra-usage for per-call breakdown",
             model = model,
             user_turns = user_turns,
             assistant_turns = assistant_turns,
@@ -5331,7 +5827,7 @@ impl SlashCommand for RenameCommand {
          With no argument: auto-generates a kebab-case name from the conversation.\n\n\
          Examples:\n\
            /rename fix-login-bug\n\
-           /rename              — auto-generate from conversation history"
+           /rename              â€” auto-generate from conversation history"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -5342,7 +5838,7 @@ impl SlashCommand for RenameCommand {
             return CommandResult::RenameSession(name.to_string());
         }
 
-        // No name given — auto-generate from conversation context.
+        // No name given â€” auto-generate from conversation context.
         if ctx.messages.is_empty() {
             return CommandResult::Error(
                 "No conversation context yet. Usage: /rename <name>".to_string(),
@@ -5670,7 +6166,7 @@ impl SlashCommand for RemoteControlCommand {
                 let session_section = if let Some(ref url) = ctx.remote_session_url {
                     format!(
                         "\nActive Session\n\
-                         ──────────────\n\
+                         â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                          Session URL:  {url}\n\
                          Share this URL or QR code with others to let them connect\n\
                          to this MangoCode session from the claude.ai web UI.\n",
@@ -5686,33 +6182,33 @@ impl SlashCommand for RemoteControlCommand {
 
                 CommandResult::Message(format!(
                     "Remote Control (Bridge)\n\
-                     ═══════════════════════\n\
+                     â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n\
                      What it does: lets you connect the claude.ai web UI or mobile app\n\
                      to this running MangoCode CLI session on your local machine.\n\
                      All prompts and responses are relayed bidirectionally.\n\
                      \n\
                      Local Machine\n\
-                     ─────────────\n\
+                     â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                      Hostname:     {hostname}\n\
-                     Device ID:    {fp_short}… (SHA-256 fingerprint)\n\
+                     Device ID:    {fp_short}â€¦ (SHA-256 fingerprint)\n\
                      \n\
                      Bridge Configuration\n\
-                     ────────────────────\n\
+                     â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                      Bridge server:   {bridge_url}\n\
                      Session token:   {token_status}\n\
                      Startup mode:    {startup_status}\n\
                      {session_section}\n\
                      How to connect\n\
-                     ──────────────\n\
-                     1. Obtain a session token from claude.ai (Settings → Remote Control)\n\
+                     â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
+                     1. Obtain a session token from claude.ai (Settings â†’ Remote Control)\n\
                      2. Set it:  export MANGOCODE_BRIDGE_TOKEN=<your-token>\n\
                      3. Enable:  /remote-control start\n\
-                     4. Restart MangoCode — the bridge will connect automatically\n\
+                     4. Restart MangoCode â€” the bridge will connect automatically\n\
                      5. Open {bridge_url}/claude-code in your browser\n\
                      \n\
                      Note: Full bridge polling requires server-side session infrastructure.\n\
-                     The cc-bridge crate implements the complete protocol (register → poll\n\
-                     → events) and is ready to use once a valid session token is provided.\n\
+                     The cc-bridge crate implements the complete protocol (register â†’ poll\n\
+                     â†’ events) and is ready to use once a valid session token is provided.\n\
                      \n\
                      Use /remote-control start   to enable bridge at next startup\n\
                      Use /remote-control stop    to disable bridge at startup",
@@ -5733,12 +6229,12 @@ impl SlashCommand for RemoteControlCommand {
                 let token_note = if std::env::var("MANGOCODE_BRIDGE_TOKEN").is_ok()
                     || std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").is_ok()
                 {
-                    "Session token detected in environment — bridge will connect on next start."
+                    "Session token detected in environment â€” bridge will connect on next start."
                         .to_string()
                 } else {
                     format!(
                         "No session token found.\n\
-                         Get a token from {bridge_url} (Settings → Remote Control)\n\
+                         Get a token from {bridge_url} (Settings â†’ Remote Control)\n\
                          then run:  export MANGOCODE_BRIDGE_TOKEN=<token>",
                         bridge_url = bridge_url
                     )
@@ -5902,7 +6398,7 @@ impl SlashCommand for ContextCommand {
 
         let bar_width = 40usize;
         let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-        let bar: String = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
+        let bar: String = "â–ˆ".repeat(filled) + &"â–‘".repeat(bar_width.saturating_sub(filled));
 
         // Estimate approximate message tokens from the message list
         let msg_char_count: usize = ctx.messages.iter().map(|m| m.get_all_text().len()).sum();
@@ -5911,7 +6407,7 @@ impl SlashCommand for ContextCommand {
 
         CommandResult::Message(format!(
             "Context Window Usage\n\
-             ────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              Model:          {model}\n\
              Context window: {window:>10} tokens\n\
              API tokens used:{used:>10} tokens  ({pct:.1}%)\n\
@@ -5978,7 +6474,7 @@ impl SlashCommand for CopyCommand {
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
                 Ok(()) => {
                     let preview: String = text.chars().take(80).collect();
-                    let ellipsis = if text.len() > 80 { "…" } else { "" };
+                    let ellipsis = if text.len() > 80 { "â€¦" } else { "" };
                     return CommandResult::Message(format!(
                         "Copied {} chars to clipboard.\nPreview: {}{}",
                         text.len(),
@@ -5998,7 +6494,7 @@ impl SlashCommand for CopyCommand {
         match std::fs::write(&tmp_path, &text) {
             Ok(()) => {
                 let preview: String = text.chars().take(80).collect();
-                let ellipsis = if text.len() > 80 { "…" } else { "" };
+                let ellipsis = if text.len() > 80 { "â€¦" } else { "" };
                 CommandResult::Message(format!(
                     "Clipboard not available; saved {} chars to {}\nPreview: {}{}",
                     text.len(),
@@ -6087,7 +6583,7 @@ mod chrome_cdp {
                 }
                 return Ok(val);
             }
-            // It's an event or different response — keep waiting.
+            // It's an event or different response â€” keep waiting.
         }
     }
 
@@ -6368,13 +6864,13 @@ impl SlashCommand for ChromeCommand {
          First, launch Chrome with remote debugging enabled:\n\
            chrome --remote-debugging-port=9222 --no-first-run\n\n\
          Subcommands:\n\
-           /chrome connect [--port 9222]      — connect to Chrome\n\
-           /chrome navigate <url>             — navigate to URL\n\
-           /chrome screenshot                 — take screenshot, save to temp file\n\
-           /chrome click <selector>           — click CSS selector\n\
-           /chrome fill <selector> <text>     — fill input field\n\
-           /chrome eval <js>                  — evaluate JavaScript\n\
-           /chrome disconnect                 — disconnect"
+           /chrome connect [--port 9222]      â€” connect to Chrome\n\
+           /chrome navigate <url>             â€” navigate to URL\n\
+           /chrome screenshot                 â€” take screenshot, save to temp file\n\
+           /chrome click <selector>           â€” click CSS selector\n\
+           /chrome fill <selector> <text>     â€” fill input field\n\
+           /chrome eval <js>                  â€” evaluate JavaScript\n\
+           /chrome disconnect                 â€” disconnect"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -6687,7 +7183,7 @@ impl SlashCommand for UpgradeCommand {
 
                 if tag == current || tag == "unknown" {
                     CommandResult::Message(format!(
-                        "MangoCode v{current} — you are up to date.\n\
+                        "MangoCode v{current} â€” you are up to date.\n\
                          Release page: {url}"
                     ))
                 } else {
@@ -6788,7 +7284,7 @@ impl SlashCommand for ReleaseNotesCommand {
                     "Release Notes: MangoCode {tag}\n\
                      Published: {published}\n\
                      URL: {html_url}\n\
-                     ─────────────────────────────────\n\
+                     â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                      {body}"
                 ))
             }
@@ -6856,16 +7352,16 @@ impl SlashCommand for RateLimitOptionsCommand {
 
         CommandResult::Message(format!(
             "Rate Limit Status\n\
-             ─────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {tier_info}\n\n\
              Available tiers:\n\
-             ┌─────────────────────────────────────────────────┐\n\
-             │ Free          │ Limited daily usage             │\n\
-             │ Pro           │ Higher limits, faster resets    │\n\
-             │ Max (5x)      │ 5× Pro limits                   │\n\
-             │ Max (20x)     │ 20× Pro limits (highest tier)   │\n\
-             │ API / Console │ Usage-billed, no hard cap       │\n\
-             └─────────────────────────────────────────────────┘\n\n\
+             â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”\n\
+             â”‚ Free          â”‚ Limited daily usage             â”‚\n\
+             â”‚ Pro           â”‚ Higher limits, faster resets    â”‚\n\
+             â”‚ Max (5x)      â”‚ 5Ã— Pro limits                   â”‚\n\
+             â”‚ Max (20x)     â”‚ 20Ã— Pro limits (highest tier)   â”‚\n\
+             â”‚ API / Console â”‚ Usage-billed, no hard cap       â”‚\n\
+             â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜\n\n\
              To upgrade: /update\n\
              Manage billing: https://claude.ai/settings/billing",
             tier_info = tier_info,
@@ -6888,11 +7384,11 @@ impl SlashCommand for StatuslineCommand {
          Controls which items appear in the TUI status bar at the bottom.\n\
          Settings are persisted to ~/.mangocode/ui-settings.json.\n\n\
          Examples:\n\
-           /statusline               — show current configuration\n\
-           /statusline show cost     — show cost in status line\n\
-           /statusline hide tokens   — hide token count\n\
-           /statusline show all      — show everything\n\
-           /statusline hide all      — hide everything"
+           /statusline               â€” show current configuration\n\
+           /statusline show cost     â€” show cost in status line\n\
+           /statusline hide tokens   â€” hide token count\n\
+           /statusline show all      â€” show everything\n\
+           /statusline hide all      â€” hide everything"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -6902,7 +7398,7 @@ impl SlashCommand for StatuslineCommand {
         if args.is_empty() {
             return CommandResult::Message(format!(
                 "Status line configuration\n\
-                 ─────────────────────────\n\
+                 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                  Show cost:   {cost}\n\
                  Show tokens: {tokens}\n\
                  Show model:  {model}\n\
@@ -7111,10 +7607,10 @@ impl SlashCommand for TerminalSetupCommand {
 
         CommandResult::Message(format!(
             "Terminal Setup Diagnostic\n\
-             ─────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {checks}\n\n\
              Recommendations for optimal MangoCode experience:\n\
-             ─────────────────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              1. Font: Use a Nerd Font for box-drawing characters and icons\n\
                 {nerd_hint}\n\
                 Download: https://www.nerdfonts.com/\n\
@@ -7133,7 +7629,7 @@ impl SlashCommand for TerminalSetupCommand {
             nerd_hint = if nerd_font {
                 "[ok] Nerd Font detected"
             } else {
-                "[!] Nerd Font not detected — box-drawing may appear broken"
+                "[!] Nerd Font not detected â€” box-drawing may appear broken"
             },
         ))
     }
@@ -7190,7 +7686,7 @@ impl SlashCommand for ExtraUsageCommand {
 
         CommandResult::Message(format!(
             "Detailed Usage Statistics\n\
-             ─────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              API calls:           {api_calls}\n\
              Avg cost/call:       ${cost_per_call:.4}\n\n\
              Token Breakdown:\n\
@@ -7218,7 +7714,7 @@ impl SlashCommand for ExtraUsageCommand {
             } else if cache_hit_pct > 40.0 {
                 "Good"
             } else if cache_total > 0 {
-                "Low — prompts may not be stable enough to cache"
+                "Low â€” prompts may not be stable enough to cache"
             } else {
                 "No cache activity"
             },
@@ -7246,9 +7742,9 @@ impl SlashCommand for AdvisorCommand {
         "Usage: /advisor [<model>|off|unset]\n\n\
          Sets the advisor model used for server-side suggestions.\n\
          Examples:\n\
-           /advisor claude-opus-4-6   — set advisor model\n\
-           /advisor off               — disable the advisor\n\
-           /advisor                   — show current advisor setting"
+           /advisor claude-opus-4-6   â€” set advisor model\n\
+           /advisor off               â€” disable the advisor\n\
+           /advisor                   â€” show current advisor setting"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -7319,16 +7815,16 @@ impl SlashCommand for InstallSlackAppCommand {
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Message(
             "MangoCode Slack Integration\n\
-             ─────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              To install MangoCode in Slack:\n\n\
              1. Ensure you have a MangoCode for Enterprise subscription\n\
-             2. Visit your Anthropic Console → Integrations → Slack\n\
+             2. Visit your Anthropic Console â†’ Integrations â†’ Slack\n\
              3. Click \"Add to Slack\" and authorize the app\n\
              4. Invite @MangoCode to any channel with: /invite @MangoCode\n\n\
              In Slack, you can then:\n\
-             • Mention @MangoCode to ask questions in any channel\n\
-             • Use /claude for direct commands\n\
-             • Share code snippets for review\n\n\
+             â€¢ Mention @MangoCode to ask questions in any channel\n\
+             â€¢ Use /claude for direct commands\n\
+             â€¢ Share code snippets for review\n\n\
              See: https://docs.anthropic.com/claude-code/slack"
                 .to_string(),
         )
@@ -7476,9 +7972,9 @@ impl SlashCommand for ThinkBackCommand {
 
         CommandResult::Message(format!(
             "Thinking trace ({n} of {total} found, from message {msg}):\n\
-             ─────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {trace}\n\
-             ─────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              Use /think-back <n> to see older traces.",
             n = n,
             total = total,
@@ -7549,14 +8045,14 @@ impl SlashCommand for ThinkBackPlayCommand {
         let steps: Vec<&str> = trace.split('\n').filter(|l| !l.trim().is_empty()).collect();
         let mut formatted = format!(
             "Thinking Trace Replay ({}/{total})\n\
-             ══════════════════════════════════\n",
+             â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n",
             n,
             total = total
         );
         for (i, step) in steps.iter().enumerate() {
             formatted.push_str(&format!("  Step {}: {}\n", i + 1, step));
         }
-        formatted.push_str("══════════════════════════════════\n");
+        formatted.push_str("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n");
         formatted.push_str(&format!(
             "{} steps shown. Use /think-back for raw traces.",
             steps.len()
@@ -7616,7 +8112,7 @@ impl SlashCommand for ColorSetCommand {
         true
     }
     fn description(&self) -> &str {
-        "Internal: set prompt color — use /color instead"
+        "Internal: set prompt color â€” use /color instead"
     }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
@@ -7644,7 +8140,7 @@ impl SlashCommand for ColorSetCommand {
                 && color[1..].chars().all(|c| c.is_ascii_hexdigit());
             if !is_hex && !known_colors.contains(&color.to_lowercase().as_str()) {
                 return CommandResult::Error(format!(
-                    "Unknown color '{}'. Use a color name (red, green, …) or a hex code (#RGB or #RRGGBB).",
+                    "Unknown color '{}'. Use a color name (red, green, â€¦) or a hex code (#RGB or #RRGGBB).",
                     color
                 ));
             }
@@ -7720,7 +8216,7 @@ impl SlashCommand for SearchCommand {
         for s in &results {
             let title = s.title.as_deref().unwrap_or("(untitled)");
             out.push_str(&format!(
-                "  [{}] {} — {} ({} messages, updated {})\n",
+                "  [{}] {} â€” {} ({} messages, updated {})\n",
                 &s.id[..s.id.len().min(12)],
                 title,
                 s.model,
@@ -7868,7 +8364,7 @@ mod teleport_bundle {
         pub effort: Option<String>,
         /// Recently accessed file paths extracted from tool-use blocks.
         pub files: Vec<String>,
-        /// Environment variables — ANTHROPIC_API_KEY is excluded for security.
+        /// Environment variables â€” ANTHROPIC_API_KEY is excluded for security.
         pub env: std::collections::HashMap<String, String>,
         pub exported_at: String,
     }
@@ -8227,7 +8723,7 @@ impl SlashCommand for TeleportCommand {
                 // Warn if the link is very long.
                 let size_hint = if link.len() > 8192 {
                     format!(
-                        "\n(Link is {} bytes — consider /teleport export for large sessions)",
+                        "\n(Link is {} bytes â€” consider /teleport export for large sessions)",
                         link.len()
                     )
                 } else {
@@ -8242,7 +8738,7 @@ impl SlashCommand for TeleportCommand {
             }
 
             "" => {
-                // No subcommand — show usage.
+                // No subcommand â€” show usage.
                 CommandResult::Message(
                     "Usage:\n\
                      \x20 /teleport export [--output <file>]   export session to .teleport bundle\n\
@@ -8284,7 +8780,7 @@ impl SlashCommand for BtwCommand {
         let question = args.trim();
         if question.is_empty() {
             return CommandResult::Error(
-                "Usage: /btw <question>  — provide a question after /btw".to_string(),
+                "Usage: /btw <question>  â€” provide a question after /btw".to_string(),
             );
         }
 
@@ -8292,7 +8788,7 @@ impl SlashCommand for BtwCommand {
         // REPL/TUI can handle it as a non-history query. We inject a system tag
         // that tells the backend to answer but not record the exchange.
         CommandResult::UserMessage(format!(
-            "[/btw side-question — answer inline, do not store in history]: {}",
+            "[/btw side-question â€” answer inline, do not store in history]: {}",
             question
         ))
     }
@@ -8353,16 +8849,16 @@ impl SlashCommand for CtxVizCommand {
 
         let bar_width = 40usize;
         let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-        let bar = "█".repeat(filled) + &"░".repeat(bar_width.saturating_sub(filled));
+        let bar = "â–ˆ".repeat(filled) + &"â–‘".repeat(bar_width.saturating_sub(filled));
 
         CommandResult::Message(format!(
             "Context Window Usage\n\
-             ────────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              Model:            {model}\n\
              System prompt:    ~{sys:>7} tokens\n\
              Conversation:     ~{conv:>7} tokens\n\
              Tool results:     ~{tool:>7} tokens\n\
-             ────────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              Total:            ~{total:>7} / {window} tokens ({pct:.1}%)\n\
              [{bar}] {pct:.1}%\n\n\
              Use /compact to reduce context usage.",
@@ -8397,11 +8893,11 @@ impl SlashCommand for SandboxToggleCommand {
          When sandbox mode is enabled, shell commands run in an isolated\n\
          environment to prevent unintended side effects.\n\n\
          Subcommands:\n\
-           /sandbox-toggle           — toggle the current state\n\
-           /sandbox-toggle on        — enable sandbox mode\n\
-           /sandbox-toggle off       — disable sandbox mode\n\
-           /sandbox-toggle status    — show current state and excluded patterns\n\
-           /sandbox-toggle exclude <pattern>  — add a command pattern to exclusions\n\n\
+           /sandbox-toggle           â€” toggle the current state\n\
+           /sandbox-toggle on        â€” enable sandbox mode\n\
+           /sandbox-toggle off       â€” disable sandbox mode\n\
+           /sandbox-toggle status    â€” show current state and excluded patterns\n\
+           /sandbox-toggle exclude <pattern>  â€” add a command pattern to exclusions\n\n\
          Sandbox is supported on macOS, Linux, and WSL2.\n\
          Note: A restart is recommended for full effect."
     }
@@ -8597,7 +9093,7 @@ impl SlashCommand for HeapdumpCommand {
         let body = lines.join("\n");
         CommandResult::Message(format!(
             "Heap Diagnostic\n\
-             ─────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              {body}"
         ))
     }
@@ -8664,24 +9160,24 @@ impl SlashCommand for InsightsCommand {
 
         CommandResult::Message(format!(
             "Session Insights\n\
-             ──────────────────────────────────────\n\
+             â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
              Conversation\n\
-             ├─ User turns          : {user_turns}\n\
-             ├─ Assistant turns     : {assistant_turns}\n\
-             └─ Completed exchanges : {total_turns}\n\
+             â”œâ”€ User turns          : {user_turns}\n\
+             â”œâ”€ Assistant turns     : {assistant_turns}\n\
+             â””â”€ Completed exchanges : {total_turns}\n\
              \n\
              Tokens\n\
-             ├─ Input               : {input_tokens}\n\
-             ├─ Output              : {output_tokens}\n\
-             ├─ Total               : {total_tokens}\n\
-             └─ Avg per exchange    : {avg_tokens_per_turn}\n\
+             â”œâ”€ Input               : {input_tokens}\n\
+             â”œâ”€ Output              : {output_tokens}\n\
+             â”œâ”€ Total               : {total_tokens}\n\
+             â””â”€ Avg per exchange    : {avg_tokens_per_turn}\n\
              \n\
              Cost\n\
-             └─ Estimated USD       : ${total_cost:.4}\n\
+             â””â”€ Estimated USD       : ${total_cost:.4}\n\
              \n\
              Tools\n\
-             ├─ Total calls         : {total_tool_calls}\n\
-             └─ Most used           : {most_frequent_tool}",
+             â”œâ”€ Total calls         : {total_tool_calls}\n\
+             â””â”€ Most used           : {most_frequent_tool}",
             user_turns = user_turns,
             assistant_turns = assistant_turns,
             total_turns = total_turns,
@@ -8741,7 +9237,7 @@ impl SlashCommand for UltrareviewCommand {
              - Cryptographic weaknesses (weak algorithms, key reuse, bad IV)\n\
              - Supply chain / dependency confusion risks\n\n\
              ## 2. Performance\n\
-             - Algorithmic complexity: O(n²) or worse in hot paths\n\
+             - Algorithmic complexity: O(nÂ²) or worse in hot paths\n\
              - Unnecessary allocations, copies, or clones\n\
              - Database N+1 query patterns\n\
              - Missing indexes on frequently queried fields\n\
@@ -8845,8 +9341,8 @@ impl SlashCommand for UndoCommand {
          With a tool_use_id argument, reverts all file changes made by that specific tool\n\
          call (restoring files to their state before the tool ran).\n\n\
          Examples:\n\
-           /undo                   — list recent edits\n\
-           /undo toolu_01XYZ...    — revert that specific tool call"
+           /undo                   â€” list recent edits\n\
+           /undo toolu_01XYZ...    â€” revert that specific tool call"
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -8959,7 +9455,7 @@ impl SlashCommand for ProvidersCommand {
                     _ => "free/local".to_string(),
                 };
                 lines.push(format!(
-                    "  {} — {}K ctx, {}",
+                    "  {} â€” {}K ctx, {}",
                     m.info.id,
                     m.info.context_window / 1000,
                     cost_str
@@ -8989,7 +9485,7 @@ impl SlashCommand for ConnectCommand {
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        // This is handled by the TUI interceptor — opening the connect dialog.
+        // This is handled by the TUI interceptor â€” opening the connect dialog.
         CommandResult::Message("Use the connect dialog to set up a provider.".to_string())
     }
 }
@@ -9031,7 +9527,7 @@ impl SlashCommand for AgentCommand {
             for name in keys {
                 let def = &all_agents[name];
                 output.push_str(&format!(
-                    "  @{} — {}\n    access: {}{}\n",
+                    "  @{} â€” {}\n    access: {}{}\n",
                     name,
                     def.description.as_deref().unwrap_or(""),
                     def.access,
@@ -9103,6 +9599,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(LogoutCommand),
         Box::new(VaultCommand),
         Box::new(GatewayCommand),
+        Box::new(PipedreamCommand),
         Box::new(InitCommand),
         Box::new(ReviewCommand),
         Box::new(HooksCommand),
@@ -9368,7 +9865,7 @@ impl SlashCommand for SkillCommand {
 /// and from configured git URLs.
 ///
 /// Pass the project `cwd` and the `skills` section of the effective config.
-/// Bundled skills take precedence — any discovered skill whose name clashes
+/// Bundled skills take precedence â€” any discovered skill whose name clashes
 /// with a built-in command will be silently skipped.
 pub fn commands_from_discovered_skills(
     cwd: &std::path::Path,
@@ -9618,7 +10115,7 @@ mod tests {
     async fn test_login_command_starts_oauth_flow() {
         let mut ctx = make_ctx();
         let cmd = find_command("login").unwrap();
-        // Default (no --console) → login_with_claude_ai = true
+        // Default (no --console) â†’ login_with_claude_ai = true
         let result = cmd.execute("", &mut ctx).await;
         assert!(matches!(result, CommandResult::StartOAuthFlow(true)));
     }

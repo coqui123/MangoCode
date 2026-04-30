@@ -113,6 +113,80 @@ impl GatewayConfig {
     }
 }
 
+/// Optional fallback configuration for Pipedream MCP.
+/// Stored in ~/.mangocode/pipedream.json (not encrypted, but with restricted file permissions).
+/// Sensitive credentials should be stored in the encrypted vault instead.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct PipedreamConfig {
+    /// Legacy plaintext OAuth client ID fallback. New writes should use the vault instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Legacy plaintext OAuth client secret fallback. New writes should use the vault instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// Legacy plaintext Pipedream project ID fallback. New writes should use the vault instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Environment (e.g., "development", "production")
+    #[serde(default = "default_environment")]
+    pub environment: String,
+    /// Optional account/workspace ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    /// Optional MCP server URL for self-hosted Pipedream instances.
+    /// Defaults to "https://remote.mcp.pipedream.net/v3" when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_url: Option<String>,
+    /// Optional OAuth token URL for self-hosted Pipedream instances.
+    /// Defaults to "https://api.pipedream.com/v1/oauth/token" when not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_url: Option<String>,
+}
+
+fn default_environment() -> String {
+    "development".to_string()
+}
+
+impl PipedreamConfig {
+    /// Load from ~/.mangocode/pipedream.json
+    pub fn load() -> Option<Self> {
+        let path = dirs::home_dir()?.join(".mangocode").join("pipedream.json");
+        let data = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+
+    /// Save to ~/.mangocode/pipedream.json
+    pub fn save(&self) -> anyhow::Result<()> {
+        let path = dirs::home_dir()
+            .expect("home dir")
+            .join(".mangocode")
+            .join("pipedream.json");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+        set_private_file_perms_best_effort(&path);
+        Ok(())
+    }
+
+    /// Return the MCP server URL, falling back to the Pipedream-hosted default.
+    pub fn mcp_url(&self) -> String {
+        self.mcp_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("https://remote.mcp.pipedream.net/v3")
+            .to_string()
+    }
+
+    /// Return the OAuth token URL, falling back to the Pipedream-hosted default.
+    pub fn token_url(&self) -> String {
+        self.token_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("https://api.pipedream.com/v1/oauth/token")
+            .to_string()
+    }
+}
+
 /// Manages the encrypted vault file.
 pub struct Vault {
     path: PathBuf,

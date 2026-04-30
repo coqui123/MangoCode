@@ -1,5 +1,5 @@
-// WebFetch tool: HTTP GET with HTML-to-text conversion and LLM-powered semantic extraction
-// for edge cases (JS-heavy pages, minimal content).
+// WebFetch tool: HTTP GET with HTML-to-text conversion and native research-pipeline
+// extraction, including optional rendered browser fallback for sparse docs pages.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -16,15 +16,39 @@ struct WebFetchInput {
     url: String,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    rendered_fallback: bool,
+    #[serde(default = "default_extract_mode")]
+    extract: String,
+    #[serde(default = "default_citation_mode")]
+    citation_mode: String,
+    #[serde(default = "default_output_format")]
+    output_format: String,
 }
 
-/// Compute a simple hash of the URL for cache purposes.
-fn cache_key(url: &str, prompt: Option<&str>) -> String {
+fn default_extract_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_citation_mode() -> String {
+    "metadata".to_string()
+}
+
+fn default_output_format() -> String {
+    "text".to_string()
+}
+
+/// Compute a simple hash of the URL and extraction options for cache purposes.
+fn cache_key(params: &WebFetchInput) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    prompt.unwrap_or("").hash(&mut hasher);
+    params.url.hash(&mut hasher);
+    params.prompt.as_deref().unwrap_or("").hash(&mut hasher);
+    params.rendered_fallback.hash(&mut hasher);
+    params.extract.hash(&mut hasher);
+    params.citation_mode.hash(&mut hasher);
+    params.output_format.hash(&mut hasher);
     format!("{:x}", hasher.finish())
 }
 
@@ -37,9 +61,9 @@ fn get_cache_dir() -> PathBuf {
 }
 
 /// Attempt to load cached extracted content for a URL.
-fn load_cached_extraction(url: &str, prompt: Option<&str>) -> Option<String> {
+fn load_cached_extraction(params: &WebFetchInput) -> Option<String> {
     let cache_dir = get_cache_dir();
-    let cache_file = cache_dir.join(format!("{}.txt", cache_key(url, prompt)));
+    let cache_file = cache_dir.join(format!("{}.txt", cache_key(params)));
 
     if cache_file.exists() {
         match fs::read_to_string(&cache_file) {
@@ -56,14 +80,14 @@ fn load_cached_extraction(url: &str, prompt: Option<&str>) -> Option<String> {
 }
 
 /// Save extracted content to cache.
-fn save_cached_extraction(url: &str, prompt: Option<&str>, content: &str) {
+fn save_cached_extraction(params: &WebFetchInput, content: &str) {
     let cache_dir = get_cache_dir();
     if let Err(e) = fs::create_dir_all(&cache_dir) {
         warn!(dir = ?cache_dir, error = %e, "Failed to create cache directory");
         return;
     }
 
-    let cache_file = cache_dir.join(format!("{}.txt", cache_key(url, prompt)));
+    let cache_file = cache_dir.join(format!("{}.txt", cache_key(params)));
     if let Err(e) = fs::write(&cache_file, content) {
         warn!(file = ?cache_file, error = %e, "Failed to write cache file");
     } else {
@@ -115,204 +139,6 @@ fn prompt_filter_text(text: &str, prompt: &str) -> String {
     }
 }
 
-/// Detect if HTML is likely a JS-heavy page with minimal semantic content.
-fn is_edge_case_html(html: &str, extracted_text: &str) -> bool {
-    // Check word count (rough estimate)
-    let word_count = extracted_text.split_whitespace().count();
-    if word_count < 100 {
-        debug!(word_count, "Edge case: low word count");
-        return true;
-    }
-
-    // Check for semantic HTML tags
-    let lower = html.to_lowercase();
-    let has_semantic =
-        lower.contains("<article") || lower.contains("<main") || lower.contains("<body");
-
-    if !has_semantic {
-        debug!("Edge case: no semantic HTML tags");
-        return true;
-    }
-
-    false
-}
-
-/// Call Claude Haiku to extract main content from HTML.
-async fn semantic_extraction(html: &str, ctx: &ToolContext) -> Option<String> {
-    // Try to create an Anthropic client from the config
-    let client = match mangocode_api::AnthropicClient::from_config(&ctx.config) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "Failed to create Anthropic client for semantic extraction");
-            return None;
-        }
-    };
-
-    // Truncate HTML to avoid exceeding token limits
-    let html_excerpt = if html.len() > 20000 {
-        format!(
-            "{}...",
-            mangocode_core::truncate::truncate_bytes_prefix(html, 20000)
-        )
-    } else {
-        html.to_string()
-    };
-
-    let system = "You are a content extraction expert. Given HTML, extract and return only the main text content. Return just plain text, no markdown or formatting.";
-    let user_message = format!(
-        "Extract the main content from this HTML and return only the text:\n\n{}",
-        html_excerpt
-    );
-
-    // Use the builder API to construct the request
-    let api_messages = vec![mangocode_api::ApiMessage {
-        role: "user".to_string(),
-        content: serde_json::Value::String(user_message),
-    }];
-
-    let request = mangocode_api::CreateMessageRequest::builder("claude-haiku-4-5", 2000)
-        .messages(api_messages)
-        .system(mangocode_api::SystemPrompt::Text(system.to_string()))
-        .build();
-
-    match client.create_message(request).await {
-        Ok(response) => {
-            // Extract text from the response content (Vec<Value>)
-            // Response content is JSON objects like {"type": "text", "text": "..."}
-            let text = response.content.iter().find_map(|block| {
-                if block.get("type")?.as_str()? == "text" {
-                    block.get("text")?.as_str().map(str::to_owned)
-                } else {
-                    None
-                }
-            });
-
-            if let Some(extracted) = text {
-                debug!(
-                    extracted_len = extracted.len(),
-                    "Semantic extraction successful"
-                );
-                return Some(extracted);
-            }
-
-            warn!("No text block in semantic extraction response");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "Semantic extraction API call failed");
-            None
-        }
-    }
-}
-
-/// Naively strip HTML tags and decode common entities.
-fn strip_html(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    let mut in_script = false;
-    let mut in_style = false;
-
-    let lower = html.to_lowercase();
-    let chars: Vec<char> = html.chars().collect();
-    let lower_chars: Vec<char> = lower.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-
-    while i < len {
-        if !in_tag && chars[i] == '<' {
-            in_tag = true;
-            // Check for script/style open/close
-            let rest: String = lower_chars[i..].iter().take(20).collect();
-            if rest.starts_with("<script") {
-                in_script = true;
-            } else if rest.starts_with("</script") {
-                in_script = false;
-            } else if rest.starts_with("<style") {
-                in_style = true;
-            } else if rest.starts_with("</style") {
-                in_style = false;
-            }
-            // Block tags => newline
-            let block_tags = [
-                "<br", "<p ", "<p>", "</p>", "<div", "</div>", "<h1", "<h2", "<h3", "<h4", "<h5",
-                "<h6", "</h1", "</h2", "</h3", "</h4", "</h5", "</h6", "<li", "</li", "<tr",
-                "</tr", "<hr",
-            ];
-            for tag in &block_tags {
-                if rest.starts_with(tag) {
-                    result.push('\n');
-                    break;
-                }
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_tag {
-            if chars[i] == '>' {
-                in_tag = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if in_script || in_style {
-            i += 1;
-            continue;
-        }
-
-        // Decode basic entities
-        if chars[i] == '&' {
-            let rest: String = chars[i..].iter().take(10).collect();
-            if rest.starts_with("&amp;") {
-                result.push('&');
-                i += 5;
-            } else if rest.starts_with("&lt;") {
-                result.push('<');
-                i += 4;
-            } else if rest.starts_with("&gt;") {
-                result.push('>');
-                i += 4;
-            } else if rest.starts_with("&quot;") {
-                result.push('"');
-                i += 6;
-            } else if rest.starts_with("&#39;") || rest.starts_with("&apos;") {
-                result.push('\'');
-                i += if rest.starts_with("&#39;") { 5 } else { 6 };
-            } else if rest.starts_with("&nbsp;") {
-                result.push(' ');
-                i += 6;
-            } else {
-                result.push('&');
-                i += 1;
-            }
-            continue;
-        }
-
-        result.push(chars[i]);
-        i += 1;
-    }
-
-    // Collapse multiple blank lines
-    let mut collapsed = String::new();
-    let mut blank_count = 0;
-    for line in result.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            blank_count += 1;
-            if blank_count <= 2 {
-                collapsed.push('\n');
-            }
-        } else {
-            blank_count = 0;
-            collapsed.push_str(trimmed);
-            collapsed.push('\n');
-        }
-    }
-
-    collapsed.trim().to_string()
-}
-
 #[async_trait]
 impl Tool for WebFetchTool {
     fn name(&self) -> &str {
@@ -340,6 +166,25 @@ impl Tool for WebFetchTool {
                 "prompt": {
                     "type": "string",
                     "description": "Optional prompt for how to process the content"
+                },
+                "rendered_fallback": {
+                    "type": "boolean",
+                    "description": "Allow rendered browser fallback when HTTP extraction is sparse"
+                },
+                "extract": {
+                    "type": "string",
+                    "enum": ["auto", "main", "raw"],
+                    "description": "Extraction mode (default auto)"
+                },
+                "citation_mode": {
+                    "type": "string",
+                    "enum": ["metadata", "inline", "none"],
+                    "description": "Include retrieval metadata/citation header"
+                },
+                "output_format": {
+                    "type": "string",
+                    "enum": ["text", "markdown"],
+                    "description": "Preferred output format"
                 }
             },
             "required": ["url"]
@@ -363,64 +208,68 @@ impl Tool for WebFetchTool {
 
         debug!(url = %params.url, "Fetching web page");
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to create HTTP client: {}", e)),
-        };
-
-        let resp = match client
-            .get(&params.url)
-            .header("User-Agent", "Claude-Code/1.0")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("Failed to fetch {}: {}", params.url, e)),
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            return ToolResult::error(format!("HTTP {} when fetching {}", status, params.url));
-        }
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => return ToolResult::error(format!("Failed to read response body: {}", e)),
-        };
-
-        // Try to load from cache first.
-        if let Some(cached) = load_cached_extraction(&params.url, params.prompt.as_deref()) {
+        // Load cached extracted content before any network work.
+        if let Some(cached) = load_cached_extraction(&params) {
             return ToolResult::success(cached);
         }
 
-        // Convert HTML to text if applicable
-        let mut text = if content_type.contains("html") {
-            strip_html(&body)
-        } else {
-            body.clone()
-        };
+        let (content_type, mut text, extraction_label) = if params.extract == "raw" {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build();
 
-        // Detect and handle edge cases with semantic extraction
-        if content_type.contains("html") && is_edge_case_html(&body, &text) {
-            debug!(url = %params.url, "Attempting semantic extraction for edge case");
-            if let Some(extracted) = semantic_extraction(&body, ctx).await {
-                text = extracted;
-            } else {
-                debug!("Semantic extraction failed, using basic HTML stripping");
+            let client = match client {
+                Ok(c) => c,
+                Err(e) => return ToolResult::error(format!("Failed to create HTTP client: {}", e)),
+            };
+
+            let resp = match client
+                .get(&params.url)
+                .header("User-Agent", "MangoCode/1.0 web fetch")
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return ToolResult::error(format!("Failed to fetch {}: {}", params.url, e));
+                }
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                return ToolResult::error(format!("HTTP {} when fetching {}", status, params.url));
             }
-        }
+
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => return ToolResult::error(format!("Failed to read response body: {}", e)),
+            };
+
+            (content_type, body, "raw".to_string())
+        } else {
+            match crate::research::fetch_research_document(&params.url, params.rendered_fallback)
+                .await
+            {
+                Ok(doc) => (
+                    doc.content_type,
+                    doc.content,
+                    if doc.rendered_fallback_used {
+                        "rendered".to_string()
+                    } else {
+                        params.extract.clone()
+                    },
+                ),
+                Err(e) => return ToolResult::error(e),
+            }
+        };
 
         if let Some(prompt) = params.prompt.as_deref() {
             text = prompt_filter_text(&text, prompt);
@@ -428,7 +277,7 @@ impl Tool for WebFetchTool {
 
         // Truncate very long content
         const MAX_LEN: usize = 100_000;
-        let text = if text.len() > MAX_LEN {
+        let mut text = if text.len() > MAX_LEN {
             format!(
                 "{}\n\n... (truncated, {} total characters)",
                 &text[..MAX_LEN],
@@ -438,8 +287,23 @@ impl Tool for WebFetchTool {
             text
         };
 
+        if params.output_format == "markdown" && !text.starts_with("# ") {
+            text = format!("# WebFetch: {}\n\n{}", params.url, text);
+        }
+
+        if params.citation_mode != "none" {
+            let header = format!(
+                "Source: {}\nRetrieved: {}\nContent-Type: {}\nExtraction: {}\n\n",
+                params.url,
+                chrono::Utc::now().to_rfc3339(),
+                content_type,
+                extraction_label
+            );
+            text = format!("{}{}", header, text);
+        }
+
         // Cache the final result
-        save_cached_extraction(&params.url, params.prompt.as_deref(), &text);
+        save_cached_extraction(&params, &text);
 
         ToolResult::success(text)
     }

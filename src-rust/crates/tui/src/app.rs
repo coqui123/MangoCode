@@ -1788,6 +1788,74 @@ impl App {
         }
     }
 
+    fn resolve_pasted_document_path(&self, data: &str) -> Option<std::path::PathBuf> {
+        let trimmed_path = data.trim().trim_matches('"').trim_matches('\'');
+        if trimmed_path.is_empty() || trimmed_path.lines().count() != 1 {
+            return None;
+        }
+
+        let mut path = std::path::PathBuf::from(trimmed_path);
+        if !path.is_absolute() {
+            path = self.project_root().join(path);
+        }
+        path.is_file().then_some(path)
+    }
+
+    fn try_attach_document_path_from_text(&mut self, data: &str) -> bool {
+        if !self.config.attachments.markdown_extraction_enabled {
+            return false;
+        }
+        let Some(path) = self.resolve_pasted_document_path(data) else {
+            return false;
+        };
+        match mangocode_core::smart_attachments::classify_path(&path) {
+            mangocode_core::smart_attachments::AttachmentKind::Pdf
+            | mangocode_core::smart_attachments::AttachmentKind::OfficeDocument
+            | mangocode_core::smart_attachments::AttachmentKind::Html
+            | mangocode_core::smart_attachments::AttachmentKind::Data
+            | mangocode_core::smart_attachments::AttachmentKind::Archive => {
+                match mangocode_core::smart_attachments::extract_markdown_native(&path) {
+                    Ok(extracted) => {
+                        let label = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("document")
+                            .to_string();
+                        let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                        self.prompt_input
+                            .add_document(crate::prompt_input::PastedDocument {
+                                path: path.clone(),
+                                label,
+                                markdown: extracted.markdown,
+                                cache_path: extracted.cache_path,
+                                media_type: mangocode_core::smart_attachments::media_type_for_path(
+                                    &path,
+                                ),
+                                from_cache: extracted.from_cache,
+                                size_bytes,
+                            });
+                        self.notifications.push(
+                            NotificationKind::Info,
+                            format!("Document attached: {}", path.display()),
+                            Some(4),
+                        );
+                        self.refresh_prompt_input();
+                        true
+                    }
+                    Err(e) => {
+                        self.notifications.push(
+                            NotificationKind::Warning,
+                            format!("Document paste extraction failed: {}", e),
+                            Some(6),
+                        );
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Handle `Event::Paste` from the terminal (bracketed paste). Call this from
     /// the outer event loop instead of [`PromptInputState::paste`] so suggestions,
     /// legacy prompt fields, paste-burst timing, and Ctrl+V dedup stay correct.
@@ -1808,6 +1876,10 @@ impl App {
             if now <= until && prev == data {
                 return;
             }
+        }
+
+        if self.try_attach_document_path_from_text(data) {
+            return;
         }
 
         self.handle_prompt_paste(data, now);
@@ -3899,7 +3971,9 @@ impl App {
                 self.notifications
                     .push(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text() {
-                self.handle_prompt_paste(&text, now);
+                let attached_doc = self.try_attach_document_path_from_text(&text);
+                let paste_text = if attached_doc { "" } else { &text };
+                self.handle_prompt_paste(paste_text, now);
                 // Many terminals (notably Windows Terminal) also deliver the same
                 // bytes as `Event::Paste` right after Ctrl+V; skip that duplicate.
                 self.suppress_duplicate_terminal_paste =

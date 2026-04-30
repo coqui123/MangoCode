@@ -641,6 +641,15 @@ impl Tool for AgentTool {
             None, // no pending message queue for sub-agents
         )
         .await;
+        crate::finish_session_lifecycle(
+            ctx,
+            format!(
+                "Session ended for sub-agent {} after {} turns.",
+                ctx.session_id,
+                ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+        )
+        .await;
 
         // Worktree mode: preserve edits and compute diff before cleanup.
         let mut preserved_changes = false;
@@ -779,6 +788,17 @@ fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
             None,
             cancel,
             None,
+        )
+        .await;
+        crate::finish_session_lifecycle(
+            &ctx_bg,
+            format!(
+                "Session ended for background agent {} after {} turns.",
+                ctx_bg.session_id,
+                ctx_bg
+                    .current_turn
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            ),
         )
         .await;
 
@@ -1115,6 +1135,15 @@ pub async fn execute_with_runtime(
         None,
     )
     .await;
+    crate::finish_session_lifecycle(
+        ctx,
+        format!(
+            "Session ended for teammate agent {} after {} turns.",
+            ctx.session_id,
+            ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+        ),
+    )
+    .await;
 
     drop(event_tx);
     if let Some(task) = forward_task {
@@ -1386,6 +1415,15 @@ pub fn init_team_swarm_runner() {
                     None,
                     cancel,
                     None,
+                )
+                .await;
+                crate::finish_session_lifecycle(
+                    &ctx,
+                    format!(
+                        "Session ended for registered agent runner {} after {} turns.",
+                        ctx.session_id,
+                        ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+                    ),
                 )
                 .await;
 

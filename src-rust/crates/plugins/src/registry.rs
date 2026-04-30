@@ -193,6 +193,8 @@ impl PluginRegistry {
                     args: mcp.args.clone(),
                     env: mcp.env.clone(),
                     url: mcp.url.clone(),
+                    headers: std::collections::HashMap::new(),
+                    pipedream: None,
                     server_type: mcp.server_type.clone(),
                 });
             }

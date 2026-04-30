@@ -17,9 +17,11 @@ pub use session_share::{export_session_text, share_session};
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
+pub mod layered_memory;
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).
 pub mod attachments;
+pub mod smart_attachments;
 
 // Git utilities (T4-3).
 pub mod git_utils;
@@ -614,10 +616,16 @@ pub mod config {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
     #[serde(rename_all = "PascalCase")]
     pub enum HookEvent {
+        /// Fires once when a session first becomes active.
+        SessionStart,
         /// Fires before a tool is executed.
         PreToolUse,
         /// Fires after a tool has returned its result.
         PostToolUse,
+        /// Fires before conversation compaction or collapse runs.
+        PreCompact,
+        /// Fires after conversation compaction or collapse succeeds.
+        PostCompact,
         /// Fires when the model finishes its turn (stop).
         Stop,
         /// Fires after the model samples a response, before tool execution.
@@ -625,6 +633,8 @@ pub mod config {
         PostModelTurn,
         /// Fires when the user submits a prompt.
         UserPromptSubmit,
+        /// Fires when the session is shutting down.
+        SessionEnd,
         /// General-purpose notification event.
         Notification,
     }
@@ -794,6 +804,112 @@ pub mod config {
         /// Request reasoning persistence across turns when supported by the model.
         #[serde(default)]
         pub preserve_thinking: bool,
+        /// Mango Research behavior.
+        #[serde(default)]
+        pub research: ResearchConfig,
+        /// Smart attachment behavior.
+        #[serde(default)]
+        pub attachments: AttachmentConfig,
+        /// Tool-output compression behavior.
+        #[serde(default)]
+        pub tool_output: ToolOutputConfig,
+        /// Layered durable memory behavior.
+        #[serde(default)]
+        pub memory: MemoryConfig,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResearchConfig {
+        #[serde(default = "default_true")]
+        pub enable_rendered_fallback: bool,
+        #[serde(default = "default_true")]
+        pub prefer_official_sources: bool,
+    }
+
+    impl Default for ResearchConfig {
+        fn default() -> Self {
+            Self {
+                enable_rendered_fallback: true,
+                prefer_official_sources: true,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AttachmentConfig {
+        #[serde(default = "default_true")]
+        #[serde(alias = "markitdown_enabled")]
+        pub markdown_extraction_enabled: bool,
+        #[serde(default = "default_true")]
+        pub images_raw_by_default: bool,
+        #[serde(default = "default_true")]
+        pub ocr_enabled: bool,
+        #[serde(default)]
+        pub tesseract_path: Option<String>,
+        #[serde(default = "default_tesseract_lang")]
+        pub tesseract_lang: String,
+    }
+
+    impl Default for AttachmentConfig {
+        fn default() -> Self {
+            Self {
+                markdown_extraction_enabled: true,
+                images_raw_by_default: true,
+                ocr_enabled: true,
+                tesseract_path: None,
+                tesseract_lang: default_tesseract_lang(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ToolOutputConfig {
+        #[serde(default = "default_tool_output_reduction")]
+        pub reduction: String,
+    }
+
+    impl Default for ToolOutputConfig {
+        fn default() -> Self {
+            Self {
+                reduction: default_tool_output_reduction(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MemoryConfig {
+        #[serde(default = "default_true")]
+        pub layered_retrieval: bool,
+        #[serde(default = "default_embedding_provider")]
+        pub embedding_provider: String,
+        #[serde(default = "default_embedding_model")]
+        pub embedding_model: String,
+    }
+
+    impl Default for MemoryConfig {
+        fn default() -> Self {
+            Self {
+                layered_retrieval: true,
+                embedding_provider: default_embedding_provider(),
+                embedding_model: default_embedding_model(),
+            }
+        }
+    }
+
+    fn default_tool_output_reduction() -> String {
+        "auto".to_string()
+    }
+
+    fn default_tesseract_lang() -> String {
+        "eng".to_string()
+    }
+
+    fn default_embedding_provider() -> String {
+        "fastembed".to_string()
+    }
+
+    fn default_embedding_model() -> String {
+        "BAAI/bge-base-en-v1.5".to_string()
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -835,8 +951,40 @@ pub mod config {
         #[serde(default)]
         pub env: HashMap<String, String>,
         pub url: Option<String>,
+        #[serde(default)]
+        pub headers: HashMap<String, String>,
+        #[serde(default)]
+        pub pipedream: Option<PipedreamMcpConfig>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct PipedreamMcpConfig {
+        #[serde(default, alias = "clientId")]
+        pub client_id: Option<String>,
+        #[serde(default, alias = "clientSecret")]
+        pub client_secret: Option<String>,
+        #[serde(default, alias = "projectId")]
+        pub project_id: Option<String>,
+        #[serde(default)]
+        pub environment: Option<String>,
+        #[serde(default, alias = "externalUserId")]
+        pub external_user_id: Option<String>,
+        #[serde(default, alias = "appSlug")]
+        pub app_slug: Option<String>,
+        #[serde(default, alias = "appDiscovery")]
+        pub app_discovery: Option<bool>,
+        #[serde(default, alias = "accountId")]
+        pub account_id: Option<String>,
+        #[serde(default, alias = "toolMode")]
+        pub tool_mode: Option<String>,
+        #[serde(default, alias = "conversationId")]
+        pub conversation_id: Option<String>,
+        #[serde(default)]
+        pub scope: Option<String>,
+        #[serde(default, alias = "tokenUrl")]
+        pub token_url: Option<String>,
     }
 
     fn default_mcp_type() -> String {
@@ -1392,6 +1540,10 @@ pub mod config {
                 critic_mode: over.config.critic_mode || base.config.critic_mode,
                 critic_model: over.config.critic_model.or(base.config.critic_model),
                 preserve_thinking: over.config.preserve_thinking || base.config.preserve_thinking,
+                research: over.config.research,
+                attachments: over.config.attachments,
+                tool_output: over.config.tool_output,
+                memory: over.config.memory,
             };
             Self {
                 config: merged_config,

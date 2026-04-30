@@ -449,6 +449,27 @@ fn codex_tool_definition(tool: &ApiToolDefinition) -> Value {
     })
 }
 
+fn codex_image_source_to_url(source: &Value) -> Option<String> {
+    if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
+        if !url.is_empty() {
+            return Some(url.to_string());
+        }
+    }
+
+    let data = source.get("data").and_then(|v| v.as_str())?;
+    if data.is_empty() {
+        return None;
+    }
+
+    let media_type = source
+        .get("media_type")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("image/png");
+
+    Some(format!("data:{};base64,{}", media_type, data))
+}
+
 fn append_codex_input_items_for_message(input_items: &mut Vec<Value>, role: &str, content: &Value) {
     let role = role.to_lowercase();
     let Some(blocks) = content.as_array() else {
@@ -481,6 +502,14 @@ fn append_codex_input_items_for_message(input_items: &mut Vec<Value>, role: &str
                             "text": text,
                         }));
                     }
+                }
+            }
+            "image" if role != "assistant" => {
+                if let Some(url) = block.get("source").and_then(codex_image_source_to_url) {
+                    text_parts.push(json!({
+                        "type": "input_image",
+                        "image_url": url,
+                    }));
                 }
             }
             "tool_use" if role == "assistant" => {

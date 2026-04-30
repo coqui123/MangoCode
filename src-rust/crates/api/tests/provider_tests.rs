@@ -5,7 +5,7 @@ use mangocode_api::provider::LlmProvider;
 use mangocode_api::provider_types::{ProviderRequest, StopReason, SystemPrompt};
 use mangocode_api::providers::OpenAiCodexProvider;
 use mangocode_api::{GoogleProvider, OpenAiProvider, ThinkingConfig};
-use mangocode_core::types::{ContentBlock, Message};
+use mangocode_core::types::{ContentBlock, ImageSource, Message};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -312,5 +312,62 @@ async fn openai_codex_includes_chatgpt_account_id_header_when_present() {
     assert!(
         lower.contains("chatgpt-account-id: acct_123"),
         "expected chatgpt-account-id header with extracted account id"
+    );
+}
+
+#[tokio::test]
+async fn openai_codex_oauth_serializes_image_inputs() {
+    let response = json!({
+        "output": [{
+            "content": [{ "type": "output_text", "text": "ok" }]
+        }],
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+
+    let (endpoint, req_rx) = spawn_json_server(response).await;
+    let mut req = base_request("gpt-5.2-codex");
+    req.messages = vec![Message::user_blocks(vec![
+        ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: Some("image/jpeg".to_string()),
+                data: Some(base64::engine::general_purpose::STANDARD.encode(b"hello-image")),
+                url: None,
+            },
+        },
+        ContentBlock::Text {
+            text: "Describe this image".to_string(),
+        },
+    ])];
+
+    let provider = OpenAiCodexProvider::new("test-oauth-token".to_string())
+        .with_endpoint(endpoint)
+        .with_skip_disk(true);
+
+    provider
+        .create_message(req)
+        .await
+        .expect("codex response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+
+    assert_eq!(body_json["input"][0]["role"], json!("user"));
+    assert_eq!(
+        body_json["input"][0]["content"][0]["type"],
+        json!("input_image")
+    );
+    assert_eq!(
+        body_json["input"][0]["content"][0]["image_url"],
+        json!("data:image/jpeg;base64,aGVsbG8taW1hZ2U=")
+    );
+    assert_eq!(
+        body_json["input"][0]["content"][1]["type"],
+        json!("input_text")
+    );
+    assert_eq!(
+        body_json["input"][0]["content"][1]["text"],
+        json!("Describe this image")
     );
 }

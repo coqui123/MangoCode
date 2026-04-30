@@ -94,6 +94,17 @@ async fn run_scheduler_loop(
                     None, // no pending message queue for cron tasks
                 )
                 .await;
+                crate::finish_session_lifecycle(
+                    &tool_ctx,
+                    format!(
+                        "Session ended for cron task {} after {} turns.",
+                        tool_ctx.session_id,
+                        tool_ctx
+                            .current_turn
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    ),
+                )
+                .await;
 
                 match outcome {
                     QueryOutcome::EndTurn { .. } => {

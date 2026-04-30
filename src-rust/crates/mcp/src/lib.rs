@@ -16,9 +16,10 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::stream::{BoxStream, StreamExt};
-use mangocode_core::config::McpServerConfig;
+use mangocode_core::config::{McpServerConfig, PipedreamMcpConfig};
 use mangocode_core::mcp_templates::TemplateRenderer;
 use mangocode_core::types::ToolDefinition;
+use mangocode_core::vault::PipedreamConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -104,7 +105,34 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
             .map(|(k, v)| (k.clone(), expand_env_vars(v)))
             .collect(),
         url: config.url.as_deref().map(expand_env_vars),
+        headers: config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+            .collect(),
+        pipedream: config.pipedream.as_ref().map(expand_pipedream_config),
         server_type: config.server_type.clone(),
+    }
+}
+
+fn expand_optional_env(input: &Option<String>) -> Option<String> {
+    input.as_deref().map(expand_env_vars)
+}
+
+fn expand_pipedream_config(config: &PipedreamMcpConfig) -> PipedreamMcpConfig {
+    PipedreamMcpConfig {
+        client_id: expand_optional_env(&config.client_id),
+        client_secret: expand_optional_env(&config.client_secret),
+        project_id: expand_optional_env(&config.project_id),
+        environment: expand_optional_env(&config.environment),
+        external_user_id: expand_optional_env(&config.external_user_id),
+        app_slug: expand_optional_env(&config.app_slug),
+        app_discovery: config.app_discovery,
+        account_id: expand_optional_env(&config.account_id),
+        tool_mode: expand_optional_env(&config.tool_mode),
+        conversation_id: expand_optional_env(&config.conversation_id),
+        scope: expand_optional_env(&config.scope),
+        token_url: expand_optional_env(&config.token_url),
     }
 }
 
@@ -399,6 +427,8 @@ pub mod types {
 
 pub mod transport {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
+    use std::str::FromStr;
 
     /// A transport can send requests and receive responses.
     #[async_trait]
@@ -406,6 +436,9 @@ pub mod transport {
         async fn send(&self, message: &JsonRpcRequest) -> anyhow::Result<()>;
         async fn recv(&self) -> anyhow::Result<Option<JsonRpcResponse>>;
         async fn close(&self) -> anyhow::Result<()>;
+        async fn set_protocol_version(&self, _version: Option<String>) -> anyhow::Result<()> {
+            Ok(())
+        }
         /// Non-blocking poll: return the next raw JSON message if one is
         /// immediately available, or `Ok(None)` if the queue is empty.
         /// Used by the notification dispatch loop to drain server-initiated
@@ -423,11 +456,57 @@ pub mod transport {
         ) -> BoxStream<'static, anyhow::Result<serde_json::Value>>;
     }
 
+    fn parse_raw_message(line: &str) -> anyhow::Result<serde_json::Value> {
+        serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("MCP raw parse error: {} (raw: {})", e, line))
+    }
+
+    fn parse_sse_or_json_messages(body: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            return Ok(vec![parse_raw_message(trimmed)?]);
+        }
+
+        let mut messages = Vec::new();
+        let mut event_lines = Vec::new();
+
+        for line in body.lines() {
+            let line = line.trim_end();
+            if line.is_empty() {
+                if !event_lines.is_empty() {
+                    let joined = event_lines.join("\n");
+                    messages.push(parse_raw_message(joined.trim())?);
+                    event_lines.clear();
+                }
+                continue;
+            }
+
+            if let Some(data) = line.strip_prefix("data:") {
+                event_lines.push(data.trim_start().to_string());
+            }
+        }
+
+        if !event_lines.is_empty() {
+            let joined = event_lines.join("\n");
+            messages.push(parse_raw_message(joined.trim())?);
+        }
+
+        if messages.is_empty() {
+            anyhow::bail!("MCP remote transport returned an unsupported response body");
+        }
+
+        Ok(messages)
+    }
+
     /// Stdio transport: spawns a subprocess and communicates via stdin/stdout.
     pub struct StdioTransport {
         child: Arc<Mutex<Child>>,
         stdin: Arc<Mutex<ChildStdin>>,
-        stdout_rx: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
+        stdout_rx: Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
     }
 
     impl StdioTransport {
@@ -459,15 +538,22 @@ pub mod transport {
                 anyhow::anyhow!("MCP server '{}': could not capture stdout", config.name)
             })?;
 
-            let (tx, rx) = mpsc::unbounded_channel::<String>();
+            let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
 
             // Background reader task — forwards stdout lines to the channel.
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if tx.send(line).is_err() {
-                        break;
+                    match parse_raw_message(&line) {
+                        Ok(value) => {
+                            if tx.send(value).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse MCP stdio message");
+                        }
                     }
                 }
             });
@@ -492,12 +578,12 @@ pub mod transport {
 
         async fn recv(&self) -> anyhow::Result<Option<JsonRpcResponse>> {
             let mut rx = self.stdout_rx.lock().await;
-            let line = rx.recv().await;
-            match line {
-                Some(s) => {
-                    let resp: JsonRpcResponse = serde_json::from_str(&s).map_err(|e| {
-                        anyhow::anyhow!("MCP response parse error: {} (raw: {})", e, s)
-                    })?;
+            match rx.recv().await {
+                Some(value) => {
+                    let resp: JsonRpcResponse =
+                        serde_json::from_value(value.clone()).map_err(|e| {
+                            anyhow::anyhow!("MCP response parse error: {} (raw: {})", e, value)
+                        })?;
                     Ok(Some(resp))
                 }
                 None => Ok(None),
@@ -513,12 +599,7 @@ pub mod transport {
         async fn try_receive_raw(&self) -> anyhow::Result<Option<serde_json::Value>> {
             let mut rx = self.stdout_rx.lock().await;
             match rx.try_recv() {
-                Ok(line) => {
-                    let val: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
-                        anyhow::anyhow!("MCP raw parse error: {} (raw: {})", e, line)
-                    })?;
-                    Ok(Some(val))
-                }
+                Ok(value) => Ok(Some(value)),
                 Err(mpsc::error::TryRecvError::Empty) => Ok(None),
                 Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
             }
@@ -541,13 +622,8 @@ pub mod transport {
                     };
 
                     match line {
-                        Some(s) => {
-                            let val: anyhow::Result<serde_json::Value> = serde_json::from_str(&s)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("MCP raw parse error: {} (raw: {})", e, s)
-                                });
-
-                            if tx.send(val).await.is_err() {
+                        Some(value) => {
+                            if tx.send(Ok(value)).await.is_err() {
                                 // Receiver dropped; exit the polling task
                                 break;
                             }
@@ -561,6 +637,729 @@ pub mod transport {
             });
 
             Box::pin(ReceiverStream::new(rx))
+        }
+    }
+
+    /// Remote HTTP/SSE transport for hosted MCP servers.
+    pub struct HttpTransport {
+        client: reqwest::Client,
+        url: String,
+        headers: HeaderMap,
+        pipedream: Option<PipedreamMcpConfig>,
+        pipedream_token: Arc<Mutex<Option<PipedreamAccessToken>>>,
+        session_id: Arc<Mutex<Option<String>>>,
+        protocol_version: Arc<Mutex<Option<String>>>,
+        raw_rx: Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
+        raw_tx: mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct PipedreamAccessToken {
+        access_token: String,
+        expires_at: u64,
+    }
+
+    impl HttpTransport {
+        fn normalize_optional_string(value: Option<String>) -> Option<String> {
+            value.and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+        }
+
+        fn read_env(key: &str) -> Option<String> {
+            Self::normalize_optional_string(std::env::var(key).ok())
+        }
+
+        fn read_vault_secret(keys: &[&str]) -> Option<String> {
+            let vault = mangocode_core::Vault::new();
+            let passphrase = mangocode_core::get_vault_passphrase()?;
+            for key in keys {
+                if let Ok(Some(value)) = vault.get_secret(key, &passphrase) {
+                    if let Some(value) = Self::normalize_optional_string(Some(value)) {
+                        return Some(value);
+                    }
+                }
+            }
+            None
+        }
+
+        fn parse_bool_value(value: &str) -> Option<bool> {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        }
+
+        fn prefer_pipedream_string(
+            config_value: Option<String>,
+            vault_value: Option<String>,
+            env_value: Option<String>,
+        ) -> Option<String> {
+            Self::normalize_optional_string(config_value)
+                .or(vault_value)
+                .or(env_value)
+        }
+
+        fn prefer_pipedream_bool(
+            config_value: Option<bool>,
+            vault_value: Option<bool>,
+            env_value: Option<bool>,
+        ) -> Option<bool> {
+            config_value.or(vault_value).or(env_value)
+        }
+
+        fn resolve_pipedream_string(
+            config_value: Option<String>,
+            env_var: &str,
+            vault_keys: &[&str],
+        ) -> Option<String> {
+            Self::prefer_pipedream_string(
+                config_value,
+                Self::read_vault_secret(vault_keys),
+                Self::read_env(env_var),
+            )
+        }
+
+        fn resolve_pipedream_string_with_file(
+            config_value: Option<String>,
+            env_var: &str,
+            vault_keys: &[&str],
+            file_value: Option<String>,
+        ) -> Option<String> {
+            // Priority: explicit config > vault > env > pipedream.json fallback
+            Self::prefer_pipedream_string(
+                config_value,
+                Self::read_vault_secret(vault_keys),
+                Self::read_env(env_var),
+            )
+            .or_else(|| Self::normalize_optional_string(file_value))
+        }
+
+        fn resolve_pipedream_bool(
+            config_value: Option<bool>,
+            env_var: &str,
+            vault_keys: &[&str],
+        ) -> Option<bool> {
+            Self::prefer_pipedream_bool(
+                config_value,
+                Self::read_vault_secret(vault_keys)
+                    .and_then(|value| Self::parse_bool_value(&value)),
+                Self::read_env(env_var).and_then(|value| Self::parse_bool_value(&value)),
+            )
+        }
+
+        fn pipedream_vault_keys(field: &str) -> &'static [&'static str] {
+            match field {
+                "client_id" => &[
+                    "pipedream-client-id",
+                    "pipedream_client_id",
+                    "PIPEDREAM_CLIENT_ID",
+                ],
+                "client_secret" => &[
+                    "pipedream-client-secret",
+                    "pipedream_client_secret",
+                    "PIPEDREAM_CLIENT_SECRET",
+                ],
+                "project_id" => &[
+                    "pipedream-project-id",
+                    "pipedream_project_id",
+                    "PIPEDREAM_PROJECT_ID",
+                ],
+                "environment" => &[
+                    "pipedream-environment",
+                    "pipedream_environment",
+                    "PIPEDREAM_ENVIRONMENT",
+                ],
+                "external_user_id" => &[
+                    "pipedream-external-user-id",
+                    "pipedream_external_user_id",
+                    "PIPEDREAM_EXTERNAL_USER_ID",
+                ],
+                "app_slug" => &[
+                    "pipedream-app-slug",
+                    "pipedream_app_slug",
+                    "PIPEDREAM_APP_SLUG",
+                ],
+                "app_discovery" => &[
+                    "pipedream-app-discovery",
+                    "pipedream_app_discovery",
+                    "PIPEDREAM_APP_DISCOVERY",
+                ],
+                "account_id" => &[
+                    "pipedream-account-id",
+                    "pipedream_account_id",
+                    "PIPEDREAM_ACCOUNT_ID",
+                ],
+                "tool_mode" => &[
+                    "pipedream-tool-mode",
+                    "pipedream_tool_mode",
+                    "PIPEDREAM_TOOL_MODE",
+                ],
+                "conversation_id" => &[
+                    "pipedream-conversation-id",
+                    "pipedream_conversation_id",
+                    "PIPEDREAM_CONVERSATION_ID",
+                ],
+                "scope" => &["pipedream-scope", "pipedream_scope", "PIPEDREAM_SCOPE"],
+                "token_url" => &[
+                    "pipedream-token-url",
+                    "pipedream_token_url",
+                    "PIPEDREAM_TOKEN_URL",
+                ],
+                "mcp_url" => &[
+                    "pipedream-mcp-url",
+                    "pipedream_mcp_url",
+                    "PIPEDREAM_MCP_URL",
+                ],
+                _ => &[],
+            }
+        }
+
+        pub async fn connect(config: &McpServerConfig) -> anyhow::Result<Self> {
+            let url = if config.server_type == "pipedream" {
+                // Priority: explicit config url > vault > env > pipedream.json fallback > default
+                let explicit = config.url.as_deref().and_then(|u| {
+                    let trimmed = u.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
+                });
+                if let Some(u) = explicit {
+                    u.to_string()
+                } else if let Some(vault_url) =
+                    Self::read_vault_secret(Self::pipedream_vault_keys("mcp_url"))
+                {
+                    vault_url
+                } else if let Some(env_url) = Self::read_env("PIPEDREAM_MCP_URL") {
+                    env_url
+                } else if let Some(file_url) = PipedreamConfig::load()
+                    .map(|c| c.mcp_url())
+                    .filter(|s| !s.is_empty())
+                {
+                    file_url
+                } else {
+                    "https://remote.mcp.pipedream.net/v3".to_string()
+                }
+            } else {
+                config.url.as_deref().unwrap_or("").trim().to_string()
+            };
+
+            if url.is_empty() {
+                anyhow::bail!("MCP server '{}' has no URL configured", config.name);
+            }
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/json, text/event-stream"),
+            );
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+            for (name, value) in &config.headers {
+                let header_name = HeaderName::from_str(name).map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': invalid HTTP header '{}': {}",
+                        config.name,
+                        name,
+                        e
+                    )
+                })?;
+                let header_value = HeaderValue::from_str(value).map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': invalid value for header '{}': {}",
+                        config.name,
+                        name,
+                        e
+                    )
+                })?;
+                headers.insert(header_name, header_value);
+            }
+
+            let client = mangocode_core::reqwest_client_builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build MCP HTTP client: {}", e))?;
+            let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+
+            Ok(Self {
+                client,
+                url: url.to_string(),
+                headers,
+                pipedream: Self::pipedream_config(config)?,
+                pipedream_token: Arc::new(Mutex::new(None)),
+                session_id: Arc::new(Mutex::new(None)),
+                protocol_version: Arc::new(Mutex::new(None)),
+                raw_rx: Arc::new(Mutex::new(raw_rx)),
+                raw_tx,
+            })
+        }
+
+        fn pipedream_config(
+            config: &McpServerConfig,
+        ) -> anyhow::Result<Option<PipedreamMcpConfig>> {
+            if config.server_type != "pipedream" {
+                return Ok(config.pipedream.clone());
+            }
+
+            let mut pipedream = config.pipedream.clone().unwrap_or_default();
+
+            // Load optional pipedream.json fallback values.
+            let file_config = PipedreamConfig::load();
+
+            pipedream.client_id = Self::resolve_pipedream_string_with_file(
+                pipedream.client_id.clone(),
+                "PIPEDREAM_CLIENT_ID",
+                Self::pipedream_vault_keys("client_id"),
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.client_id.clone())
+                    .filter(|s| !s.is_empty()),
+            );
+            pipedream.client_secret = Self::resolve_pipedream_string_with_file(
+                pipedream.client_secret.clone(),
+                "PIPEDREAM_CLIENT_SECRET",
+                Self::pipedream_vault_keys("client_secret"),
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.client_secret.clone())
+                    .filter(|s| !s.is_empty()),
+            );
+            pipedream.project_id = Self::resolve_pipedream_string_with_file(
+                pipedream.project_id.clone(),
+                "PIPEDREAM_PROJECT_ID",
+                Self::pipedream_vault_keys("project_id"),
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.project_id.clone())
+                    .filter(|s| !s.is_empty()),
+            );
+            pipedream.environment = Self::resolve_pipedream_string_with_file(
+                pipedream.environment.clone(),
+                "PIPEDREAM_ENVIRONMENT",
+                Self::pipedream_vault_keys("environment"),
+                file_config
+                    .as_ref()
+                    .map(|c| c.environment.clone())
+                    .filter(|s| !s.is_empty()),
+            )
+            .or_else(|| Some("development".to_string()));
+            pipedream.external_user_id = Self::resolve_pipedream_string(
+                pipedream.external_user_id.clone(),
+                "PIPEDREAM_EXTERNAL_USER_ID",
+                Self::pipedream_vault_keys("external_user_id"),
+            )
+            .or_else(|| Some("local-dev".to_string()));
+            pipedream.app_slug = Self::resolve_pipedream_string(
+                pipedream.app_slug.clone(),
+                "PIPEDREAM_APP_SLUG",
+                Self::pipedream_vault_keys("app_slug"),
+            );
+            pipedream.app_discovery = Self::resolve_pipedream_bool(
+                pipedream.app_discovery,
+                "PIPEDREAM_APP_DISCOVERY",
+                Self::pipedream_vault_keys("app_discovery"),
+            );
+            pipedream.account_id = Self::resolve_pipedream_string_with_file(
+                pipedream.account_id.clone(),
+                "PIPEDREAM_ACCOUNT_ID",
+                Self::pipedream_vault_keys("account_id"),
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.account_id.clone())
+                    .filter(|s| !s.is_empty()),
+            );
+            pipedream.tool_mode = Self::resolve_pipedream_string(
+                pipedream.tool_mode.clone(),
+                "PIPEDREAM_TOOL_MODE",
+                Self::pipedream_vault_keys("tool_mode"),
+            );
+            pipedream.conversation_id = Self::resolve_pipedream_string(
+                pipedream.conversation_id.clone(),
+                "PIPEDREAM_CONVERSATION_ID",
+                Self::pipedream_vault_keys("conversation_id"),
+            );
+            pipedream.scope = Self::resolve_pipedream_string(
+                pipedream.scope.clone(),
+                "PIPEDREAM_SCOPE",
+                Self::pipedream_vault_keys("scope"),
+            );
+            pipedream.token_url = Self::resolve_pipedream_string_with_file(
+                pipedream.token_url.clone(),
+                "PIPEDREAM_TOKEN_URL",
+                Self::pipedream_vault_keys("token_url"),
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.token_url.clone())
+                    .filter(|s| !s.is_empty()),
+            );
+
+            let has_app = pipedream
+                .app_slug
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let uses_app_discovery = pipedream.app_discovery.unwrap_or(false);
+
+            if !has_app && !uses_app_discovery {
+                pipedream.app_discovery = Some(true);
+            }
+
+            Ok(Some(pipedream))
+        }
+
+        fn required_pipedream_value<'a>(
+            config: &'a PipedreamMcpConfig,
+            value: &'a Option<String>,
+            name: &str,
+        ) -> anyhow::Result<&'a str> {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    let _ = config;
+                    anyhow::anyhow!("Pipedream MCP is missing required setting '{}'", name)
+                })
+        }
+
+        fn now_secs() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        }
+
+        async fn pipedream_access_token(
+            &self,
+            config: &PipedreamMcpConfig,
+        ) -> anyhow::Result<String> {
+            {
+                let cached = self.pipedream_token.lock().await;
+                if let Some(token) = cached.as_ref() {
+                    if token.expires_at > Self::now_secs() + 60 {
+                        return Ok(token.access_token.clone());
+                    }
+                }
+            }
+
+            let client_id = Self::required_pipedream_value(config, &config.client_id, "client_id")?;
+            let client_secret =
+                Self::required_pipedream_value(config, &config.client_secret, "client_secret")?;
+            let token_url = config
+                .token_url
+                .as_deref()
+                .unwrap_or("https://api.pipedream.com/v1/oauth/token");
+
+            let mut payload = serde_json::json!({
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            });
+            if let Some(scope) = config.scope.as_deref().filter(|s| !s.trim().is_empty()) {
+                payload["scope"] = serde_json::Value::String(scope.to_string());
+            }
+
+            let response = self
+                .client
+                .post(token_url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("Pipedream token request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("Pipedream token request failed with {}: {}", status, body);
+            }
+
+            #[derive(Deserialize)]
+            struct TokenResponse {
+                access_token: String,
+                expires_in: Option<u64>,
+            }
+
+            let token: TokenResponse = response
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse Pipedream token response: {}", e))?;
+            let expires_at = Self::now_secs() + token.expires_in.unwrap_or(3600);
+
+            let mut cached = self.pipedream_token.lock().await;
+            *cached = Some(PipedreamAccessToken {
+                access_token: token.access_token.clone(),
+                expires_at,
+            });
+
+            Ok(token.access_token)
+        }
+
+        async fn request_headers(&self) -> anyhow::Result<HeaderMap> {
+            let mut headers = self.headers.clone();
+
+            if let Some(session_id) = self.session_id.lock().await.clone() {
+                headers.insert(
+                    HeaderName::from_static("mcp-session-id"),
+                    HeaderValue::from_str(&session_id)?,
+                );
+            }
+
+            if let Some(protocol_version) = self.protocol_version.lock().await.clone() {
+                headers.insert(
+                    HeaderName::from_static("mcp-protocol-version"),
+                    HeaderValue::from_str(&protocol_version)?,
+                );
+            }
+
+            if let Some(pipedream) = &self.pipedream {
+                let token = self.pipedream_access_token(pipedream).await?;
+                let authorization = format!("Bearer {}", token);
+                headers.insert(
+                    HeaderName::from_static("authorization"),
+                    HeaderValue::from_str(&authorization)
+                        .map_err(|e| anyhow::anyhow!("Invalid Pipedream access token: {}", e))?,
+                );
+
+                let project_id =
+                    Self::required_pipedream_value(pipedream, &pipedream.project_id, "project_id")?;
+                let environment = Self::required_pipedream_value(
+                    pipedream,
+                    &pipedream.environment,
+                    "environment",
+                )?;
+                let external_user_id = Self::required_pipedream_value(
+                    pipedream,
+                    &pipedream.external_user_id,
+                    "external_user_id",
+                )?;
+
+                headers.insert(
+                    HeaderName::from_static("x-pd-project-id"),
+                    HeaderValue::from_str(project_id)?,
+                );
+                headers.insert(
+                    HeaderName::from_static("x-pd-environment"),
+                    HeaderValue::from_str(environment)?,
+                );
+                headers.insert(
+                    HeaderName::from_static("x-pd-external-user-id"),
+                    HeaderValue::from_str(external_user_id)?,
+                );
+
+                if let Some(account_id) = pipedream.account_id.as_deref().filter(|s| !s.is_empty())
+                {
+                    headers.insert(
+                        HeaderName::from_static("x-pd-account-id"),
+                        HeaderValue::from_str(account_id)?,
+                    );
+                }
+
+                if let Some(tool_mode) = pipedream.tool_mode.as_deref().filter(|s| !s.is_empty()) {
+                    headers.insert(
+                        HeaderName::from_static("x-pd-tool-mode"),
+                        HeaderValue::from_str(tool_mode)?,
+                    );
+                }
+
+                if let Some(conversation_id) = pipedream
+                    .conversation_id
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                {
+                    headers.insert(
+                        HeaderName::from_static("x-pd-conversation-id"),
+                        HeaderValue::from_str(conversation_id)?,
+                    );
+                }
+
+                if pipedream.app_discovery.unwrap_or(false) {
+                    headers.insert(
+                        HeaderName::from_static("x-pd-app-discovery"),
+                        HeaderValue::from_static("true"),
+                    );
+                } else {
+                    let app_slug =
+                        Self::required_pipedream_value(pipedream, &pipedream.app_slug, "app_slug")?;
+                    headers.insert(
+                        HeaderName::from_static("x-pd-app-slug"),
+                        HeaderValue::from_str(app_slug)?,
+                    );
+                }
+            }
+
+            Ok(headers)
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for HttpTransport {
+        async fn send(&self, message: &JsonRpcRequest) -> anyhow::Result<()> {
+            let response = self
+                .client
+                .post(&self.url)
+                .headers(self.request_headers().await?)
+                .json(message)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP HTTP request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("MCP HTTP request failed with {}: {}", status, body);
+            }
+
+            if let Some(session_id) = response.headers().get("mcp-session-id") {
+                if let Ok(session_id) = session_id.to_str() {
+                    let mut stored = self.session_id.lock().await;
+                    *stored = Some(session_id.to_string());
+                }
+            }
+
+            let body = response
+                .text()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed reading MCP HTTP response body: {}", e))?;
+
+            for message in parse_sse_or_json_messages(&body)? {
+                if self.raw_tx.send(message).is_err() {
+                    anyhow::bail!("MCP HTTP response channel closed");
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn recv(&self) -> anyhow::Result<Option<JsonRpcResponse>> {
+            let mut rx = self.raw_rx.lock().await;
+            loop {
+                match rx.recv().await {
+                    Some(value) => {
+                        if value.get("id").map(|v| !v.is_null()).unwrap_or(false) {
+                            let resp: JsonRpcResponse = serde_json::from_value(value.clone())
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "MCP HTTP response parse error: {} (raw: {})",
+                                        e,
+                                        value
+                                    )
+                                })?;
+                            return Ok(Some(resp));
+                        }
+                    }
+                    None => return Ok(None),
+                }
+            }
+        }
+
+        async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_protocol_version(&self, version: Option<String>) -> anyhow::Result<()> {
+            let mut stored = self.protocol_version.lock().await;
+            *stored = version;
+            Ok(())
+        }
+
+        async fn try_receive_raw(&self) -> anyhow::Result<Option<serde_json::Value>> {
+            let mut rx = self.raw_rx.lock().await;
+            match rx.try_recv() {
+                Ok(value) => Ok(Some(value)),
+                Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+            }
+        }
+
+        fn subscribe_to_notifications(
+            &self,
+        ) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
+            let raw_rx = Arc::clone(&self.raw_rx);
+            let (tx, rx) = mpsc::channel::<anyhow::Result<serde_json::Value>>(100);
+
+            tokio::spawn(async move {
+                loop {
+                    let message = {
+                        let mut receiver = raw_rx.lock().await;
+                        receiver.recv().await
+                    };
+
+                    match message {
+                        Some(value) => {
+                            if tx.send(Ok(value)).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            });
+
+            Box::pin(ReceiverStream::new(rx))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::HttpTransport;
+
+        #[test]
+        fn pipedream_string_precedence_prefers_explicit_then_vault_then_env() {
+            assert_eq!(
+                HttpTransport::prefer_pipedream_string(
+                    Some("config".to_string()),
+                    Some("vault".to_string()),
+                    Some("env".to_string()),
+                )
+                .as_deref(),
+                Some("config")
+            );
+            assert_eq!(
+                HttpTransport::prefer_pipedream_string(
+                    None,
+                    Some("vault".to_string()),
+                    Some("env".to_string()),
+                )
+                .as_deref(),
+                Some("vault")
+            );
+            assert_eq!(
+                HttpTransport::prefer_pipedream_string(None, None, Some("env".to_string()))
+                    .as_deref(),
+                Some("env")
+            );
+        }
+
+        #[test]
+        fn pipedream_bool_precedence_prefers_explicit_then_vault_then_env() {
+            assert_eq!(
+                HttpTransport::prefer_pipedream_bool(Some(true), Some(false), Some(false)),
+                Some(true)
+            );
+            assert_eq!(
+                HttpTransport::prefer_pipedream_bool(None, Some(false), Some(true)),
+                Some(false)
+            );
+            assert_eq!(
+                HttpTransport::prefer_pipedream_bool(None, None, Some(true)),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn pipedream_vault_keys_include_hyphenated_and_env_aliases() {
+            let keys = HttpTransport::pipedream_vault_keys("client_id");
+            assert!(keys.contains(&"pipedream-client-id"));
+            assert!(keys.contains(&"PIPEDREAM_CLIENT_ID"));
         }
     }
 }
@@ -585,15 +1384,72 @@ pub mod client {
         transport: Arc<dyn transport::McpTransport>,
         next_id: AtomicU64,
         pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+        notification_rx: Arc<Mutex<mpsc::UnboundedReceiver<serde_json::Value>>>,
     }
 
     impl McpClient {
-        /// Connect to an MCP server using stdio transport and complete the
-        /// initialize handshake.  The `config` should already have env vars
-        /// expanded via `expand_server_config`.
-        pub async fn connect_stdio(config: &McpServerConfig) -> anyhow::Result<Self> {
-            let transport = transport::StdioTransport::spawn(config).await?;
-            let client = Self {
+        fn start_message_router(
+            server_name: String,
+            transport: Arc<dyn transport::McpTransport>,
+            pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcResponse>>>>,
+            notification_tx: mpsc::UnboundedSender<serde_json::Value>,
+        ) {
+            tokio::spawn(async move {
+                let mut stream = transport.subscribe_to_notifications();
+
+                while let Some(result) = stream.next().await {
+                    let raw = match result {
+                        Ok(raw) => raw,
+                        Err(e) => {
+                            debug!(server = %server_name, error = %e, "MCP message router stopped");
+                            break;
+                        }
+                    };
+
+                    let has_id = raw.get("id").map(|v| !v.is_null()).unwrap_or(false);
+                    if has_id {
+                        if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
+                            if let Some(sender) = pending.lock().await.remove(&id) {
+                                match serde_json::from_value::<JsonRpcResponse>(raw.clone()) {
+                                    Ok(response) => {
+                                        let _ = sender.send(response);
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            server = %server_name,
+                                            error = %e,
+                                            response_id = id,
+                                            "Failed to parse MCP response in router"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    if raw.get("method").is_some() && notification_tx.send(raw).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        fn new_with_transport(
+            config: &McpServerConfig,
+            transport: Arc<dyn transport::McpTransport>,
+        ) -> Self {
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+
+            Self::start_message_router(
+                config.name.clone(),
+                Arc::clone(&transport),
+                Arc::clone(&pending),
+                notification_tx,
+            );
+
+            Self {
                 server_name: config.name.clone(),
                 server_info: None,
                 capabilities: ServerCapabilities::default(),
@@ -601,11 +1457,27 @@ pub mod client {
                 resources: vec![],
                 prompts: vec![],
                 instructions: None,
-                transport: Arc::new(transport),
+                transport,
                 next_id: AtomicU64::new(1),
-                pending: Arc::new(Mutex::new(HashMap::new())),
-            };
+                pending,
+                notification_rx: Arc::new(Mutex::new(notification_rx)),
+            }
+        }
 
+        /// Connect to an MCP server using stdio transport and complete the
+        /// initialize handshake.  The `config` should already have env vars
+        /// expanded via `expand_server_config`.
+        pub async fn connect_stdio(config: &McpServerConfig) -> anyhow::Result<Self> {
+            let transport = transport::StdioTransport::spawn(config).await?;
+            let client = Self::new_with_transport(config, Arc::new(transport));
+            client.initialize().await
+        }
+
+        /// Connect to an MCP server over remote HTTP/SSE and complete the
+        /// initialize handshake.
+        pub async fn connect_remote(config: &McpServerConfig) -> anyhow::Result<Self> {
+            let transport = transport::HttpTransport::connect(config).await?;
+            let client = Self::new_with_transport(config, Arc::new(transport));
             client.initialize().await
         }
 
@@ -635,6 +1507,9 @@ pub mod client {
             self.server_info = Some(result.server_info);
             self.instructions = result.instructions;
             self.capabilities = result.capabilities.clone();
+            self.transport
+                .set_protocol_version(Some(result.protocol_version.clone()))
+                .await?;
 
             // Send initialized notification
             let notif = JsonRpcRequest::notification("notifications/initialized", None);
@@ -797,47 +1672,8 @@ pub mod client {
                 tokio::sync::mpsc::Sender<ResourceChangedEvent>,
             >,
         ) {
-            let mut notification_stream = self.transport.subscribe_to_notifications();
-
-            while let Some(result) = notification_stream.next().await {
-                let raw = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        debug!(
-                            server = %self.server_name,
-                            error = %e,
-                            "poll_notifications: transport error"
-                        );
-                        break;
-                    }
-                };
-
-                let has_id = raw.get("id").map(|v| !v.is_null()).unwrap_or(false);
-                if has_id {
-                    if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
-                        if let Some(sender) = self.pending.lock().await.remove(&id) {
-                            match serde_json::from_value::<JsonRpcResponse>(raw.clone()) {
-                                Ok(response) => {
-                                    let _ = sender.send(response);
-                                }
-                                Err(e) => {
-                                    debug!(
-                                        server = %self.server_name,
-                                        error = %e,
-                                        response_id = id,
-                                        "poll_notifications: failed to parse RPC response"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                if raw.get("method").is_none() {
-                    continue;
-                }
-
+            let mut notification_rx = self.notification_rx.lock().await;
+            while let Some(raw) = notification_rx.recv().await {
                 self.process_notification(raw, resource_subscriptions).await;
             }
         }
@@ -956,8 +1792,19 @@ pub mod client {
             server_name: impl Into<String>,
             transport: Arc<dyn transport::McpTransport>,
         ) -> Self {
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+            let server_name = server_name.into();
+
+            Self::start_message_router(
+                server_name.clone(),
+                Arc::clone(&transport),
+                Arc::clone(&pending),
+                notification_tx,
+            );
+
             Self {
-                server_name: server_name.into(),
+                server_name,
                 server_info: None,
                 capabilities: ServerCapabilities::default(),
                 tools: vec![],
@@ -966,7 +1813,8 @@ pub mod client {
                 instructions: None,
                 transport,
                 next_id: AtomicU64::new(1),
-                pending: Arc::new(Mutex::new(HashMap::new())),
+                pending,
+                notification_rx: Arc::new(Mutex::new(notification_rx)),
             }
         }
     }
@@ -1066,6 +1914,37 @@ impl McpManager {
                                 server = %expanded.name,
                                 error = %e,
                                 "Failed to connect to MCP server"
+                            );
+                            manager
+                                .failed_servers
+                                .push((expanded.name.clone(), e.to_string()));
+                        }
+                    }
+                }
+                "http" | "sse" | "pipedream" => {
+                    debug!(
+                        server = %expanded.name,
+                        url = ?expanded.url,
+                        transport = %expanded.server_type,
+                        "Connecting to MCP server via remote transport"
+                    );
+                    match McpClient::connect_remote(&expanded).await {
+                        Ok(client) => {
+                            info!(
+                                server = %expanded.name,
+                                tools = client.tools.len(),
+                                resources = client.resources.len(),
+                                "MCP remote server connected"
+                            );
+                            manager
+                                .clients
+                                .insert(expanded.name.clone(), Arc::new(client));
+                        }
+                        Err(e) => {
+                            error!(
+                                server = %expanded.name,
+                                error = %e,
+                                "Failed to connect to remote MCP server"
                             );
                             manager
                                 .failed_servers
@@ -1328,7 +2207,15 @@ impl McpManager {
             None => return McpAuthState::NotRequired,
         };
 
+        let has_auth_headers = config.headers.keys().any(|key| {
+            key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("x-api-key")
+        });
+        if has_auth_headers {
+            return McpAuthState::NotRequired;
+        }
+
         match config.server_type.as_str() {
+            "pipedream" => McpAuthState::NotRequired,
             "http" | "sse" => McpAuthState::Required {
                 auth_url: config
                     .url
@@ -1614,6 +2501,15 @@ mod tests {
                 m
             },
             url: None,
+            headers: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "Authorization".to_string(),
+                    "Bearer ${_CC_TEST_HOME}".to_string(),
+                );
+                m
+            },
+            pipedream: None,
             server_type: "stdio".to_string(),
         };
         let expanded = expand_server_config(&cfg);
@@ -1622,6 +2518,10 @@ mod tests {
         assert_eq!(
             expanded.env.get("PATH").map(|s| s.as_str()),
             Some("/home/user/bin")
+        );
+        assert_eq!(
+            expanded.headers.get("Authorization").map(|s| s.as_str()),
+            Some("Bearer /home/user")
         );
         std::env::remove_var("_CC_TEST_HOME");
     }
@@ -1875,6 +2775,10 @@ mod notification_tests {
         }
 
         async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn set_protocol_version(&self, _version: Option<String>) -> anyhow::Result<()> {
             Ok(())
         }
 

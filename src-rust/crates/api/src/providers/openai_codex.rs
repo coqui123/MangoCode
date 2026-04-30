@@ -645,7 +645,7 @@ impl LlmProvider for OpenAiCodexProvider {
             streaming: true,
             tool_calling: true,
             thinking: false,
-            image_input: false,
+            image_input: true,
             pdf_input: false,
             audio_input: false,
             video_input: false,

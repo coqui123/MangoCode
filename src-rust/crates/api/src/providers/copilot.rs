@@ -1294,3 +1294,86 @@ impl LlmProvider for CopilotProvider {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_types::SystemPrompt;
+    use crate::ThinkingConfig;
+    use mangocode_core::types::{ImageSource, Message};
+
+    fn base_request(model: &str) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: vec![Message::user("Say hello")],
+            system_prompt: Some(SystemPrompt::Text("You are a test assistant".to_string())),
+            tools: vec![],
+            max_tokens: 64,
+            temperature: Some(0.1),
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: Some(ThinkingConfig::enabled(128)),
+            provider_options: json!({}),
+        }
+    }
+
+    #[test]
+    fn responses_input_serializes_user_images_as_input_image_parts() {
+        let mut request = base_request("gpt-5.2");
+        request.messages = vec![Message::user_blocks(vec![
+            ContentBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("image/png".to_string()),
+                    data: Some("aGVsbG8=".to_string()),
+                    url: None,
+                },
+            },
+            ContentBlock::Text {
+                text: "Describe this screenshot".to_string(),
+            },
+        ])];
+
+        let input = CopilotProvider::to_responses_input(&request);
+
+        assert_eq!(input[0]["role"], json!("system"));
+        assert_eq!(input[1]["role"], json!("user"));
+        assert_eq!(input[1]["content"][0]["type"], json!("input_image"));
+        assert_eq!(
+            input[1]["content"][0]["image_url"],
+            json!("data:image/png;base64,aGVsbG8=")
+        );
+        assert_eq!(input[1]["content"][1]["type"], json!("input_text"));
+        assert_eq!(
+            input[1]["content"][1]["text"],
+            json!("Describe this screenshot")
+        );
+    }
+
+    #[test]
+    fn request_has_image_detects_multimodal_messages() {
+        let request = ProviderRequest {
+            model: "gpt-5.2".to_string(),
+            messages: vec![Message::user_blocks(vec![ContentBlock::Image {
+                source: ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some("image/jpeg".to_string()),
+                    data: Some("aGVsbG8=".to_string()),
+                    url: None,
+                },
+            }])],
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: json!({}),
+        };
+
+        assert!(CopilotProvider::request_has_image(&request));
+    }
+}

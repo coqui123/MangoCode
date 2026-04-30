@@ -16,6 +16,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+async fn connect_client(config: &McpServerConfig) -> anyhow::Result<McpClient> {
+    match config.server_type.as_str() {
+        "stdio" => McpClient::connect_stdio(config).await,
+        "http" | "sse" | "pipedream" => McpClient::connect_remote(config).await,
+        other => Err(anyhow::anyhow!("unsupported transport: {}", other)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status
 // ---------------------------------------------------------------------------
@@ -141,9 +149,15 @@ impl McpConnectionManager {
             expand_server_config(&st.config)
         };
 
-        debug!(server = %name, command = ?config.command, "Connecting to MCP server via stdio");
+        debug!(
+            server = %name,
+            transport = %config.server_type,
+            command = ?config.command,
+            url = ?config.url,
+            "Connecting to MCP server"
+        );
 
-        match McpClient::connect_stdio(&config).await {
+        match connect_client(&config).await {
             Ok(client) => {
                 let tool_count = client.tools.len();
                 let client_arc = Arc::new(client);
@@ -340,7 +354,7 @@ impl McpConnectionManager {
 
             info!(server = %name, attempt_backoff_secs = backoff.as_secs(), "Attempting MCP reconnect");
 
-            match McpClient::connect_stdio(&config).await {
+            match connect_client(&config).await {
                 Ok(client) => {
                     let tool_count = client.tools.len();
                     let client_arc = Arc::new(client);
@@ -387,6 +401,8 @@ mod tests {
                         args: vec![],
                         env: std::collections::HashMap::new(),
                         url: None,
+                        headers: std::collections::HashMap::new(),
+                        pipedream: None,
                         server_type: "stdio".to_string(),
                     },
                 )

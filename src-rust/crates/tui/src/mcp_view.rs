@@ -55,7 +55,7 @@ impl McpViewStatus {
 #[derive(Debug, Clone)]
 pub struct McpServerView {
     pub name: String,
-    pub transport: String, // "stdio" | "sse" | "http"
+    pub transport: String, // "stdio" | "sse" | "http" | "pipedream"
     pub status: McpViewStatus,
     pub tool_count: usize,
     pub resource_count: usize,
@@ -369,6 +369,12 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         .enumerate()
         .filter(|(_, s)| s.transport == "http")
         .collect();
+    let pipedream: Vec<_> = state
+        .servers
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.transport == "pipedream")
+        .collect();
 
     let mut row = 0u16;
 
@@ -483,6 +489,15 @@ fn render_server_list(state: &McpViewState, area: Rect, buf: &mut Buffer) {
     render_group(
         &http,
         "HTTP",
+        &mut row,
+        inner,
+        buf,
+        state.selected_server,
+        focused,
+    );
+    render_group(
+        &pipedream,
+        "Pipedream",
         &mut row,
         inner,
         buf,

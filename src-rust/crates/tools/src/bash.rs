@@ -1,6 +1,7 @@
 // Bash tool: execute shell commands with timeout, streaming output, and
 // persistent shell state (cwd + env) across invocations.
 
+use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{session_shell_state, PermissionLevel, ShellState, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use mangocode_core::bash_classifier::{classify_bash_command, BashRiskLevel};
@@ -31,6 +32,8 @@ struct BashInput {
     timeout: u64,
     #[serde(default)]
     run_in_background: bool,
+    #[serde(default)]
+    output_mode: Option<OutputMode>,
 }
 
 fn default_timeout() -> u64 {
@@ -288,6 +291,11 @@ impl Tool for BashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run command in the background"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["auto", "raw", "summary"],
+                    "description": "Control RTK-style output reduction (default auto)"
                 }
             },
             "required": ["command"]
@@ -321,6 +329,10 @@ impl Tool for BashTool {
         let shell_state_arc = session_shell_state(&ctx.session_id);
 
         // ── Background path ──────────────────────────────────────────────────
+        let output_mode = params
+            .output_mode
+            .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
@@ -343,6 +355,7 @@ impl Tool for BashTool {
                     &shell_state_arc,
                     timeout_dur,
                     timeout_ms,
+                    output_mode,
                 )
                 .await;
         }
@@ -462,13 +475,16 @@ impl Tool for BashTool {
                     );
                 }
 
+                let reduced =
+                    reduce_command_output(&params.command, &output, exit_code, output_mode);
+
                 if exit_code != 0 {
                     ToolResult::error(format!(
                         "Command exited with code {}\n{}",
-                        exit_code, output
+                        exit_code, reduced.content
                     ))
                 } else {
-                    ToolResult::success(output)
+                    ToolResult::success(reduced.content)
                 }
             }
             Err(_) => {
@@ -488,6 +504,7 @@ impl BashTool {
         shell_state_arc: &std::sync::Arc<parking_lot::Mutex<crate::ShellState>>,
         timeout_dur: Duration,
         timeout_ms: u64,
+        output_mode: OutputMode,
     ) -> ToolResult {
         let effective_cwd = {
             let state = shell_state_arc.lock();
@@ -562,13 +579,14 @@ impl BashTool {
                         end
                     );
                 }
+                let reduced = reduce_command_output(command, &output, exit_code, output_mode);
                 if exit_code != 0 {
                     ToolResult::error(format!(
                         "Command exited with code {}\n{}",
-                        exit_code, output
+                        exit_code, reduced.content
                     ))
                 } else {
-                    ToolResult::success(output)
+                    ToolResult::success(reduced.content)
                 }
             }
             Err(_) => {

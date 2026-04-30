@@ -4,6 +4,9 @@ src-rust/target/
 # Claude Code local session data (contains local paths and dev commands)
 .claude/
 
+# MangoCode local runtime caches and memory DBs
+**/.mangocode/
+
 # Environment / secrets
 .env
 .env.local

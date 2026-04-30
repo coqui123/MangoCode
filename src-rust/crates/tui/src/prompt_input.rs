@@ -20,6 +20,18 @@ use ratatui::{
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 107, 0); // #FF6B00 mango skin prompt accent
 const PROMPT_POINTER: &str = "\u{276f}";
 
+/// A native Markdown document attachment waiting to be included in the next message.
+#[derive(Debug, Clone)]
+pub struct PastedDocument {
+    pub path: std::path::PathBuf,
+    pub label: String,
+    pub markdown: String,
+    pub cache_path: std::path::PathBuf,
+    pub media_type: Option<String>,
+    pub from_cache: bool,
+    pub size_bytes: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Vim mode
 // ---------------------------------------------------------------------------
@@ -1733,6 +1745,8 @@ pub struct PromptInputState {
     pub vim_quit_requested: bool,
     /// Pending image attachments (from clipboard paste) to be sent with next message.
     pub pending_images: Vec<crate::image_paste::PastedImage>,
+    /// Pending document attachments converted to native Markdown for next message.
+    pub pending_documents: Vec<PastedDocument>,
     /// Emacs-style kill ring for Ctrl+K, Ctrl+U, Ctrl+W operations.
     pub kill_ring: KillRing,
 }
@@ -1769,6 +1783,7 @@ impl PromptInputState {
             vim_search_last: None,
             vim_quit_requested: false,
             pending_images: Vec::new(),
+            pending_documents: Vec::new(),
             kill_ring: KillRing::new(),
         }
     }
@@ -1781,6 +1796,16 @@ impl PromptInputState {
     /// Drain and return all pending image attachments (called at send time).
     pub fn clear_images(&mut self) -> Vec<crate::image_paste::PastedImage> {
         std::mem::take(&mut self.pending_images)
+    }
+
+    /// Add a converted document attachment to the pending list.
+    pub fn add_document(&mut self, doc: PastedDocument) {
+        self.pending_documents.push(doc);
+    }
+
+    /// Drain and return all pending document attachments (called at send time).
+    pub fn clear_documents(&mut self) -> Vec<PastedDocument> {
+        std::mem::take(&mut self.pending_documents)
     }
 
     /// Insert a character at cursor position.
@@ -3029,8 +3054,8 @@ pub fn input_height(state: &PromptInputState) -> u16 {
     };
     // top-line + text rows + bottom-line + 1 breathing-room row, at least 4, at most 12
     let base = ((line_count as u16) + 3).clamp(4, 12);
-    // +1 for image pill row when images are pending
-    base + if state.pending_images.is_empty() {
+    // +1 for attachment pill row when images/documents are pending.
+    base + if state.pending_images.is_empty() && state.pending_documents.is_empty() {
         0
     } else {
         1
@@ -3052,8 +3077,9 @@ pub fn render_prompt_input(
         return;
     }
 
-    // If images are pending, render a pill row above everything else and shrink area.
-    let (area, image_row_y) = if !state.pending_images.is_empty() && area.height > 1 {
+    // If attachments are pending, render a pill row above everything else and shrink area.
+    let has_attachments = !state.pending_images.is_empty() || !state.pending_documents.is_empty();
+    let (area, attachment_row_y) = if has_attachments && area.height > 1 {
         let pill_y = area.y;
         let rest = Rect {
             x: area.x,
@@ -3066,7 +3092,7 @@ pub fn render_prompt_input(
         (area, None)
     };
 
-    if let Some(pill_y) = image_row_y {
+    if let Some(pill_y) = attachment_row_y {
         let mut pills: Vec<Span<'static>> = Vec::new();
         for img in &state.pending_images {
             let label = if let Some((w, h)) = img.dimensions {
@@ -3077,6 +3103,20 @@ pub fn render_prompt_input(
             pills.push(Span::styled(
                 label,
                 Style::default().fg(Color::Black).bg(Color::Cyan),
+            ));
+            pills.push(Span::raw(" "));
+        }
+        for doc in &state.pending_documents {
+            let cache_marker = if doc.from_cache { " cached" } else { "" };
+            let label = format!(
+                " doc {} {}KB{} ",
+                doc.label,
+                doc.size_bytes.div_ceil(1024),
+                cache_marker
+            );
+            pills.push(Span::styled(
+                label,
+                Style::default().fg(Color::Black).bg(Color::LightGreen),
             ));
             pills.push(Span::raw(" "));
         }
@@ -3539,6 +3579,59 @@ mod tests {
         let taken = s.take();
         assert_eq!(taken, "hello");
         assert!(s.text.is_empty());
+    }
+
+    #[test]
+    fn attachment_queues_drain_on_clear() {
+        let mut s = PromptInputState::new();
+        s.add_image(crate::image_paste::PastedImage {
+            path: std::path::PathBuf::from("clipboard.png"),
+            label: "clipboard.png".to_string(),
+            dimensions: Some((128, 64)),
+        });
+        s.add_document(PastedDocument {
+            path: std::path::PathBuf::from("docs/guide.pdf"),
+            label: "guide.pdf".to_string(),
+            markdown: "# Guide".to_string(),
+            cache_path: std::path::PathBuf::from(".mangocode/attachments/guide.md"),
+            media_type: Some("application/pdf".to_string()),
+            from_cache: false,
+            size_bytes: 1024,
+        });
+
+        let images = s.clear_images();
+        let docs = s.clear_documents();
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(docs.len(), 1);
+        assert!(s.pending_images.is_empty());
+        assert!(s.pending_documents.is_empty());
+    }
+
+    #[test]
+    fn clear_preserves_pending_attachments_until_submit() {
+        let mut s = PromptInputState::new();
+        s.text = "hello".to_string();
+        s.add_image(crate::image_paste::PastedImage {
+            path: std::path::PathBuf::from("clipboard.png"),
+            label: "clipboard.png".to_string(),
+            dimensions: None,
+        });
+        s.add_document(PastedDocument {
+            path: std::path::PathBuf::from("docs/readme.html"),
+            label: "readme.html".to_string(),
+            markdown: "body".to_string(),
+            cache_path: std::path::PathBuf::from(".mangocode/attachments/readme.md"),
+            media_type: Some("text/html".to_string()),
+            from_cache: true,
+            size_bytes: 64,
+        });
+
+        s.clear();
+
+        assert!(s.text.is_empty());
+        assert_eq!(s.pending_images.len(), 1);
+        assert_eq!(s.pending_documents.len(), 1);
     }
 
     #[test]

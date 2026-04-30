@@ -10,6 +10,7 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
+use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{session_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use mangocode_core::bash_classifier::{classify_bash_command, BashRiskLevel};
@@ -46,6 +47,8 @@ struct BashInput {
     timeout: u64,
     #[serde(default)]
     run_in_background: bool,
+    #[serde(default)]
+    output_mode: Option<OutputMode>,
 }
 
 fn default_timeout() -> u64 {
@@ -390,6 +393,7 @@ async fn run_windows_fallback(
     effective_cwd: &PathBuf,
     timeout_dur: Duration,
     timeout_ms: u64,
+    output_mode: OutputMode,
 ) -> ToolResult {
     let mut child = match Command::new("cmd")
         .arg("/C")
@@ -447,7 +451,7 @@ async fn run_windows_fallback(
             if output.is_empty() {
                 output = "(no output)".to_string();
             }
-            truncate_output(output, exit_code)
+            reduce_output(command, output, exit_code, output_mode)
         }
         Err(_) => {
             let _ = child.kill().await;
@@ -460,27 +464,20 @@ async fn run_windows_fallback(
 // Shared output truncation helper
 // ---------------------------------------------------------------------------
 
-fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
-    const MAX_OUTPUT_LEN: usize = 100_000;
-    if output.len() > MAX_OUTPUT_LEN {
-        let half = MAX_OUTPUT_LEN / 2;
-        let start = output[..half].to_string();
-        let end = output[output.len() - half..].to_string();
-        output = format!(
-            "{}\n\n... ({} characters truncated) ...\n\n{}",
-            start,
-            output.len() - MAX_OUTPUT_LEN,
-            end
-        );
-    }
-
+fn reduce_output(
+    command: &str,
+    output: String,
+    exit_code: i32,
+    output_mode: OutputMode,
+) -> ToolResult {
+    let reduced = reduce_command_output(command, &output, exit_code, output_mode);
     if exit_code != 0 {
         ToolResult::error(format!(
             "Command exited with code {}\n{}",
-            exit_code, output
+            exit_code, reduced.content
         ))
     } else {
-        ToolResult::success(output)
+        ToolResult::success(reduced.content)
     }
 }
 
@@ -525,6 +522,11 @@ impl Tool for PtyBashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run command in the background"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["auto", "raw", "summary"],
+                    "description": "Control RTK-style output reduction (default auto)"
                 }
             },
             "required": ["command"]
@@ -557,6 +559,10 @@ impl Tool for PtyBashTool {
         let shell_state_arc = session_shell_state(&ctx.session_id);
 
         // ── Background path ──────────────────────────────────────────────────
+        let output_mode = params
+            .output_mode
+            .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
@@ -574,8 +580,14 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_windows_fallback(&params.command, &effective_cwd, timeout_dur, timeout_ms)
-                .await;
+            return run_windows_fallback(
+                &params.command,
+                &effective_cwd,
+                timeout_dur,
+                timeout_ms,
+                output_mode,
+            )
+            .await;
         }
 
         // ── Unix PTY path ────────────────────────────────────────────────────
@@ -641,7 +653,7 @@ impl Tool for PtyBashTool {
                         output = "(no output)".to_string();
                     }
 
-                    truncate_output(output, exit_code)
+                    reduce_output(&params.command, output, exit_code, output_mode)
                 }
                 Ok(Err(e)) => ToolResult::error(format!("PTY execution failed: {}", e)),
                 Err(_) => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),

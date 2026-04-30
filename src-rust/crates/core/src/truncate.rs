@@ -1,7 +1,7 @@
 //! Text truncation utilities.
 
 /// Return a prefix of `text` with at most `max_bytes` UTF-8 bytes, never splitting a `char` boundary.
-pub fn truncate_bytes_prefix<'a>(text: &'a str, max_bytes: usize) -> &'a str {
+pub fn truncate_bytes_prefix(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
         return text;
     }

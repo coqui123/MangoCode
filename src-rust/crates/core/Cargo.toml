@@ -18,7 +18,7 @@ otel = [
 ]
 
 # Experimental/feature-flagged capabilities
-default = ["voice", "ultraplan", "cached_microcompact"]
+default = ["voice", "ultraplan", "cached_microcompact", "fastembed"]
 
 # Interaction & UI features
 ultraplan = []
@@ -44,6 +44,7 @@ cached_microcompact = []
 compaction_reminders = []
 agent_memory_snapshot = []
 teammem = []
+fastembed = ["dep:fastembed"]
 
 # Tools & Infrastructure features
 bash_classifier = []
@@ -113,6 +114,8 @@ tokio-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
 opentelemetry = { version = "0.24", optional = true }
@@ -121,6 +124,7 @@ opentelemetry-otlp = { version = "0.17", optional = true }
 tracing-opentelemetry = { version = "0.25", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
 tiktoken-rs = "0.6"
+fastembed = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

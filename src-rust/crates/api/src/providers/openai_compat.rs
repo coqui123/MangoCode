@@ -901,7 +901,10 @@ impl LlmProvider for OpenAiCompatProvider {
             streaming: true,
             tool_calling: true,
             thinking: self.quirks.reasoning_field.is_some(),
-            image_input: true,
+            // OpenAI-compatible gateways host a mix of text-only and
+            // multimodal models. Provider-level capability is conservative;
+            // Smart Attachments uses provider+model heuristics for routing.
+            image_input: false,
             pdf_input: false,
             audio_input: false,
             video_input: false,

@@ -2,6 +2,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use mangocode_core::smart_attachments::{classify_path, extract_markdown_native, AttachmentKind};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::debug;
@@ -92,11 +93,30 @@ impl Tool for FileReadTool {
             ));
         }
 
-        if ext == "pdf" {
-            return ToolResult::success(format!(
-                "[PDF file: {}. Use the `pages` parameter to read specific page ranges.]",
-                path.display()
-            ));
+        match classify_path(&path) {
+            AttachmentKind::Pdf
+            | AttachmentKind::OfficeDocument
+            | AttachmentKind::Html
+            | AttachmentKind::Data
+            | AttachmentKind::Archive => {
+                return match extract_markdown_native(&path) {
+                    Ok(extracted) => ToolResult::success(format!(
+                        "[Document converted with native Markdown extraction: {}{}]\n\n{}",
+                        path.display(),
+                        if extracted.from_cache {
+                            " (cached)"
+                        } else {
+                            ""
+                        },
+                        extracted.markdown
+                    )),
+                    Err(e) => ToolResult::error(format!(
+                        "Could not convert document with native Markdown extraction: {}. If this is scanned/complex content, use a model/provider that supports the raw format.",
+                        e
+                    )),
+                };
+            }
+            _ => {}
         }
 
         // Read text file

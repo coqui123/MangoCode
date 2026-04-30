@@ -169,8 +169,8 @@ pub use notifications::NotificationKind;
 pub use onboarding_dialog::{render_onboarding_dialog, OnboardingDialogState};
 pub use overage_upsell::{render_overage_upsell, OverageCreditUpsellState};
 pub use prompt_input::{
-    compute_typeahead, handle_paste, render_prompt_input, InputMode, PromptInputState, VimFindKind,
-    VimMode, VimOperator, VimPendingState,
+    compute_typeahead, handle_paste, render_prompt_input, InputMode, PastedDocument,
+    PromptInputState, VimFindKind, VimMode, VimOperator, VimPendingState,
 };
 pub use session_branching::{
     render_session_branching, BranchBrowserMode, BranchInfo, SessionBranchingState,

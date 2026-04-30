@@ -65,11 +65,12 @@ use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo}
 use mangocode_tools::{Tool, ToolContext, ToolResult};
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,9 @@ pub struct QueryState {
 
 static QUERY_STATE: Lazy<Mutex<HashMap<String, QueryState>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static SESSION_START_EVENTS: Lazy<Mutex<HashSet<String>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+static SESSION_END_EVENTS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 static QUERY_STATE_CLOCK: AtomicU64 = AtomicU64::new(1);
 const QUERY_STATE_MAX_ENTRIES: usize = 256;
 
@@ -173,6 +177,204 @@ fn tool_invalidates_git_context(tool_name: &str) -> bool {
             | "PowerShell"
             | TOOL_NAME_APPLY_PATCH
     )
+}
+
+fn configure_layered_memory_embeddings(tool_ctx: &ToolContext) {
+    mangocode_core::layered_memory::configure_embeddings(
+        &tool_ctx.config.memory.embedding_provider,
+        &tool_ctx.config.memory.embedding_model,
+    );
+}
+
+fn capture_explicit_lifecycle_memory(tool_ctx: &ToolContext, event: &str, text: &str) {
+    if !tool_ctx.config.memory.layered_retrieval || text.trim().is_empty() {
+        return;
+    }
+    configure_layered_memory_embeddings(tool_ctx);
+    let project = tool_ctx.working_dir.display().to_string();
+    let db_path = mangocode_core::layered_memory::project_memory_db_path(&tool_ctx.working_dir);
+    let Ok(store) = mangocode_core::layered_memory::LayeredMemoryStore::open(&db_path) else {
+        return;
+    };
+    let sample = mangocode_core::truncate::truncate_bytes_prefix(text, 8_000);
+    let _ = mangocode_core::layered_memory::capture_explicit_memories(
+        &store,
+        sample,
+        Some(event),
+        Some(&project),
+    );
+}
+
+async fn fire_lifecycle_event(
+    tool_ctx: &ToolContext,
+    event: mangocode_core::config::HookEvent,
+    event_name: &str,
+    text: String,
+) {
+    capture_explicit_lifecycle_memory(tool_ctx, event_name, &text);
+
+    if !tool_ctx.config.hooks.contains_key(&event) {
+        return;
+    }
+
+    let hook_ctx = mangocode_core::hooks::HookContext {
+        event: event_name.to_string(),
+        tool_name: None,
+        tool_input: None,
+        tool_output: Some(text),
+        is_error: None,
+        session_id: Some(tool_ctx.session_id.clone()),
+    };
+
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        mangocode_core::hooks::run_hooks(
+            &tool_ctx.config.hooks,
+            event,
+            &hook_ctx,
+            &tool_ctx.working_dir,
+        ),
+    )
+    .await;
+}
+
+pub async fn ensure_session_start_lifecycle(tool_ctx: &ToolContext, summary: String) {
+    SESSION_END_EVENTS
+        .lock()
+        .unwrap()
+        .remove(&tool_ctx.session_id);
+    let should_fire = {
+        let mut started = SESSION_START_EVENTS.lock().unwrap();
+        started.insert(tool_ctx.session_id.clone())
+    };
+    if !should_fire {
+        return;
+    }
+    fire_lifecycle_event(
+        tool_ctx,
+        mangocode_core::config::HookEvent::SessionStart,
+        "SessionStart",
+        summary,
+    )
+    .await;
+}
+
+pub async fn finish_session_lifecycle(tool_ctx: &ToolContext, summary: String) {
+    let should_fire = {
+        let mut ended = SESSION_END_EVENTS.lock().unwrap();
+        ended.insert(tool_ctx.session_id.clone())
+    };
+    if !should_fire {
+        return;
+    }
+
+    fire_lifecycle_event(
+        tool_ctx,
+        mangocode_core::config::HookEvent::SessionEnd,
+        "SessionEnd",
+        summary,
+    )
+    .await;
+
+    SESSION_START_EVENTS
+        .lock()
+        .unwrap()
+        .remove(&tool_ctx.session_id);
+    QUERY_STATE.lock().unwrap().remove(&tool_ctx.session_id);
+    mangocode_tools::clear_session_shell_state(&tool_ctx.session_id);
+    mangocode_tools::clear_session_snapshot(&tool_ctx.session_id);
+}
+
+fn capture_post_tool_memory(
+    tool_ctx: &ToolContext,
+    tool_name: &str,
+    tool_input: &Value,
+    output: &str,
+    is_error: bool,
+) {
+    if is_error || !tool_ctx.config.memory.layered_retrieval {
+        return;
+    }
+    configure_layered_memory_embeddings(tool_ctx);
+
+    // Never persist raw terminal logs. Those already live in ~/.mangocode/tool-logs
+    // when reducers are enabled and can be inspected explicitly by the user.
+    if matches!(tool_name, "Bash" | "PowerShell") {
+        return;
+    }
+
+    let project = tool_ctx.working_dir.display().to_string();
+    let db_path = mangocode_core::layered_memory::project_memory_db_path(&tool_ctx.working_dir);
+    let Ok(store) = mangocode_core::layered_memory::LayeredMemoryStore::open(&db_path) else {
+        return;
+    };
+
+    let source = format!("PostToolUse:{}", tool_name);
+    for url in extract_source_urls(tool_input, output).into_iter().take(8) {
+        let content = format!("{} relied on source {}", tool_name, url);
+        let _ = store.insert(
+            mangocode_core::layered_memory::MemoryClass::ExternalDoc,
+            &content,
+            Some(&source),
+            Some(&project),
+        );
+    }
+
+    if !matches!(tool_name, "TaskOutput") {
+        let sample = mangocode_core::truncate::truncate_bytes_prefix(output, 8_000);
+        let _ = mangocode_core::layered_memory::capture_explicit_memories(
+            &store,
+            sample,
+            Some(&source),
+            Some(&project),
+        );
+    }
+}
+
+fn extract_source_urls(tool_input: &Value, output: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(url) = tool_input.get("url").and_then(|v| v.as_str()) {
+        urls.push(url.to_string());
+    }
+    if let Some(urls_value) = tool_input.get("urls").and_then(|v| v.as_array()) {
+        urls.extend(
+            urls_value
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::to_string),
+        );
+    }
+
+    for line in output.lines().take(200) {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Source:") {
+            urls.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("URL:") {
+            urls.push(rest.trim().to_string());
+        }
+        urls.extend(trimmed.split_whitespace().filter_map(|part| {
+            let candidate = part.trim_matches(|c: char| {
+                matches!(
+                    c,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';'
+                )
+            });
+            if candidate.starts_with("http://")
+                || candidate.starts_with("https://")
+                || candidate.starts_with("file://")
+            {
+                Some(candidate.trim_end_matches('.').to_string())
+            } else {
+                None
+            }
+        }));
+    }
+    urls.retain(|url| {
+        url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://")
+    });
+    urls.sort();
+    urls.dedup();
+    urls
 }
 
 /// Configuration for a single query-loop invocation.
@@ -914,6 +1116,15 @@ pub async fn run_query_loop(
             String::new()
         }
     };
+    ensure_session_start_lifecycle(
+        tool_ctx,
+        format!(
+            "Session started in {} using model {}.",
+            tool_ctx.working_dir.display(),
+            effective_model
+        ),
+    )
+    .await;
 
     let send_query_error = |msg: String| {
         if let Some(ref tx) = event_tx {
@@ -1071,6 +1282,49 @@ pub async fn run_query_loop(
                     Some(existing) => format!("{}\n\n{}", existing, memory_dynamic),
                     None => memory_dynamic,
                 });
+            }
+
+            if tool_ctx.config.memory.layered_retrieval {
+                if let Some(user_query) = latest_user_query(messages) {
+                    configure_layered_memory_embeddings(&tool_ctx);
+                    let db_path = mangocode_core::layered_memory::project_memory_db_path(
+                        &tool_ctx.working_dir,
+                    );
+                    if let Ok(store) =
+                        mangocode_core::layered_memory::LayeredMemoryStore::open(&db_path)
+                    {
+                        let project = tool_ctx.working_dir.display().to_string();
+                        let _captured = mangocode_core::layered_memory::capture_explicit_memories(
+                            &store,
+                            &user_query,
+                            Some("UserPromptSubmit"),
+                            Some(&project),
+                        );
+                        let manifest = store.manifest(20).unwrap_or_default();
+                        let hits = store.search(&user_query, 6).unwrap_or_default();
+                        let mut layered_dynamic = String::new();
+                        if !manifest.trim().is_empty() {
+                            layered_dynamic.push_str("Layered memory manifest:\n");
+                            layered_dynamic.push_str(&manifest);
+                            layered_dynamic.push('\n');
+                        }
+                        if !hits.is_empty() {
+                            layered_dynamic.push_str("\nRelevant layered memories:\n");
+                            layered_dynamic.push_str(
+                                &mangocode_core::layered_memory::format_memory_records(&hits),
+                            );
+                        }
+                        if !layered_dynamic.trim().is_empty() {
+                            patched.append_system_prompt =
+                                Some(match patched.append_system_prompt {
+                                    Some(existing) => {
+                                        format!("{}\n\n{}", existing, layered_dynamic)
+                                    }
+                                    None => layered_dynamic,
+                                });
+                        }
+                    }
+                }
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -2160,6 +2414,14 @@ pub async fn run_query_loop(
                                 mark_git_context_dirty(&tool_ctx.session_id);
                             }
 
+                            capture_post_tool_memory(
+                                tool_ctx,
+                                &p.name,
+                                &p.input,
+                                &result.content,
+                                result.is_error,
+                            );
+
                             if let Some(metrics) = &tool_ctx.session_metrics {
                                 metrics.increment_tool_use();
                                 metrics.add_tool_duration(tool_duration_ms);
@@ -2411,6 +2673,16 @@ pub async fn run_query_loop(
             // Reactive path: emergency collapse takes priority over normal compact.
             let context_limit = compact::context_window_for_model(&config.model);
             if compact::should_context_collapse(usage.input_tokens, context_limit) {
+                fire_lifecycle_event(
+                    tool_ctx,
+                    mangocode_core::config::HookEvent::PreCompact,
+                    "PreCompact",
+                    format!(
+                        "Preparing emergency context collapse at {} input tokens (limit {}).",
+                        usage.input_tokens, context_limit
+                    ),
+                )
+                .await;
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status(
                         "Compacting context... (emergency collapse)".to_string(),
@@ -2419,6 +2691,16 @@ pub async fn run_query_loop(
                 match compact::context_collapse(std::mem::take(messages), client, config).await {
                     Ok(result) => {
                         *messages = result.messages;
+                        fire_lifecycle_event(
+                            tool_ctx,
+                            mangocode_core::config::HookEvent::PostCompact,
+                            "PostCompact",
+                            format!(
+                                "Emergency context collapse completed; freed approximately {} tokens.",
+                                result.tokens_freed
+                            ),
+                        )
+                        .await;
                         info!(
                             tokens_freed = result.tokens_freed,
                             "Context-collapse complete"
@@ -2431,6 +2713,16 @@ pub async fn run_query_loop(
                     }
                 }
             } else if compact::should_compact(usage.input_tokens, context_limit) {
+                fire_lifecycle_event(
+                    tool_ctx,
+                    mangocode_core::config::HookEvent::PreCompact,
+                    "PreCompact",
+                    format!(
+                        "Preparing reactive compact at {} input tokens (limit {}).",
+                        usage.input_tokens, context_limit
+                    ),
+                )
+                .await;
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
                 }
@@ -2445,6 +2737,16 @@ pub async fn run_query_loop(
                 {
                     Ok(result) => {
                         *messages = result.messages;
+                        fire_lifecycle_event(
+                            tool_ctx,
+                            mangocode_core::config::HookEvent::PostCompact,
+                            "PostCompact",
+                            format!(
+                                "Reactive compact completed; freed approximately {} tokens.",
+                                result.tokens_freed
+                            ),
+                        )
+                        .await;
                         info!(
                             tokens_freed = result.tokens_freed,
                             "Reactive compact complete"
@@ -2460,6 +2762,20 @@ pub async fn run_query_loop(
             }
         } else if stop == "end_turn" || stop == "tool_use" {
             // Proactive auto-compact (original path, used when reactive compact is off).
+            let should_preemptively_compact =
+                compact::should_auto_compact(usage.input_tokens, &config.model, &compact_state);
+            if should_preemptively_compact {
+                fire_lifecycle_event(
+                    tool_ctx,
+                    mangocode_core::config::HookEvent::PreCompact,
+                    "PreCompact",
+                    format!(
+                        "Preparing proactive compact at {} input tokens for model {}.",
+                        usage.input_tokens, config.model
+                    ),
+                )
+                .await;
+            }
             if let Some(new_msgs) = compact::auto_compact_if_needed(
                 client,
                 messages,
@@ -2470,6 +2786,16 @@ pub async fn run_query_loop(
             .await
             {
                 *messages = new_msgs;
+                fire_lifecycle_event(
+                    tool_ctx,
+                    mangocode_core::config::HookEvent::PostCompact,
+                    "PostCompact",
+                    format!(
+                        "Proactive compact completed at {} input tokens for model {}.",
+                        usage.input_tokens, config.model
+                    ),
+                )
+                .await;
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(QueryEvent::Status(
                         "Context compacted to stay within limits.".to_string(),
@@ -2489,11 +2815,13 @@ pub async fn run_query_loop(
         // Helper closure for firing the Stop hook.
         macro_rules! fire_stop_hook {
             ($msg:expr) => {{
+                let stop_text = $msg.get_all_text();
+                capture_explicit_lifecycle_memory(tool_ctx, "Stop", &stop_text);
                 let stop_ctx = mangocode_core::hooks::HookContext {
                     event: "Stop".to_string(),
                     tool_name: None,
                     tool_input: None,
-                    tool_output: Some($msg.get_all_text()),
+                    tool_output: Some(stop_text),
                     is_error: None,
                     session_id: Some(tool_ctx.session_id.clone()),
                 };
@@ -2848,6 +3176,14 @@ pub async fn run_query_loop(
                     end_hook_span(post_hook_span);
 
                     mangocode_plugins::run_global_post_tool_hook(
+                        &p.name,
+                        &p.input,
+                        &result.content,
+                        result.is_error,
+                    );
+
+                    capture_post_tool_memory(
+                        tool_ctx,
                         &p.name,
                         &p.input,
                         &result.content,

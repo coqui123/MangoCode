@@ -356,6 +356,17 @@ impl ProactiveAgent {
                 None, // no pending message queue
             )
             .await;
+            crate::finish_session_lifecycle(
+                &tool_ctx,
+                format!(
+                    "Session ended for proactive agent {} after {} turns.",
+                    tool_ctx.session_id,
+                    tool_ctx
+                        .current_turn
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                ),
+            )
+            .await;
 
             // Update state.
             {

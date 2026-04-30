@@ -33,14 +33,14 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             (None, Some(_)) => return std::cmp::Ordering::Less,
             (Some(_), None) => return std::cmp::Ordering::Greater,
             (Some(a_c), Some(b_c)) => {
-                if a_c.is_digit(10) && b_c.is_digit(10) {
+                if a_c.is_ascii_digit() && b_c.is_ascii_digit() {
                     // Parse numbers
                     let mut a_num = String::new();
                     let mut b_num = String::new();
 
                     a_num.push(a_c);
                     while let Some(&c) = a_chars.peek() {
-                        if c.is_digit(10) {
+                        if c.is_ascii_digit() {
                             a_num.push(a_chars.next().unwrap());
                         } else {
                             break;
@@ -49,7 +49,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
                     b_num.push(b_c);
                     while let Some(&c) = b_chars.peek() {
-                        if c.is_digit(10) {
+                        if c.is_ascii_digit() {
                             b_num.push(b_chars.next().unwrap());
                         } else {
                             break;

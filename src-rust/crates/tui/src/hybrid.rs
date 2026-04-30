@@ -253,11 +253,13 @@ impl HybridTerminal {
 
     pub fn print_message(&mut self, msg: &Message, app: &App) -> io::Result<()> {
         let (cols, _) = terminal::size().unwrap_or((80, 24));
-        let mut ctx = RenderContext::default();
-        ctx.width = cols.saturating_sub(1).max(1);
-        ctx.tool_names = build_tool_names(&app.messages);
-        ctx.expanded_thinking = app.thinking_expanded.clone();
-        ctx.expanded_tool_outputs = app.expanded_tool_outputs.clone();
+        let ctx = RenderContext {
+            width: cols.saturating_sub(1).max(1),
+            tool_names: build_tool_names(&app.messages),
+            expanded_thinking: app.thinking_expanded.clone(),
+            expanded_tool_outputs: app.expanded_tool_outputs.clone(),
+            ..Default::default()
+        };
         let lines = render_message(msg, &ctx);
         let tool_row_ids = tool_row_ids_for_message(msg, &lines, app);
         for (line, tool_id) in lines.into_iter().zip(tool_row_ids) {

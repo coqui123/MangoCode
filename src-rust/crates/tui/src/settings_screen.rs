@@ -921,7 +921,9 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
         lines.push(indent_line("  (none configured)", Color::DarkGray));
     } else {
         for srv in &cfg.mcp_servers {
-            let kind = if srv.url.is_some() {
+            let kind = if srv.server_type == "pipedream" {
+                "pipedream"
+            } else if srv.url.is_some() {
                 "http"
             } else {
                 &srv.server_type

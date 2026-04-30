@@ -82,6 +82,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 icy_sixel = "0.5"
 image = { version = "0.25", features = ["png", "jpeg"] }
 resvg = "0.44"
+fastembed = "5"
 
 # Text processing
 similar = "2"

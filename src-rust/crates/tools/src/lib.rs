@@ -37,11 +37,13 @@ pub mod lsp_tool;
 pub mod mcp_auth_tool;
 pub mod mcp_resources;
 pub mod notebook_edit;
+pub mod output_reducers;
 pub mod powershell;
 pub mod pr_watch;
 pub mod pty_bash;
 pub mod remote_trigger;
 pub mod repl_tool;
+pub mod research;
 pub mod send_message;
 pub mod skill_tool;
 pub mod sleep;
@@ -76,11 +78,13 @@ pub use lsp_tool::LspTool;
 pub use mcp_auth_tool::McpAuthTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
 pub use notebook_edit::NotebookEditTool;
+pub use output_reducers::ToolLogReadTool;
 pub use powershell::PowerShellTool;
 pub use pr_watch::{heartbeat_scan_watched_prs, PrWatchTool};
 pub use pty_bash::PtyBashTool;
 pub use remote_trigger::RemoteTriggerTool;
 pub use repl_tool::ReplTool;
+pub use research::{DeepReadTool, DocReadTool, DocSearchTool, RenderedFetchTool};
 pub use send_message::{drain_inbox, peek_inbox, SendMessageTool};
 pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
@@ -362,6 +366,11 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(GrepTool),
         Box::new(WebFetchTool),
         Box::new(WebSearchTool),
+        Box::new(DocSearchTool),
+        Box::new(DocReadTool),
+        Box::new(DeepReadTool),
+        Box::new(RenderedFetchTool),
+        Box::new(ToolLogReadTool),
         Box::new(NotebookEditTool),
         Box::new(TaskCreateTool),
         Box::new(TaskGetTool),

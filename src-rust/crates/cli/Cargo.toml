@@ -43,3 +43,7 @@ urlencoding = "2"
 
 [build-dependencies]
 chrono = { workspace = true }
+
+[features]
+browser = ["mangocode-tools/browser"]
+computer-use = ["mangocode-tools/computer-use"]

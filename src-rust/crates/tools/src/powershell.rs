@@ -13,6 +13,7 @@
 //   Medium   → requires approval only when ctx.require_confirmation is set
 //   Low      → executes directly
 
+use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{session_shell_state, PermissionLevel, ShellState, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
@@ -38,6 +39,8 @@ struct PowerShellInput {
     /// When true, Medium-risk commands also prompt for approval.
     #[serde(default)]
     require_confirmation: bool,
+    #[serde(default)]
+    output_mode: Option<OutputMode>,
 }
 
 fn default_timeout() -> u64 {
@@ -215,6 +218,11 @@ impl Tool for PowerShellTool {
                 "require_confirmation": {
                     "type": "boolean",
                     "description": "When true, Medium-risk commands also prompt for approval"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["auto", "raw", "summary"],
+                    "description": "Control RTK-style output reduction (default auto)"
                 }
             },
             "required": ["command"]
@@ -226,6 +234,9 @@ impl Tool for PowerShellTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let output_mode = params
+            .output_mode
+            .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
 
         // ── Step 1: classify the command ─────────────────────────────────────
         let risk = classify_ps_command(&params.command);
@@ -407,13 +418,16 @@ impl Tool for PowerShellTool {
                     );
                 }
 
+                let reduced =
+                    reduce_command_output(&params.command, &output, exit_code, output_mode);
+
                 if exit_code != 0 {
                     ToolResult::error(format!(
                         "PowerShell exited with code {}\n{}",
-                        exit_code, output
+                        exit_code, reduced.content
                     ))
                 } else {
-                    ToolResult::success(output)
+                    ToolResult::success(reduced.content)
                 }
             }
             Err(_) => {

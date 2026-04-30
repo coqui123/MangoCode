@@ -14,7 +14,15 @@ use crate::vault::{get_vault_passphrase, Vault};
 use crate::ProviderId;
 
 /// Vault entry keys that are not merged into [`AuthStore`] (infrastructure secrets).
-const VAULT_SKIP_MERGE_KEYS: &[&str] = &["gateway"];
+const VAULT_SKIP_MERGE_KEYS: &[&str] = &["gateway", "tesseract", "ocr-tesseract"];
+
+#[inline]
+fn is_infrastructure_vault_key(pid: &str) -> bool {
+    VAULT_SKIP_MERGE_KEYS.contains(&pid)
+        || pid.starts_with("pipedream-")
+        || pid.starts_with("pipedream_")
+        || pid.starts_with("PIPEDREAM_")
+}
 
 /// Canonical provider id for in-memory and `auth.json` rows (matches [`AuthStore::api_key_for`]).
 #[inline]
@@ -176,7 +184,7 @@ impl AuthStore {
             Err(_) => return,
         };
         for (pid, entry) in data.entries.iter() {
-            if VAULT_SKIP_MERGE_KEYS.iter().any(|k| *k == pid.as_str()) {
+            if is_infrastructure_vault_key(pid.as_str()) {
                 continue;
             }
             if let Some(cred) = Self::credential_from_vault_secret(&entry.secret) {
@@ -379,5 +387,16 @@ mod tests {
             super::vault_provider_key_to_storage_key("codex"),
             ProviderId::OPENAI_CODEX
         );
+    }
+
+    #[test]
+    fn infrastructure_vault_keys_skip_pipedream_rows() {
+        assert!(super::is_infrastructure_vault_key("gateway"));
+        assert!(super::is_infrastructure_vault_key("pipedream-client-id"));
+        assert!(super::is_infrastructure_vault_key(
+            "pipedream_client_secret"
+        ));
+        assert!(super::is_infrastructure_vault_key("PIPEDREAM_PROJECT_ID"));
+        assert!(!super::is_infrastructure_vault_key("openai"));
     }
 }

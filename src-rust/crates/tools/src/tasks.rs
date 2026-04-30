@@ -4,6 +4,7 @@
 // Tasks have id, subject, description, status, owner, blocks/blocked-by dependencies,
 // and optional output.
 
+use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -495,6 +496,8 @@ struct TaskOutputInput {
     task_id: String,
     #[serde(default = "default_block")]
     block: bool,
+    #[serde(default)]
+    output_mode: Option<OutputMode>,
 }
 
 fn default_block() -> bool {
@@ -518,17 +521,25 @@ impl Tool for TaskOutputTool {
             "type": "object",
             "properties": {
                 "task_id": { "type": "string", "description": "Task ID to get output for" },
-                "block": { "type": "boolean", "description": "Wait for task to complete (default true)" }
+                "block": { "type": "boolean", "description": "Wait for task to complete (default true)" },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["auto", "raw", "summary"],
+                    "description": "Control RTK-style output reduction for task output (default auto)"
+                }
             },
             "required": ["task_id"]
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: TaskOutputInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let output_mode = params
+            .output_mode
+            .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
 
         match TASK_STORE.get(&params.task_id) {
             Some(task) => {
@@ -543,10 +554,26 @@ impl Tool for TaskOutputTool {
                     }
                     _ => "success",
                 };
+                let mut task_value = task.to_full_value();
+                if let Some(output) = task.output.as_deref() {
+                    if let Some(obj) = task_value.as_object_mut() {
+                        let reduced = reduce_command_output(
+                            &task.subject,
+                            output,
+                            if task.status == TaskStatus::Failed {
+                                1
+                            } else {
+                                0
+                            },
+                            output_mode,
+                        );
+                        obj.insert("output".to_string(), json!(reduced.content));
+                    }
+                }
                 ToolResult::success(
                     serde_json::to_string_pretty(&json!({
                         "retrieval_status": retrieval_status,
-                        "task": task.to_full_value(),
+                        "task": task_value,
                     }))
                     .unwrap_or_default(),
                 )
