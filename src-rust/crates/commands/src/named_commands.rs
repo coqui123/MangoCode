@@ -42,7 +42,7 @@ impl NamedCommand for AgentsCommand {
         "Manage and configure sub-agents"
     }
     fn usage(&self) -> &str {
-        "claude agents [list|create|edit|delete] [name]"
+        "mangocode agents [list|create|edit|delete] [name]"
     }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
@@ -56,7 +56,7 @@ impl NamedCommand for AgentsCommand {
                     return CommandResult::Message(
                         "Available Agents (0)\n\n\
                          No custom agents defined. Create one with /new-agent\n\
-                         or run: claude agents create <name>"
+                         or run: mangocode agents create <name>"
                             .to_string(),
                     );
                 }
@@ -73,7 +73,7 @@ impl NamedCommand for AgentsCommand {
                         ));
                     }
                 }
-                out.push_str("\nUse 'claude agents create <name>' to add a new agent.");
+                out.push_str("\nUse 'mangocode agents create <name>' to add a new agent.");
                 CommandResult::Message(out)
             }
             "create" => {
@@ -93,7 +93,9 @@ impl NamedCommand for AgentsCommand {
                 let name = match args.get(1).copied() {
                     Some(n) => n,
                     None => {
-                        return CommandResult::Error("Usage: claude agents edit <name>".to_string())
+                        return CommandResult::Error(
+                            "Usage: mangocode agents edit <name>".to_string(),
+                        )
                     }
                 };
                 CommandResult::Message(format!(
@@ -105,7 +107,7 @@ impl NamedCommand for AgentsCommand {
                     Some(n) => n,
                     None => {
                         return CommandResult::Error(
-                            "Usage: claude agents delete <name>".to_string(),
+                            "Usage: mangocode agents delete <name>".to_string(),
                         )
                     }
                 };
@@ -132,13 +134,13 @@ impl NamedCommand for AddDirCommand {
         "Add a directory to MangoCode's allowed workspace paths"
     }
     fn usage(&self) -> &str {
-        "claude add-dir <path>"
+        "mangocode add-dir <path>"
     }
 
     fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
         let raw = match args.first() {
             Some(p) => *p,
-            None => return CommandResult::Error("Usage: claude add-dir <path>".to_string()),
+            None => return CommandResult::Error("Usage: mangocode add-dir <path>".to_string()),
         };
 
         let path = std::path::Path::new(raw);
@@ -482,7 +484,7 @@ impl NamedCommand for BranchCommand {
         "Create a branch of the current conversation at this point"
     }
     fn usage(&self) -> &str {
-        "claude branch [create|list|switch] [name|id]"
+        "mangocode branch [create|list|switch] [name|id]"
     }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
@@ -521,7 +523,7 @@ impl NamedCommand for BranchCommand {
                         let title = new_session.title.as_deref().unwrap_or("(untitled)");
                         CommandResult::Message(format!(
                             "Created branch: \"{title}\"\nNew session ID: {}\n\
-                             To resume original: claude -r {}\n\
+                             To resume original: mangocode --resume {}\n\
                              To switch to branch: /branch switch {}",
                             new_session.id,
                             ctx.session_id,
@@ -564,7 +566,7 @@ impl NamedCommand for BranchCommand {
                             b.title.as_deref().unwrap_or("(untitled)")
                         ));
                     }
-                    out.push_str("\nUse: claude branch switch <id>");
+                    out.push_str("\nUse: mangocode branch switch <id>");
                     CommandResult::Message(out)
                 }
             }
@@ -573,7 +575,7 @@ impl NamedCommand for BranchCommand {
                     Some(i) if !i.is_empty() => i.to_string(),
                     _ => {
                         return CommandResult::Error(
-                            "Usage: claude branch switch <session-id>".to_string(),
+                            "Usage: mangocode branch switch <session-id>".to_string(),
                         )
                     }
                 };
@@ -588,7 +590,7 @@ impl NamedCommand for BranchCommand {
                     Err(e) => CommandResult::Error(format!("Could not load session '{id}': {e}")),
                 }
             }
-            sub => CommandResult::Error(format!("Unknown branch subcommand: '{sub}'\nUsage: claude branch [create|list|switch] [name|id]")),
+            sub => CommandResult::Error(format!("Unknown branch subcommand: '{sub}'\nUsage: mangocode branch [create|list|switch] [name|id]")),
         }
     }
 }
@@ -607,7 +609,7 @@ impl NamedCommand for TagCommand {
         "Toggle a searchable tag on the current session"
     }
     fn usage(&self) -> &str {
-        "claude tag [list|add|remove|toggle] [tag]"
+        "mangocode tag [list|add|remove|toggle] [tag]"
     }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
@@ -643,7 +645,9 @@ impl NamedCommand for TagCommand {
             "add" => {
                 let tag = match args.get(1).copied() {
                     Some(t) if !t.is_empty() => t.to_string(),
-                    _ => return CommandResult::Error("Usage: claude tag add <tag>".to_string()),
+                    _ => {
+                        return CommandResult::Error("Usage: mangocode tag add <tag>".to_string())
+                    }
                 };
 
                 let result = tokio::task::block_in_place(|| {
@@ -661,7 +665,11 @@ impl NamedCommand for TagCommand {
             "remove" => {
                 let tag = match args.get(1).copied() {
                     Some(t) if !t.is_empty() => t.to_string(),
-                    _ => return CommandResult::Error("Usage: claude tag remove <tag>".to_string()),
+                    _ => {
+                        return CommandResult::Error(
+                            "Usage: mangocode tag remove <tag>".to_string(),
+                        )
+                    }
                 };
 
                 let result = tokio::task::block_in_place(|| {
@@ -677,7 +685,11 @@ impl NamedCommand for TagCommand {
             "toggle" => {
                 let tag = match args.get(1).copied() {
                     Some(t) if !t.is_empty() => t.to_string(),
-                    _ => return CommandResult::Error("Usage: claude tag toggle <tag>".to_string()),
+                    _ => {
+                        return CommandResult::Error(
+                            "Usage: mangocode tag toggle <tag>".to_string(),
+                        )
+                    }
                 };
 
                 // Load session to check existing tags
@@ -721,7 +733,7 @@ impl NamedCommand for TagCommand {
                 }
             }
             sub => CommandResult::Error(format!(
-                "Unknown tag subcommand: '{sub}'\nUsage: claude tag [list|add|remove|toggle] [tag]"
+                "Unknown tag subcommand: '{sub}'\nUsage: mangocode tag [list|add|remove|toggle] [tag]"
             )),
         }
     }
@@ -741,15 +753,14 @@ impl NamedCommand for PassesCommand {
         "Share a free week of MangoCode with friends"
     }
     fn usage(&self) -> &str {
-        "claude passes"
+        "mangocode passes"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         CommandResult::Message(
-            "MangoCode Passes \u{2014} Share MangoCode with friends\n\n\
-             Share a free week of MangoCode with a friend\n\
-             Visit https://claude.ai/passes to get your referral link\n\
-             Each referral gives your friend 1 week of MangoCode Pro"
+            "Claude Passes companion link\n\n\
+             This opens the referral page used by the compatible Claude ecosystem.\n\
+             Visit https://claude.ai/passes to get your referral link."
                 .to_string(),
         )
     }
@@ -792,7 +803,7 @@ impl NamedCommand for IdeCommand {
         "Manage IDE integrations and show status"
     }
     fn usage(&self) -> &str {
-        "claude ide [status|connect|disconnect|open]"
+        "mangocode ide [status|connect|disconnect|open]"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
@@ -856,7 +867,7 @@ impl NamedCommand for IdeCommand {
             "No active IDE extension connections found.".to_string()
         } else {
             format!(
-                "Connected IDEs:\n{}\n\nUse 'claude ide open <file>' to open a file in the IDE.",
+                "Connected IDEs:\n{}\n\nUse 'mangocode ide open <file>' to open a file in the IDE.",
                 ides.join("\n")
             )
         };
@@ -879,7 +890,7 @@ impl NamedCommand for PrCommentsCommand {
         "Get review comments from the current GitHub pull request"
     }
     fn usage(&self) -> &str {
-        "claude pr-comments"
+        "mangocode pr-comments"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
@@ -960,10 +971,10 @@ impl NamedCommand for DesktopCommand {
         "desktop"
     }
     fn description(&self) -> &str {
-        "Download and set up MangoCode Desktop app"
+        "Show desktop companion app links and session deep links"
     }
     fn usage(&self) -> &str {
-        "claude desktop"
+        "mangocode desktop"
     }
 
     fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
@@ -971,7 +982,7 @@ impl NamedCommand for DesktopCommand {
         let arch = std::env::consts::ARCH;
         let download_url = "https://claude.ai/download";
 
-        // Detect if MangoCode Desktop is likely installed (platform-specific heuristic).
+        // Detect if the compatible Claude desktop app is likely installed.
         let desktop_likely_installed = match os {
             "macos" => {
                 std::path::Path::new("/Applications/Claude.app").exists()
@@ -1001,14 +1012,20 @@ impl NamedCommand for DesktopCommand {
             let deep_link = format!("claude://session/{}", session_id);
 
             let mut msg = String::new();
-            msg.push_str("\u{2713} Already connected to MangoCode Desktop\n\n");
-            msg.push_str("Your MangoCode session is synced with MangoCode Desktop.\n\n");
-            msg.push_str(&format!("Open this session in Desktop: {deep_link}\n\n"));
+            msg.push_str("\u{2713} Desktop companion link available\n\n");
+            msg.push_str(
+                "This MangoCode session can be opened in the compatible Claude desktop app.\n\n",
+            );
+            msg.push_str(&format!(
+                "Open this session in the desktop companion: {deep_link}\n\n"
+            ));
             if desktop_likely_installed {
-                msg.push_str("MangoCode Desktop is installed on this machine.\n");
-                msg.push_str(&format!("Manage your installation: {download_url}"));
+                msg.push_str("A compatible desktop app appears to be installed on this machine.\n");
+                msg.push_str(&format!("Manage or update it here: {download_url}"));
             } else {
-                msg.push_str(&format!("Download / manage Desktop: {download_url}"));
+                msg.push_str(&format!(
+                    "Download or manage the compatible desktop app here: {download_url}"
+                ));
             }
             return CommandResult::Message(msg);
         }
@@ -1016,46 +1033,51 @@ impl NamedCommand for DesktopCommand {
         let msg = if os == "macos" {
             if desktop_likely_installed {
                 format!(
-                    "Open MangoCode Desktop \u{2014} macOS\n\n\
-                     MangoCode Desktop appears to be installed.\n\
-                     Launch it from /Applications/Claude.app and sign in with your Anthropic account.\n\n\
-                     Download / update: {download_url}"
+                    "Desktop companion \u{2014} macOS\n\n\
+                     MangoCode uses the compatible Claude desktop app for this handoff.\n\
+                     A compatible desktop app appears to be installed.\n\
+                     Launch it from /Applications/Claude.app.\n\n\
+                     Download or update: {download_url}"
                 )
             } else {
                 format!(
-                    "Download MangoCode Desktop \u{2014} macOS\n\n\
+                    "Desktop companion \u{2014} macOS\n\n\
+                     MangoCode uses the compatible Claude desktop app for this handoff.\n\
                      Download: {download_url}\n\n\
                      Setup instructions:\n\
-                     1. Download and install MangoCode Desktop for macOS\n\
-                     2. Open MangoCode Desktop and sign in with the same Anthropic account\n\
-                     3. MangoCode will detect the Desktop bridge automatically"
+                     1. Download and install the Claude desktop app for macOS\n\
+                     2. Open the app and complete sign-in there\n\
+                     3. MangoCode will detect the desktop bridge automatically"
                 )
             }
         } else if os == "windows" {
             let arch_note = if arch == "x86_64" { " (x64)" } else { "" };
             if desktop_likely_installed {
                 format!(
-                    "Open MangoCode Desktop \u{2014} Windows{arch_note}\n\n\
-                     MangoCode Desktop appears to be installed.\n\
-                     Launch it from your Start menu and sign in with your Anthropic account.\n\n\
-                     Download / update: {download_url}"
+                    "Desktop companion \u{2014} Windows{arch_note}\n\n\
+                     MangoCode uses the compatible Claude desktop app for this handoff.\n\
+                     A compatible desktop app appears to be installed.\n\
+                     Launch it from your Start menu.\n\n\
+                     Download or update: {download_url}"
                 )
             } else {
                 format!(
-                    "Download MangoCode Desktop for Windows{arch_note}\n\n\
+                    "Desktop companion \u{2014} Windows{arch_note}\n\n\
+                     MangoCode uses the compatible Claude desktop app for this handoff.\n\
                      Download: {download_url}\n\n\
                      Setup instructions:\n\
-                     1. Download and run the MangoCode Desktop installer\n\
-                     2. Open MangoCode Desktop and sign in with the same Anthropic account\n\
-                     3. MangoCode will detect the Desktop bridge automatically"
+                     1. Download and run the Claude desktop app installer\n\
+                     2. Open the app and complete sign-in there\n\
+                     3. MangoCode will detect the desktop bridge automatically"
                 )
             }
         } else {
             // Linux and other platforms
             format!(
-                "MangoCode Desktop is not yet available for {os}\n\n\
-                 On Linux, you can use MangoCode via the CLI or visit https://claude.ai in your browser.\n\
-                 Check {download_url} for the latest platform availability."
+                "Desktop companion \u{2014} {os}\n\n\
+                 MangoCode uses the compatible Claude desktop app for this handoff.\n\
+                 On Linux, continue using MangoCode via the CLI or the compatible Claude web app.\n\
+                 Check {download_url} for current desktop platform availability."
             )
         };
 
@@ -1132,10 +1154,10 @@ impl NamedCommand for MobileCommand {
         "mobile"
     }
     fn description(&self) -> &str {
-        "Download the MangoCode mobile app"
+        "Show mobile companion app links and session QR codes"
     }
     fn usage(&self) -> &str {
-        "claude mobile [ios|android]"
+        "mangocode mobile [ios|android]"
     }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
@@ -1153,7 +1175,7 @@ impl NamedCommand for MobileCommand {
             String::new()
         };
 
-        // Choose which platform / URL to show the QR for (default: claude.ai/mobile).
+        // Choose which platform / URL to show the QR for.
         let (platform_label, qr_url): (&str, &str) = match args.first().copied().unwrap_or("") {
             "ios" | "1" => ("[1] iOS  (selected)", ios_url),
             "android" | "2" => ("[2] Android  (selected)", android_url),
@@ -1173,7 +1195,10 @@ impl NamedCommand for MobileCommand {
         let qr_lines = render_qr(qr_url);
 
         let mut out = String::new();
-        out.push_str("Scan to download MangoCode mobile app\n");
+        out.push_str("Mobile companion links\n\n");
+        out.push_str(
+            "MangoCode uses the compatible Claude mobile app for this handoff and session QR flow.\n\n",
+        );
         out.push_str(&format!("Platform: {platform_label}\n\n"));
         if has_session {
             out.push_str(
@@ -1214,18 +1239,18 @@ impl NamedCommand for InstallGithubAppCommand {
         "install-github-app"
     }
     fn description(&self) -> &str {
-        "Set up MangoCode GitHub Actions for a repository"
+        "Show setup steps for the compatible Claude Code GitHub App"
     }
     fn usage(&self) -> &str {
-        "claude install-github-app"
+        "mangocode install-github-app"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         CommandResult::Message(
-            "To install the MangoCode GitHub App:\n\
+            "To enable GitHub Actions through the compatible Claude Code GitHub App:\n\
              1. Visit https://github.com/apps/claude-code-app and click Install\n\
              2. Select the repositories to enable\n\
-             3. Add your ANTHROPIC_API_KEY to repository secrets\n\n\
+             3. Add the secret expected by that workflow. For Claude-compatible runs, this is usually ANTHROPIC_API_KEY\n\n\
              The app enables MangoCode in GitHub Actions workflows.\n\
              Docs: https://docs.anthropic.com/claude-code/github-actions"
                 .to_string(),
@@ -1247,7 +1272,7 @@ impl NamedCommand for RemoteSetupCommand {
         "Check and configure a remote MangoCode environment"
     }
     fn usage(&self) -> &str {
-        "claude remote-setup"
+        "mangocode remote-setup"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
@@ -1281,7 +1306,7 @@ impl NamedCommand for RemoteSetupCommand {
             }
         ));
 
-        // Step 3: Check claude config dir exists
+        // Step 3: Check MangoCode config dir exists
         let config_dir = dirs::home_dir()
             .map(|h| h.join(".mangocode"))
             .unwrap_or_default();
@@ -1292,7 +1317,7 @@ impl NamedCommand for RemoteSetupCommand {
             if has_config {
                 format!("exists at {}", config_dir.display())
             } else {
-                "missing \u{2014} run 'claude' once to initialize".to_string()
+                "missing \u{2014} run 'mangocode' once to initialize".to_string()
             }
         ));
 
@@ -1327,9 +1352,9 @@ impl NamedCommand for RemoteSetupCommand {
              {}",
             steps.join("\n"),
             if all_ok {
-                "\u{2713} All checks passed. MangoCode is ready for remote use.\nStart a session: claude --bridge"
+                "\u{2713} All checks passed. MangoCode is ready for remote use.\nStart MangoCode normally, and the remote bridge will connect when configured."
             } else {
-                "\u{2717} Some checks failed. Fix the issues above and run 'claude remote-setup' again."
+                "\u{2717} Some checks failed. Fix the issues above and run 'mangocode remote-setup' again."
             }
         ))
     }
@@ -1349,13 +1374,13 @@ impl NamedCommand for StickersCommand {
         "Open the MangoCode sticker page in your browser"
     }
     fn usage(&self) -> &str {
-        "claude stickers"
+        "mangocode stickers"
     }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         let url = "https://www.stickermule.com/claudecode";
         match open::that(url) {
-            Ok(_) => CommandResult::Message(format!("Opening stickers page: {url}")),
+            Ok(_) => CommandResult::Message(format!("Opening sticker page: {url}")),
             Err(e) => {
                 CommandResult::Message(format!("Visit: {url}\n(Could not open browser: {e})"))
             }
@@ -1377,7 +1402,7 @@ impl NamedCommand for UltraplanCommand {
         "Launch Ultraplan agentic code planner with extended thinking"
     }
     fn usage(&self) -> &str {
-        "claude ultraplan [--effort=medium|high|maximum]"
+        "mangocode ultraplan [--effort=medium|high|maximum]"
     }
 
     fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {

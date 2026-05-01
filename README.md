@@ -1,27 +1,40 @@
 # MangoCode
 
-MangoCode is a Rust-powered terminal coding agent built for real-world development: interactive sessions, multi-provider model access, MCP tooling, and automation-ready headless runs.
+MangoCode is the open, multi-provider coding agent for serious local and hybrid workflows.
 
-This repo began from the Claurst clean-room effort and has since been heavily modified with substantial runtime, provider, UX, and architecture changes.
+It is a Rust-powered terminal coding agent built for real-world development: interactive pair-programming, automation-ready headless runs, MCP-connected tooling, local and cloud model routing, and durable project memory.
+
+If you want one agent that can work in the terminal, plug into external tool ecosystems, run against multiple model providers, and stay useful in CI or remote environments, MangoCode is built for that job.
 
 <img width="2132" height="1124" alt="image" src="https://github.com/user-attachments/assets/27aec059-6f1c-4427-a727-1d4466c71e47" />
 
-## Highlights
+## Why MangoCode
 
-- Provider flexibility without lock-in: use cloud and local models with one CLI (`/connect`, `/model`, `--provider`, `--model`).
-- Interactive and headless in one tool: use the TUI for day-to-day coding and the same engine for scripts/CI (`--print`, `--output-format stream-json`).
-- MCP-ready by design: connect external tool ecosystems and workflows through built-in MCP support.
-- Rust workspace architecture: modular crates for CLI, core runtime, query engine, tools, MCP, and TUI.
-- Practical operator workflows: built-in commands for setup, health checks, permissions, tasks, and diagnostics.
-- Persistent developer state: settings, auth, and session history live in local config for repeatable workflows.
-- Native intelligence layer: Smart Attachments, Mango Research, output compression, and layered memory are documented in [docs/mango-intelligence.md](docs/mango-intelligence.md).
+- Open and model-flexible: route work across Anthropic, OpenAI, Google, Qwen, Ollama, Vertex, OpenAI-compatible backends, and more without locking your workflow to a single vendor.
+- Built for local and hybrid development: use the TUI for day-to-day coding, run headless in CI, connect MCP servers, and keep the same core runtime across both.
+- Strong native tooling story: file editing, shell execution, research tools, MCP resources, skills, tasks, worktrees, and review flows live in one system instead of being bolted on as separate apps.
+- Serious context handling: Smart Attachments, OCR fallbacks, Mango Research, layered memory, and tool-output compression help the agent stay useful in large real repositories.
+- Automation-ready: structured `stream-json` output, background tasks, diagnostics, permissions, and provider controls make MangoCode practical for repeatable workflows.
+- Rust workspace architecture: modular crates for CLI, core runtime, query engine, providers, tools, MCP, plugins, and TUI make the system extensible instead of monolithic.
+
+## Kick-Ass Features
+
+- Multi-provider routing without lock-in: switch models with `/connect`, `/model`, `--provider`, and `--model`.
+- Interactive and headless in one tool: use the terminal UI locally, then reuse the same engine in scripts and CI with `--print` and `--output-format stream-json`.
+- MCP-ready by design: connect local `stdio` servers and hosted remote MCP servers at the same time.
+- Native intelligence layer: Smart Attachments, Mango Research, output compression, layered memory, and local embeddings are documented in [docs/mango-intelligence.md](docs/mango-intelligence.md).
+- Practical operator workflows: built-in commands for setup, health checks, permissions, tasks, review, diagnostics, and provider management.
+- Persistent developer state: settings, auth, sessions, cached docs, attachment extracts, and tool logs live in local MangoCode data directories.
+- Local-first options when you want them: Ollama, local OCR, local embeddings, vault-backed credentials, and headless-friendly provider selection.
 
 ## Current Status
 
-- Core Rust workspace is active and used as the primary implementation
-- Multi-provider support is available
-- `/connect` provider onboarding flow is available in-app
-- Project is actively evolving
+- Core Rust workspace is active and used as the primary implementation.
+- Multi-provider support is available today.
+- `/connect` provider onboarding is available in-app.
+- Headless automation and structured output are available today.
+- MCP support, memory, research, and attachment processing are already integrated.
+- Project is actively evolving and still being sharpened.
 
 ## Installation and Running
 
@@ -331,7 +344,7 @@ cargo test
 cargo run -p mangocode
 ```
 
-## Important Notice
+## Project Background And Clean-Room Notice
 
 This repository does not include proprietary Claude Code TypeScript source code.
 
@@ -342,7 +355,7 @@ MangoCode follows a clean-room style process:
 
 The guiding principle is idea-expression separation: behavior and interfaces can be reimplemented without copying protected expression.
 
-## Credits
+## Credits And Lineage
 
 Major credit to the original Claurst effort and research by Kuber Mehta, which provided the initial foundation this repository builds on.
 

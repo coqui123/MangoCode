@@ -3512,15 +3512,837 @@ impl SlashCommand for InitCommand {
 
 // ---- /review -------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewMode {
+    Quick,
+    Balanced,
+    Deep,
+    Security,
+    Architecture,
+    Testing,
+}
+
+impl Default for ReviewMode {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+impl ReviewMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "quick" => Some(Self::Quick),
+            "balanced" | "default" | "standard" => Some(Self::Balanced),
+            "deep" | "ultra" | "thorough" => Some(Self::Deep),
+            "security" | "secure" => Some(Self::Security),
+            "architecture" | "arch" => Some(Self::Architecture),
+            "testing" | "tests" | "test" => Some(Self::Testing),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Balanced => "balanced",
+            Self::Deep => "deep",
+            Self::Security => "security",
+            Self::Architecture => "architecture",
+            Self::Testing => "testing",
+        }
+    }
+
+    fn max_output_tokens(self) -> u32 {
+        match self {
+            Self::Quick => 2200,
+            Self::Balanced => 3200,
+            Self::Deep => 4800,
+            Self::Security | Self::Architecture | Self::Testing => 3600,
+        }
+    }
+
+    fn thinking_budget(self) -> Option<u32> {
+        match self {
+            Self::Quick => None,
+            Self::Balanced => Some(1024),
+            Self::Deep => Some(4096),
+            Self::Security | Self::Architecture | Self::Testing => Some(2048),
+        }
+    }
+
+    fn emphasis(self) -> &'static str {
+        match self {
+            Self::Quick => {
+                "Prioritize the highest-signal correctness and regression findings only."
+            }
+            Self::Balanced => {
+                "Balance correctness, regression risk, maintainability, and test adequacy."
+            }
+            Self::Deep => {
+                "Be exhaustive. Spend extra effort uncovering subtle bugs, missing edge cases, and hidden regressions."
+            }
+            Self::Security => {
+                "Prioritize security, auth, secrets handling, permissions, sandbox escape, data exposure, and unsafe defaults."
+            }
+            Self::Architecture => {
+                "Prioritize architectural coherence, coupling, boundary violations, maintainability, and long-term operability."
+            }
+            Self::Testing => {
+                "Prioritize regression risk, missing coverage, broken assumptions, flaky behavior, and test design gaps."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewOptions {
+    base_ref: Option<String>,
+    mode: ReviewMode,
+    focus: Vec<String>,
+    model_override: Option<String>,
+    provider_override: Option<String>,
+    post_to_github: bool,
+    max_diff_chars: usize,
+}
+
+impl Default for ReviewOptions {
+    fn default() -> Self {
+        Self {
+            base_ref: None,
+            mode: ReviewMode::Balanced,
+            focus: Vec::new(),
+            model_override: None,
+            provider_override: None,
+            post_to_github: true,
+            max_diff_chars: 120_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReviewDiffSummary {
+    files: Vec<ReviewChangedFile>,
+    total_additions: usize,
+    total_deletions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewChangedFile {
+    path: String,
+    additions: usize,
+    deletions: usize,
+}
+
+fn parse_review_args(args: &str) -> Result<ReviewOptions, String> {
+    let tokens = split_command_args(args);
+    let mut opts = ReviewOptions::default();
+    let mut i = 0usize;
+
+    while i < tokens.len() {
+        let token = &tokens[i];
+        match token.as_str() {
+            "--post" => opts.post_to_github = true,
+            "--no-post" => opts.post_to_github = false,
+            "--mode" => {
+                i += 1;
+                let value = tokens
+                    .get(i)
+                    .ok_or_else(|| "--mode requires a value.".to_string())?;
+                opts.mode = ReviewMode::parse(value).ok_or_else(|| {
+                    format!(
+                        "Unknown review mode '{}'. Use quick, balanced, deep, security, architecture, or testing.",
+                        value
+                    )
+                })?;
+            }
+            "--focus" => {
+                i += 1;
+                let value = tokens
+                    .get(i)
+                    .ok_or_else(|| "--focus requires a comma-separated value list.".to_string())?;
+                merge_review_focus(&mut opts.focus, value);
+            }
+            "--model" => {
+                i += 1;
+                let value = tokens
+                    .get(i)
+                    .ok_or_else(|| "--model requires a model name.".to_string())?;
+                opts.model_override = Some(value.clone());
+            }
+            "--provider" => {
+                i += 1;
+                let value = tokens
+                    .get(i)
+                    .ok_or_else(|| "--provider requires a provider ID.".to_string())?;
+                opts.provider_override = Some(canonical_review_provider_id(value));
+            }
+            "--max-diff-chars" => {
+                i += 1;
+                let value = tokens
+                    .get(i)
+                    .ok_or_else(|| "--max-diff-chars requires a number.".to_string())?;
+                let parsed = value.parse::<usize>().map_err(|_| {
+                    format!(
+                        "Invalid --max-diff-chars value '{}'. Expected a number.",
+                        value
+                    )
+                })?;
+                if parsed < 5_000 {
+                    return Err("--max-diff-chars must be at least 5000.".to_string());
+                }
+                opts.max_diff_chars = parsed;
+            }
+            _ => {
+                if let Some(value) = token.strip_prefix("--mode=") {
+                    opts.mode = ReviewMode::parse(value).ok_or_else(|| {
+                        format!(
+                            "Unknown review mode '{}'. Use quick, balanced, deep, security, architecture, or testing.",
+                            value
+                        )
+                    })?;
+                } else if let Some(value) = token.strip_prefix("--focus=") {
+                    merge_review_focus(&mut opts.focus, value);
+                } else if let Some(value) = token.strip_prefix("--model=") {
+                    opts.model_override = Some(value.to_string());
+                } else if let Some(value) = token.strip_prefix("--provider=") {
+                    opts.provider_override = Some(canonical_review_provider_id(value));
+                } else if let Some(value) = token.strip_prefix("--max-diff-chars=") {
+                    let parsed = value.parse::<usize>().map_err(|_| {
+                        format!(
+                            "Invalid --max-diff-chars value '{}'. Expected a number.",
+                            value
+                        )
+                    })?;
+                    if parsed < 5_000 {
+                        return Err("--max-diff-chars must be at least 5000.".to_string());
+                    }
+                    opts.max_diff_chars = parsed;
+                } else if token.starts_with("--") {
+                    return Err(format!("Unknown flag '{}'. Try `/help review`.", token));
+                } else if opts.base_ref.is_none() {
+                    opts.base_ref = Some(token.clone());
+                } else {
+                    return Err(format!(
+                        "Unexpected extra argument '{}'. Try `/help review`.",
+                        token
+                    ));
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    Ok(opts)
+}
+
+fn merge_review_focus(out: &mut Vec<String>, raw: &str) {
+    for item in raw.split(',') {
+        let normalized = item.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && !out.iter().any(|existing| existing == &normalized) {
+            out.push(normalized);
+        }
+    }
+}
+
+fn canonical_review_provider_id(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "togetherai" => "together-ai".to_string(),
+        "lmstudio" => "lm-studio".to_string(),
+        "llamacpp" => "llama-cpp".to_string(),
+        "moonshot" => "moonshotai".to_string(),
+        "zhipu" => "zhipuai".to_string(),
+        "codex" => "openai-codex".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn is_known_review_provider_id(raw: &str) -> bool {
+    matches!(
+        canonical_review_provider_id(raw).as_str(),
+        "anthropic"
+            | "anthropic-max"
+            | "openai"
+            | "openai-codex"
+            | "google"
+            | "google-vertex"
+            | "amazon-bedrock"
+            | "azure"
+            | "github-copilot"
+            | "mistral"
+            | "xai"
+            | "groq"
+            | "deepinfra"
+            | "cerebras"
+            | "cohere"
+            | "together-ai"
+            | "perplexity"
+            | "openrouter"
+            | "ollama"
+            | "lm-studio"
+            | "llama-cpp"
+            | "deepseek"
+            | "venice"
+            | "sambanova"
+            | "huggingface"
+            | "nvidia"
+            | "siliconflow"
+            | "moonshotai"
+            | "zhipuai"
+            | "nebius"
+            | "ovhcloud"
+            | "scaleway"
+            | "vultr"
+            | "baseten"
+            | "friendli"
+            | "upstage"
+            | "stepfun"
+            | "fireworks"
+            | "novita"
+            | "minimax"
+            | "qwen"
+    )
+}
+
+fn summarize_review_diff(diff: &str) -> ReviewDiffSummary {
+    let mut summary = ReviewDiffSummary::default();
+    let mut current: Option<ReviewChangedFile> = None;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(file) = current.take() {
+                summary.total_additions += file.additions;
+                summary.total_deletions += file.deletions;
+                summary.files.push(file);
+            }
+
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let path = parts
+                .get(1)
+                .map(|part| part.trim_start_matches("b/"))
+                .unwrap_or("(unknown)")
+                .to_string();
+            current = Some(ReviewChangedFile {
+                path,
+                additions: 0,
+                deletions: 0,
+            });
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("rename to ") {
+            if let Some(file) = current.as_mut() {
+                file.path = path.to_string();
+            }
+            continue;
+        }
+
+        if line.starts_with("+++ ") || line.starts_with("--- ") {
+            continue;
+        }
+
+        if let Some(file) = current.as_mut() {
+            if line.starts_with('+') {
+                file.additions += 1;
+            } else if line.starts_with('-') {
+                file.deletions += 1;
+            }
+        }
+    }
+
+    if let Some(file) = current.take() {
+        summary.total_additions += file.additions;
+        summary.total_deletions += file.deletions;
+        summary.files.push(file);
+    }
+
+    summary
+}
+
+fn format_review_file_summary(diff_source: &str, summary: &ReviewDiffSummary) -> String {
+    let mut lines = vec![
+        format!("Diff source: {}", diff_source),
+        format!(
+            "Files changed: {} | +{} / -{}",
+            summary.files.len(),
+            summary.total_additions,
+            summary.total_deletions
+        ),
+    ];
+
+    if summary.files.is_empty() {
+        lines.push("Changed files: (unable to infer from diff)".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Changed files:".to_string());
+    for file in summary.files.iter().take(20) {
+        lines.push(format!(
+            "  - {} (+{} / -{})",
+            file.path, file.additions, file.deletions
+        ));
+    }
+
+    if summary.files.len() > 20 {
+        lines.push(format!("  - ... {} more files", summary.files.len() - 20));
+    }
+
+    lines.join("\n")
+}
+
+fn default_review_focus(mode: ReviewMode) -> Vec<&'static str> {
+    match mode {
+        ReviewMode::Quick => vec!["correctness", "regressions", "highest-risk files"],
+        ReviewMode::Balanced => vec![
+            "bugs",
+            "regressions",
+            "test gaps",
+            "architecture",
+            "maintainability",
+        ],
+        ReviewMode::Deep => vec![
+            "bugs",
+            "regressions",
+            "edge cases",
+            "security",
+            "test gaps",
+            "architecture",
+            "maintainability",
+        ],
+        ReviewMode::Security => vec![
+            "security",
+            "auth",
+            "permissions",
+            "secrets",
+            "data exposure",
+            "unsafe defaults",
+        ],
+        ReviewMode::Architecture => vec![
+            "architecture",
+            "coupling",
+            "boundaries",
+            "maintainability",
+            "operability",
+            "technical debt",
+        ],
+        ReviewMode::Testing => vec![
+            "regressions",
+            "test gaps",
+            "edge cases",
+            "flaky behavior",
+            "coverage risks",
+        ],
+    }
+}
+
+fn build_review_prompt(
+    opts: &ReviewOptions,
+    diff_source: &str,
+    file_summary: &str,
+    diff_for_llm: &str,
+    diff_was_truncated: bool,
+) -> String {
+    let focus = if opts.focus.is_empty() {
+        default_review_focus(opts.mode).join(", ")
+    } else {
+        opts.focus.join(", ")
+    };
+
+    let truncation_note = if diff_was_truncated {
+        "The diff was truncated to fit review context. Call out uncertainty if a conclusion depends on omitted parts."
+    } else {
+        "The full diff fit in context."
+    };
+
+    format!(
+        "You are MangoCode's principal code reviewer.\n\
+         Review the diff like a high-signal senior engineer whose job is to stop bugs and regressions before merge.\n\
+         {}\n\
+         Focus areas: {}.\n\
+         Diff source: {}.\n\
+         {}\n\n\
+         Review rules:\n\
+         - Prioritize correctness, regression risk, architectural concerns, test gaps, and security over style nitpicks.\n\
+         - Only report an issue when the diff provides concrete evidence or a strong, explained inference.\n\
+         - Prefer specific file references such as `path:line` when you can infer them from the diff; otherwise use `path`.\n\
+         - Explain why each finding matters and what could break.\n\
+         - If there are no material issues in a section, say so briefly.\n\
+         - Highlight meaningful strengths too, not just problems.\n\n\
+         Return Markdown with these sections in this exact order:\n\
+         ## Findings\n\
+         - Ordered by severity, each bullet formatted as `[critical|high|medium|low] path[:line] - issue. impact. fix/test direction.`\n\
+         - If you found no material issues, write `- No material correctness issues found.`\n\n\
+         ## Regression Risks\n\
+         - Short bullets covering behavior that is most likely to break in production.\n\n\
+         ## Test Gaps\n\
+         - Short bullets covering missing or weak validation.\n\n\
+         ## Architecture & Maintainability\n\
+         - Short bullets covering design and long-term code health.\n\n\
+         ## Strengths\n\
+         - Short bullets describing what the change does well.\n\n\
+         ## Verdict\n\
+         - One line: `APPROVE`, `COMMENT`, or `REQUEST_CHANGES` with a brief rationale.\n\n\
+         Change summary:\n\
+         {}\n\n\
+         ```diff\n{}\n```",
+        opts.mode.emphasis(),
+        focus,
+        diff_source,
+        truncation_note,
+        file_summary,
+        diff_for_llm
+    )
+}
+
+fn review_text_from_response(response: &mangocode_api::ProviderResponse) -> Option<String> {
+    let mut out = String::new();
+    for block in &response.content {
+        match block {
+            mangocode_core::types::ContentBlock::Text { text } => {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            mangocode_core::types::ContentBlock::Thinking { thinking, .. } => {
+                if !thinking.trim().is_empty() {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(thinking);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn resolve_review_provider_and_model(
+    opts: &ReviewOptions,
+    ctx: &CommandContext,
+) -> (String, String) {
+    let effective_model = opts.model_override.clone().unwrap_or_else(|| {
+        if let Some(ref registry) = ctx.model_registry {
+            mangocode_api::effective_model_for_config(&ctx.config, registry)
+        } else {
+            ctx.config.effective_model().to_string()
+        }
+    });
+
+    if let Some(ref provider) = opts.provider_override {
+        return (provider.clone(), effective_model);
+    }
+
+    if let Some(ref explicit_model) = opts.model_override {
+        if let Some((provider_prefix, rest)) = explicit_model.split_once('/') {
+            if is_known_review_provider_id(provider_prefix) {
+                return (
+                    canonical_review_provider_id(provider_prefix),
+                    rest.to_string(),
+                );
+            }
+        }
+    }
+
+    if let Some(ref configured_provider) = ctx.config.provider {
+        return (
+            canonical_review_provider_id(configured_provider),
+            effective_model,
+        );
+    }
+
+    if let Some(ref registry) = ctx.model_registry {
+        if let Some(provider_id) = registry.find_provider_for_model(&effective_model) {
+            return (provider_id.to_string(), effective_model);
+        }
+    }
+
+    ("anthropic".to_string(), effective_model)
+}
+
+async fn execute_review_command(args: &str, ctx: &mut CommandContext) -> CommandResult {
+    let opts = match parse_review_args(args) {
+        Ok(opts) => opts,
+        Err(err) => return CommandResult::Error(err),
+    };
+
+    let repo_root = mangocode_core::git_utils::get_repo_root(&ctx.working_dir)
+        .unwrap_or_else(|| ctx.working_dir.clone());
+
+    let (diff_source, diff) = if let Some(base) = opts.base_ref.as_deref() {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo_root)
+            .args(["diff", &format!("{}...HEAD", base)])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => (
+                format!("{}...HEAD", base),
+                String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            ),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return CommandResult::Error(format!("git diff failed: {}", stderr.trim()));
+            }
+            Err(e) => return CommandResult::Error(format!("Failed to run git: {}", e)),
+        }
+    } else {
+        let staged = mangocode_core::git_utils::get_staged_diff(&repo_root);
+        if staged.is_empty() {
+            (
+                "unstaged changes".to_string(),
+                mangocode_core::git_utils::get_unstaged_diff(&repo_root),
+            )
+        } else {
+            ("staged changes".to_string(), staged)
+        }
+    };
+
+    if diff.is_empty() {
+        return CommandResult::Message(
+            "No diff found. Stage some changes or provide a base ref (e.g. /review main)."
+                .to_string(),
+        );
+    }
+
+    let diff_summary = summarize_review_diff(&diff);
+    let file_summary = format_review_file_summary(&diff_source, &diff_summary);
+
+    let diff_was_truncated = diff.len() > opts.max_diff_chars;
+    let diff_for_llm = if diff_was_truncated {
+        format!(
+            "{}\n\n[... diff truncated at {} bytes ...]",
+            truncate_bytes_with_ellipsis(&diff, opts.max_diff_chars),
+            opts.max_diff_chars
+        )
+    } else {
+        diff.clone()
+    };
+
+    let (provider_id, model) = resolve_review_provider_and_model(&opts, ctx);
+    let auth = ctx.config.resolve_auth_async().await;
+    let provider_registry = mangocode_api::ProviderRegistry::from_environment_with_auth_store(
+        mangocode_api::client::ClientConfig {
+            api_key: auth
+                .as_ref()
+                .map(|(token, _)| token.clone())
+                .unwrap_or_default(),
+            api_base: ctx.config.resolve_api_base(),
+            use_bearer_auth: auth.as_ref().map(|(_, bearer)| *bearer).unwrap_or(false),
+            ..Default::default()
+        },
+    );
+
+    let provider = match provider_registry.get(&mangocode_core::ProviderId::new(&provider_id)) {
+        Some(provider) => provider.clone(),
+        None => {
+            let hint = if provider_id == "anthropic" || provider_id == "anthropic-max" {
+                "Run `/login` or configure `ANTHROPIC_API_KEY`."
+            } else {
+                "Connect that provider first with `/connect` or configure its credentials."
+            };
+            return CommandResult::Error(format!(
+                "Provider '{}' is not configured for `/review`. {}",
+                provider_id, hint
+            ));
+        }
+    };
+
+    let review_prompt = build_review_prompt(
+        &opts,
+        &diff_source,
+        &file_summary,
+        &diff_for_llm,
+        diff_was_truncated,
+    );
+
+    let review_request = mangocode_api::ProviderRequest {
+        model: model.clone(),
+        messages: vec![mangocode_core::types::Message::user(review_prompt)],
+        system_prompt: Some(mangocode_api::SystemPrompt::Text(
+            "You are a principal code reviewer. Be precise, skeptical, and constructive. Prefer evidence-backed findings over style commentary.".to_string(),
+        )),
+        tools: Vec::new(),
+        max_tokens: opts
+            .mode
+            .max_output_tokens()
+            .min(ctx.config.effective_max_tokens()),
+        temperature: Some(0.1),
+        top_p: None,
+        top_k: None,
+        stop_sequences: Vec::new(),
+        thinking: if provider.capabilities().thinking {
+            opts.mode
+                .thinking_budget()
+                .map(mangocode_api::ThinkingConfig::enabled)
+        } else {
+            None
+        },
+        provider_options: serde_json::json!({}),
+    };
+
+    let review_response = match provider.create_message(review_request).await {
+        Ok(response) => response,
+        Err(e) => {
+            return CommandResult::Error(format!(
+                "Review failed with provider '{}' and model '{}': {}",
+                provider_id, model, e
+            ));
+        }
+    };
+
+    let review_text = match review_text_from_response(&review_response) {
+        Some(text) => text,
+        None => return CommandResult::Error("LLM returned an empty review.".to_string()),
+    };
+
+    let github_token = std::env::var("GITHUB_TOKEN").ok();
+    let mut github_post_result: Option<String> = None;
+
+    if opts.post_to_github && github_token.is_none() {
+        github_post_result =
+            Some("\n(GitHub posting skipped: GITHUB_TOKEN is not set.)".to_string());
+    }
+
+    if opts.post_to_github {
+        if let Some(ref token) = github_token {
+            let pr_number: Option<u64> = std::env::var("CLAUDE_PR_NUMBER")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .or_else(|| detect_pr_number_from_git(&repo_root));
+
+            if let Some(pr_num) = pr_number {
+                if let Some((owner, repo)) = detect_github_owner_repo(&repo_root) {
+                    let comment_body = format!(
+                        "## MangoCode Code Review\n\nMode: `{}`\nProvider: `{}`\nModel: `{}`\n\n{}\n\n---\n*Generated by MangoCode review mode*",
+                        opts.mode.as_str(),
+                        provider_id,
+                        model,
+                        review_text
+                    );
+
+                    let url = format!(
+                        "https://api.github.com/repos/{}/{}/issues/{}/comments",
+                        owner, repo, pr_num
+                    );
+
+                    let http = reqwest::Client::new();
+                    let post_result = http
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {}", token))
+                        .header("User-Agent", "mangocode/1.0")
+                        .header("Accept", "application/vnd.github+json")
+                        .json(&serde_json::json!({ "body": comment_body }))
+                        .send()
+                        .await;
+
+                    match post_result {
+                        Ok(resp) if resp.status().is_success() => {
+                            github_post_result = Some(format!(
+                                "\nPosted review comment to PR #{} ({}/{}).",
+                                pr_num, owner, repo
+                            ));
+                        }
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            let body = resp.text().await.unwrap_or_default();
+                            github_post_result =
+                                Some(format!("\nGitHub API returned {}: {}", status, body));
+                        }
+                        Err(e) => {
+                            github_post_result = Some(format!("\nFailed to post to GitHub: {}", e));
+                        }
+                    }
+                } else {
+                    github_post_result = Some(
+                        "\n(Could not detect GitHub owner/repo from git remote - review not posted.)"
+                            .to_string(),
+                    );
+                }
+            } else {
+                github_post_result = Some(
+                    "\n(GITHUB_TOKEN set but no PR number found. Set CLAUDE_PR_NUMBER=<n> to post the review.)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let mut output = format!(
+        "## Code Review\n\nMode: `{}`\nProvider: `{}`\nModel: `{}`\n\n{}\n\n{}",
+        opts.mode.as_str(),
+        provider_id,
+        model,
+        file_summary,
+        review_text
+    );
+
+    if let Some(ref note) = github_post_result {
+        output.push_str(note);
+    }
+
+    CommandResult::Message(output)
+}
+
 #[async_trait]
 impl SlashCommand for ReviewCommand {
     fn name(&self) -> &str {
         "review"
     }
     fn description(&self) -> &str {
-        "Review code changes via LLM and optionally post to GitHub PR"
+        "Run a structured code review over a git diff and optionally post it to GitHub"
     }
     fn help(&self) -> &str {
+        "Usage: /review [base-ref] [--mode MODE] [--focus a,b,c] [--model MODEL] [--provider ID] [--post|--no-post]\n\n\
+         Runs a high-signal review over `git diff <base>...HEAD` (or staged changes when no base\n\
+         is given, falling back to unstaged changes), then optionally posts the review to the\n\
+         associated GitHub PR.\n\n\
+         Review modes:\n\
+           quick         Fast pass for top bugs and regressions\n\
+           balanced      Default review across bugs, regressions, tests, and architecture\n\
+           deep          More exhaustive review with extra reasoning budget when supported\n\
+           security      Security-focused review\n\
+           architecture  Design and maintainability review\n\
+           testing       Regression and test-gap review\n\n\
+         GitHub posting requires:\n\
+           GITHUB_TOKEN      a personal access token with repo scope\n\
+           CLAUDE_PR_NUMBER  the PR number (kept for Claude-compatible workflows; auto-detected if absent)\n\n\
+         Examples:\n\
+           /review\n\
+           /review main --mode deep\n\
+           /review origin/main --focus bugs,regressions,tests\n\
+           /review --model openai/gpt-5 --mode architecture\n\
+           /review --provider openrouter --model anthropic/claude-sonnet-4 --mode security --no-post"
+        /*
+        if std::process::id() != 0 {
+            return "Usage: /review [base-ref] [--mode MODE] [--focus a,b,c] [--model MODEL] [--provider ID] [--post|--no-post]\n\n\
+             Runs a high-signal review over `git diff <base>...HEAD` (or staged changes when no base\n\
+             is given, falling back to unstaged changes), then optionally posts the review to the\n\
+             associated GitHub PR.\n\n\
+             Review modes:\n\
+               quick         Fast pass for top bugs and regressions\n\
+               balanced      Default review across bugs, regressions, tests, and architecture\n\
+               deep          More exhaustive review with extra reasoning budget when supported\n\
+               security      Security-focused review\n\
+               architecture  Design and maintainability review\n\
+               testing       Regression and test-gap review\n\n\
+             GitHub posting requires:\n\
+               GITHUB_TOKEN      a personal access token with repo scope\n\
+               CLAUDE_PR_NUMBER  the PR number (kept for Claude-compatible workflows; auto-detected if absent)\n\n\
+             Examples:\n\
+               /review\n\
+               /review main --mode deep\n\
+               /review origin/main --focus bugs,regressions,tests\n\
+               /review --model openai/gpt-5 --mode architecture\n\
+               /review --provider openrouter --model anthropic/claude-sonnet-4 --mode security --no-post";
+        }
+
         "Usage: /review [base-ref]\n\n\
          Runs `git diff <base>...HEAD` (or `git diff --cached` when no base is given),\n\
          sends the diff to the LLM for a structured review, then optionally posts the\n\
@@ -3532,9 +4354,16 @@ impl SlashCommand for ReviewCommand {
            /review            # diff of staged changes\n\
            /review main       # diff from main..HEAD\n\
            /review origin/main"
+        */
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        execute_review_command(args, ctx).await
+        /*
+        if std::process::id() != 0 {
+            return execute_review_command(args, ctx).await;
+        }
+
         let base = args.trim();
 
         // ------------------------------------------------------------------
@@ -3766,6 +4595,7 @@ impl SlashCommand for ReviewCommand {
         }
 
         CommandResult::Message(output)
+        */
     }
 }
 
@@ -10202,5 +11032,78 @@ mod tests {
                 "second value".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_review_args_supports_modes_and_overrides() {
+        let opts = parse_review_args(
+            "main --mode deep --focus bugs,tests --model openai/gpt-5 --no-post --max-diff-chars 200000",
+        )
+        .unwrap();
+        assert_eq!(opts.base_ref.as_deref(), Some("main"));
+        assert_eq!(opts.mode, ReviewMode::Deep);
+        assert_eq!(opts.focus, vec!["bugs".to_string(), "tests".to_string()]);
+        assert_eq!(opts.model_override.as_deref(), Some("openai/gpt-5"));
+        assert!(!opts.post_to_github);
+        assert_eq!(opts.max_diff_chars, 200_000);
+    }
+
+    #[test]
+    fn test_parse_review_args_rejects_unknown_flag() {
+        let err = parse_review_args("--wat").unwrap_err();
+        assert!(err.contains("Unknown flag"));
+    }
+
+    #[test]
+    fn test_summarize_review_diff_counts_changes() {
+        let diff = "\
+diff --git a/src/foo.rs b/src/foo.rs
+index 1111111..2222222 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,2 +1,3 @@
+-old_line();
++new_line();
++added_line();
+ keep_line();
+diff --git a/src/bar.rs b/src/bar.rs
+index 3333333..4444444 100644
+--- a/src/bar.rs
++++ b/src/bar.rs
+@@ -10,1 +10,0 @@
+-remove_me();
+";
+        let summary = summarize_review_diff(diff);
+        assert_eq!(summary.files.len(), 2);
+        assert_eq!(summary.total_additions, 2);
+        assert_eq!(summary.total_deletions, 2);
+        assert_eq!(summary.files[0].path, "src/foo.rs");
+        assert_eq!(summary.files[0].additions, 2);
+        assert_eq!(summary.files[0].deletions, 1);
+    }
+
+    #[test]
+    fn test_resolve_review_provider_and_model_prefers_configured_provider_for_slashy_models() {
+        let mut ctx = make_ctx();
+        ctx.config.provider = Some("openrouter".to_string());
+        ctx.config.model = Some("anthropic/claude-sonnet-4".to_string());
+
+        let opts = ReviewOptions::default();
+        let (provider, model) = resolve_review_provider_and_model(&opts, &ctx);
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_resolve_review_provider_and_model_honors_explicit_provider_prefix() {
+        let ctx = make_ctx();
+        let opts = ReviewOptions {
+            model_override: Some("openai/gpt-5".to_string()),
+            ..Default::default()
+        };
+
+        let (provider, model) = resolve_review_provider_and_model(&opts, &ctx);
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-5");
     }
 }
