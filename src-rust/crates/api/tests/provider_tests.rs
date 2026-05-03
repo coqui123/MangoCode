@@ -1,6 +1,7 @@
 //! Provider serialization/deserialization integration tests.
 
 use base64::Engine;
+use futures::StreamExt;
 use mangocode_api::provider::LlmProvider;
 use mangocode_api::provider_types::{ProviderRequest, StopReason, SystemPrompt};
 use mangocode_api::providers::openai_compat_providers;
@@ -72,6 +73,50 @@ async fn spawn_json_server(response_body: Value) -> (String, oneshot::Receiver<S
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
+        );
+
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+    });
+
+    (format!("http://{}", addr), rx)
+}
+
+async fn spawn_sse_server(response_body: String) -> (String, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept connection");
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut n = 0usize;
+
+        loop {
+            let read = stream
+                .read(&mut buf[n..])
+                .await
+                .expect("read request bytes");
+            if read == 0 {
+                break;
+            }
+            n += read;
+            if n >= 4 && buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let full_request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let _ = tx.send(full_request);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
         );
 
         stream
@@ -229,13 +274,42 @@ async fn ollama_provider_serializes_without_auth_header() {
     );
     assert_eq!(body_json["messages"][0]["role"], json!("system"));
     assert_eq!(body_json["messages"][1]["role"], json!("user"));
-    assert_eq!(body_json["reasoning_effort"], json!("low"));
-    assert_eq!(body_json["reasoning"]["effort"], json!("low"));
+    assert_eq!(body_json["enable_thinking"], json!(true));
+    assert_eq!(body_json["thinking_budget"], json!(128));
+    assert!(body_json.get("reasoning_effort").is_none());
+    assert!(body_json.get("reasoning").is_none());
     assert_eq!(parsed.stop_reason, StopReason::EndTurn);
     assert!(matches!(
         &parsed.content[0],
         ContentBlock::Text { text } if text.contains("Ollama mock")
     ));
+}
+
+#[tokio::test]
+async fn ollama_stream_parses_nested_message_content() {
+    let response_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"message\":{\"content\":\"Hello\"}}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"message\":{\"content\":\" world\"}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let (base_url, _req_rx) = spawn_sse_server(response_body.to_string()).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+    let mut stream = provider
+        .create_message_stream(base_request("SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"))
+        .await
+        .expect("create stream");
+
+    let mut text = String::new();
+    while let Some(event) = stream.next().await {
+        match event.expect("stream item") {
+            mangocode_api::StreamEvent::TextDelta { text: chunk, .. } => text.push_str(&chunk),
+            mangocode_api::StreamEvent::MessageStop => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(text, "Hello world");
 }
 
 #[tokio::test]

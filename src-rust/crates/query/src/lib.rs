@@ -19,6 +19,7 @@ pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
 pub mod memory_loader;
+pub mod ollama;
 pub mod proactive;
 pub mod session_memory;
 pub mod skill_prefetch;
@@ -66,6 +67,7 @@ use mangocode_tools::{Tool, ToolContext, ToolResult};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use crate::ollama::ensure_local_ollama_server;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -1626,6 +1628,9 @@ pub async fn run_query_loop(
                                 .get(&provider_id_str)
                                 .and_then(|c| c.api_base.clone());
 
+                            if provider_id_str == "ollama" {
+                                ensure_local_ollama_server();
+                            }
                             let provider = match provider_id_str.as_str() {
                                 "ollama" => openai_compat_providers::ollama(),
                                 "lmstudio" | "lm-studio" => openai_compat_providers::lm_studio(),
@@ -1761,7 +1766,10 @@ pub async fn run_query_loop(
                                                     .with_api_key(key),
                                                 "fireworks" => openai_compat_providers::fireworks()
                                                     .with_api_key(key),
-                                                "ollama" => openai_compat_providers::ollama(),
+                                                "ollama" => {
+                                                    ensure_local_ollama_server();
+                                                    openai_compat_providers::ollama()
+                                                }
                                                 "lmstudio" | "lm-studio" => {
                                                     openai_compat_providers::lm_studio()
                                                 }
@@ -1815,6 +1823,7 @@ pub async fn run_query_loop(
                     let overridden: Option<std::sync::Arc<dyn mangocode_api::LlmProvider>> =
                         match provider_id_str.as_str() {
                             "ollama" => Some({
+                                ensure_local_ollama_server();
                                 let p: std::sync::Arc<dyn mangocode_api::LlmProvider> =
                                     std::sync::Arc::new(
                                         mangocode_api::providers::openai_compat_providers::ollama()

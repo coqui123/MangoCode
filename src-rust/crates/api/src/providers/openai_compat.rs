@@ -265,15 +265,86 @@ impl OpenAiCompatProvider {
         lower.contains("thinking") || lower.contains("qwen3") || lower.contains("gpt-oss")
     }
 
+    fn ollama_model_uses_qwen_thinking(model: &str) -> bool {
+        model.to_ascii_lowercase().contains("qwen3")
+    }
+
+    fn extract_delta_text(delta: &Value) -> Option<String> {
+        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+            return Some(content.to_string());
+        }
+
+        if let Some(message) = delta.get("message") {
+            if let Some(content) = message.get("content") {
+                if let Some(text) = content.as_str() {
+                    return Some(text.to_string());
+                }
+                if let Some(parts) = content.as_array() {
+                    let mut result = String::new();
+                    for part in parts {
+                        if let Some(text) = part.as_str() {
+                            result.push_str(text);
+                        } else if let Some(text) = part
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                        {
+                            result.push_str(text);
+                        } else if let Some(subparts) = part.get("parts").and_then(|p| p.as_array()) {
+                            for subpart in subparts {
+                                if let Some(text) = subpart.as_str() {
+                                    result.push_str(text);
+                                } else if let Some(text) = subpart
+                                    .get("text")
+                                    .and_then(|t| t.as_str())
+                                {
+                                    result.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    if !result.is_empty() {
+                        return Some(result);
+                    }
+                }
+                if let Some(text) = content
+                    .get("parts")
+                    .and_then(|parts| parts.as_array())
+                    .and_then(|parts| {
+                        let mut buf = String::new();
+                        for part in parts {
+                            if let Some(text) = part.as_str() {
+                                buf.push_str(text);
+                            }
+                        }
+                        if buf.is_empty() {
+                            None
+                        } else {
+                            Some(buf)
+                        }
+                    })
+                {
+                    return Some(text);
+                }
+            }
+        }
+
+        None
+    }
+
     fn apply_thinking_config(&self, body: &mut Value, request: &ProviderRequest) {
         let Some(thinking) = &request.thinking else {
             return;
         };
 
         if self.id == ProviderId::OLLAMA && Self::ollama_model_supports_reasoning(&request.model) {
-            let effort = Self::ollama_reasoning_effort_from_budget(thinking.budget_tokens);
-            body["reasoning_effort"] = json!(effort);
-            body["reasoning"] = json!({ "effort": effort });
+            if Self::ollama_model_uses_qwen_thinking(&request.model) {
+                body["enable_thinking"] = json!(true);
+                body["thinking_budget"] = json!(thinking.budget_tokens);
+            } else {
+                let effort = Self::ollama_reasoning_effort_from_budget(thinking.budget_tokens);
+                body["reasoning_effort"] = json!(effort);
+                body["reasoning"] = json!({ "effort": effort });
+            }
         }
     }
 
@@ -733,11 +804,11 @@ impl LlmProvider for OpenAiCompatProvider {
                     }
 
                     // Text content delta
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
+                    if let Some(content) = Self::extract_delta_text(delta) {
                         if !content.is_empty() {
                             yield Ok(StreamEvent::TextDelta {
                                 index: 0,
-                                text: content.to_string(),
+                                text: content,
                             });
                         }
                     }

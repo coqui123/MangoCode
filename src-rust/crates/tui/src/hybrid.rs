@@ -64,6 +64,7 @@ pub struct HybridTerminal {
     screen_lines: HashMap<u16, (Line<'static>, Option<String>)>,
     expansion_fingerprint: u64,
     deferred_new_messages: bool,
+    last_terminal_size: Option<(u16, u16)>,
     restored: bool,
 }
 
@@ -89,6 +90,7 @@ impl HybridTerminal {
             screen_lines: HashMap::new(),
             expansion_fingerprint: expansion_fingerprint(app),
             deferred_new_messages: false,
+            last_terminal_size: None,
             restored: false,
         };
         terminal.render_live(app)?;
@@ -162,10 +164,21 @@ impl HybridTerminal {
             || (app.messages.is_empty() && self.printed_messages == 0)
         {
             self.render_fullscreen_app(app, cols, rows)?;
+            self.last_terminal_size = Some((cols, rows));
             return Ok(());
         }
         if self.overlay_active {
             self.leave_fullscreen(false)?;
+        }
+        if let Some((old_cols, old_rows)) = self.last_terminal_size {
+            if old_cols != cols || old_rows != rows {
+                self.clear_composer_area_at(old_rows, self.composer_height)?;
+                self.composer_buffer = None;
+                if old_rows != rows {
+                    self.reset_scroll_region()?;
+                    self.apply_scroll_region()?;
+                }
+            }
         }
         if self.deferred_new_messages && !app.is_streaming {
             self.deferred_new_messages = false;
@@ -202,6 +215,7 @@ impl HybridTerminal {
         self.flush_buffer_diff(top, &buffer, previous.as_ref())?;
         self.composer_buffer = Some(buffer);
         let (row, col) = composer_cursor(app, cols, top);
+        self.last_terminal_size = Some((cols, rows));
         queue!(self.stdout, MoveTo(col, row))?;
         self.stdout.flush()
     }
@@ -487,12 +501,27 @@ impl HybridTerminal {
             return Ok(());
         }
         let (_, rows) = terminal::size().unwrap_or((80, 24));
-        let top = rows.saturating_sub(self.composer_height);
-        for i in 0..self.composer_height {
+        self.clear_composer_area_at(rows, self.composer_height)
+    }
+
+    fn clear_composer_area_at(&mut self, rows: u16, composer_height: u16) -> io::Result<()> {
+        if composer_height == 0 {
+            return Ok(());
+        }
+        let top = rows.saturating_sub(composer_height);
+        let (_, current_rows) = terminal::size().unwrap_or((80, 24));
+        if top >= current_rows {
+            return Ok(());
+        }
+        for i in 0..composer_height {
+            let row = top.saturating_add(i);
+            if row >= current_rows {
+                break;
+            }
             queue_base_style(&mut self.stdout)?;
             queue!(
                 self.stdout,
-                MoveTo(0, top.saturating_add(i)),
+                MoveTo(0, row),
                 Clear(ClearType::CurrentLine)
             )?;
         }
