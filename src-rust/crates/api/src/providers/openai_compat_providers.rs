@@ -6,7 +6,12 @@
 // variable is absent or empty the provider is still constructed but
 // `health_check()` will return `ProviderStatus::Unavailable`.
 
+use std::fs;
+use std::path::PathBuf;
+
+use dirs;
 use mangocode_core::provider_id::ProviderId;
+use url::Url;
 
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
@@ -93,6 +98,64 @@ pub fn ollama_native_base_from_env() -> String {
     native_ollama_base_url(&host)
 }
 
+fn is_local_ollama_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    Url::parse(&with_scheme)
+        .ok()
+        .and_then(|url| url.host_str().map(|h| h == "127.0.0.1" || h == "localhost"))
+        .unwrap_or(false)
+}
+
+fn ollama_model_store_dir() -> Option<PathBuf> {
+    let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    if !is_local_ollama_host(&host) {
+        return None;
+    }
+
+    let mut path = dirs::home_dir()?;
+    path.push(".ollama");
+    path.push("models");
+    Some(path)
+}
+
+fn discover_installed_ollama_models_from_local_store() -> Vec<OllamaInstalledModel> {
+    let models_dir = match ollama_model_store_dir() {
+        Some(dir) => dir,
+        None => return Vec::new(),
+    };
+
+    let mut installed = Vec::new();
+    if let Ok(entries) = fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            installed.push(OllamaInstalledModel {
+                name,
+                modified_at: None,
+                size: None,
+                digest: None,
+                details: None,
+            });
+        }
+    }
+    installed
+}
+
 /// A single model installed on the local Ollama server, as returned by
 /// `GET /api/tags`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -123,15 +186,30 @@ pub struct OllamaModelDetails {
 struct OllamaTagsResponse {
     #[serde(default)]
     models: Vec<OllamaInstalledModel>,
+    #[serde(default)]
+    tags: Vec<OllamaInstalledModel>,
 }
 
 /// Parse a JSON body returned by `GET /api/tags` into a list of installed
-/// models. Returns an empty list when the body is not valid JSON or has no
-/// `models` field, so callers can treat it as "Ollama running but nothing
-/// installed".
+/// models. Supports the three common shapes observed from Ollama servers:
+/// 1) object with `models` array, 2) object with `tags` array, and
+/// 3) array of model objects.
+///
+/// Returns an empty list when the body is not valid JSON or contains no
+/// recognized model array.
 pub fn parse_ollama_tags_response(body: &str) -> Vec<OllamaInstalledModel> {
     serde_json::from_str::<OllamaTagsResponse>(body)
-        .map(|r| r.models)
+        .ok()
+        .and_then(|r| {
+            if !r.models.is_empty() {
+                Some(r.models)
+            } else if !r.tags.is_empty() {
+                Some(r.tags)
+            } else {
+                Some(Vec::new())
+            }
+        })
+        .or_else(|| serde_json::from_str::<Vec<OllamaInstalledModel>>(body).ok())
         .unwrap_or_default()
 }
 
@@ -181,7 +259,17 @@ pub async fn discover_installed_ollama_models(
         return Err(OllamaDiscoveryError::HttpStatus { status });
     }
     let body = resp.text().await.map_err(OllamaDiscoveryError::Body)?;
-    Ok(parse_ollama_tags_response(&body))
+    let installed = parse_ollama_tags_response(&body);
+    if !installed.is_empty() {
+        return Ok(installed);
+    }
+
+    let local = discover_installed_ollama_models_from_local_store();
+    if !local.is_empty() {
+        return Ok(local);
+    }
+
+    Ok(installed)
 }
 
 /// LM Studio — local OpenAI-compatible server.
@@ -717,5 +805,28 @@ mod tests {
         // Malformed bodies should fall back to an empty list rather than panic.
         assert!(parse_ollama_tags_response("not json").is_empty());
         assert!(parse_ollama_tags_response("").is_empty());
+    }
+
+    #[test]
+    fn parse_tags_response_handles_tags_field() {
+        let body = r#"{
+            "tags": [
+                { "name": "llama3.2:latest" }
+            ]
+        }"#;
+        let models = parse_ollama_tags_response(body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "llama3.2:latest");
+    }
+
+    #[test]
+    fn parse_tags_response_handles_array_directly() {
+        let body = r#"[
+            { "name": "qwen3:8b" },
+            { "name": "llama3.2:latest" }
+        ]"#;
+        let models = parse_ollama_tags_response(body);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[1].name, "llama3.2:latest");
     }
 }

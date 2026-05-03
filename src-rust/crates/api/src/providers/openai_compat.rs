@@ -25,6 +25,7 @@ use crate::provider_types::{
 
 // Re-use the message transformation helpers from openai.rs.
 use super::openai::OpenAiProvider;
+use super::openai_compat_providers::{discover_installed_ollama_models, ollama_native_base_from_env};
 use super::request_options::merge_openai_compatible_options;
 
 // ---------------------------------------------------------------------------
@@ -1313,6 +1314,27 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        if self.id == ProviderId::OLLAMA {
+            let base = ollama_native_base_from_env();
+            let installed = discover_installed_ollama_models(&base, std::time::Duration::from_secs(3)).await.map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Failed to discover local Ollama models: {}", e),
+                status: None,
+                body: None,
+            })?;
+            let provider_id = self.id.clone();
+            return Ok(installed
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: ModelId::new(m.name.clone()),
+                    provider_id: provider_id.clone(),
+                    name: m.name.clone(),
+                    context_window: 128_000,
+                    max_output_tokens: 16_384,
+                })
+                .collect());
+        }
+
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let builder = self.http_client.get(&url);
         let builder = self.apply_auth(builder);

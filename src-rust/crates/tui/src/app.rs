@@ -2026,6 +2026,16 @@ impl App {
         }
     }
 
+    fn active_model_picker_provider(&self) -> String {
+        if let Some(provider) = self.config.provider.as_deref() {
+            provider.to_string()
+        } else if let Some(provider) = Self::infer_provider_from_model(&self.model_name) {
+            provider
+        } else {
+            "anthropic".to_string()
+        }
+    }
+
     fn complete_existing_codex_oauth_connect(&mut self) {
         self.auth_store = mangocode_core::AuthStore::load();
         self.set_provider_default("openai-codex".to_string());
@@ -2135,7 +2145,7 @@ impl App {
                 true
             }
             "model" => {
-                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                let provider = self.active_model_picker_provider();
 
                 // Reload cache from disk in case the background models.dev fetch
                 // has written new data since we last opened the picker.
@@ -2150,7 +2160,7 @@ impl App {
                 // Get models from the registry (models.dev data); falls back to
                 // hardcoded when the registry has no data for this provider.
                 let models = crate::model_picker::models_for_provider_from_registry(
-                    provider,
+                    &provider,
                     &self.model_registry,
                 );
                 self.model_picker.set_models(models);
@@ -6204,6 +6214,16 @@ mod tests {
         assert!(!app.should_quit);
         assert!(app.intercept_slash_command("exit"));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_model_picker_infers_provider_from_model_name_when_unset() {
+        let mut config = Config::default();
+        config.model = Some("ollama/llama3.2".to_string());
+        let cost_tracker = mangocode_core::cost::CostTracker::new();
+        let app = App::new(config, cost_tracker);
+
+        assert_eq!(app.active_model_picker_provider(), "ollama");
     }
 
     #[test]
