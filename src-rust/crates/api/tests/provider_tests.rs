@@ -532,3 +532,175 @@ async fn openai_codex_oauth_serializes_image_inputs() {
         json!("Describe this image")
     );
 }
+
+#[tokio::test]
+async fn ollama_stream_extracts_inline_think_tags_as_reasoning() {
+    let response_body = concat!(
+        "data: {\"id\":\"o1\",\"model\":\"qwen3\",\"choices\":[{\"delta\":{\"content\":\"<think>secret\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\" reasoning</think>visible \"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, _req_rx) = spawn_sse_server(response_body.to_string()).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+    let mut stream = provider
+        .create_message_stream(base_request("qwen3:8b"))
+        .await
+        .expect("create stream");
+
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+    while let Some(event) = stream.next().await {
+        match event.expect("stream item") {
+            mangocode_api::StreamEvent::TextDelta { text, .. } => visible.push_str(&text),
+            mangocode_api::StreamEvent::ReasoningDelta {
+                reasoning: r, ..
+            } => reasoning.push_str(&r),
+            mangocode_api::StreamEvent::MessageStop => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        reasoning.contains("secret reasoning"),
+        "reasoning should contain stripped <think> contents, got {:?}",
+        reasoning
+    );
+    assert!(
+        visible.contains("visible") && visible.contains("answer"),
+        "visible text should contain post-</think> content, got {:?}",
+        visible
+    );
+    assert!(
+        !visible.contains("<think>") && !visible.contains("</think>"),
+        "raw think tags must not be forwarded to visible text, got {:?}",
+        visible
+    );
+}
+
+#[tokio::test]
+async fn ollama_stream_emits_message_start_before_first_chunk_parsed() {
+    // A stream that delivers only an SSE comment then a normal chunk; we
+    // assert that MessageStart is the very first event the consumer observes.
+    let response_body = concat!(
+        ": keep-alive\n\n",
+        "data: {\"id\":\"o1\",\"model\":\"qwen3\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, _req_rx) = spawn_sse_server(response_body.to_string()).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+    let mut stream = provider
+        .create_message_stream(base_request("qwen3:8b"))
+        .await
+        .expect("create stream");
+
+    let first = stream.next().await.expect("first event").expect("first ok");
+    assert!(
+        matches!(first, mangocode_api::StreamEvent::MessageStart { .. }),
+        "expected MessageStart as first event, got {:?}",
+        first
+    );
+}
+
+#[tokio::test]
+async fn ollama_stream_split_think_tag_across_chunks_is_handled() {
+    // `<think>` is split across SSE chunks at byte level — exercises the
+    // splitter's pending-buffer behaviour.
+    let response_body = concat!(
+        "data: {\"id\":\"o1\",\"choices\":[{\"delta\":{\"content\":\"<thi\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"nk>r1</think>v1\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (base_url, _req_rx) = spawn_sse_server(response_body.to_string()).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+    let mut stream = provider
+        .create_message_stream(base_request("qwen3:8b"))
+        .await
+        .expect("create stream");
+
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+    while let Some(event) = stream.next().await {
+        match event.expect("stream item") {
+            mangocode_api::StreamEvent::TextDelta { text, .. } => visible.push_str(&text),
+            mangocode_api::StreamEvent::ReasoningDelta { reasoning: r, .. } => {
+                reasoning.push_str(&r)
+            }
+            mangocode_api::StreamEvent::MessageStop => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reasoning, "r1");
+    assert_eq!(visible, "v1");
+}
+
+#[tokio::test]
+async fn ollama_drops_tools_for_unknown_model_to_avoid_stall() {
+    let response = json!({
+        "id": "chatcmpl-tool-gate",
+        "model": "tinyllama",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "ok" }
+        }]
+    });
+    let (base_url, req_rx) = spawn_json_server(response).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+
+    let mut req = base_request("tinyllama");
+    req.tools = vec![mangocode_core::types::ToolDefinition {
+        name: "get_weather".to_string(),
+        description: "fetch weather".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+    }];
+
+    provider
+        .create_message(req)
+        .await
+        .expect("ollama response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+    assert!(
+        body_json.get("tools").is_none(),
+        "tools should be dropped for unknown ollama model: {:?}",
+        body_json.get("tools")
+    );
+}
+
+#[tokio::test]
+async fn ollama_keeps_tools_for_known_model() {
+    let response = json!({
+        "id": "chatcmpl-tool-gate",
+        "model": "llama3.2",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": "ok" }
+        }]
+    });
+    let (base_url, req_rx) = spawn_json_server(response).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+
+    let mut req = base_request("llama3.2");
+    req.tools = vec![mangocode_core::types::ToolDefinition {
+        name: "get_weather".to_string(),
+        description: "fetch weather".to_string(),
+        input_schema: json!({"type":"object","properties":{}}),
+    }];
+
+    provider
+        .create_message(req)
+        .await
+        .expect("ollama response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+    assert!(
+        body_json.get("tools").is_some(),
+        "tools must still be sent to known tool-capable ollama model"
+    );
+}

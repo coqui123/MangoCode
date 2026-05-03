@@ -19,14 +19,45 @@ use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 pub fn ollama() -> OpenAiCompatProvider {
     let host =
         std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let base_url = format!("{}/v1", host.trim_end_matches('/'));
+    let base_url = normalize_ollama_base_url(&host);
     OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", base_url).with_quirks(ProviderQuirks {
         overflow_patterns: vec![
             "prompt too long".to_string(),
             "exceeded.*context length".to_string(),
         ],
+        // Ollama / Qwen-thinking models stream reasoning inline as `<think>...</think>`
+        // inside `delta.content`. The streaming parser strips the wrapper and
+        // forwards the inner text as ReasoningDelta events.
+        inline_think_tags: true,
         ..Default::default()
     })
+}
+
+/// Normalize a user-supplied `OLLAMA_HOST` value into a full
+/// `http(s)://host:port/v1` base URL.
+///
+/// Accepts:
+///   - Bare host:port              (e.g. `127.0.0.1:11434`)
+///   - With scheme                 (e.g. `http://127.0.0.1:11434`)
+///   - With trailing slash         (e.g. `http://127.0.0.1:11434/`)
+///   - Already-suffixed `/v1`      (e.g. `http://127.0.0.1:11434/v1`)
+///   - Already-suffixed `/v1/`     (e.g. `http://127.0.0.1:11434/v1/`)
+///
+/// Falls through to `format!("{host}/v1")` for exotic paths so reverse-proxy
+/// users can still mount Ollama under a custom prefix.
+pub(crate) fn normalize_ollama_base_url(host: &str) -> String {
+    let trimmed = host.trim();
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    let no_trail = with_scheme.trim_end_matches('/').to_string();
+    if no_trail.ends_with("/v1") {
+        no_trail
+    } else {
+        format!("{}/v1", no_trail)
+    }
 }
 
 /// LM Studio — local OpenAI-compatible server.
@@ -430,4 +461,53 @@ pub fn fireworks() -> OpenAiCompatProvider {
         "https://api.fireworks.ai/inference/v1",
     )
     .with_api_key(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ollama_base_url;
+
+    #[test]
+    fn normalize_ollama_accepts_bare_host_port() {
+        assert_eq!(
+            normalize_ollama_base_url("127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_accepts_full_http_url() {
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_strips_trailing_slash() {
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_does_not_double_v1_suffix() {
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            normalize_ollama_base_url("http://127.0.0.1:11434/v1/"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn normalize_ollama_keeps_https_scheme() {
+        assert_eq!(
+            normalize_ollama_base_url("https://ollama.example.com"),
+            "https://ollama.example.com/v1"
+        );
+    }
 }
