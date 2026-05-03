@@ -18,10 +18,11 @@ pub use openai_compat::OpenAiCompatProvider;
 
 pub mod openai_compat_providers;
 pub use openai_compat_providers::{
-    baseten, cerebras, deepinfra, deepseek, fireworks, friendli, groq, huggingface, llama_cpp,
-    lm_studio, mistral, moonshot, nebius, novita, nvidia, ollama, openrouter, ovhcloud, perplexity,
-    qwen, sambanova, scaleway, siliconflow, stepfun, together_ai, upstage, venice, vultr_ai, xai,
-    zhipu,
+    baseten, cerebras, deepinfra, deepseek, discover_installed_ollama_models, fireworks, friendli,
+    groq, huggingface, llama_cpp, lm_studio, mistral, moonshot, native_ollama_base_url, nebius,
+    novita, nvidia, ollama, ollama_native_base_from_env, openrouter, ovhcloud, parse_ollama_tags_response,
+    perplexity, qwen, sambanova, scaleway, siliconflow, stepfun, together_ai, upstage, venice,
+    vultr_ai, xai, zhipu, OllamaDiscoveryError, OllamaInstalledModel, OllamaModelDetails,
 };
 
 pub mod cohere;

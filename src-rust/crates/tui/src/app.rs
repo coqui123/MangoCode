@@ -5886,7 +5886,32 @@ impl App {
                     .provider
                     .clone()
                     .unwrap_or_else(|| "anthropic".to_string());
-                if let Some(ref registry) = self.provider_registry {
+
+                // Ollama: query the native `/api/tags` endpoint directly so the
+                // picker reflects models actually installed on the user's
+                // machine (rather than a static curated list). Any failure
+                // falls back to a static list with a diagnostic entry.
+                if provider_id_str == "ollama" {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    self.model_fetch_rx = Some(rx);
+                    self.model_picker.loading_models = true;
+                    let base = mangocode_api::ollama_native_base_from_env();
+                    tokio::spawn(async move {
+                        let timeout = std::time::Duration::from_secs(3);
+                        match mangocode_api::discover_installed_ollama_models(&base, timeout).await
+                        {
+                            Ok(installed) => {
+                                let entries =
+                                    crate::model_picker::ollama_entries_from_installed(&installed);
+                                let _ = tx.send(Ok(entries)).await;
+                            }
+                            Err(_) => {
+                                let entries = crate::model_picker::ollama_offline_entries();
+                                let _ = tx.send(Ok(entries)).await;
+                            }
+                        }
+                    });
+                } else if let Some(ref registry) = self.provider_registry {
                     let pid = mangocode_core::ProviderId::new(&provider_id_str);
                     if let Some(provider) = registry.get(&pid) {
                         let provider = provider.clone();
