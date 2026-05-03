@@ -591,6 +591,21 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("mistral", "Mistral", "local"),
             model_entry("codellama", "Code Llama", "local"),
             model_entry("gemma2", "Gemma 2", "local"),
+            model_entry(
+                "gemma4",
+                "Gemma 4",
+                "local — multimodal, native tool calling",
+            ),
+            model_entry(
+                "gemma4:e4b",
+                "Gemma 4 e4b",
+                "local — small variant, ~128K ctx",
+            ),
+            model_entry(
+                "gemma4:31b",
+                "Gemma 4 31B",
+                "local — workstation variant, ~256K ctx",
+            ),
             model_entry("phi3", "Phi-3", "local"),
             model_entry("qwen2.5", "Qwen 2.5", "local"),
         ],
@@ -1425,6 +1440,58 @@ mod tests {
         assert!(ids.contains(&"64500165/omnicoder-2-9b-Q4-K-M"));
         assert!(ids.contains(&"SimonPu/qwen3:4b-thinking-2507-q8_0"));
         assert!(ids.contains(&"nemotron-cascade-2:30b"));
+        // Gemma 4 family appears in the static fallback so users discover it
+        // even before the daemon answers /api/tags.
+        assert!(ids.contains(&"gemma4"));
+        assert!(ids.contains(&"gemma4:e4b"));
+        assert!(ids.contains(&"gemma4:31b"));
+    }
+
+    // Dynamic Ollama discovery — every Gemma 4 tag returned by /api/tags
+    // should be exposed with the `ollama/` prefix exactly as published, so
+    // `--model ollama/gemma4:e4b` resolves without further translation.
+    #[test]
+    fn ollama_dynamic_discovery_maps_gemma4_tags() {
+        let installed: Vec<mangocode_api::OllamaInstalledModel> = [
+            "gemma4:latest",
+            "gemma4:e2b",
+            "gemma4:e4b",
+            "gemma4:26b",
+            "gemma4:31b",
+            "gemma4:31b-cloud",
+        ]
+        .iter()
+        .map(|name| mangocode_api::OllamaInstalledModel {
+            name: (*name).to_string(),
+            modified_at: None,
+            size: None,
+            digest: None,
+            details: None,
+        })
+        .collect();
+        let entries = ollama_entries_from_installed(&installed);
+        let ids: Vec<&str> = entries.iter().map(|m| m.id.as_str()).collect();
+        for tag in [
+            "ollama/gemma4:latest",
+            "ollama/gemma4:e2b",
+            "ollama/gemma4:e4b",
+            "ollama/gemma4:26b",
+            "ollama/gemma4:31b",
+            "ollama/gemma4:31b-cloud",
+        ] {
+            assert!(ids.contains(&tag), "missing {tag}");
+        }
+    }
+
+    // Gemma 4 uses OpenAI-Harmony channel tokens, not Qwen `<think>` tags.
+    // The picker must not advertise effort controls for it because they
+    // would have no effect.
+    #[test]
+    fn gemma4_does_not_claim_effort_support() {
+        assert!(!model_supports_effort("gemma4"));
+        assert!(!model_supports_effort("gemma4:e4b"));
+        assert!(!model_supports_effort("ollama/gemma4:31b"));
+        assert!(!model_supports_max_effort("gemma4:31b"));
     }
 
     #[test]
