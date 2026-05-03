@@ -80,6 +80,208 @@ pub struct ProviderQuirks {
     /// that support it. When `Some(false)`, disable. `None` omits the param.
     /// For Qwen3.6-Plus, parallel_tool_calls is supported via OpenAI compat.
     pub parallel_tool_calls: Option<bool>,
+
+    /// When `true`, the provider may emit reasoning text wrapped in inline
+    /// `<think>...</think>` tags inside `delta.content`/`message.content`
+    /// rather than in a structured `reasoning_content` field. Common for
+    /// local Ollama / Qwen / DeepSeek-R1 distills served via the OpenAI
+    /// chat-completions adapter. When set, the streaming parser strips the
+    /// tags from visible text and re-emits the inner text as
+    /// `ReasoningDelta` events.
+    pub inline_think_tags: bool,
+}
+
+fn env_flag_truthy(v: &str) -> bool {
+    matches!(
+        v,
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+    )
+}
+
+/// Strip `<think>...</think>` blocks from a complete (non-streaming) text
+/// response. Returns `(visible_text, reasoning_text)`. Used to handle Ollama /
+/// Qwen-style providers that embed reasoning inline in `message.content`.
+pub(crate) fn strip_think_tags_complete(text: &str) -> (String, String) {
+    let mut splitter = ThinkTagSplitter::new();
+    let mut split = splitter.push(text);
+    let tail = splitter.flush();
+    split.visible.push_str(&tail.visible);
+    split.reasoning.push_str(&tail.reasoning);
+    (split.visible, split.reasoning)
+}
+
+// ---------------------------------------------------------------------------
+// Inline `<think>` tag extraction
+// ---------------------------------------------------------------------------
+
+/// Streaming-safe parser that extracts `<think>...</think>` reasoning blocks
+/// from a sequence of text fragments. Returns visible text and reasoning text
+/// separately so the caller can emit them as `TextDelta` and `ReasoningDelta`.
+///
+/// Handles tags split arbitrarily across chunks (e.g. `<thi` + `nk>`),
+/// nested-thinking is treated as flat (re-entry on `<think>` while already
+/// inside is folded back into reasoning), and partial tag prefixes at the end
+/// of a chunk are buffered until the next chunk arrives.
+#[derive(Debug, Default)]
+pub(crate) struct ThinkTagSplitter {
+    /// `true` while inside a `<think>...</think>` block.
+    inside: bool,
+    /// Pending bytes that might be the start of a tag — held until we either
+    /// see the rest of the tag or confirm it's literal content.
+    pending: String,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ThinkSplit {
+    pub visible: String,
+    pub reasoning: String,
+}
+
+impl ThinkTagSplitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed a chunk of text and produce visible+reasoning slices for it.
+    pub fn push(&mut self, fragment: &str) -> ThinkSplit {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(fragment);
+
+        let mut out = ThinkSplit::default();
+        let mut i = 0;
+        let bytes = buf.as_bytes();
+
+        while i < bytes.len() {
+            let rest = &buf[i..];
+            if !self.inside {
+                // Look for the next '<' that might start a tag.
+                if let Some(lt_off) = rest.find('<') {
+                    out.visible.push_str(&rest[..lt_off]);
+                    let tag_start = i + lt_off;
+                    let tag_rest = &buf[tag_start..];
+                    if let Some(rel_end) = tag_rest.find('>') {
+                        let full_tag = &tag_rest[..=rel_end];
+                        let trimmed = full_tag
+                            .trim_start_matches('<')
+                            .trim_end_matches('>')
+                            .trim();
+                        let lower = trimmed.to_ascii_lowercase();
+                        if lower == "think" || lower.starts_with("think ") {
+                            self.inside = true;
+                            i = tag_start + rel_end + 1;
+                            continue;
+                        } else {
+                            // Not a think open tag — pass through verbatim.
+                            out.visible.push_str(full_tag);
+                            i = tag_start + rel_end + 1;
+                            continue;
+                        }
+                    } else {
+                        // Tag may be split across chunks: only buffer if the
+                        // partial could plausibly become a `<think...>` open.
+                        if Self::could_be_think_open(tag_rest) {
+                            self.pending = tag_rest.to_string();
+                            return out;
+                        } else {
+                            out.visible.push_str(tag_rest);
+                            return out;
+                        }
+                    }
+                } else {
+                    out.visible.push_str(rest);
+                    return out;
+                }
+            } else {
+                // Inside a thinking block — consume up to `</think>`.
+                if let Some(close_off) = rest.to_ascii_lowercase().find("</think>") {
+                    out.reasoning.push_str(&rest[..close_off]);
+                    self.inside = false;
+                    i += close_off + "</think>".len();
+                    continue;
+                } else {
+                    // No full `</think>` in `rest`. Hold back the longest
+                    // suffix of `rest` that is a prefix of `</think>` so that
+                    // when more data arrives we can still match the closing
+                    // tag across the boundary. Anything before that suffix is
+                    // safe to emit as reasoning text.
+                    let hold_len = Self::longest_close_prefix_suffix(rest);
+                    let split_at = rest.len() - hold_len;
+                    let (emit, tail) = rest.split_at(split_at);
+                    out.reasoning.push_str(emit);
+                    if !tail.is_empty() {
+                        self.pending = tail.to_string();
+                    }
+                    return out;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Flush any pending bytes as visible/reasoning content (called on stream end).
+    pub fn flush(&mut self) -> ThinkSplit {
+        let mut out = ThinkSplit::default();
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            if self.inside {
+                out.reasoning.push_str(&pending);
+            } else {
+                out.visible.push_str(&pending);
+            }
+        }
+        out
+    }
+
+    /// Could `s` be the prefix of an opening `<think...>` tag?
+    fn could_be_think_open(s: &str) -> bool {
+        // Accept `<`, `<t`, `<th`, ... `<think`, `<think `.
+        let lower = s.to_ascii_lowercase();
+        let tgt = "<think";
+        if lower.len() <= tgt.len() {
+            tgt.starts_with(&lower)
+        } else {
+            // `<think` followed by space/attr characters before `>`.
+            lower.starts_with(tgt)
+                && !lower
+                    .chars()
+                    .nth(tgt.len())
+                    .map(|c| c.is_alphanumeric())
+                    .unwrap_or(false)
+        }
+    }
+
+    /// Could `s` be the prefix of a closing `</think>` tag?
+    fn could_be_think_close(s: &str) -> bool {
+        let lower = s.to_ascii_lowercase();
+        let tgt = "</think>";
+        if lower.len() <= tgt.len() {
+            tgt.starts_with(&lower)
+        } else {
+            false
+        }
+    }
+
+    /// Length of the longest suffix of `s` that is a prefix of `</think>`.
+    /// Used to know how many trailing bytes to hold back when we don't yet
+    /// have a full closing tag.
+    fn longest_close_prefix_suffix(s: &str) -> usize {
+        let close = "</think>";
+        let s_lower = s.to_ascii_lowercase();
+        let max = std::cmp::min(s.len(), close.len() - 1);
+        for n in (1..=max).rev() {
+            // n is the candidate suffix length in bytes; ensure it lands on a
+            // char boundary in the lowercased string and the original.
+            if !s.is_char_boundary(s.len() - n) {
+                continue;
+            }
+            let suf = &s_lower[s_lower.len() - n..];
+            if close.starts_with(suf) {
+                return n;
+            }
+        }
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +471,71 @@ impl OpenAiCompatProvider {
         model.to_ascii_lowercase().contains("qwen3")
     }
 
+    /// Returns `true` when an Ollama model is known to handle native
+    /// OpenAI-style `tools` arrays correctly. Models outside this list
+    /// frequently stall, hallucinate XML/plain-text "tool calls" inside
+    /// `<think>` blocks, or simply return empty content. We default to
+    /// gating tools off for unknown models so the TUI gets a usable reply
+    /// instead of an indefinite "Calling model..." spinner.
+    ///
+    /// The list intentionally covers only models that Ollama itself
+    /// documents as tool-capable. Set
+    /// `MANGOCODE_OLLAMA_FORCE_TOOLS=1` to bypass the gate.
+    fn ollama_model_supports_tools(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        const KNOWN_TOOL_FAMILIES: &[&str] = &[
+            "llama3.1",
+            "llama3.2",
+            "llama3.3",
+            "llama4",
+            "qwen2.5",
+            "qwen3",
+            "mistral-nemo",
+            "mistral-large",
+            "mixtral",
+            "command-r",
+            "firefunction",
+            "hermes3",
+            "granite",
+            "smollm2",
+            "gpt-oss",
+        ];
+        KNOWN_TOOL_FAMILIES
+            .iter()
+            .any(|family| lower.contains(family))
+    }
+
+    /// Apply Ollama-specific tool-gating rules. Returns the (possibly empty)
+    /// tools array that should actually be sent to the provider, plus a flag
+    /// indicating whether tools were dropped.
+    fn gated_tools_for_request(&self, request: &ProviderRequest, tools: Vec<Value>) -> Vec<Value> {
+        if tools.is_empty() {
+            return tools;
+        }
+        if self.id != ProviderId::OLLAMA {
+            return tools;
+        }
+        let force = std::env::var("MANGOCODE_OLLAMA_FORCE_TOOLS")
+            .ok()
+            .map(|v| env_flag_truthy(&v))
+            .unwrap_or(false);
+        if force {
+            return tools;
+        }
+        if Self::ollama_model_supports_tools(&request.model) {
+            return tools;
+        }
+        // Drop tools rather than send a request the model is likely to stall on.
+        // The query layer can still observe the warning via stderr.
+        eprintln!(
+            "[mangocode] warn: Ollama model '{}' is not in the known tool-capable list; \
+             dropping tools from request to avoid stalls. Override with \
+             MANGOCODE_OLLAMA_FORCE_TOOLS=1 if your custom Modelfile supports tools.",
+            request.model
+        );
+        Vec::new()
+    }
+
     fn extract_delta_text(delta: &Value) -> Option<String> {
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             return Some(content.to_string());
@@ -389,6 +656,7 @@ impl OpenAiCompatProvider {
 
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools = self.gated_tools_for_request(request, tools);
         let max_tokens = self
             .quirks
             .max_tokens_cap
@@ -508,7 +776,29 @@ impl OpenAiCompatProvider {
             body: Some(text.clone()),
         })?;
 
-        OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
+        let mut response = OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)?;
+
+        // Strip inline `<think>...</think>` tags from non-streaming text.
+        // We do not currently expose a separate reasoning field on
+        // ProviderResponse; dropping the wrapper is enough to keep the visible
+        // assistant text clean. The streaming path emits the inner text as
+        // ReasoningDelta events for the TUI.
+        let inline_think_tags = self.quirks.inline_think_tags || self.id == ProviderId::OLLAMA;
+        if inline_think_tags {
+            for block in response.content.iter_mut() {
+                if let ContentBlock::Text { text } = block {
+                    if text.contains("<think") {
+                        let (visible, _reasoning) = strip_think_tags_complete(text);
+                        *text = visible.trim_start_matches('\n').to_string();
+                    }
+                }
+            }
+            response
+                .content
+                .retain(|b| !matches!(b, ContentBlock::Text { text } if text.is_empty()));
+        }
+
+        Ok(response)
     }
 
     // -----------------------------------------------------------------------
@@ -521,6 +811,7 @@ impl OpenAiCompatProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools = self.gated_tools_for_request(request, tools);
         let max_tokens = self
             .quirks
             .max_tokens_cap
@@ -640,24 +931,29 @@ impl LlmProvider for OpenAiCompatProvider {
     {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
+        let request_model = request.model.clone();
         let reasoning_field = self.quirks.reasoning_field.clone();
+        let inline_think_tags =
+            self.quirks.inline_think_tags || self.id == ProviderId::OLLAMA;
         let dump_sse = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_SSE")
             .ok()
-            .map(|v| {
-                matches!(
-                    v.as_str(),
-                    "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-                )
-            })
+            .map(|v| env_flag_truthy(&v))
             .unwrap_or(false);
+        let debug_ollama = std::env::var("MANGOCODE_DEBUG_OLLAMA_STREAM")
+            .ok()
+            .map(|v| env_flag_truthy(&v))
+            .unwrap_or(false);
+        let idle_timeout_ms: u64 = std::env::var("MANGOCODE_OLLAMA_IDLE_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120_000);
 
         let s = stream! {
             let mut byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
 
-            let mut message_started = false;
             let mut message_id = String::from("unknown");
-            let mut model_name = String::new();
+            let mut think_splitter = ThinkTagSplitter::new();
             #[derive(Debug, Clone)]
             struct ToolCallBuf {
                 id: String,
@@ -668,7 +964,48 @@ impl LlmProvider for OpenAiCompatProvider {
             let mut tool_call_buffers: std::collections::HashMap<usize, ToolCallBuf> =
                 std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Emit an early MessageStart so the UI can show "model is alive"
+            // even when the provider buffers all reasoning in `<think>` tags
+            // before any visible content. We use placeholder id/model values;
+            // the TUI shows progress immediately and does not need to wait
+            // for the first JSON chunk to arrive.
+            yield Ok(StreamEvent::MessageStart {
+                id: message_id.clone(),
+                model: request_model.clone(),
+                usage: UsageInfo::default(),
+            });
+            // Open the default text content block up front so subsequent
+            // TextDelta / ReasoningDelta events have a parent.
+            yield Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Text { text: String::new() },
+            });
+
+            loop {
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_millis(idle_timeout_ms),
+                    byte_stream.next(),
+                )
+                .await;
+
+                let chunk_result = match next {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream idle for {}ms with no data — provider may be stalled. \
+                                 If using Ollama with a thinking model, try a larger num_ctx \
+                                 or set MANGOCODE_OLLAMA_IDLE_TIMEOUT_MS.",
+                                idle_timeout_ms
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
+
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -709,6 +1046,21 @@ impl LlmProvider for OpenAiCompatProvider {
                     };
 
                     if data == "[DONE]" {
+                        if inline_think_tags {
+                            let tail = think_splitter.flush();
+                            if !tail.reasoning.is_empty() {
+                                yield Ok(StreamEvent::ReasoningDelta {
+                                    index: 0,
+                                    reasoning: tail.reasoning,
+                                });
+                            }
+                            if !tail.visible.is_empty() {
+                                yield Ok(StreamEvent::TextDelta {
+                                    index: 0,
+                                    text: tail.visible,
+                                });
+                            }
+                        }
                         yield Ok(StreamEvent::MessageStop);
                         return;
                     }
@@ -720,6 +1072,11 @@ impl LlmProvider for OpenAiCompatProvider {
                         let truncated = if data.len() > MAX { &data[..MAX] } else { data };
                         trace!(target: "mangocode_api::providers::openai_compat::wire", sse_data = %truncated);
                     }
+                    if debug_ollama {
+                        const MAX: usize = 4096;
+                        let truncated = if data.len() > MAX { &data[..MAX] } else { data };
+                        eprintln!("[ollama stream] raw_chunk={}", truncated);
+                    }
 
                     let chunk_json: Value = match serde_json::from_str(data) {
                         Ok(v) => v,
@@ -729,23 +1086,14 @@ impl LlmProvider for OpenAiCompatProvider {
                         }
                     };
 
-                    if !message_started {
-                        if let Some(id) = chunk_json.get("id").and_then(|v| v.as_str()) {
+                    // First parsed chunk: capture provider-supplied id so any
+                    // synthetic tool-call ids reference it. We do not re-emit
+                    // MessageStart because we already emitted one before the
+                    // first chunk.
+                    if let Some(id) = chunk_json.get("id").and_then(|v| v.as_str()) {
+                        if id != message_id {
                             message_id = id.to_string();
                         }
-                        if let Some(m) = chunk_json.get("model").and_then(|v| v.as_str()) {
-                            model_name = m.to_string();
-                        }
-                        yield Ok(StreamEvent::MessageStart {
-                            id: message_id.clone(),
-                            model: model_name.clone(),
-                            usage: UsageInfo::default(),
-                        });
-                        yield Ok(StreamEvent::ContentBlockStart {
-                            index: 0,
-                            content_block: ContentBlock::Text { text: String::new() },
-                        });
-                        message_started = true;
                     }
 
                     let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
@@ -806,10 +1154,38 @@ impl LlmProvider for OpenAiCompatProvider {
                     // Text content delta
                     if let Some(content) = Self::extract_delta_text(delta) {
                         if !content.is_empty() {
-                            yield Ok(StreamEvent::TextDelta {
-                                index: 0,
-                                text: content,
-                            });
+                            if inline_think_tags {
+                                let split = think_splitter.push(&content);
+                                if !split.reasoning.is_empty() {
+                                    if debug_ollama {
+                                        eprintln!(
+                                            "[ollama stream] classified=reasoning bytes={}",
+                                            split.reasoning.len()
+                                        );
+                                    }
+                                    yield Ok(StreamEvent::ReasoningDelta {
+                                        index: 0,
+                                        reasoning: split.reasoning,
+                                    });
+                                }
+                                if !split.visible.is_empty() {
+                                    if debug_ollama {
+                                        eprintln!(
+                                            "[ollama stream] classified=visible bytes={}",
+                                            split.visible.len()
+                                        );
+                                    }
+                                    yield Ok(StreamEvent::TextDelta {
+                                        index: 0,
+                                        text: split.visible,
+                                    });
+                                }
+                            } else {
+                                yield Ok(StreamEvent::TextDelta {
+                                    index: 0,
+                                    text: content,
+                                });
+                            }
                         }
                     }
 
@@ -913,9 +1289,23 @@ impl LlmProvider for OpenAiCompatProvider {
                 }
             }
 
-            if message_started {
-                yield Ok(StreamEvent::MessageStop);
+            if inline_think_tags {
+                let tail = think_splitter.flush();
+                if !tail.reasoning.is_empty() {
+                    yield Ok(StreamEvent::ReasoningDelta {
+                        index: 0,
+                        reasoning: tail.reasoning,
+                    });
+                }
+                if !tail.visible.is_empty() {
+                    yield Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: tail.visible,
+                    });
+                }
             }
+            // We always emit MessageStart up front, so always close.
+            yield Ok(StreamEvent::MessageStop);
         };
 
         Ok(Box::pin(s))
@@ -1121,5 +1511,144 @@ mod tests {
 
         assert!(provider.has_no_key());
         assert!(!provider.allows_missing_api_key());
+    }
+
+    // -----------------------------------------------------------------------
+    // ThinkTagSplitter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn think_splitter_extracts_complete_block_in_one_chunk() {
+        let mut s = ThinkTagSplitter::new();
+        let r = s.push("<think>weighing options</think>here is the answer");
+        assert_eq!(r.reasoning, "weighing options");
+        assert_eq!(r.visible, "here is the answer");
+        let tail = s.flush();
+        assert!(tail.reasoning.is_empty());
+        assert!(tail.visible.is_empty());
+    }
+
+    #[test]
+    fn think_splitter_handles_open_tag_split_across_chunks() {
+        let mut s = ThinkTagSplitter::new();
+        let a = s.push("Hi <thi");
+        assert_eq!(a.visible, "Hi ");
+        assert!(a.reasoning.is_empty());
+        let b = s.push("nk>secret</think>visible");
+        assert_eq!(b.reasoning, "secret");
+        assert_eq!(b.visible, "visible");
+    }
+
+    #[test]
+    fn think_splitter_handles_close_tag_split_across_chunks() {
+        let mut s = ThinkTagSplitter::new();
+        let a = s.push("<think>thinking part</thi");
+        assert_eq!(a.reasoning, "thinking part");
+        assert!(a.visible.is_empty());
+        let b = s.push("nk>final answer");
+        assert_eq!(b.visible, "final answer");
+        assert!(b.reasoning.is_empty());
+    }
+
+    #[test]
+    fn think_splitter_emits_visible_after_close_tag() {
+        let mut s = ThinkTagSplitter::new();
+        let r = s.push("<think>r</think>visible-only");
+        assert_eq!(r.visible, "visible-only");
+    }
+
+    #[test]
+    fn think_splitter_passes_through_text_with_no_tags() {
+        let mut s = ThinkTagSplitter::new();
+        let r = s.push("plain assistant text");
+        assert_eq!(r.visible, "plain assistant text");
+        assert!(r.reasoning.is_empty());
+    }
+
+    #[test]
+    fn think_splitter_does_not_swallow_unrelated_lt() {
+        let mut s = ThinkTagSplitter::new();
+        let r = s.push("if x < y then\n");
+        assert_eq!(r.visible, "if x < y then\n");
+        assert!(r.reasoning.is_empty());
+    }
+
+    #[test]
+    fn think_splitter_keeps_non_think_xml_tags() {
+        let mut s = ThinkTagSplitter::new();
+        let r = s.push("<b>bold</b>");
+        // Non-think tags are preserved as visible text.
+        assert!(r.visible.contains("<b>"));
+        assert!(r.visible.contains("</b>"));
+        assert_eq!(r.reasoning, "");
+    }
+
+    #[test]
+    fn think_splitter_byte_by_byte_open_split() {
+        let mut s = ThinkTagSplitter::new();
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for ch in "<think>r</think>v".chars() {
+            let r = s.push(&ch.to_string());
+            visible.push_str(&r.visible);
+            reasoning.push_str(&r.reasoning);
+        }
+        let tail = s.flush();
+        visible.push_str(&tail.visible);
+        reasoning.push_str(&tail.reasoning);
+        assert_eq!(reasoning, "r");
+        assert_eq!(visible, "v");
+    }
+
+    #[test]
+    fn think_splitter_flushes_unterminated_block_as_reasoning() {
+        let mut s = ThinkTagSplitter::new();
+        // Force the splitter into a pending state with a partial close tag,
+        // then flush — the held-back bytes should surface as reasoning.
+        let r1 = s.push("<think>more </thi");
+        assert_eq!(r1.reasoning, "more ");
+        let tail = s.flush();
+        assert_eq!(tail.reasoning, "</thi");
+        assert!(tail.visible.is_empty());
+    }
+
+    #[test]
+    fn strip_think_tags_complete_strips_inline_block() {
+        let (visible, reasoning) =
+            strip_think_tags_complete("<think>scratch</think>\n\nfinal answer");
+        assert_eq!(reasoning, "scratch");
+        assert!(visible.contains("final answer"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Ollama tool gating
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ollama_tool_gate_recognizes_known_models() {
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools("llama3.2"));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools("qwen2.5:14b"));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools(
+            "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"
+        ));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools("gpt-oss:20b"));
+    }
+
+    #[test]
+    fn ollama_tool_gate_rejects_unknown_models() {
+        assert!(!OpenAiCompatProvider::ollama_model_supports_tools("phi3"));
+        assert!(!OpenAiCompatProvider::ollama_model_supports_tools(
+            "tinyllama"
+        ));
+    }
+
+    #[test]
+    fn env_flag_truthy_recognises_common_truthy_strings() {
+        for v in ["1", "true", "TRUE", "on", "yes"] {
+            assert!(env_flag_truthy(v), "{} should be truthy", v);
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!env_flag_truthy(v), "{} should be falsy", v);
+        }
     }
 }

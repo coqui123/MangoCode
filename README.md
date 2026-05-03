@@ -138,6 +138,65 @@ cargo run -p mangocode -- --provider google --model gemini-2.5-pro
 cargo run -p mangocode -- --provider ollama --model ollama/llama3.2
 ```
 
+### Ollama Notes And Troubleshooting
+
+MangoCode talks to Ollama via its OpenAI-compatible `/v1/chat/completions`
+endpoint. This works with both vanilla and "thinking" models, but a few
+behaviours are worth knowing.
+
+**Inline `<think>` reasoning.** Local thinking models (Qwen3 / DeepSeek-R1
+distills / `gpt-oss:20b` / Modelfiles tagged `Thinking`) typically stream
+their chain-of-thought wrapped inline as `<think>...</think>` inside
+`delta.content` rather than in a separate `reasoning_content` field. MangoCode
+strips those wrappers automatically: the inner text is forwarded as
+reasoning/progress events so the TUI no longer freezes on a "Calling model..."
+spinner while the model is thinking, and the final visible answer (the text
+after `</think>`) is emitted as normal assistant content.
+
+**Tool calling.** Not every Ollama model handles native OpenAI-style `tools`
+arrays. MangoCode keeps a curated allowlist of known-good families
+(`llama3.x`, `llama4`, `qwen2.5`, `qwen3`, `mistral-nemo`, `mistral-large`,
+`mixtral`, `command-r`, `firefunction`, `hermes3`, `granite`, `smollm2`,
+`gpt-oss`) and silently drops the `tools` array for any other model so the
+request does not stall. If you have a custom Modelfile that genuinely
+supports tools, set `MANGOCODE_OLLAMA_FORCE_TOOLS=1` to bypass the gate.
+
+**Autostart.** When `OLLAMA_HOST` is unset and port `11434` is free,
+MangoCode runs `ollama serve` to start a local daemon. The listen address
+is governed entirely by `OLLAMA_HOST` (or the daemon default
+`127.0.0.1:11434`); MangoCode does **not** pass `--port` to `ollama serve`
+because no released `ollama` build accepts that flag.
+
+**Quick connectivity checks.** If the TUI hangs on a model request, first
+verify the daemon directly:
+
+```bash
+# Basic reachability
+curl http://127.0.0.1:11434/api/tags
+
+# OpenAI-compatible streaming smoke test
+curl -N http://127.0.0.1:11434/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3:8b","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+If either request succeeds but MangoCode still hangs, run with the debug
+flag to see how each chunk is classified:
+
+```bash
+MANGOCODE_DEBUG_OLLAMA_STREAM=1 cargo run -p mangocode -- --provider ollama --model qwen3:8b
+```
+
+**`OLLAMA_HOST` accepts** bare `host:port` (`127.0.0.1:11434`), full URLs
+(`http://127.0.0.1:11434`), or pre-suffixed (`http://127.0.0.1:11434/v1`) —
+they all normalise to the same base URL.
+
+**Stalled-stream timeout.** If no data arrives from the model for 120 s
+MangoCode aborts the request with a clear error rather than hanging
+indefinitely. Override with `MANGOCODE_OLLAMA_IDLE_TIMEOUT_MS=300000` for
+slow first-token times on under-resourced machines, or pull a Modelfile
+with a larger `num_ctx` if the model is paging.
+
 ### Google Vertex (ADC) Auth Flow
 
 Use this flow for Vertex-hosted Gemini models via Application Default Credentials.
