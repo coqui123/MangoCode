@@ -3,6 +3,7 @@
 use base64::Engine;
 use mangocode_api::provider::LlmProvider;
 use mangocode_api::provider_types::{ProviderRequest, StopReason, SystemPrompt};
+use mangocode_api::providers::openai_compat_providers;
 use mangocode_api::providers::OpenAiCodexProvider;
 use mangocode_api::{GoogleProvider, OpenAiProvider, ThinkingConfig};
 use mangocode_core::types::{ContentBlock, ImageSource, Message};
@@ -181,6 +182,92 @@ async fn google_provider_serializes_and_deserializes() {
         &parsed.content[0],
         ContentBlock::Text { text } if text.contains("Google mock")
     ));
+}
+
+#[tokio::test]
+async fn ollama_provider_serializes_without_auth_header() {
+    let response = json!({
+        "id": "chatcmpl-ollama-test-1",
+        "model": "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": "Hello from Ollama mock"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14
+        }
+    });
+
+    let (base_url, req_rx) = spawn_json_server(response).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+
+    let parsed = provider
+        .create_message(base_request("SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"))
+        .await
+        .expect("ollama response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let request_line = raw.lines().next().expect("request line");
+    assert!(request_line.contains("/v1/chat/completions"));
+    assert!(
+        !raw.to_ascii_lowercase().contains("authorization: bearer"),
+        "ollama requests should not include bearer auth by default"
+    );
+
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+
+    assert_eq!(
+        body_json["model"],
+        json!("SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL")
+    );
+    assert_eq!(body_json["messages"][0]["role"], json!("system"));
+    assert_eq!(body_json["messages"][1]["role"], json!("user"));
+    assert_eq!(body_json["reasoning_effort"], json!("low"));
+    assert_eq!(body_json["reasoning"]["effort"], json!("low"));
+    assert_eq!(parsed.stop_reason, StopReason::EndTurn);
+    assert!(matches!(
+        &parsed.content[0],
+        ContentBlock::Text { text } if text.contains("Ollama mock")
+    ));
+}
+
+#[tokio::test]
+async fn ollama_provider_omits_reasoning_for_non_thinking_models() {
+    let response = json!({
+        "id": "chatcmpl-ollama-test-2",
+        "model": "llama3.2",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": "Hello from non-thinking Ollama mock"
+            }
+        }]
+    });
+
+    let (base_url, req_rx) = spawn_json_server(response).await;
+    let provider = openai_compat_providers::ollama().with_base_url(format!("{}/v1", base_url));
+
+    provider
+        .create_message(base_request("llama3.2"))
+        .await
+        .expect("ollama response parsed");
+
+    let raw = req_rx.await.expect("captured request");
+    let body = raw.split("\r\n\r\n").nth(1).expect("request body present");
+    let body_json: Value = serde_json::from_str(body).expect("json request body");
+
+    assert_eq!(body_json["model"], json!("llama3.2"));
+    assert!(body_json.get("reasoning_effort").is_none());
+    assert!(body_json.get("reasoning").is_none());
 }
 
 #[tokio::test]

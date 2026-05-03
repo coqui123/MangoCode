@@ -148,9 +148,19 @@ fn is_pid_alive(pid: u64) -> bool {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{}", pid)).exists()
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        false
     }
 }
 

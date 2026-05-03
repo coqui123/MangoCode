@@ -153,6 +153,23 @@ impl OpenAiCompatProvider {
         self.api_key.is_none()
     }
 
+    /// Returns `true` when the provider is expected to work without a key.
+    ///
+    /// This is based primarily on the provider ID so custom local hostnames
+    /// such as `host.docker.internal` still count as valid keyless backends.
+    fn allows_missing_api_key(&self) -> bool {
+        matches!(
+            &*self.id,
+            ProviderId::OLLAMA
+                | ProviderId::LM_STUDIO
+                | ProviderId::LLAMA_CPP
+                | "vllm"
+                | "llama-server"
+        ) || self.base_url.contains("localhost")
+            || self.base_url.contains("127.0.0.1")
+            || self.base_url.contains("::1")
+    }
+
     /// Scrub a tool-call ID according to the configured quirks.
     fn scrub_tool_id(&self, id: &str) -> String {
         let mut s = id.to_string();
@@ -234,6 +251,32 @@ impl OpenAiCompatProvider {
         request.temperature.or(self.quirks.default_temperature)
     }
 
+    fn ollama_reasoning_effort_from_budget(budget_tokens: u32) -> &'static str {
+        match budget_tokens {
+            0 => "none",
+            1..=1024 => "low",
+            1025..=4096 => "medium",
+            _ => "high",
+        }
+    }
+
+    fn ollama_model_supports_reasoning(model: &str) -> bool {
+        let lower = model.to_ascii_lowercase();
+        lower.contains("thinking") || lower.contains("qwen3") || lower.contains("gpt-oss")
+    }
+
+    fn apply_thinking_config(&self, body: &mut Value, request: &ProviderRequest) {
+        let Some(thinking) = &request.thinking else {
+            return;
+        };
+
+        if self.id == ProviderId::OLLAMA && Self::ollama_model_supports_reasoning(&request.model) {
+            let effort = Self::ollama_reasoning_effort_from_budget(thinking.budget_tokens);
+            body["reasoning_effort"] = json!(effort);
+            body["reasoning"] = json!({ "effort": effort });
+        }
+    }
+
     /// Attach the authorization header if an API key is configured.
     fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(key) = &self.api_key {
@@ -300,6 +343,7 @@ impl OpenAiCompatProvider {
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
         }
+        self.apply_thinking_config(&mut body, request);
         // Qwen-specific: preserve_thinking keeps reasoning traces across turns.
         // Only inject when the quirk is explicitly enabled (set by query layer
         // via build_provider_options based on session heuristics).
@@ -435,6 +479,7 @@ impl OpenAiCompatProvider {
         if !request.stop_sequences.is_empty() {
             body["stop"] = json!(request.stop_sequences);
         }
+        self.apply_thinking_config(&mut body, request);
         // Qwen-specific: preserve_thinking keeps reasoning traces across turns.
         if self.quirks.preserve_thinking {
             body["preserve_thinking"] = json!(true);
@@ -660,7 +705,7 @@ impl LlmProvider for OpenAiCompatProvider {
                     // Check provider-specific field first, then common aliases.
                     {
                         const COMMON_REASONING_FIELDS: &[&str] =
-                            &["reasoning_content", "reasoning_text", "reasoning"];
+                            &["reasoning_content", "reasoning_text", "reasoning", "thinking"];
 
                         let fields_to_check: Vec<&str> = if let Some(ref f) = reasoning_field {
                             let mut v = vec![f.as_str()];
@@ -863,21 +908,10 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         // Providers that need an API key but have none configured are
         // immediately unavailable without making a network call.
-        if self.has_no_key() {
-            // Local providers (Ollama, LM Studio, llama.cpp) have no key by
-            // design.  For remote providers the key will be None only if the
-            // env var was missing or empty; report that clearly.
-            //
-            // We distinguish by whether the base_url is a localhost address.
-            let is_local = self.base_url.contains("localhost")
-                || self.base_url.contains("127.0.0.1")
-                || self.base_url.contains("::1");
-
-            if !is_local {
-                return Ok(ProviderStatus::Unavailable {
-                    reason: "No API key configured".to_string(),
-                });
-            }
+        if self.has_no_key() && !self.allows_missing_api_key() {
+            return Ok(ProviderStatus::Unavailable {
+                reason: "No API key configured".to_string(),
+            });
         }
 
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
@@ -900,7 +934,7 @@ impl LlmProvider for OpenAiCompatProvider {
         ProviderCapabilities {
             streaming: true,
             tool_calling: true,
-            thinking: self.quirks.reasoning_field.is_some(),
+            thinking: self.quirks.reasoning_field.is_some() || self.id == ProviderId::OLLAMA,
             // OpenAI-compatible gateways host a mix of text-only and
             // multimodal models. Provider-level capability is conservative;
             // Smart Attachments uses provider+model heuristics for routing.
@@ -945,5 +979,76 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn local_provider_ids_allow_missing_api_key_even_with_custom_hostnames() {
+        let provider = OpenAiCompatProvider::new(
+            ProviderId::OLLAMA,
+            "Ollama",
+            "http://host.docker.internal:11434/v1",
+        );
+
+        assert!(provider.has_no_key());
+        assert!(provider.allows_missing_api_key());
+    }
+
+    #[test]
+    fn ollama_reasoning_effort_tracks_thinking_budget() {
+        assert_eq!(
+            OpenAiCompatProvider::ollama_reasoning_effort_from_budget(0),
+            "none"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::ollama_reasoning_effort_from_budget(128),
+            "low"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::ollama_reasoning_effort_from_budget(4096),
+            "medium"
+        );
+        assert_eq!(
+            OpenAiCompatProvider::ollama_reasoning_effort_from_budget(8192),
+            "high"
+        );
+    }
+
+    #[test]
+    fn ollama_reasoning_controls_only_target_thinking_models() {
+        assert!(OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"
+        ));
+        assert!(OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "batiai/qwen3.5-9b"
+        ));
+        assert!(OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "gpt-oss:20b"
+        ));
+        assert!(!OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "llama3.2"
+        ));
+        assert!(!OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "mistral"
+        ));
+    }
+
+    #[test]
+    fn ollama_reports_thinking_capability() {
+        let provider =
+            OpenAiCompatProvider::new(ProviderId::OLLAMA, "Ollama", "http://localhost:11434/v1");
+
+        assert!(provider.capabilities().thinking);
+    }
+
+    #[test]
+    fn unknown_remote_provider_without_key_requires_auth() {
+        let provider = OpenAiCompatProvider::new(
+            "custom-compat",
+            "Custom Compat",
+            "https://api.example.com/v1",
+        );
+
+        assert!(provider.has_no_key());
+        assert!(!provider.allows_missing_api_key());
     }
 }

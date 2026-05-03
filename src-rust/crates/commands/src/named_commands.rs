@@ -248,7 +248,11 @@ fn supported_vault_provider_rows() -> &'static [(&'static str, &'static str, &'s
         ("qwen", "DASHSCOPE_API_KEY", "Alias: alibaba"),
         ("mistral", "MISTRAL_API_KEY", ""),
         ("sambanova", "SAMBANOVA_API_KEY", ""),
-        ("huggingface", "HF_TOKEN", ""),
+        (
+            "huggingface",
+            "HF_TOKEN or HUGGINGFACE_HUB_TOKEN",
+            "OpenAI-compatible chat router",
+        ),
         ("nvidia", "NVIDIA_API_KEY", ""),
         ("siliconflow", "SILICONFLOW_API_KEY", ""),
         ("moonshotai", "MOONSHOT_API_KEY", "Alias: moonshot"),

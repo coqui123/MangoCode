@@ -6,9 +6,9 @@
 //
 // Platform notes
 // ──────────────
-//  Unix  → portable_pty (native openpty)
-//  Windows → falls back to the existing cmd.exe approach; ConPTY is available
-//             in portable_pty but adds complexity for minimal gain on Windows.
+//  Unix    -> portable_pty (native openpty)
+//  Windows -> prefer Git Bash for shell-state parity; fall back to cmd.exe
+//             when bash is unavailable on the host.
 
 use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{session_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
@@ -24,16 +24,16 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::debug;
 
-// Unix-only imports used by the shell-state helpers and PTY execution path.
-#[cfg(unix)]
+// Imports used by the shell-state helpers and Bash wrapper script.
+#[cfg(any(unix, windows))]
 use crate::ShellState;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use regex::Regex;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::HashMap;
 
-/// Sentinel appended to the shell wrapper script (Unix only).
-#[cfg(unix)]
+/// Sentinel appended to the shell wrapper script.
+#[cfg(any(unix, windows))]
 const SHELL_STATE_SENTINEL: &str = "__CC_SHELL_STATE__";
 
 pub struct PtyBashTool;
@@ -56,10 +56,10 @@ fn default_timeout() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Shell state helpers — Unix only (used by the PTY wrapper script)
+// Shell state helpers (used by Unix PTY and Windows Bash wrapper scripts)
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String, String>)> {
     let mut iter = lines.iter();
     let cwd_line = iter.next()?;
@@ -75,6 +75,7 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
             let key = line[..eq].to_string();
             let val = line[eq + 1..].to_string();
             if !key.starts_with('_')
+                && !key.starts_with('=')
                 && ![
                     "SHLVL",
                     "BASH_LINENO",
@@ -93,7 +94,7 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
     Some((cwd, env_vars))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
     let re =
         Regex::new(r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#)
@@ -113,10 +114,126 @@ fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
     map
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn path_to_bash_literal(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy().replace('\\', "/");
+        windows_path_to_bash_path(&raw).unwrap_or(raw)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn windows_path_to_bash_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return None;
+    }
+    if bytes[2] != b'\\' && bytes[2] != b'/' {
+        return None;
+    }
+
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = path[3..].replace('\\', "/");
+    Some(format!("/{}/{}", drive, rest.trim_start_matches('/')))
+}
+
+#[cfg(windows)]
+fn windows_has_bash() -> bool {
+    which::which("bash").is_ok()
+}
+
+#[cfg(windows)]
+fn escape_for_cmd_assignment(value: &str) -> String {
+    value
+        .replace('^', "^^")
+        .replace('%', "%%")
+        .replace('"', "^\"")
+}
+
+#[cfg(windows)]
+fn build_cmd_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -> String {
+    let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
+    let cwd_escaped = escape_for_cmd_assignment(effective_cwd.to_string_lossy().as_ref());
+
+    let mut set_lines = String::new();
+    for (k, v) in &state.env_vars {
+        let v_escaped = escape_for_cmd_assignment(v);
+        set_lines.push_str(&format!("set \"{}={}\"\r\n", k, v_escaped));
+    }
+
+    format!(
+        r#"@echo off
+cd /d "{cwd}"
+{sets}{user_cmd}
+set "__CC_EXIT_CODE=%ERRORLEVEL%"
+echo {sentinel}
+cd
+set
+exit /b %__CC_EXIT_CODE%
+"#,
+        cwd = cwd_escaped,
+        sets = set_lines,
+        user_cmd = command,
+        sentinel = SHELL_STATE_SENTINEL,
+    )
+}
+
+#[cfg(windows)]
+fn normalize_windows_paths_for_bash(command: &str) -> String {
+    let double_quoted_re = Regex::new(r#""(?P<path>[A-Za-z]:[\\/][^"]*)""#)
+        .expect("Double-quoted Windows path regex must compile");
+    let command = double_quoted_re
+        .replace_all(command, |caps: &regex::Captures<'_>| {
+            format!(
+                r#""{}""#,
+                windows_path_to_bash_path(&caps["path"])
+                    .unwrap_or_else(|| caps["path"].to_string())
+            )
+        })
+        .into_owned();
+
+    let single_quoted_re = Regex::new(r#"'(?P<path>[A-Za-z]:[\\/][^']*)'"#)
+        .expect("Single-quoted Windows path regex must compile");
+    let command = single_quoted_re
+        .replace_all(&command, |caps: &regex::Captures<'_>| {
+            format!(
+                "'{}'",
+                windows_path_to_bash_path(&caps["path"])
+                    .unwrap_or_else(|| caps["path"].to_string())
+            )
+        })
+        .into_owned();
+
+    let bare_re = Regex::new(r#"(?P<path>[A-Za-z]:[\\/][^\s"'`;&|<>)]*)"#)
+        .expect("Bare Windows path regex must compile");
+    bare_re
+        .replace_all(&command, |caps: &regex::Captures<'_>| {
+            windows_path_to_bash_path(&caps["path"]).unwrap_or_else(|| caps["path"].to_string())
+        })
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn bash_path_to_windows_path(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = (bytes[1] as char).to_ascii_uppercase();
+        let rest = raw[3..].replace('/', "\\");
+        return PathBuf::from(format!("{}:\\{}", drive, rest));
+    }
+    path
+}
+
+#[cfg(any(unix, windows))]
 fn build_wrapper_script(command: &str, state: &ShellState, base_cwd: &PathBuf) -> String {
     let effective_cwd = state.cwd.as_ref().unwrap_or(base_cwd);
-    let cwd_escaped: String = effective_cwd.to_string_lossy().replace('\'', "'\\''");
+    let cwd_escaped: String = path_to_bash_literal(effective_cwd).replace('\'', "'\\''");
 
     let mut export_lines = String::new();
     for (k, v) in &state.env_vars {
@@ -138,7 +255,16 @@ exit $__CC_EXIT_CODE
 "#,
         cwd = cwd_escaped,
         exports = export_lines,
-        user_cmd = command,
+        user_cmd = {
+            #[cfg(windows)]
+            {
+                normalize_windows_paths_for_bash(command)
+            }
+            #[cfg(not(windows))]
+            {
+                command.to_string()
+            }
+        },
         sentinel = SHELL_STATE_SENTINEL,
     )
 }
@@ -157,16 +283,30 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
 
     tokio::spawn(async move {
         let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            let child = if cfg!(windows) {
-                Command::new("cmd")
-                    .arg("/C")
-                    .arg(&command_clone)
-                    .current_dir(&cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .spawn()
-            } else {
+            #[cfg(windows)]
+            let child = {
+                if windows_has_bash() {
+                    Command::new("bash")
+                        .arg("-lc")
+                        .arg(normalize_windows_paths_for_bash(&command_clone))
+                        .current_dir(&cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .stdin(Stdio::null())
+                        .spawn()
+                } else {
+                    Command::new("cmd")
+                        .arg("/C")
+                        .arg(&command_clone)
+                        .current_dir(&cwd)
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .stdin(Stdio::null())
+                        .spawn()
+                }
+            };
+            #[cfg(not(windows))]
+            let child = {
                 Command::new("bash")
                     .arg("-c")
                     .arg(&command_clone)
@@ -384,29 +524,25 @@ async fn run_in_pty(
 }
 
 // ---------------------------------------------------------------------------
-// Windows fallback (cmd.exe, no PTY)
+// Windows Bash execution (no PTY)
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-async fn run_windows_fallback(
-    command: &str,
-    effective_cwd: &PathBuf,
+async fn run_windows_bash(
+    script: &str,
+    working_dir: &PathBuf,
     timeout_dur: Duration,
     timeout_ms: u64,
-    output_mode: OutputMode,
-) -> ToolResult {
-    let mut child = match Command::new("cmd")
-        .arg("/C")
-        .arg(command)
-        .current_dir(effective_cwd)
+) -> Result<(Vec<String>, Vec<String>, i32), String> {
+    let mut child = Command::new("bash")
+        .arg("-lc")
+        .arg(script)
+        .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
-    };
+        .map_err(|e| format!("Failed to spawn bash: {}", e))?;
 
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
@@ -437,25 +573,66 @@ async fn run_windows_fallback(
     match result {
         Ok((stdout_lines, stderr_lines, status)) => {
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            let mut output = String::new();
-            if !stdout_lines.is_empty() {
-                output.push_str(&stdout_lines.join("\n"));
-            }
-            if !stderr_lines.is_empty() {
-                if !output.is_empty() {
-                    output.push('\n');
-                }
-                output.push_str("STDERR:\n");
-                output.push_str(&stderr_lines.join("\n"));
-            }
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            reduce_output(command, output, exit_code, output_mode)
+            Ok((stdout_lines, stderr_lines, exit_code))
         }
         Err(_) => {
             let _ = child.kill().await;
-            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+            Err(format!("Command timed out after {}ms", timeout_ms))
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn run_windows_cmd(
+    script: &str,
+    working_dir: &PathBuf,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+) -> Result<(Vec<String>, Vec<String>, i32), String> {
+    let mut child = Command::new("cmd")
+        .arg("/C")
+        .arg(script)
+        .current_dir(working_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn cmd.exe: {}", e))?;
+
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let result = tokio::time::timeout(timeout_dur, async {
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+
+        if let Some(stdout) = stdout_handle {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                stdout_lines.push(line);
+            }
+        }
+        if let Some(stderr) = stderr_handle {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                stderr_lines.push(line);
+            }
+        }
+        let status = child.wait().await;
+        (stdout_lines, stderr_lines, status)
+    })
+    .await;
+
+    match result {
+        Ok((stdout_lines, stderr_lines, status)) => {
+            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            Ok((stdout_lines, stderr_lines, exit_code))
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(format!("Command timed out after {}ms", timeout_ms))
         }
     }
 }
@@ -580,14 +757,112 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_windows_fallback(
-                &params.command,
-                &effective_cwd,
-                timeout_dur,
-                timeout_ms,
-                output_mode,
-            )
-            .await;
+
+            if windows_has_bash() {
+                let script = {
+                    let state = shell_state_arc.lock();
+                    build_wrapper_script(&params.command, &state, &ctx.working_dir)
+                };
+
+                return match run_windows_bash(&script, &ctx.working_dir, timeout_dur, timeout_ms)
+                    .await
+                {
+                    Ok((stdout_lines, stderr_lines, exit_code)) => {
+                        let sentinel_pos = stdout_lines
+                            .iter()
+                            .rposition(|l| l.trim() == SHELL_STATE_SENTINEL);
+
+                        let (user_lines, state_lines) = match sentinel_pos {
+                            Some(pos) => (&stdout_lines[..pos], &stdout_lines[pos + 1..]),
+                            None => (stdout_lines.as_slice(), &[][..]),
+                        };
+
+                        if !state_lines.is_empty() {
+                            if let Some((new_cwd, env_delta)) =
+                                parse_shell_state_block(&state_lines.to_vec())
+                            {
+                                let mut state = shell_state_arc.lock();
+                                state.cwd = Some(bash_path_to_windows_path(new_cwd));
+                                for (k, v) in env_delta {
+                                    state.env_vars.insert(k, v);
+                                }
+                            }
+                        }
+
+                        let exports = extract_exports_from_command(&params.command);
+                        if !exports.is_empty() {
+                            let mut state = shell_state_arc.lock();
+                            for (k, v) in exports {
+                                state.env_vars.insert(k, v);
+                            }
+                        }
+
+                        let mut output = String::new();
+                        if !user_lines.is_empty() {
+                            output.push_str(&user_lines.join("\n"));
+                        }
+                        if !stderr_lines.is_empty() {
+                            if !output.is_empty() {
+                                output.push('\n');
+                            }
+                            output.push_str("STDERR:\n");
+                            output.push_str(&stderr_lines.join("\n"));
+                        }
+                        if output.is_empty() {
+                            output = "(no output)".to_string();
+                        }
+                        reduce_output(&params.command, output, exit_code, output_mode)
+                    }
+                    Err(e) => ToolResult::error(e),
+                };
+            }
+
+            let script = {
+                let state = shell_state_arc.lock();
+                build_cmd_wrapper_script(&params.command, &state, &ctx.working_dir)
+            };
+
+            return match run_windows_cmd(&script, &effective_cwd, timeout_dur, timeout_ms).await {
+                Ok((stdout_lines, stderr_lines, exit_code)) => {
+                    let sentinel_pos = stdout_lines
+                        .iter()
+                        .rposition(|l| l.trim() == SHELL_STATE_SENTINEL);
+
+                    let (user_lines, state_lines) = match sentinel_pos {
+                        Some(pos) => (&stdout_lines[..pos], &stdout_lines[pos + 1..]),
+                        None => (stdout_lines.as_slice(), &[][..]),
+                    };
+
+                    if !state_lines.is_empty() {
+                        if let Some((new_cwd, env_delta)) =
+                            parse_shell_state_block(&state_lines.to_vec())
+                        {
+                            let mut state = shell_state_arc.lock();
+                            state.cwd = Some(new_cwd);
+                            for (k, v) in env_delta {
+                                state.env_vars.insert(k, v);
+                            }
+                        }
+                    }
+
+                    let mut output = String::new();
+                    if !user_lines.is_empty() {
+                        output.push_str(&user_lines.join("\n"));
+                    }
+                    if !stderr_lines.is_empty() {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str("STDERR:\n");
+                        output.push_str(&stderr_lines.join("\n"));
+                    }
+                    if output.is_empty() {
+                        output = "(no output)".to_string();
+                    }
+                    reduce_output(&params.command, output, exit_code, output_mode)
+                }
+                Err(e) => ToolResult::error(e),
+            };
         }
 
         // ── Unix PTY path ────────────────────────────────────────────────────
@@ -659,5 +934,85 @@ impl Tool for PtyBashTool {
                 Err(_) => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_windows_drive_paths_to_bash_paths() {
+        assert_eq!(
+            windows_path_to_bash_path(r"C:\Users\alexa\Documents\GitHub").as_deref(),
+            Some("/c/Users/alexa/Documents/GitHub")
+        );
+        assert_eq!(
+            windows_path_to_bash_path("D:/work/project").as_deref(),
+            Some("/d/work/project")
+        );
+        assert_eq!(windows_path_to_bash_path("/c/Users/alexa"), None);
+    }
+
+    #[test]
+    fn ignores_windows_drive_markers_in_shell_state_blocks() {
+        let lines = vec![
+            r"C:\repo".to_string(),
+            r"=C:=C:\repo".to_string(),
+            "PATH=C:\\Windows\\System32".to_string(),
+        ];
+
+        let (_, env) = parse_shell_state_block(&lines).expect("shell state should parse");
+        assert!(!env.contains_key("=C:"));
+        assert_eq!(
+            env.get("PATH").map(String::as_str),
+            Some(r"C:\Windows\System32")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_bash_literal_preserves_backslashes() {
+        assert_eq!(
+            path_to_bash_literal(std::path::Path::new(r"/tmp/path\with\slashes")),
+            r"/tmp/path\with\slashes"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bash_literal_converts_drive_paths() {
+        assert_eq!(
+            path_to_bash_literal(std::path::Path::new(r"C:\Users\alexa\Documents")),
+            "/c/Users/alexa/Documents"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_windows_paths_inside_bash_commands() {
+        let normalized = normalize_windows_paths_for_bash(
+            r#"cd "C:\Users\alexa\Documents\GitHub\healthcar-hackathon-5-1-26" && pwd"#,
+        );
+        assert_eq!(
+            normalized,
+            r#"cd "/c/Users/alexa/Documents/GitHub/healthcar-hackathon-5-1-26" && pwd"#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_quoted_windows_paths_with_spaces_inside_bash_commands() {
+        let normalized = normalize_windows_paths_for_bash(r#"cd "C:\Program Files\Git" && pwd"#);
+        assert_eq!(normalized, r#"cd "/c/Program Files/Git" && pwd"#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn converts_bash_pwd_back_to_windows_path_for_state() {
+        assert_eq!(
+            bash_path_to_windows_path(PathBuf::from("/c/Users/alexa/Documents")),
+            PathBuf::from(r"C:\Users\alexa\Documents")
+        );
     }
 }

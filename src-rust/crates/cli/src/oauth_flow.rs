@@ -180,35 +180,7 @@ pub async fn run_oauth_login_flow(login_with_claude_ai: bool) -> anyhow::Result<
 
 /// Attempt to open the URL in the system default browser (best-effort).
 fn try_open_browser(url: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        // Use PowerShell to safely open URLs containing special characters (& etc.)
-        let ps_cmd = format!("Start-Process '{}'", url.replace('\'', "''"));
-        let _ = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open")
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let _ = open::that(url);
 }
 
 /// Tiny async HTTP server that captures /callback?code=AUTH_CODE&state=STATE.

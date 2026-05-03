@@ -27,3 +27,4 @@ getrandom = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
 urlencoding = { workspace = true }
+open = { workspace = true }

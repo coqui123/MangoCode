@@ -147,21 +147,7 @@ pub fn initiate_xaa_login(server_name: &str, idp_url: &str) -> std::io::Result<X
 
 /// Open a URL in the system browser.
 fn open_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .status()?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg(url).status()?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open").arg(url).status()?;
-    }
-    Ok(())
+    open::that(url)
 }
 
 /// Exchange an authorization code for an access token.

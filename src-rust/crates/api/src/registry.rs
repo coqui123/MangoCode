@@ -28,14 +28,24 @@ fn vault_key_aliases(provider_id: &str) -> &'static [&'static str] {
         "zhipuai" => &["zhipu"],
         "vultr" => &["vultr-ai"],
         "vultr-ai" => &["vultr"],
+        "huggingface" => &["hf"],
+        "hf" => &["huggingface"],
         _ => &[],
     }
 }
 
 fn env_or_vault(env_var: &str, provider_id: &str) -> Option<String> {
-    std::env::var(env_var)
-        .ok()
-        .filter(|value| !value.is_empty())
+    env_any_or_vault(&[env_var], provider_id)
+}
+
+fn env_any_or_vault(env_vars: &[&str], provider_id: &str) -> Option<String> {
+    env_vars
+        .iter()
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| {
             let vault = mangocode_core::Vault::new();
             mangocode_core::get_vault_passphrase().and_then(|passphrase| {
@@ -425,9 +435,12 @@ impl ProviderRegistry {
         register_if_key_set(self, "SAMBANOVA_API_KEY", "sambanova", |key| {
             Arc::new(p::sambanova().with_api_key(key))
         });
-        register_if_key_set(self, "HF_TOKEN", "huggingface", |key| {
-            Arc::new(p::huggingface().with_api_key(key))
-        });
+        if let Some(key) = env_any_or_vault(
+            &["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGINGFACE_API_KEY"],
+            "huggingface",
+        ) {
+            self.register(Arc::new(p::huggingface().with_api_key(key)));
+        }
         register_if_key_set(self, "MINIMAX_API_KEY", "minimax", |key| {
             Arc::new(MinimaxProvider::new(key))
         });
@@ -497,6 +510,8 @@ mod tests {
         assert_eq!(vault_key_aliases("zhipuai"), &["zhipu"]);
         assert_eq!(vault_key_aliases("vultr"), &["vultr-ai"]);
         assert_eq!(vault_key_aliases("vultr-ai"), &["vultr"]);
+        assert_eq!(vault_key_aliases("huggingface"), &["hf"]);
+        assert_eq!(vault_key_aliases("hf"), &["huggingface"]);
         assert!(vault_key_aliases("openai").is_empty());
     }
 }

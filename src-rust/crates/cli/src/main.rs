@@ -46,7 +46,7 @@ use mangocode_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
 };
-use mangocode_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use mangocode_tools::{clear_session_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
 use parking_lot::Mutex as ParkingMutex;
 use rpassword::prompt_password;
 use std::{
@@ -63,6 +63,88 @@ fn tui_effort_to_core(effort: mangocode_tui::EffortLevel) -> mangocode_core::eff
         mangocode_tui::EffortLevel::Normal => mangocode_core::effort::EffortLevel::Medium,
         mangocode_tui::EffortLevel::High => mangocode_core::effort::EffortLevel::High,
         mangocode_tui::EffortLevel::Max => mangocode_core::effort::EffortLevel::Max,
+    }
+}
+
+fn normalize_prompt_fragment(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_system_prompt_append(
+    system_parts: &mut Vec<String>,
+    append: &str,
+    append_if_missing: bool,
+) {
+    let append = append.trim();
+    if append.is_empty() {
+        return;
+    }
+
+    if append_if_missing {
+        let existing = normalize_prompt_fragment(&system_parts.join("\n\n"));
+        let needle = normalize_prompt_fragment(append);
+        if needle.is_empty() || existing.contains(&needle) {
+            return;
+        }
+    }
+
+    system_parts.push(append.to_string());
+}
+
+async fn build_session_system_prompt(
+    working_dir: std::path::PathBuf,
+    config: &Config,
+    append_if_missing: bool,
+) -> String {
+    let ctx_builder =
+        ContextBuilder::new(working_dir).disable_claude_mds(config.disable_claude_mds);
+    let system_ctx = ctx_builder.build_system_context().await;
+    let user_ctx = ctx_builder.build_user_context().await;
+
+    let mut system_parts = vec![
+        include_str!("system_prompt.txt").to_string(),
+        system_ctx,
+        user_ctx,
+    ];
+    if let Some(ref custom) = config.custom_system_prompt {
+        system_parts[0] = custom.clone();
+    }
+    if let Some(ref append) = config.append_system_prompt {
+        push_system_prompt_append(&mut system_parts, append, append_if_missing);
+    }
+    system_parts.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_append_in_headless_skips_existing_fragment() {
+        let mut parts = vec!["Base prompt.\n\nUse the repo root carefully.".to_string()];
+        push_system_prompt_append(&mut parts, "Use the repo root carefully.", true);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn prompt_append_in_headless_adds_missing_fragment() {
+        let mut parts = vec!["Base prompt.".to_string()];
+        push_system_prompt_append(&mut parts, "Extra instruction.", true);
+        assert_eq!(parts, vec!["Base prompt.", "Extra instruction."]);
+    }
+
+    #[test]
+    fn prompt_append_in_interactive_keeps_existing_fragment() {
+        let mut parts = vec!["Base prompt. Extra instruction.".to_string()];
+        push_system_prompt_append(&mut parts, "Extra instruction.", false);
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn prompt_append_dedupes_across_whitespace_differences() {
+        let mut parts = vec!["Base prompt.\nUse   the repo root carefully.".to_string()];
+        push_system_prompt_append(&mut parts, "Use the repo root carefully.", true);
+        assert_eq!(parts.len(), 1);
     }
 }
 
@@ -885,29 +967,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build context
-    let ctx_builder =
-        ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
-    let system_ctx = ctx_builder.build_system_context().await;
-    let user_ctx = ctx_builder.build_user_context().await;
-
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
-    }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
-
-    // Determine mode early (needed for auth error handling and permission handler selection).
+    // Determine mode early (needed for auth error handling, permission handler
+    // selection, and headless-only prompt de-duplication).
     let is_headless = cli.print || cli.prompt.is_some();
+
+    let system_prompt = build_session_system_prompt(cwd.clone(), &config, is_headless).await;
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -937,6 +1001,8 @@ async fn main() -> anyhow::Result<()> {
             || std::env::var("MINIMAX_API_KEY").is_ok()
             || std::env::var("SAMBANOVA_API_KEY").is_ok()
             || std::env::var("HF_TOKEN").is_ok()
+            || std::env::var("HUGGINGFACE_HUB_TOKEN").is_ok()
+            || std::env::var("HUGGINGFACE_API_KEY").is_ok()
             || std::env::var("NVIDIA_API_KEY").is_ok()
             || std::env::var("SILICONFLOW_API_KEY").is_ok()
             || std::env::var("MOONSHOT_API_KEY").is_ok()
@@ -2292,6 +2358,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         live_config.model = Some(session.model.clone());
     }
     tool_ctx.config = live_config.clone();
+    base_query_config.working_directory = Some(tool_ctx.working_dir.display().to_string());
+    base_query_config.system_prompt = Some(
+        build_session_system_prompt(tool_ctx.working_dir.clone(), &tool_ctx.config, false).await,
+    );
 
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     init_mascot(&mut app);
@@ -2783,6 +2853,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &cmd_ctx.config,
+                                            false,
+                                        )
+                                        .await,
+                                    );
                                     app.config.project_dir = Some(tool_ctx.working_dir.clone());
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
@@ -2791,6 +2871,35 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.status_message =
                                         Some(format!("Resumed session {}.", &session.id[..8]));
                                     terminal.reset_transcript(&app, &messages)?;
+                                }
+                                Some(CommandResult::SetWorkingDir(new_dir, msg)) => {
+                                    tool_ctx.working_dir = new_dir.clone();
+                                    cmd_ctx.working_dir = new_dir.clone();
+                                    tool_ctx.config.project_dir = Some(new_dir.clone());
+                                    cmd_ctx.config.project_dir = Some(new_dir.clone());
+                                    app.config.project_dir = Some(new_dir.clone());
+                                    base_query_config.working_directory =
+                                        Some(new_dir.display().to_string());
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            new_dir.clone(),
+                                            &cmd_ctx.config,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    session.working_dir = Some(new_dir.display().to_string());
+                                    session.updated_at = chrono::Utc::now();
+                                    clear_session_shell_state(&tool_ctx.session_id);
+                                    let _ = std::env::set_current_dir(&new_dir);
+                                    let _ = mangocode_core::history::save_session(&session).await;
+                                    app.status_message = Some(msg.clone());
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
                                     session.title = Some(title.clone());
@@ -2823,6 +2932,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
                                     app.config = new_cfg.clone();
@@ -2844,6 +2963,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.status_message = Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
                                     // Sync model name + fast_mode visual indicator.
@@ -3986,6 +4115,21 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
 async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
     match args.first().map(|s| s.as_str()) {
+        Some("codex") => match args.get(1).map(|s| s.as_str()) {
+            Some("login") => {
+                auth_codex_login().await;
+            }
+            Some(unknown) => {
+                eprintln!("Unknown auth codex subcommand: '{}'", unknown);
+                eprintln!("Usage: mangocode auth codex login");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Usage: mangocode auth codex login");
+                std::process::exit(1);
+            }
+        },
+
         Some("login") => {
             // --console flag selects the Console OAuth flow (creates an API key)
             // Default (no flag) uses the Claude.ai flow (Bearer token)
@@ -4028,18 +4172,20 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
         Some(unknown) => {
             eprintln!("Unknown auth subcommand: '{}'", unknown);
             eprintln!();
-            eprintln!("Usage: claude auth <subcommand>");
+            eprintln!("Usage: mangocode auth <subcommand>");
             eprintln!(
                 "  login [--console]   Authenticate (claude.ai by default; --console for API key)"
             );
+            eprintln!("  codex login         Authenticate OpenAI Codex OAuth for headless use");
             eprintln!("  logout              Remove stored credentials");
             eprintln!("  status [--json]     Show authentication status");
             std::process::exit(1);
         }
 
         None => {
-            eprintln!("Usage: claude auth <login|logout|status>");
+            eprintln!("Usage: mangocode auth <login|codex|logout|status>");
             eprintln!("  login [--console]   Authenticate with Anthropic");
+            eprintln!("  codex login         Authenticate OpenAI Codex OAuth for headless use");
             eprintln!("  logout              Remove stored credentials");
             eprintln!("  status [--json]     Show authentication status");
             std::process::exit(1);
@@ -4047,6 +4193,49 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn auth_codex_login() {
+    println!("Starting OpenAI Codex OAuth login...");
+    if mangocode_core::codex_oauth::likely_headless_or_remote() {
+        println!();
+        println!("{}", mangocode_core::codex_oauth::HEADLESS_CODEX_OAUTH_HINT);
+        println!();
+    }
+
+    match codex_oauth_flow::run_terminal_oauth_flow().await {
+        Ok(tokens) => {
+            if let Err(e) = mangocode_core::oauth_config::save_codex_tokens(&tokens) {
+                eprintln!("Warning: failed to save legacy Codex token file: {}", e);
+            }
+
+            let expires_ms = tokens
+                .expires_at
+                .map(|secs| secs.saturating_mul(1000))
+                .unwrap_or(0);
+            let mut store = mangocode_core::AuthStore::load();
+            store.set(
+                mangocode_core::ProviderId::OPENAI_CODEX,
+                mangocode_core::StoredCredential::OAuthToken {
+                    access: tokens.access_token.clone(),
+                    refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                    expires: expires_ms,
+                },
+            );
+
+            println!("Successfully logged in to OpenAI Codex OAuth.");
+            if let Some(account_id) = tokens.account_id.as_deref() {
+                println!("  ChatGPT account id: {}", account_id);
+            }
+            println!("  Provider: openai-codex");
+            println!("Use headless mode with `--provider openai-codex`.");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("OpenAI Codex OAuth login failed: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Print current auth status, then exit with code 0 (logged in) or 1 (not logged in).

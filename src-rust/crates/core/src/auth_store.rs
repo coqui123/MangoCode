@@ -346,7 +346,13 @@ impl AuthStore {
             "venice" => "VENICE_API_KEY",
             "github-copilot" => "GITHUB_TOKEN",
             "azure" => "AZURE_API_KEY",
-            "huggingface" => "HF_TOKEN",
+            "huggingface" => {
+                return std::env::var("HF_TOKEN")
+                    .or_else(|_| std::env::var("HUGGINGFACE_HUB_TOKEN"))
+                    .or_else(|_| std::env::var("HUGGINGFACE_API_KEY"))
+                    .ok()
+                    .filter(|k| !k.is_empty());
+            }
             "nvidia" => "NVIDIA_API_KEY",
             _ => return None,
         };

@@ -263,9 +263,17 @@ pub fn sambanova() -> OpenAiCompatProvider {
     .with_api_key(key)
 }
 
-/// Hugging Face Inference API.  Reads `HF_TOKEN`.
+fn huggingface_api_key() -> String {
+    std::env::var("HF_TOKEN")
+        .or_else(|_| std::env::var("HUGGINGFACE_HUB_TOKEN"))
+        .or_else(|_| std::env::var("HUGGINGFACE_API_KEY"))
+        .unwrap_or_default()
+}
+
+/// Hugging Face Inference Providers OpenAI-compatible chat endpoint.
+/// Reads `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, or `HUGGINGFACE_API_KEY`.
 pub fn huggingface() -> OpenAiCompatProvider {
-    let key = std::env::var("HF_TOKEN").unwrap_or_default();
+    let key = huggingface_api_key();
     OpenAiCompatProvider::new(
         ProviderId::HUGGINGFACE,
         "Hugging Face",

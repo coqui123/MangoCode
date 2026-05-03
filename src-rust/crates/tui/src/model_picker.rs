@@ -98,10 +98,14 @@ impl EffortLevel {
 
 /// Returns `true` for models that support extended thinking / effort levels.
 pub fn model_supports_effort(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
     id.starts_with("claude-3-7")
         || id.starts_with("claude-opus-4")
         || id.starts_with("claude-sonnet-4")
-        || id.to_ascii_lowercase().starts_with("gpt-5")
+        || lower.starts_with("gpt-5")
+        || lower.contains("thinking")
+        || lower.contains("qwen3")
+        || lower.contains("gpt-oss")
 }
 
 /// Returns `true` for models that support the maximum effort tier.
@@ -472,7 +476,45 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             "Llama 3.3 70B",
             "128K context",
         )],
+        "huggingface" => vec![
+            model_entry(
+                "openai/gpt-oss-120b:fastest",
+                "GPT-OSS 120B",
+                "HF Inference Providers router, fastest policy",
+            ),
+            model_entry(
+                "deepseek-ai/DeepSeek-R1:fastest",
+                "DeepSeek R1",
+                "HF Inference Providers router, fastest policy",
+            ),
+            model_entry(
+                "meta-llama/Llama-3.1-8B-Instruct:fastest",
+                "Llama 3.1 8B Instruct",
+                "HF Inference Providers router, fastest policy",
+            ),
+        ],
         "ollama" => vec![
+            model_entry(
+                "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL",
+                "Qwen3 30B Thinking",
+                "local Ollama",
+            ),
+            model_entry("batiai/qwen3.5-9b", "Qwen3.5 9B", "local Ollama"),
+            model_entry(
+                "64500165/omnicoder-2-9b-Q4-K-M",
+                "OmniCoder 2 9B",
+                "local Ollama",
+            ),
+            model_entry(
+                "SimonPu/qwen3:4b-thinking-2507-q8_0",
+                "Qwen3 4B Thinking",
+                "local Ollama",
+            ),
+            model_entry(
+                "nemotron-cascade-2:30b",
+                "Nemotron Cascade 2 30B",
+                "local Ollama",
+            ),
             model_entry("llama3.2", "Llama 3.2", "local"),
             model_entry("mistral", "Mistral", "local"),
             model_entry("codellama", "Code Llama", "local"),
@@ -539,6 +581,7 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         }
         "deepinfra" => "deepinfra/meta-llama/Llama-3.3-70B-Instruct".to_string(),
         "venice" => "venice/llama-3.3-70b".to_string(),
+        "huggingface" => "huggingface/openai/gpt-oss-120b:fastest".to_string(),
         "ollama" => "ollama/llama3.2".to_string(),
         "lmstudio" => "lmstudio/default".to_string(),
         "llamacpp" => "llamacpp/default".to_string(),
@@ -1232,6 +1275,15 @@ mod tests {
         assert!(!model_supports_max_effort("gpt-5.1-codex"));
     }
 
+    #[test]
+    fn ollama_thinking_models_support_effort_controls() {
+        assert!(model_supports_effort(
+            "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"
+        ));
+        assert!(model_supports_effort("batiai/qwen3.5-9b"));
+        assert!(!model_supports_effort("llama3.2"));
+    }
+
     // 13. Non-effort models return None from effective_effort.
     #[test]
     fn haiku_has_no_effort() {
@@ -1296,6 +1348,19 @@ mod tests {
         let models = models_for_provider("ollama");
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"llama3.2"));
+        assert!(ids.contains(&"SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"));
+        assert!(ids.contains(&"batiai/qwen3.5-9b"));
+        assert!(ids.contains(&"64500165/omnicoder-2-9b-Q4-K-M"));
+        assert!(ids.contains(&"SimonPu/qwen3:4b-thinking-2507-q8_0"));
+        assert!(ids.contains(&"nemotron-cascade-2:30b"));
+    }
+
+    #[test]
+    fn models_for_provider_huggingface_matches_router_docs() {
+        let models = models_for_provider("huggingface");
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"openai/gpt-oss-120b:fastest"));
+        assert!(ids.contains(&"deepseek-ai/DeepSeek-R1:fastest"));
     }
 
     #[test]
@@ -1309,6 +1374,14 @@ mod tests {
     #[test]
     fn default_model_for_provider_openai() {
         assert_eq!(default_model_for_provider("openai"), "openai/gpt-4o");
+    }
+
+    #[test]
+    fn default_model_for_provider_huggingface_uses_router_policy_suffix() {
+        assert_eq!(
+            default_model_for_provider("huggingface"),
+            "huggingface/openai/gpt-oss-120b:fastest"
+        );
     }
 
     #[test]

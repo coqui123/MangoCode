@@ -57,6 +57,8 @@ pub enum CommandResult {
     SetMessages(Vec<Message>),
     /// Load a previously saved session into the live REPL.
     ResumeSession(mangocode_core::history::ConversationSession),
+    /// Switch the active project/workspace directory for the live session.
+    SetWorkingDir(std::path::PathBuf, String),
     /// Update the current session title.
     RenameSession(String),
     /// Trigger the OAuth login flow (handled by the REPL in main.rs).
@@ -119,6 +121,7 @@ pub struct FlagsCommand;
 pub struct ColorCommand;
 pub struct VersionCommand;
 pub struct ResumeCommand;
+pub struct WorkspaceCommand;
 pub struct StatusCommand;
 pub struct DiffCommand;
 pub struct MemoryCommand;
@@ -227,39 +230,7 @@ where
 }
 
 fn open_with_system(target: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        let ps_cmd = format!("Start-Process '{}'", target.replace('\'', "''"));
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(target)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        return Ok(());
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(target)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        Ok(())
-    }
+    open::that(target)
 }
 
 fn format_keystroke(keystroke: &mangocode_core::keybindings::ParsedKeystroke) -> String {
@@ -426,6 +397,19 @@ fn split_command_args(args: &str) -> Vec<String> {
     out
 }
 
+fn strip_matching_quotes(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[trimmed.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
 fn format_compact_token_count(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -490,7 +474,8 @@ fn command_category(name: &str) -> &'static str {
         "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
         "login" | "logout" | "permissions" => "Auth & Permissions",
-        "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review" => "Project",
+        "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review"
+        | "workspace" | "cwd" | "cd" | "project" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
         "session" | "resume" | "remote-control" | "remote-env" | "share" | "teleport" => {
             "Sessions & Remote"
@@ -1470,6 +1455,84 @@ impl SlashCommand for ResumeCommand {
                 }
             }
         }
+    }
+}
+
+// ---- /workspace ----------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for WorkspaceCommand {
+    fn name(&self) -> &str {
+        "workspace"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["cwd", "cd", "project"]
+    }
+    fn description(&self) -> &str {
+        "Show or switch the active project workspace"
+    }
+    fn help(&self) -> &str {
+        "Usage: /workspace [path]\n\n\
+         Without a path, shows the current active workspace. With a path, switches \
+         MangoCode's active project directory for tools, prompts, hooks, memories, \
+         file operations, and shell commands. This is different from running `cd` \
+         inside Bash: it updates MangoCode's session-level workspace."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let requested = strip_matching_quotes(args);
+        if requested.is_empty() {
+            return CommandResult::Message(format!(
+                "Active workspace:\n  {}",
+                ctx.working_dir.display()
+            ));
+        }
+
+        let expanded = if requested == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from(requested))
+        } else if let Some(rest) = requested.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(requested))
+        } else if let Some(rest) = requested.strip_prefix("~\\") {
+            dirs::home_dir()
+                .map(|home| home.join(rest))
+                .unwrap_or_else(|| PathBuf::from(requested))
+        } else {
+            PathBuf::from(requested)
+        };
+
+        let candidate = if expanded.is_absolute() {
+            expanded
+        } else {
+            ctx.working_dir.join(expanded)
+        };
+
+        let canonical = match std::fs::canonicalize(&candidate) {
+            Ok(path) => path,
+            Err(e) => {
+                return CommandResult::Error(format!(
+                    "Cannot switch workspace to '{}': {}",
+                    candidate.display(),
+                    e
+                ));
+            }
+        };
+
+        if !canonical.is_dir() {
+            return CommandResult::Error(format!(
+                "Cannot switch workspace to '{}': not a directory",
+                canonical.display()
+            ));
+        }
+
+        ctx.working_dir = canonical.clone();
+        ctx.config.project_dir = Some(canonical.clone());
+
+        CommandResult::SetWorkingDir(
+            canonical.clone(),
+            format!("Active workspace is now {}.", canonical.display()),
+        )
     }
 }
 
@@ -2885,7 +2948,11 @@ impl SlashCommand for VaultCommand {
                     ("qwen", "DASHSCOPE_API_KEY", "Alias: alibaba"),
                     ("mistral", "MISTRAL_API_KEY", ""),
                     ("sambanova", "SAMBANOVA_API_KEY", ""),
-                    ("huggingface", "HF_TOKEN", ""),
+                    (
+                        "huggingface",
+                        "HF_TOKEN or HUGGINGFACE_HUB_TOKEN",
+                        "OpenAI-compatible chat router",
+                    ),
                     ("nvidia", "NVIDIA_API_KEY", ""),
                     ("siliconflow", "SILICONFLOW_API_KEY", ""),
                     ("moonshotai", "MOONSHOT_API_KEY", "Alias: moonshot"),
@@ -10418,6 +10485,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(PluginCommand),
         Box::new(VersionCommand),
         Box::new(ResumeCommand),
+        Box::new(WorkspaceCommand),
         Box::new(ReloadPluginsCommand),
         Box::new(StatusCommand),
         Box::new(DiffCommand),
@@ -11032,6 +11100,73 @@ mod tests {
                 "second value".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_strip_matching_quotes_only_removes_outer_pair() {
+        assert_eq!(
+            strip_matching_quotes(r#""C:\path with spaces""#),
+            r"C:\path with spaces"
+        );
+        assert_eq!(
+            strip_matching_quotes("'./relative path'"),
+            "./relative path"
+        );
+        assert_eq!(
+            strip_matching_quotes(r#""unterminated"#),
+            r#""unterminated"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_command_reports_current_workspace() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("workspace").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => assert!(msg.contains("Active workspace")),
+            other => panic!("expected workspace message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_workspace_aliases_are_project_commands() {
+        assert_eq!(command_category("workspace"), "Project");
+        assert_eq!(command_category("cwd"), "Project");
+        assert_eq!(command_category("cd"), "Project");
+        assert_eq!(command_category("project"), "Project");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_command_switches_to_quoted_path() {
+        let mut ctx = make_ctx();
+        let target = std::env::current_dir().unwrap();
+        let cmd = find_command("workspace").unwrap();
+        let result = cmd
+            .execute(&format!("\"{}\"", target.display()), &mut ctx)
+            .await;
+        match result {
+            CommandResult::SetWorkingDir(path, msg) => {
+                assert_eq!(path, target.canonicalize().unwrap());
+                assert!(msg.contains("Active workspace is now"));
+            }
+            other => panic!("expected SetWorkingDir, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_workspace_command_switches_to_unquoted_path() {
+        let mut ctx = make_ctx();
+        let target = std::env::current_dir().unwrap();
+        let cmd = find_command("workspace").unwrap();
+        let result = cmd.execute(&target.display().to_string(), &mut ctx).await;
+        match result {
+            CommandResult::SetWorkingDir(path, msg) => {
+                assert_eq!(path, target.canonicalize().unwrap());
+                assert!(msg.contains("Active workspace is now"));
+            }
+            other => panic!("expected SetWorkingDir, got {:?}", other),
+        }
     }
 
     #[test]

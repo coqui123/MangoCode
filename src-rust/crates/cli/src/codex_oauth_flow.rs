@@ -265,7 +265,46 @@ pub async fn run_oauth_flow(
             )
         })?;
 
-    open::that(&auth_url).map_err(|e| anyhow!("Failed to open browser: {}", e))?;
+    let _ = open::that(&auth_url);
+
+    let code = accept_oauth_callback(&listener, &state).await?;
+    exchange_code_for_tokens(&code, &verifier).await
+}
+
+/// Plain terminal variant for `mangocode auth codex login`.
+///
+/// It still uses browser + localhost callback OAuth, but does not require the TUI.
+pub async fn run_terminal_oauth_flow() -> anyhow::Result<CodexTokens> {
+    let verifier = generate_code_verifier();
+    let challenge = compute_code_challenge(&verifier);
+    let state = generate_state();
+    let auth_url = build_auth_url(&challenge, &state);
+
+    let addr = format!("127.0.0.1:{}", CODEX_OAUTH_PORT);
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Could not bind OAuth callback on {}: {}. Try closing other apps using this port, or run login on a machine where port {} is free.\n\n{}",
+                addr,
+                e,
+                CODEX_OAUTH_PORT,
+                mangocode_core::codex_oauth::HEADLESS_CODEX_OAUTH_HINT
+            )
+        })?;
+
+    println!("Open this URL to sign in to OpenAI Codex:");
+    println!("{}", auth_url);
+    println!();
+    println!(
+        "Waiting for OAuth callback on {} (timeout: 5 minutes)...",
+        CODEX_REDIRECT_URI
+    );
+
+    if let Err(e) = open::that(&auth_url) {
+        eprintln!("Warning: could not open browser automatically: {}", e);
+        eprintln!("Open the URL above manually.");
+    }
 
     let code = accept_oauth_callback(&listener, &state).await?;
     exchange_code_for_tokens(&code, &verifier).await
