@@ -93,7 +93,9 @@ pub use providers::CopilotProvider;
 
 // Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
 pub use providers::{
-    deepseek, groq, lm_studio, mistral, ollama, openrouter, xai, OpenAiCompatProvider,
+    deepseek, discover_installed_ollama_models, groq, lm_studio, mistral, native_ollama_base_url,
+    ollama, ollama_native_base_from_env, openrouter, parse_ollama_tags_response, xai,
+    OllamaDiscoveryError, OllamaInstalledModel, OllamaModelDetails, OpenAiCompatProvider,
 };
 
 // Phase 2D re-exports — Cohere native provider.

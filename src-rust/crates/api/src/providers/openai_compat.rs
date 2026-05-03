@@ -499,6 +499,7 @@ impl OpenAiCompatProvider {
             "granite",
             "smollm2",
             "gpt-oss",
+            "gemma4",
         ];
         KNOWN_TOOL_FAMILIES
             .iter()
@@ -1639,6 +1640,44 @@ mod tests {
         assert!(!OpenAiCompatProvider::ollama_model_supports_tools("phi3"));
         assert!(!OpenAiCompatProvider::ollama_model_supports_tools(
             "tinyllama"
+        ));
+    }
+
+    // Gemma 4 documents native function-calling, so the tool gate should let
+    // tools through for every published tag.
+    #[test]
+    fn ollama_tool_gate_accepts_gemma4_tags() {
+        for tag in [
+            "gemma4",
+            "gemma4:latest",
+            "gemma4:e2b",
+            "gemma4:e4b",
+            "gemma4:26b",
+            "gemma4:31b",
+            "gemma4:31b-cloud",
+        ] {
+            assert!(
+                OpenAiCompatProvider::ollama_model_supports_tools(tag),
+                "expected {tag} to be tool-capable"
+            );
+        }
+    }
+
+    // Gemma 4 emits its chain-of-thought via OpenAI-Harmony channel tokens
+    // (`<|channel>thought ... <channel|>`), not the Qwen-style
+    // `<think>...</think>` wrapper that the streaming parser handles. Until
+    // a channel-token parser exists we deliberately leave gemma4 off the
+    // reasoning path so we don't surface raw markup as user-visible text.
+    #[test]
+    fn ollama_reasoning_does_not_assume_gemma4_uses_qwen_think_tags() {
+        assert!(!OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "gemma4"
+        ));
+        assert!(!OpenAiCompatProvider::ollama_model_supports_reasoning(
+            "gemma4:e4b"
+        ));
+        assert!(!OpenAiCompatProvider::ollama_model_uses_qwen_thinking(
+            "gemma4:31b"
         ));
     }
 

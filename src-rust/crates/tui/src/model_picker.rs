@@ -274,6 +274,78 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
     }
 }
 
+/// Render a human-readable size string for the Ollama model description.
+fn format_ollama_size(bytes: Option<u64>) -> Option<String> {
+    let b = bytes? as f64;
+    let gib = b / (1024.0 * 1024.0 * 1024.0);
+    if gib >= 1.0 {
+        Some(format!("{:.1} GB", gib))
+    } else {
+        let mib = b / (1024.0 * 1024.0);
+        Some(format!("{:.0} MB", mib))
+    }
+}
+
+/// Convert an installed Ollama model into a [`ModelEntry`] suitable for the
+/// picker. The model ID is prefixed with `ollama/` to match other provider
+/// conventions used in the picker.
+pub fn ollama_installed_to_entry(m: &mangocode_api::OllamaInstalledModel) -> ModelEntry {
+    let mut desc_parts: Vec<String> = Vec::new();
+    if let Some(details) = m.details.as_ref() {
+        if let Some(p) = details.parameter_size.as_deref() {
+            desc_parts.push(p.to_string());
+        }
+        if let Some(q) = details.quantization_level.as_deref() {
+            desc_parts.push(q.to_string());
+        }
+    }
+    if let Some(size) = format_ollama_size(m.size) {
+        desc_parts.push(size);
+    }
+    desc_parts.push("local Ollama".to_string());
+    ModelEntry {
+        id: format!("ollama/{}", m.name),
+        display_name: m.name.clone(),
+        description: desc_parts.join(" • "),
+        is_current: false,
+    }
+}
+
+/// Build a list of [`ModelEntry`] values for the Ollama provider from a list
+/// of models installed on the local server. If `installed` is empty, a single
+/// hint entry suggesting `ollama pull` is returned so the picker is never
+/// blank when Ollama is reachable but has no models.
+pub fn ollama_entries_from_installed(
+    installed: &[mangocode_api::OllamaInstalledModel],
+) -> Vec<ModelEntry> {
+    if installed.is_empty() {
+        return vec![ModelEntry {
+            id: "ollama/none".to_string(),
+            display_name: "No models installed".to_string(),
+            description: "Run `ollama pull <model>` to install one (e.g. `ollama pull llama3.2`)"
+                .to_string(),
+            is_current: false,
+        }];
+    }
+    installed.iter().map(ollama_installed_to_entry).collect()
+}
+
+/// Build the Ollama section for the picker when the local server is
+/// unreachable. Returns the hardcoded fallback list with a leading diagnostic
+/// entry so the user understands why nothing dynamic was discovered.
+pub fn ollama_offline_entries() -> Vec<ModelEntry> {
+    let mut entries = vec![ModelEntry {
+        id: "ollama/__offline__".to_string(),
+        display_name: "Ollama not reachable".to_string(),
+        description:
+            "Start `ollama serve` (or set OLLAMA_HOST) to discover installed models — showing static suggestions below"
+                .to_string(),
+        is_current: false,
+    }];
+    entries.extend(models_for_provider("ollama"));
+    entries
+}
+
 /// Get models for a provider from the model registry (models.dev data).
 ///
 /// Falls back to the hardcoded `models_for_provider()` list when the registry
@@ -519,6 +591,21 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("mistral", "Mistral", "local"),
             model_entry("codellama", "Code Llama", "local"),
             model_entry("gemma2", "Gemma 2", "local"),
+            model_entry(
+                "gemma4",
+                "Gemma 4",
+                "local — multimodal, native tool calling",
+            ),
+            model_entry(
+                "gemma4:e4b",
+                "Gemma 4 e4b",
+                "local — small variant, ~128K ctx",
+            ),
+            model_entry(
+                "gemma4:31b",
+                "Gemma 4 31B",
+                "local — workstation variant, ~256K ctx",
+            ),
             model_entry("phi3", "Phi-3", "local"),
             model_entry("qwen2.5", "Qwen 2.5", "local"),
         ],
@@ -1353,6 +1440,58 @@ mod tests {
         assert!(ids.contains(&"64500165/omnicoder-2-9b-Q4-K-M"));
         assert!(ids.contains(&"SimonPu/qwen3:4b-thinking-2507-q8_0"));
         assert!(ids.contains(&"nemotron-cascade-2:30b"));
+        // Gemma 4 family appears in the static fallback so users discover it
+        // even before the daemon answers /api/tags.
+        assert!(ids.contains(&"gemma4"));
+        assert!(ids.contains(&"gemma4:e4b"));
+        assert!(ids.contains(&"gemma4:31b"));
+    }
+
+    // Dynamic Ollama discovery — every Gemma 4 tag returned by /api/tags
+    // should be exposed with the `ollama/` prefix exactly as published, so
+    // `--model ollama/gemma4:e4b` resolves without further translation.
+    #[test]
+    fn ollama_dynamic_discovery_maps_gemma4_tags() {
+        let installed: Vec<mangocode_api::OllamaInstalledModel> = [
+            "gemma4:latest",
+            "gemma4:e2b",
+            "gemma4:e4b",
+            "gemma4:26b",
+            "gemma4:31b",
+            "gemma4:31b-cloud",
+        ]
+        .iter()
+        .map(|name| mangocode_api::OllamaInstalledModel {
+            name: (*name).to_string(),
+            modified_at: None,
+            size: None,
+            digest: None,
+            details: None,
+        })
+        .collect();
+        let entries = ollama_entries_from_installed(&installed);
+        let ids: Vec<&str> = entries.iter().map(|m| m.id.as_str()).collect();
+        for tag in [
+            "ollama/gemma4:latest",
+            "ollama/gemma4:e2b",
+            "ollama/gemma4:e4b",
+            "ollama/gemma4:26b",
+            "ollama/gemma4:31b",
+            "ollama/gemma4:31b-cloud",
+        ] {
+            assert!(ids.contains(&tag), "missing {tag}");
+        }
+    }
+
+    // Gemma 4 uses OpenAI-Harmony channel tokens, not Qwen `<think>` tags.
+    // The picker must not advertise effort controls for it because they
+    // would have no effect.
+    #[test]
+    fn gemma4_does_not_claim_effort_support() {
+        assert!(!model_supports_effort("gemma4"));
+        assert!(!model_supports_effort("gemma4:e4b"));
+        assert!(!model_supports_effort("ollama/gemma4:31b"));
+        assert!(!model_supports_max_effort("gemma4:31b"));
     }
 
     #[test]
@@ -1399,5 +1538,79 @@ mod tests {
         let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"gpt-4o"));
         assert!(!ids.iter().any(|id| id.contains("claude")));
+    }
+
+    // 19. Dynamic Ollama discovery — entries are converted with `ollama/`
+    // prefix and the description is enriched with parameter size + size on
+    // disk when available.
+    #[test]
+    fn ollama_installed_entry_uses_ollama_prefix_and_metadata() {
+        let installed = mangocode_api::OllamaInstalledModel {
+            name: "qwen3:8b".to_string(),
+            modified_at: None,
+            size: Some(4_900_000_000),
+            digest: None,
+            details: Some(mangocode_api::OllamaModelDetails {
+                family: Some("qwen".to_string()),
+                parameter_size: Some("8B".to_string()),
+                quantization_level: Some("Q4_K_M".to_string()),
+            }),
+        };
+        let entry = ollama_installed_to_entry(&installed);
+        assert_eq!(entry.id, "ollama/qwen3:8b");
+        assert_eq!(entry.display_name, "qwen3:8b");
+        assert!(entry.description.contains("8B"));
+        assert!(entry.description.contains("Q4_K_M"));
+        assert!(entry.description.contains("GB"));
+        assert!(entry.description.contains("local Ollama"));
+    }
+
+    // 20. Empty `/api/tags` response → a single hint entry suggesting `ollama
+    // pull`, never a blank picker.
+    #[test]
+    fn ollama_entries_empty_returns_pull_hint() {
+        let entries = ollama_entries_from_installed(&[]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].description.to_lowercase().contains("ollama pull"));
+    }
+
+    // 21. Ollama unreachable → fallback list begins with a diagnostic entry,
+    // followed by the static suggestions.
+    #[test]
+    fn ollama_offline_entries_have_diagnostic_first() {
+        let entries = ollama_offline_entries();
+        assert!(entries.len() > 1);
+        assert!(entries[0].description.to_lowercase().contains("ollama"));
+        let ids: Vec<&str> = entries.iter().map(|m| m.id.as_str()).collect();
+        // Followed by the static fallback list.
+        assert!(ids.contains(&"llama3.2"));
+    }
+
+    // 22. The picker accepts a list of dynamically discovered Ollama entries
+    // via `set_models`, and they appear with the `ollama/` prefix.
+    #[test]
+    fn picker_accepts_dynamic_ollama_entries() {
+        let installed = vec![
+            mangocode_api::OllamaInstalledModel {
+                name: "llama3.2:latest".to_string(),
+                modified_at: None,
+                size: None,
+                digest: None,
+                details: None,
+            },
+            mangocode_api::OllamaInstalledModel {
+                name: "qwen3:4b".to_string(),
+                modified_at: None,
+                size: None,
+                digest: None,
+                details: None,
+            },
+        ];
+        let entries = ollama_entries_from_installed(&installed);
+        let mut p = ModelPickerState::new();
+        p.set_models(entries);
+        let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"ollama/llama3.2:latest"));
+        assert!(ids.contains(&"ollama/qwen3:4b"));
     }
 }

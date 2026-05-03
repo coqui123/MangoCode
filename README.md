@@ -136,6 +136,10 @@ cargo run -p mangocode -- --provider google --model gemini-2.5-pro
 
 # Local Ollama
 cargo run -p mangocode -- --provider ollama --model ollama/llama3.2
+
+# Local Ollama — Gemma 4 (multimodal, native function-calling)
+ollama pull gemma4:e4b   # small/local-friendly (~128K ctx)
+cargo run -p mangocode -- --provider ollama --model ollama/gemma4:e4b
 ```
 
 ### Ollama Notes And Troubleshooting
@@ -157,15 +161,32 @@ after `</think>`) is emitted as normal assistant content.
 arrays. MangoCode keeps a curated allowlist of known-good families
 (`llama3.x`, `llama4`, `qwen2.5`, `qwen3`, `mistral-nemo`, `mistral-large`,
 `mixtral`, `command-r`, `firefunction`, `hermes3`, `granite`, `smollm2`,
-`gpt-oss`) and silently drops the `tools` array for any other model so the
-request does not stall. If you have a custom Modelfile that genuinely
-supports tools, set `MANGOCODE_OLLAMA_FORCE_TOOLS=1` to bypass the gate.
+`gpt-oss`, `gemma4`) and silently drops the `tools` array for any other
+model so the request does not stall. If you have a custom Modelfile that
+genuinely supports tools, set `MANGOCODE_OLLAMA_FORCE_TOOLS=1` to bypass
+the gate.
 
 **Autostart.** When `OLLAMA_HOST` is unset and port `11434` is free,
 MangoCode runs `ollama serve` to start a local daemon. The listen address
 is governed entirely by `OLLAMA_HOST` (or the daemon default
 `127.0.0.1:11434`); MangoCode does **not** pass `--port` to `ollama serve`
 because no released `ollama` build accepts that flag.
+
+**Dynamic model discovery.** When you open the `/model` picker with the
+Ollama provider selected, MangoCode queries the local daemon at
+`GET /api/tags` (the same endpoint backing `ollama list`) and shows the
+models that are actually installed on your machine, including parameter
+size, quantisation, and on-disk size when the daemon reports them. Each
+discovered tag is exposed as `ollama/<tag>` (e.g. `ollama/qwen3:8b`,
+`ollama/llama3.2:latest`). The lookup uses a 3-second timeout — if the
+daemon is unreachable the picker falls back to a static suggestion list
+prefixed with a "start `ollama serve`" diagnostic, and if the daemon is
+running but has no models pulled the picker shows a hint to run
+`ollama pull <model>`. Verify what the picker should see with:
+
+```bash
+curl http://127.0.0.1:11434/api/tags
+```
 
 **Quick connectivity checks.** If the TUI hangs on a model request, first
 verify the daemon directly:
@@ -196,6 +217,44 @@ MangoCode aborts the request with a clear error rather than hanging
 indefinitely. Override with `MANGOCODE_OLLAMA_IDLE_TIMEOUT_MS=300000` for
 slow first-token times on under-resourced machines, or pull a Modelfile
 with a larger `num_ctx` if the model is paging.
+
+**Gemma 4 setup.** Gemma 4 is a multimodal (text + image) family with
+native OpenAI-style function calling, so it is on the tool-capable
+allowlist out of the box. Pull whichever variant fits your hardware:
+
+```bash
+# Default tag — picks the recommended size for your machine
+ollama run gemma4
+
+# Small / local-friendly (~128K context)
+ollama run gemma4:e2b
+ollama run gemma4:e4b
+
+# Workstation (~256K context)
+ollama run gemma4:26b
+ollama run gemma4:31b
+ollama run gemma4:31b-cloud
+
+# Confirm it appears in /api/tags so the /model picker can discover it
+curl http://127.0.0.1:11434/api/tags
+```
+
+Then point MangoCode at the tag you want:
+
+```bash
+cargo run -p mangocode -- --provider ollama --model ollama/gemma4
+cargo run -p mangocode -- --provider ollama --model ollama/gemma4:e4b
+cargo run -p mangocode -- --provider ollama --model ollama/gemma4:31b
+```
+
+Gemma 4's reasoning is emitted through OpenAI-Harmony channel tokens
+(`<|channel>thought ... <channel|>`), not the Qwen-style
+`<think>...</think>` wrapper that MangoCode strips automatically. Effort /
+extended-thinking controls therefore have no effect on `gemma4` tags
+today — the model still answers, just without surfacing its hidden
+chain-of-thought as MangoCode "reasoning" events. To force-enable
+thinking on a custom Modelfile, prefix the system prompt with `<|think|>`
+yourself.
 
 ### Google Vertex (ADC) Auth Flow
 

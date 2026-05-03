@@ -60,6 +60,130 @@ pub(crate) fn normalize_ollama_base_url(host: &str) -> String {
     }
 }
 
+/// Derive the native Ollama API base URL (without `/v1`) from a user-supplied
+/// `OLLAMA_HOST` value.
+///
+/// The OpenAI-compatible endpoint lives at `<host>/v1/...`, while native
+/// Ollama endpoints (`/api/tags`, `/api/show`, etc.) live at `<host>/...`.
+/// This is used by [`discover_installed_ollama_models`] to query
+/// `GET /api/tags`.
+pub fn native_ollama_base_url(host: &str) -> String {
+    let trimmed = host.trim();
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    let no_trail = with_scheme.trim_end_matches('/').to_string();
+    // Strip a trailing `/v1` (and any duplicate trailing slash) so we land on
+    // the native API base. `trim_end_matches` handles `/v1` only; we already
+    // stripped the trailing slash above.
+    if let Some(stripped) = no_trail.strip_suffix("/v1") {
+        stripped.to_string()
+    } else {
+        no_trail
+    }
+}
+
+/// Read the configured `OLLAMA_HOST` value (or the default) and return the
+/// native API base URL.
+pub fn ollama_native_base_from_env() -> String {
+    let host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    native_ollama_base_url(&host)
+}
+
+/// A single model installed on the local Ollama server, as returned by
+/// `GET /api/tags`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OllamaInstalledModel {
+    /// Tag-qualified model name, e.g. `qwen3:8b` or `llama3.2:latest`.
+    pub name: String,
+    #[serde(default)]
+    pub modified_at: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub details: Option<OllamaModelDetails>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OllamaModelDetails {
+    #[serde(default)]
+    pub family: Option<String>,
+    #[serde(default)]
+    pub parameter_size: Option<String>,
+    #[serde(default)]
+    pub quantization_level: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaInstalledModel>,
+}
+
+/// Parse a JSON body returned by `GET /api/tags` into a list of installed
+/// models. Returns an empty list when the body is not valid JSON or has no
+/// `models` field, so callers can treat it as "Ollama running but nothing
+/// installed".
+pub fn parse_ollama_tags_response(body: &str) -> Vec<OllamaInstalledModel> {
+    serde_json::from_str::<OllamaTagsResponse>(body)
+        .map(|r| r.models)
+        .unwrap_or_default()
+}
+
+/// Errors returned when discovering installed Ollama models.
+#[derive(Debug, thiserror::Error)]
+pub enum OllamaDiscoveryError {
+    #[error("Ollama server not reachable at {base_url}: {source}")]
+    Unreachable {
+        base_url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("Ollama /api/tags returned HTTP {status}")]
+    HttpStatus { status: u16 },
+    #[error("Failed to read Ollama response body: {0}")]
+    Body(#[source] reqwest::Error),
+}
+
+/// Query `GET <base>/api/tags` against the local Ollama server and return the
+/// list of installed models.
+///
+/// Uses a short total timeout (default 3 seconds) so a hung server cannot
+/// block the model picker. On any error the caller is expected to fall back
+/// to a static list and surface a diagnostic to the user.
+pub async fn discover_installed_ollama_models(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<OllamaInstalledModel>, OllamaDiscoveryError> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| OllamaDiscoveryError::Unreachable {
+            base_url: base_url.to_string(),
+            source: e,
+        })?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| OllamaDiscoveryError::Unreachable {
+            base_url: base_url.to_string(),
+            source: e,
+        })?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(OllamaDiscoveryError::HttpStatus { status });
+    }
+    let body = resp.text().await.map_err(OllamaDiscoveryError::Body)?;
+    Ok(parse_ollama_tags_response(&body))
+}
+
 /// LM Studio — local OpenAI-compatible server.
 /// Reads `LM_STUDIO_HOST` for the base URL; defaults to `http://localhost:1234`.
 pub fn lm_studio() -> OpenAiCompatProvider {
@@ -465,7 +589,7 @@ pub fn fireworks() -> OpenAiCompatProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ollama_base_url;
+    use super::{native_ollama_base_url, normalize_ollama_base_url, parse_ollama_tags_response};
 
     #[test]
     fn normalize_ollama_accepts_bare_host_port() {
@@ -509,5 +633,89 @@ mod tests {
             normalize_ollama_base_url("https://ollama.example.com"),
             "https://ollama.example.com/v1"
         );
+    }
+
+    #[test]
+    fn native_base_url_strips_v1_suffix() {
+        assert_eq!(
+            native_ollama_base_url("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn native_base_url_handles_bare_host_port() {
+        assert_eq!(
+            native_ollama_base_url("127.0.0.1:11434"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn native_base_url_handles_full_url_without_v1() {
+        assert_eq!(
+            native_ollama_base_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn native_base_url_strips_trailing_slash_before_v1_check() {
+        assert_eq!(
+            native_ollama_base_url("http://127.0.0.1:11434/v1/"),
+            "http://127.0.0.1:11434"
+        );
+        assert_eq!(
+            native_ollama_base_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn native_base_url_keeps_https() {
+        assert_eq!(
+            native_ollama_base_url("https://ollama.example.com/v1"),
+            "https://ollama.example.com"
+        );
+    }
+
+    #[test]
+    fn parse_tags_response_extracts_names() {
+        let body = r#"{
+            "models": [
+                {
+                    "name": "qwen3:8b",
+                    "modified_at": "2025-01-01T00:00:00Z",
+                    "size": 4920000000,
+                    "digest": "abc123",
+                    "details": {
+                        "family": "qwen",
+                        "parameter_size": "8B",
+                        "quantization_level": "Q4_K_M"
+                    }
+                },
+                { "name": "llama3.2:latest" }
+            ]
+        }"#;
+        let models = parse_ollama_tags_response(body);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "qwen3:8b");
+        assert_eq!(models[0].size, Some(4_920_000_000));
+        let details = models[0].details.as_ref().expect("details");
+        assert_eq!(details.parameter_size.as_deref(), Some("8B"));
+        assert_eq!(details.quantization_level.as_deref(), Some("Q4_K_M"));
+        assert_eq!(models[1].name, "llama3.2:latest");
+    }
+
+    #[test]
+    fn parse_tags_response_handles_empty_models() {
+        assert!(parse_ollama_tags_response(r#"{"models":[]}"#).is_empty());
+    }
+
+    #[test]
+    fn parse_tags_response_handles_invalid_json() {
+        // Malformed bodies should fall back to an empty list rather than panic.
+        assert!(parse_ollama_tags_response("not json").is_empty());
+        assert!(parse_ollama_tags_response("").is_empty());
     }
 }
