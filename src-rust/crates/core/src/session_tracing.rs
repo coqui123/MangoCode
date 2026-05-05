@@ -173,6 +173,10 @@ fn new_span(name: &str) -> Arc<dyn SpanLike> {
 pub fn start_interaction_span(request_id: &str) -> Arc<dyn SpanLike> {
     let span = new_span("interaction");
     span.set_attribute("request_id", request_id);
+    span.set_attribute("session_id", request_id);
+    if let Some(turn_id) = crate::harness::active_turn_id(request_id) {
+        span.set_attribute("turn_id", &turn_id);
+    }
     span
 }
 
@@ -203,6 +207,26 @@ pub fn start_tool_span(tool_name: &str) -> Arc<dyn SpanLike> {
     span
 }
 
+/// Start a tool execution span with harness identifiers attached.
+pub fn start_tool_span_with_ids(
+    tool_name: &str,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+    tool_call_id: Option<&str>,
+) -> Arc<dyn SpanLike> {
+    let span = start_tool_span(tool_name);
+    if let Some(session_id) = session_id {
+        span.set_attribute("session_id", session_id);
+    }
+    if let Some(turn_id) = turn_id {
+        span.set_attribute("turn_id", turn_id);
+    }
+    if let Some(tool_call_id) = tool_call_id {
+        span.set_attribute("tool_call_id", tool_call_id);
+    }
+    span
+}
+
 /// End a tool execution span.
 pub fn end_tool_span(span: Arc<dyn SpanLike>, success: bool, error: Option<&str>) {
     span.set_attribute("success", if success { "true" } else { "false" });
@@ -210,6 +234,22 @@ pub fn end_tool_span(span: Arc<dyn SpanLike>, success: bool, error: Option<&str>
         span.record_exception(error);
         span.set_attribute("error", error);
     }
+    span.end();
+}
+
+/// Start a checkpoint capture/restore span.
+pub fn start_checkpoint_span(session_id: &str, turn_id: &str, kind: &str) -> Arc<dyn SpanLike> {
+    let span = new_span("checkpoint.capture");
+    span.set_attribute("session_id", session_id);
+    span.set_attribute("turn_id", turn_id);
+    span.set_attribute("checkpoint_kind", kind);
+    span
+}
+
+/// End a checkpoint span with the durable checkpoint identifier.
+pub fn end_checkpoint_span(span: Arc<dyn SpanLike>, checkpoint_id: &str, backend: &str) {
+    span.set_attribute("checkpoint_id", checkpoint_id);
+    span.set_attribute("checkpoint_backend", backend);
     span.end();
 }
 

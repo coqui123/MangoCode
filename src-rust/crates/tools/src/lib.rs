@@ -267,7 +267,9 @@ impl ToolContext {
             is_read_only,
             context_description: None,
         };
+        mangocode_core::harness::record_permission_request(&self.session_id, &request);
         let decision = self.permission_handler.request_permission(&request);
+        mangocode_core::harness::record_permission_decision(&self.session_id, &request, &decision);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
             _ => Err(mangocode_core::error::ClaudeError::PermissionDenied(
@@ -295,7 +297,9 @@ impl ToolContext {
             is_read_only,
             context_description: None,
         };
+        mangocode_core::harness::record_permission_request(&self.session_id, &request);
         let decision = self.permission_handler.request_permission(&request);
+        mangocode_core::harness::record_permission_decision(&self.session_id, &request, &decision);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
             _ => Err(mangocode_core::error::ClaudeError::PermissionDenied(

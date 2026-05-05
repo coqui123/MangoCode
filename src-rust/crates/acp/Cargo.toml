@@ -7,6 +7,8 @@ description = "Agent Client Protocol (ACP) server for MangoCode — JSON-RPC 2.0
 [dependencies]
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
+mangocode-query = { workspace = true }
+mangocode-tools = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,3 +16,6 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }

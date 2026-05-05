@@ -10276,10 +10276,33 @@ impl SlashCommand for UndoCommand {
         let (reverted, errors) = snap.revert(tool_use_id);
 
         if reverted.is_empty() && errors.is_empty() {
-            return CommandResult::Error(format!(
-                "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
-                tool_use_id
-            ));
+            match mangocode_core::harness::restore_tool_snapshot(&session_id, tool_use_id) {
+                Ok((durable_reverted, durable_errors))
+                    if !durable_reverted.is_empty() || !durable_errors.is_empty() =>
+                {
+                    let mut msg = format!(
+                        "Reverted {} file(s) for tool call '{}' from durable harness history:",
+                        durable_reverted.len(),
+                        tool_use_id
+                    );
+                    for p in &durable_reverted {
+                        msg.push_str(&format!("\n  {}", p));
+                    }
+                    if !durable_errors.is_empty() {
+                        msg.push_str("\n\nErrors:");
+                        for e in durable_errors {
+                            msg.push_str(&format!("\n  {}", e));
+                        }
+                    }
+                    return CommandResult::Message(msg);
+                }
+                _ => {
+                    return CommandResult::Error(format!(
+                        "No changes found for tool_use_id '{}'. Use /undo with no arguments to list available IDs.",
+                        tool_use_id
+                    ));
+                }
+            }
         }
 
         let mut msg = format!(

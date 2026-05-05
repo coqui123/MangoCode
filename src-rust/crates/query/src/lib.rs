@@ -45,6 +45,7 @@ pub use skill_prefetch::{
     format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
 };
 
+use crate::ollama::ensure_local_ollama_server;
 use mangocode_api::{
     AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
@@ -60,14 +61,13 @@ use mangocode_core::ps_classifier::{classify_ps_command, PsRiskLevel};
 use mangocode_core::session_tracing::{
     end_hook_span, end_interaction_span, end_llm_request_span, end_permission_span, end_tool_span,
     start_hook_span, start_interaction_span, start_llm_request_span, start_permission_span,
-    start_tool_span,
+    start_tool_span_with_ids,
 };
 use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
 use mangocode_tools::{Tool, ToolContext, ToolResult};
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use crate::ollama::ensure_local_ollama_server;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -852,6 +852,311 @@ pub enum QueryEvent {
     },
 }
 
+fn record_query_event(
+    recorder: &mangocode_core::harness::HarnessRecorder,
+    turn_id: &str,
+    event: &QueryEvent,
+) {
+    match event {
+        QueryEvent::Stream(stream) => record_stream_event(recorder, turn_id, stream, None),
+        QueryEvent::StreamWithParent {
+            event,
+            parent_tool_use_id,
+        } => record_stream_event(recorder, turn_id, event, Some(parent_tool_use_id.as_str())),
+        QueryEvent::ToolStart {
+            tool_name,
+            tool_id,
+            input_json,
+            parent_tool_use_id,
+        } => {
+            let input = serde_json::from_str::<Value>(input_json)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": input_json }));
+            recorder.record(
+                "tool.started",
+                Some(turn_id.to_string()),
+                Some(tool_id.clone()),
+                None,
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "input": input,
+                    "parent_tool_use_id": parent_tool_use_id,
+                }),
+            );
+        }
+        QueryEvent::ToolEnd {
+            tool_name,
+            tool_id,
+            result,
+            is_error,
+            parent_tool_use_id,
+        } => {
+            recorder.record(
+                "tool.completed",
+                Some(turn_id.to_string()),
+                Some(tool_id.clone()),
+                None,
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "result": result,
+                    "is_error": is_error,
+                    "parent_tool_use_id": parent_tool_use_id,
+                }),
+            );
+        }
+        QueryEvent::TurnComplete {
+            turn,
+            stop_reason,
+            usage,
+        } => {
+            recorder.record(
+                "model.turn_completed",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({
+                    "provider_turn": turn,
+                    "stop_reason": stop_reason,
+                    "usage": usage,
+                }),
+            );
+        }
+        QueryEvent::Status(message) => {
+            recorder.record(
+                "status",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({ "message": message }),
+            );
+        }
+        QueryEvent::Error(message) => {
+            recorder.record(
+                "error",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({ "message": message }),
+            );
+        }
+        QueryEvent::TokenWarning { state, pct_used } => {
+            recorder.record(
+                "token.warning",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({
+                    "state": format!("{:?}", state),
+                    "pct_used": pct_used,
+                }),
+            );
+        }
+    }
+}
+
+fn record_stream_event(
+    recorder: &mangocode_core::harness::HarnessRecorder,
+    turn_id: &str,
+    event: &AnthropicStreamEvent,
+    parent_tool_use_id: Option<&str>,
+) {
+    match event {
+        AnthropicStreamEvent::ContentBlockDelta {
+            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+            ..
+        } => {
+            recorder.record(
+                "message.delta",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({
+                    "role": "assistant",
+                    "text": text,
+                    "parent_tool_use_id": parent_tool_use_id,
+                }),
+            );
+        }
+        AnthropicStreamEvent::ContentBlockDelta {
+            delta: mangocode_api::streaming::ContentDelta::ThinkingDelta { thinking },
+            ..
+        } => {
+            recorder.record(
+                "message.thinking_delta",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({
+                    "thinking": thinking,
+                    "parent_tool_use_id": parent_tool_use_id,
+                }),
+            );
+        }
+        other => {
+            recorder.record(
+                "provider.stream",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({
+                    "debug": format!("{:?}", other),
+                    "parent_tool_use_id": parent_tool_use_id,
+                }),
+            );
+        }
+    }
+}
+
+fn file_snapshot_payload_since(
+    tool_ctx: &ToolContext,
+    start_index: usize,
+    recorder: &mangocode_core::harness::HarnessRecorder,
+    turn_id: &str,
+) -> Option<Value> {
+    if let Some(snapshot) = file_snapshot_payload_from_harness_events(recorder, turn_id) {
+        return Some(snapshot);
+    }
+
+    let history = tool_ctx.file_history.lock();
+    let entries = history
+        .entries()
+        .iter()
+        .skip(start_index)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    let mut by_path: BTreeMap<std::path::PathBuf, Value> = BTreeMap::new();
+    for entry in entries {
+        let after_content = std::fs::read(&entry.path).ok();
+        let after_existed = after_content.is_some();
+        let after_text = after_content
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+        let after_base64 = after_content.as_ref().and_then(|bytes| {
+            if after_text.is_none() {
+                use base64::Engine as _;
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+            } else {
+                None
+            }
+        });
+        let after_hash = after_content.as_ref().map(|bytes| sha256_hex(bytes));
+        let after_binary = after_existed && after_text.is_none();
+        if let Some(snapshot) = by_path.get_mut(&entry.path) {
+            snapshot["after_existed"] = serde_json::json!(after_existed);
+            snapshot["after_hash"] = serde_json::json!(after_hash);
+            snapshot["after_text"] = serde_json::json!(after_text);
+            snapshot["after_base64"] = serde_json::json!(after_base64);
+            snapshot["binary"] =
+                serde_json::json!(snapshot["binary"].as_bool().unwrap_or(false) || after_binary);
+            snapshot["tool_name"] = serde_json::json!(entry.tool_name);
+            snapshot["timestamp_ms"] = serde_json::json!(entry.timestamp_ms);
+        } else {
+            by_path.insert(
+                entry.path.clone(),
+                serde_json::json!({
+                    "path": entry.path,
+                    "existed": true,
+                    "after_existed": after_existed,
+                    "before_hash": entry.before_hash,
+                    "after_hash": after_hash,
+                    "before_text": entry.before_text,
+                    "after_text": after_text,
+                    "before_base64": null,
+                    "after_base64": after_base64,
+                    "binary": entry.binary || after_binary,
+                    "turn_index": entry.turn_index,
+                    "timestamp_ms": entry.timestamp_ms,
+                    "tool_name": entry.tool_name,
+                }),
+            );
+        }
+    }
+    let snapshots: Vec<Value> = by_path.into_values().collect();
+    Some(Value::Array(snapshots))
+}
+
+fn file_snapshot_payload_from_harness_events(
+    recorder: &mangocode_core::harness::HarnessRecorder,
+    turn_id: &str,
+) -> Option<Value> {
+    let mut by_path: BTreeMap<std::path::PathBuf, Value> = BTreeMap::new();
+    for event in recorder.events_for_turn(turn_id) {
+        match event.event_type.as_str() {
+            "tool.snapshot_before" => {
+                let Some(path_str) = event.payload.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(path_str);
+                by_path.entry(path.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "path": path,
+                        "existed": event.payload.get("existed").and_then(Value::as_bool).unwrap_or(false),
+                        "before_hash": null,
+                        "before_text": event.payload.get("before_text").cloned().unwrap_or(Value::Null),
+                        "before_base64": event.payload.get("before_base64").cloned().unwrap_or(Value::Null),
+                        "binary": event.payload.get("binary").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                });
+            }
+            "file.changed" => {
+                let Some(path_str) = event.payload.get("path").and_then(Value::as_str) else {
+                    continue;
+                };
+                let path = std::path::PathBuf::from(path_str);
+                let entry = by_path.entry(path.clone()).or_insert_with(|| {
+                    serde_json::json!({
+                        "path": path,
+                        "existed": event.payload.get("existed").and_then(Value::as_bool).unwrap_or(true),
+                        "before_hash": event.payload.get("before_hash").cloned().unwrap_or(Value::Null),
+                        "before_text": event.payload.get("before_text").cloned().unwrap_or(Value::Null),
+                        "before_base64": null,
+                        "binary": event.payload.get("binary").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                });
+                let after_content = std::fs::read(&path).ok();
+                let after_text = after_content
+                    .as_ref()
+                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+                let after_base64 = after_content.as_ref().and_then(|bytes| {
+                    if after_text.is_none() {
+                        use base64::Engine as _;
+                        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                    } else {
+                        None
+                    }
+                });
+                entry["after_existed"] = serde_json::json!(after_content.is_some());
+                entry["after_hash"] =
+                    serde_json::json!(after_content.as_ref().map(|bytes| sha256_hex(bytes)));
+                entry["after_text"] = serde_json::json!(after_text);
+                entry["after_base64"] = serde_json::json!(after_base64);
+                entry["tool_name"] = event
+                    .payload
+                    .get("tool_name")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                entry["tool_call_id"] = serde_json::json!(event.tool_call_id);
+                entry["turn_id"] = serde_json::json!(event.turn_id);
+            }
+            _ => {}
+        }
+    }
+
+    if by_path.is_empty() {
+        None
+    } else {
+        Some(Value::Array(by_path.into_values().collect()))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 // ---------------------------------------------------------------------------
 // T1-3: Post-sampling hooks
 // ---------------------------------------------------------------------------
@@ -1115,7 +1420,146 @@ pub async fn run_query_loop(
     cost_tracker: Arc<CostTracker>,
     event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: tokio_util::sync::CancellationToken,
+    pending_messages: Option<&mut Vec<String>>,
+) -> QueryOutcome {
+    let file_history_start = tool_ctx.file_history.lock().len();
+    let (harness_turn_id, harness_recorder) = mangocode_core::harness::start_turn(
+        &tool_ctx.session_id,
+        Some(&config.model),
+        Some(&tool_ctx.working_dir),
+        Some(serde_json::json!({
+            "cwd": tool_ctx.working_dir,
+            "model": config.model,
+            "message_count": messages.len(),
+        })),
+    );
+    let before_checkpoint = harness_recorder
+        .capture_checkpoint(
+            &harness_turn_id,
+            mangocode_core::harness::CheckpointKind::Before,
+            &tool_ctx.working_dir,
+            None,
+        )
+        .ok();
+
+    let (harness_event_tx, mut harness_event_rx) = mpsc::unbounded_channel();
+    let downstream_event_tx = event_tx.clone();
+    let recorder_for_events = harness_recorder.clone();
+    let turn_for_events = harness_turn_id.clone();
+    let event_forwarder = tokio::spawn(async move {
+        while let Some(event) = harness_event_rx.recv().await {
+            record_query_event(&recorder_for_events, &turn_for_events, &event);
+            if let Some(ref tx) = downstream_event_tx {
+                let _ = tx.send(event);
+            }
+        }
+    });
+
+    let outcome = run_query_loop_inner(
+        client,
+        messages,
+        tools,
+        tool_ctx,
+        config,
+        cost_tracker,
+        Some(harness_event_tx),
+        cancel_token,
+        pending_messages,
+        Some((harness_recorder.clone(), harness_turn_id.clone())),
+    )
+    .await;
+
+    harness_recorder.record(
+        "messages.snapshot",
+        Some(harness_turn_id.clone()),
+        None,
+        None,
+        serde_json::json!({
+            "message_count": messages.len(),
+            "messages": &*messages,
+        }),
+    );
+
+    let snapshot = file_snapshot_payload_since(
+        tool_ctx,
+        file_history_start,
+        &harness_recorder,
+        &harness_turn_id,
+    );
+    if let (Some(before), Some(snapshot)) = (&before_checkpoint, snapshot.as_ref()) {
+        if before.backend != mangocode_core::harness::CheckpointBackend::GitRef {
+            let _ = harness_recorder.update_checkpoint_snapshot(before, snapshot.clone());
+        }
+    }
+    let _ = harness_recorder.capture_checkpoint(
+        &harness_turn_id,
+        mangocode_core::harness::CheckpointKind::After,
+        &tool_ctx.working_dir,
+        snapshot,
+    );
+
+    let (status, detail) = match &outcome {
+        QueryOutcome::EndTurn { usage, .. } => (
+            mangocode_core::harness::HarnessTurnStatus::Completed,
+            serde_json::json!({
+                "stop_reason": "end_turn",
+                "usage": usage,
+            }),
+        ),
+        QueryOutcome::MaxTokens { usage, .. } => (
+            mangocode_core::harness::HarnessTurnStatus::Completed,
+            serde_json::json!({
+                "stop_reason": "max_tokens",
+                "usage": usage,
+            }),
+        ),
+        QueryOutcome::Cancelled => (
+            mangocode_core::harness::HarnessTurnStatus::Cancelled,
+            serde_json::json!({ "stop_reason": "cancelled" }),
+        ),
+        QueryOutcome::BudgetExceeded {
+            cost_usd,
+            limit_usd,
+        } => (
+            mangocode_core::harness::HarnessTurnStatus::Failed,
+            serde_json::json!({
+                "stop_reason": "budget_exceeded",
+                "cost_usd": cost_usd,
+                "limit_usd": limit_usd,
+            }),
+        ),
+        QueryOutcome::Error(err) => (
+            mangocode_core::harness::HarnessTurnStatus::Failed,
+            serde_json::json!({
+                "stop_reason": "error",
+                "error": err.to_string(),
+            }),
+        ),
+    };
+    harness_recorder.record_turn_status(
+        &harness_turn_id,
+        status,
+        Some(&config.model),
+        Some(&tool_ctx.working_dir),
+        Some(detail),
+    );
+    mangocode_core::harness::finish_turn(&tool_ctx.session_id, &harness_turn_id);
+    let _ = tokio::time::timeout(Duration::from_secs(2), event_forwarder).await;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_query_loop_inner(
+    client: &mangocode_api::AnthropicClient,
+    messages: &mut Vec<Message>,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+    config: &QueryConfig,
+    cost_tracker: Arc<CostTracker>,
+    event_tx: Option<mpsc::UnboundedSender<QueryEvent>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     mut pending_messages: Option<&mut Vec<String>>,
+    harness_context: Option<(mangocode_core::harness::HarnessRecorder, String)>,
 ) -> QueryOutcome {
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
@@ -2372,6 +2816,11 @@ pub async fn run_query_loop(
                             .iter()
                             .map(|p| {
                                 let event_tx_for_exec = event_tx.clone();
+                                let harness_recorder_for_exec = harness_context
+                                    .as_ref()
+                                    .map(|(recorder, _)| recorder.clone());
+                                let harness_turn_for_exec =
+                                    harness_context.as_ref().map(|(_, turn_id)| turn_id.clone());
                                 if let Some(r) = p.blocked_result.clone() {
                                     futures::future::Either::Left(async move { (r, 0_u64) })
                                 } else {
@@ -2396,6 +2845,8 @@ pub async fn run_query_loop(
                                             ctx: tool_ctx,
                                             event_tx: event_tx_for_exec.as_ref(),
                                             parent_messages: parent_msgs,
+                                            harness_recorder: harness_recorder_for_exec,
+                                            harness_turn_id: harness_turn_for_exec,
                                         })
                                         .await;
                                         (result, tool_started.elapsed().as_millis() as u64)
@@ -3146,6 +3597,11 @@ pub async fn run_query_loop(
                     .iter()
                     .map(|p| {
                         let event_tx_for_exec = event_tx.clone();
+                        let harness_recorder_for_exec = harness_context
+                            .as_ref()
+                            .map(|(recorder, _)| recorder.clone());
+                        let harness_turn_for_exec =
+                            harness_context.as_ref().map(|(_, turn_id)| turn_id.clone());
                         if let Some(r) = p.blocked_result.clone() {
                             futures::future::Either::Left(async move { (r, 0_u64) })
                         } else {
@@ -3170,6 +3626,8 @@ pub async fn run_query_loop(
                                     ctx: tool_ctx,
                                     event_tx: event_tx_for_exec.as_ref(),
                                     parent_messages: parent_msgs,
+                                    harness_recorder: harness_recorder_for_exec,
+                                    harness_turn_id: harness_turn_for_exec,
                                 })
                                 .await;
                                 (result, tool_started.elapsed().as_millis() as u64)
@@ -3518,10 +3976,22 @@ struct ExecuteToolRequest<'a> {
     /// Snapshot of the parent conversation history at the time of tool
     /// invocation. Passed through to AgentTool for fork-mode context sharing.
     parent_messages: Option<Vec<Message>>,
+    harness_recorder: Option<mangocode_core::harness::HarnessRecorder>,
+    harness_turn_id: Option<String>,
+}
+
+struct ToolPreSnapshot {
+    path: std::path::PathBuf,
+    before_content: Option<Vec<u8>>,
 }
 
 async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
-    let tool_span = start_tool_span(req.name);
+    let tool_span = start_tool_span_with_ids(
+        req.name,
+        Some(&req.ctx.session_id),
+        req.harness_turn_id.as_deref(),
+        Some(req.tool_id),
+    );
 
     if req.name == mangocode_core::constants::TOOL_NAME_AGENT {
         let parent_msgs = req.parent_messages.as_deref();
@@ -3591,7 +4061,18 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
     match tool {
         Some(tool) => {
             debug!(tool = req.name, "Executing tool");
+            let snapshots = collect_tool_pre_snapshots(req.ctx, req.name, req.input);
             let result = tool.execute(req.input.clone(), req.ctx).await;
+            if !result.is_error {
+                persist_tool_snapshots(
+                    req.ctx,
+                    req.tool_id,
+                    req.name,
+                    snapshots,
+                    req.harness_recorder.as_ref(),
+                    req.harness_turn_id.as_deref(),
+                );
+            }
             end_tool_span(
                 tool_span,
                 !result.is_error,
@@ -3610,6 +4091,139 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
             result
         }
     }
+}
+
+fn collect_tool_pre_snapshots(
+    ctx: &ToolContext,
+    tool_name: &str,
+    input: &Value,
+) -> Vec<ToolPreSnapshot> {
+    let mut paths = Vec::new();
+    match tool_name {
+        mangocode_core::constants::TOOL_NAME_FILE_WRITE
+        | mangocode_core::constants::TOOL_NAME_FILE_EDIT => {
+            if let Some(path) = input.get("file_path").and_then(Value::as_str) {
+                paths.push(path.to_string());
+            }
+        }
+        "NotebookEdit" => {
+            if let Some(path) = input.get("notebook_path").and_then(Value::as_str) {
+                paths.push(path.to_string());
+            }
+        }
+        "BatchEdit" => {
+            if let Some(edits) = input.get("edits").and_then(Value::as_array) {
+                for edit in edits {
+                    if let Some(path) = edit.get("file_path").and_then(Value::as_str) {
+                        paths.push(path.to_string());
+                    }
+                }
+            }
+        }
+        mangocode_core::constants::TOOL_NAME_APPLY_PATCH => {
+            if !input
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                if let Some(patch) = input.get("patch").and_then(Value::as_str) {
+                    paths.extend(extract_apply_patch_paths(patch));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            let resolved = ctx.resolve_path(&path);
+            let before_content = std::fs::read(&resolved).ok();
+            ToolPreSnapshot {
+                path: resolved,
+                before_content,
+            }
+        })
+        .collect()
+}
+
+fn persist_tool_snapshots(
+    ctx: &ToolContext,
+    tool_id: &str,
+    tool_name: &str,
+    snapshots: Vec<ToolPreSnapshot>,
+    harness_recorder: Option<&mangocode_core::harness::HarnessRecorder>,
+    harness_turn_id: Option<&str>,
+) {
+    if snapshots.is_empty() {
+        return;
+    }
+    let snap = mangocode_tools::session_snapshot(&ctx.session_id);
+    let mut snap = snap.lock();
+    for snapshot in snapshots {
+        if let (Some(recorder), Some(turn_id)) = (harness_recorder, harness_turn_id) {
+            recorder.record_tool_snapshot_before_for_turn(
+                turn_id,
+                tool_id,
+                &snapshot.path,
+                snapshot.before_content.as_deref(),
+            );
+            let after_content = std::fs::read(&snapshot.path).ok();
+            recorder.record_file_change_for_turn(
+                turn_id,
+                Some(tool_id),
+                &snapshot.path,
+                snapshot.before_content.as_deref(),
+                after_content.as_deref(),
+                tool_name,
+            );
+        } else {
+            mangocode_core::harness::record_tool_snapshot_before(
+                &ctx.session_id,
+                tool_id,
+                &snapshot.path,
+                snapshot.before_content.as_deref(),
+            );
+            if let Ok(after_content) = std::fs::read(&snapshot.path) {
+                mangocode_core::harness::record_file_change_with_tool(
+                    &ctx.session_id,
+                    Some(tool_id),
+                    &snapshot.path,
+                    snapshot.before_content.as_deref(),
+                    &after_content,
+                    tool_name,
+                );
+            }
+        }
+        let text_snapshot = snapshot
+            .before_content
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+        if snapshot.before_content.is_none() || text_snapshot.is_some() {
+            snap.record_snapshot(tool_id, &snapshot.path.to_string_lossy(), text_snapshot);
+        }
+    }
+}
+
+fn extract_apply_patch_paths(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            let raw = line.strip_prefix("+++ ")?;
+            let path = raw.trim_start_matches("b/").trim();
+            if path == "/dev/null" || path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
 }
 
 /// Load persisted todos for `session_id` and return a nudge string if any are

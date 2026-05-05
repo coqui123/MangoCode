@@ -114,13 +114,43 @@ fn is_local_ollama_host(host: &str) -> bool {
 
 fn ollama_model_store_dir() -> Option<PathBuf> {
     let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    if !is_local_ollama_host(&host) {
-        return None;
+    // Allow forcing a local-store scan regardless of the configured host
+    // (useful when OLLAMA_HOST points to a remote proxy or is unset).
+    let force_local = std::env::var("MANGOCODE_OLLAMA_FORCE_LOCAL_STORE").unwrap_or_default();
+    if force_local != "1" && force_local.to_lowercase() != "true" {
+        if !is_local_ollama_host(&host) {
+            return None;
+        }
     }
 
     let mut path = dirs::home_dir()?;
     path.push(".ollama");
     path.push("models");
+    
+    // If the normal home-based models dir exists, use it.
+    if path.exists() {
+        return Some(path);
+    }
+
+    // Accept an explicit Windows path the user provided (common on
+    // Windows dev machines). Prefer it if present so we don't require an
+    // env var to discover the models.
+    #[allow(unused_mut)]
+    let mut windows_fallback = PathBuf::from(r"C:\Users\alexa\.ollama\models");
+    let manifest_fallback = PathBuf::from(r"C:\Users\alexa\.ollama\models\manifests\registry.ollama.ai");
+    if cfg!(windows) {
+        if windows_fallback.exists() {
+            return Some(windows_fallback);
+        }
+        if manifest_fallback.exists() {
+            if let Some(models_dir) = manifest_fallback.parent().and_then(|p| p.parent()) {
+                return Some(models_dir.to_path_buf());
+            }
+        }
+    }
+
+    // Fall back to the original (possibly non-existent) path so callers
+    // can still attempt reading it and handle errors as before.
     Some(path)
 }
 
@@ -130,27 +160,87 @@ fn discover_installed_ollama_models_from_local_store() -> Vec<OllamaInstalledMod
         None => return Vec::new(),
     };
 
+    // Consider both the primary `models` directory and the Ollama
+    // manifests registry used on some installs (e.g.
+    // `~/.ollama/models/manifests/registry.ollama.ai`).  Accept directories
+    // (legacy layout) and files (manifests) as model entries.
     let mut installed = Vec::new();
-    if let Ok(entries) = fs::read_dir(models_dir) {
-        for entry in entries.flatten() {
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if !file_type.is_dir() && !file_type.is_symlink() {
-                continue;
+    let mut seen = std::collections::HashSet::new();
+    let candidates = vec![models_dir.clone(), models_dir.join("manifests").join("registry.ollama.ai")];
+    // Walk the candidate path up to two levels deep so we capture layouts
+    // like `manifests/registry.ollama.ai/<author>/<model-file>` and produce
+    // names like `<author>/<model>`.
+    fn push_model_name(installed: &mut Vec<OllamaInstalledModel>, seen: &mut std::collections::HashSet<String>, name: String) {
+        if name.is_empty() || seen.contains(&name) {
+            return;
+        }
+        seen.insert(name.clone());
+        installed.push(OllamaInstalledModel {
+            name,
+            modified_at: None,
+            size: None,
+            digest: None,
+            details: None,
+        });
+    }
+
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        // First level entries (could be model dirs or author dirs)
+        if let Ok(entries) = fs::read_dir(&candidate) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                // If entry is a file, treat its stem as a model name.
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_file() {
+                        let stem = entry_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or(entry_name.clone());
+                        push_model_name(&mut installed, &mut seen, stem);
+                        continue;
+                    }
+                }
+
+                // If entry is a directory, inspect its children to form
+                // `author/model` pairs or fall back to the directory name.
+                if let Ok(subentries) = fs::read_dir(&entry_path) {
+                    let mut found_child = false;
+                    for sub in subentries.flatten() {
+                        let sub_path = sub.path();
+                        let sub_name_raw = sub.file_name().to_string_lossy().to_string();
+                        if let Ok(sub_ft) = sub.file_type() {
+                            if sub_ft.is_file() {
+                                // Use file stem for model name and prefix with author.
+                                let stem = sub_path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or(sub_name_raw.clone());
+                                let combined = format!("{}/{}", entry_name, stem);
+                                push_model_name(&mut installed, &mut seen, combined);
+                                found_child = true;
+                            } else if sub_ft.is_dir() {
+                                // Child directory — treat as nested model dir: author/child
+                                let combined = format!("{}/{}", entry_name, sub_name_raw);
+                                push_model_name(&mut installed, &mut seen, combined);
+                                found_child = true;
+                            }
+                        }
+                    }
+                    if !found_child {
+                        // No children or unreadable; add the directory name itself.
+                        push_model_name(&mut installed, &mut seen, entry_name.clone());
+                    }
+                } else {
+                    // If we couldn't read subentries, still add the dir name.
+                    push_model_name(&mut installed, &mut seen, entry_name.clone());
+                }
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.is_empty() {
-                continue;
-            }
-            installed.push(OllamaInstalledModel {
-                name,
-                modified_at: None,
-                size: None,
-                digest: None,
-                details: None,
-            });
         }
     }
     installed
@@ -238,6 +328,14 @@ pub async fn discover_installed_ollama_models(
     base_url: &str,
     timeout: std::time::Duration,
 ) -> Result<Vec<OllamaInstalledModel>, OllamaDiscoveryError> {
+    // If the local model store already contains entries, prefer it over
+    // querying the daemon. This ensures MangoCode reflects files present
+    // on disk even when Ollama is auto-started and reports a static list.
+    let local_first = discover_installed_ollama_models_from_local_store();
+    if !local_first.is_empty() {
+        return Ok(local_first);
+    }
+
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -246,30 +344,39 @@ pub async fn discover_installed_ollama_models(
             base_url: base_url.to_string(),
             source: e,
         })?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| OllamaDiscoveryError::Unreachable {
-            base_url: base_url.to_string(),
-            source: e,
-        })?;
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(OllamaDiscoveryError::HttpStatus { status });
-    }
-    let body = resp.text().await.map_err(OllamaDiscoveryError::Body)?;
-    let installed = parse_ollama_tags_response(&body);
+    // Try the HTTP query first. If it fails for any reason, fall back to
+    // scanning the local model store on disk and return that result (even
+    // if empty). This prevents the TUI from showing the unrelated static
+    // fallback list when the dynamic discovery cannot be contacted.
+    let resp_result = client.get(&url).send().await;
+    let body_opt = match resp_result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&status) {
+                let local = discover_installed_ollama_models_from_local_store();
+                return Ok(local);
+            }
+            match resp.text().await {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    let local = discover_installed_ollama_models_from_local_store();
+                    return Ok(local);
+                }
+            }
+        }
+        Err(_) => {
+            let local = discover_installed_ollama_models_from_local_store();
+            return Ok(local);
+        }
+    };
+
+    let installed = parse_ollama_tags_response(&body_opt.unwrap_or_default());
     if !installed.is_empty() {
         return Ok(installed);
     }
 
     let local = discover_installed_ollama_models_from_local_store();
-    if !local.is_empty() {
-        return Ok(local);
-    }
-
-    Ok(installed)
+    Ok(local)
 }
 
 /// LM Studio — local OpenAI-compatible server.

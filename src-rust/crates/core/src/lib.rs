@@ -17,6 +17,9 @@ pub use session_share::{export_session_text, share_session};
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
+
+// Durable local harness events/checkpoints/traces.
+pub mod harness;
 pub mod layered_memory;
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).

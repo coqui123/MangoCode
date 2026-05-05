@@ -59,6 +59,23 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Store an already-captured text snapshot.
+    ///
+    /// This is used by the durable harness path, where the query layer captures
+    /// file bytes before executing a tool but only commits the undo snapshot if
+    /// the tool actually succeeds.
+    pub fn record_snapshot(
+        &mut self,
+        tool_use_id: &str,
+        path: &str,
+        content_before_write: Option<String>,
+    ) {
+        self.snapshots
+            .entry(tool_use_id.to_string())
+            .or_default()
+            .push((path.to_string(), content_before_write));
+    }
+
     /// Revert all file changes that were made by `tool_use_id`.
     ///
     /// Files are reverted in *reverse* snapshot order (the last file written is
