@@ -4,11 +4,93 @@ version.workspace = true
 edition.workspace = true
 description = "Agent Client Protocol (ACP) server for MangoCode — JSON-RPC 2.0 over stdio"
 
+[features]
+default = ["proactive", "default-tools"]
+proactive = ["mangocode-core/proactive", "mangocode-query/proactive"]
+default-tools = [
+    "mangocode-query/default-tools",
+    "mangocode-tools/default-tools",
+    "tool-agent",
+    "tool-team-create",
+    "tool-team-delete",
+]
+default-tools-no-web-research = [
+    "mangocode-query/default-tools-no-web-research",
+    "mangocode-tools/default-tools-no-web-research",
+    "tool-agent",
+    "tool-team-create",
+    "tool-team-delete",
+]
+full-tools = [
+    "mangocode-query/full-tools",
+    "mangocode-tools/full-tools",
+    "tool-agent",
+    "tool-team-create",
+    "tool-team-delete",
+]
+tool-agent = ["mangocode-query/tool-agent", "mangocode-tools/tool-agent"]
+tool-apply-patch = ["mangocode-query/tool-apply-patch", "mangocode-tools/tool-apply-patch"]
+tool-ask-user = ["mangocode-query/tool-ask-user", "mangocode-tools/tool-ask-user"]
+tool-bash = ["mangocode-query/tool-bash", "mangocode-tools/tool-bash"]
+tool-batch-edit = ["mangocode-query/tool-batch-edit", "mangocode-tools/tool-batch-edit"]
+tool-brief = ["mangocode-query/tool-brief", "mangocode-tools/tool-brief"]
+tool-browser = ["mangocode-query/tool-browser", "mangocode-tools/tool-browser"]
+tool-computer-use = ["mangocode-query/tool-computer-use", "mangocode-tools/tool-computer-use"]
+tool-config = ["mangocode-query/tool-config", "mangocode-tools/tool-config"]
+tool-cron-create = ["mangocode-query/tool-cron-create", "mangocode-tools/tool-cron-create"]
+tool-cron-delete = ["mangocode-query/tool-cron-delete", "mangocode-tools/tool-cron-delete"]
+tool-cron-list = ["mangocode-query/tool-cron-list", "mangocode-tools/tool-cron-list"]
+tool-create-goal = ["mangocode-query/tool-create-goal", "mangocode-tools/tool-create-goal"]
+tool-deep-read = ["mangocode-query/tool-deep-read", "mangocode-tools/tool-deep-read"]
+tool-doc-read = ["mangocode-query/tool-doc-read", "mangocode-tools/tool-doc-read"]
+tool-doc-search = ["mangocode-query/tool-doc-search", "mangocode-tools/tool-doc-search"]
+tool-edit = ["mangocode-query/tool-edit", "mangocode-tools/tool-edit"]
+tool-enter-plan-mode = ["mangocode-query/tool-enter-plan-mode", "mangocode-tools/tool-enter-plan-mode"]
+tool-enter-worktree = ["mangocode-query/tool-enter-worktree", "mangocode-tools/tool-enter-worktree"]
+tool-exit-plan-mode = ["mangocode-query/tool-exit-plan-mode", "mangocode-tools/tool-exit-plan-mode"]
+tool-exit-worktree = ["mangocode-query/tool-exit-worktree", "mangocode-tools/tool-exit-worktree"]
+tool-get-goal = ["mangocode-query/tool-get-goal", "mangocode-tools/tool-get-goal"]
+tool-glob = ["mangocode-query/tool-glob", "mangocode-tools/tool-glob"]
+tool-grep = ["mangocode-query/tool-grep", "mangocode-tools/tool-grep"]
+tool-list-mcp-resources = ["mangocode-query/tool-list-mcp-resources", "mangocode-tools/tool-list-mcp-resources"]
+tool-lsp = ["mangocode-query/tool-lsp", "mangocode-tools/tool-lsp"]
+tool-mcp-auth = ["mangocode-query/tool-mcp-auth", "mangocode-tools/tool-mcp-auth"]
+tool-notebook-edit = ["mangocode-query/tool-notebook-edit", "mangocode-tools/tool-notebook-edit"]
+tool-powershell = ["mangocode-query/tool-powershell", "mangocode-tools/tool-powershell"]
+tool-pr-watch = ["mangocode-query/tool-pr-watch", "mangocode-tools/tool-pr-watch"]
+tool-read = ["mangocode-query/tool-read", "mangocode-tools/tool-read"]
+tool-read-mcp-resource = ["mangocode-query/tool-read-mcp-resource", "mangocode-tools/tool-read-mcp-resource"]
+tool-remote-trigger = ["mangocode-query/tool-remote-trigger", "mangocode-tools/tool-remote-trigger"]
+tool-rendered-fetch = ["mangocode-query/tool-rendered-fetch", "mangocode-tools/tool-rendered-fetch"]
+tool-repl = ["mangocode-query/tool-repl", "mangocode-tools/tool-repl"]
+tool-send-message = ["mangocode-query/tool-send-message", "mangocode-tools/tool-send-message"]
+tool-skill = ["mangocode-query/tool-skill", "mangocode-tools/tool-skill"]
+tool-sleep = ["mangocode-query/tool-sleep", "mangocode-tools/tool-sleep"]
+tool-structured-output = ["mangocode-query/tool-structured-output", "mangocode-tools/tool-structured-output"]
+tool-task-create = ["mangocode-query/tool-task-create", "mangocode-tools/tool-task-create"]
+tool-task-get = ["mangocode-query/tool-task-get", "mangocode-tools/tool-task-get"]
+tool-task-list = ["mangocode-query/tool-task-list", "mangocode-tools/tool-task-list"]
+tool-task-output = ["mangocode-query/tool-task-output", "mangocode-tools/tool-task-output"]
+tool-task-stop = ["mangocode-query/tool-task-stop", "mangocode-tools/tool-task-stop"]
+tool-task-update = ["mangocode-query/tool-task-update", "mangocode-tools/tool-task-update"]
+tool-team-create = ["mangocode-query/tool-team-create", "mangocode-tools/tool-team-create"]
+tool-team-delete = ["mangocode-query/tool-team-delete", "mangocode-tools/tool-team-delete"]
+tool-todo-write = ["mangocode-query/tool-todo-write", "mangocode-tools/tool-todo-write"]
+tool-tool-log-read = ["mangocode-query/tool-tool-log-read", "mangocode-tools/tool-tool-log-read"]
+tool-tool-search = ["mangocode-query/tool-tool-search", "mangocode-tools/tool-tool-search"]
+tool-update-goal = ["mangocode-query/tool-update-goal", "mangocode-tools/tool-update-goal"]
+tool-view-image = ["mangocode-query/tool-view-image", "mangocode-tools/tool-view-image"]
+tool-web-fetch = ["mangocode-query/tool-web-fetch", "mangocode-tools/tool-web-fetch"]
+tool-web-search = ["mangocode-query/tool-web-search", "mangocode-tools/tool-web-search"]
+tool-write = ["mangocode-query/tool-write", "mangocode-tools/tool-write"]
+
 [dependencies]
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
-mangocode-query = { workspace = true }
-mangocode-tools = { workspace = true }
+mangocode-query = { workspace = true, default-features = false }
+mangocode-tools = { workspace = true, default-features = false }
+mangocode-mcp = { workspace = true }
+mangocode-plugins = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

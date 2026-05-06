@@ -18,6 +18,11 @@
 //
 // This keeps the module self-contained and avoids any extra crate boundary.
 
+#![cfg_attr(
+    not(any(feature = "tool-team-create", feature = "tool-team-delete")),
+    allow(dead_code, unused_imports)
+)]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -164,6 +169,7 @@ struct TeamConfig {
 // TeamCreateTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-team-create")]
 pub struct TeamCreateTool;
 
 /// Per-agent specification provided in the input.
@@ -202,6 +208,7 @@ fn default_parallel() -> bool {
     true
 }
 
+#[cfg(feature = "tool-team-create")]
 #[async_trait]
 impl Tool for TeamCreateTool {
     fn name(&self) -> &str {
@@ -477,6 +484,7 @@ impl Tool for TeamCreateTool {
 // TeamDeleteTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-team-delete")]
 pub struct TeamDeleteTool;
 
 #[derive(Debug, Deserialize)]
@@ -484,6 +492,7 @@ struct TeamDeleteInput {
     team_name: String,
 }
 
+#[cfg(feature = "tool-team-delete")]
 #[async_trait]
 impl Tool for TeamDeleteTool {
     fn name(&self) -> &str {

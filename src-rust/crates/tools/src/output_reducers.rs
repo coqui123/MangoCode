@@ -3,6 +3,11 @@
 //! Reducers keep the model-facing output small while preserving raw command
 //! logs on disk for follow-up inspection.
 
+#![cfg_attr(
+    not(feature = "tool-tool-log-read"),
+    allow(dead_code, unused_imports)
+)]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -40,6 +45,27 @@ pub struct ReducedOutput {
     pub raw_log_path: Option<PathBuf>,
 }
 
+impl ReducedOutput {
+    pub fn metadata(&self) -> Value {
+        json!({
+            "reducer": self.reducer,
+            "original_bytes": self.original_bytes,
+            "reduced_bytes": self.reduced_bytes,
+            "raw_log_path": self.raw_log_path.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+
+    pub fn into_tool_result(self, exit_code: i32, error_prefix: &str) -> ToolResult {
+        let metadata = self.metadata();
+        if exit_code != 0 {
+            ToolResult::error(format!("{} {}\n{}", error_prefix, exit_code, self.content))
+                .with_metadata(metadata)
+        } else {
+            ToolResult::success(self.content).with_metadata(metadata)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolLogReadInput {
     #[serde(default)]
@@ -54,8 +80,10 @@ fn default_max_log_chars() -> usize {
     MAX_RAW_OUTPUT_CHARS
 }
 
+#[cfg(feature = "tool-tool-log-read")]
 pub struct ToolLogReadTool;
 
+#[cfg(feature = "tool-tool-log-read")]
 #[async_trait]
 impl Tool for ToolLogReadTool {
     fn name(&self) -> &str {
@@ -505,5 +533,17 @@ mod tests {
         let reduced = reduce_command_output("cargo test", "error: bad", 101, OutputMode::Summary);
         assert!(reduced.content.contains("ToolLogRead"));
         assert!(reduced.raw_log_path.is_some());
+    }
+
+    #[test]
+    fn reduced_output_tool_result_carries_raw_log_metadata() {
+        let reduced = reduce_command_output("cargo test", "error: bad", 101, OutputMode::Summary);
+        let result = reduced.into_tool_result(101, "Command exited with code");
+        let raw_log_path = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("raw_log_path"))
+            .and_then(Value::as_str);
+        assert!(raw_log_path.is_some());
     }
 }

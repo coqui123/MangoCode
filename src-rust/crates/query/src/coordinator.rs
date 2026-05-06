@@ -9,7 +9,7 @@ pub const COORDINATOR_ONLY_TOOLS: &[&str] = &[
     "TaskStop",
     "TeamCreate",
     "TeamDelete",
-    "SyntheticOutput",
+    "StructuredOutput",
 ];
 
 /// Tools that workers are allowed to use in simple mode (MANGOCODE_SIMPLE=1).
@@ -325,6 +325,7 @@ mod tests {
             "Agent".to_string(),
             "SendMessage".to_string(),
             "TaskStop".to_string(),
+            "StructuredOutput".to_string(),
             "Read".to_string(),
         ];
         let ctx = coordinator_user_context(&tools, &[]);
@@ -333,6 +334,7 @@ mod tests {
         assert!(!ctx.contains("Agent"));
         assert!(!ctx.contains("SendMessage"));
         assert!(!ctx.contains("TaskStop"));
+        assert!(!ctx.contains("StructuredOutput"));
     }
 
     #[test]

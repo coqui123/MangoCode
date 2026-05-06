@@ -1,6 +1,6 @@
 // Computer Use tool — cross-platform mouse/keyboard/screenshot control.
 //
-// All implementation is gated behind `#[cfg(feature = "computer-use")]`
+// All implementation is gated behind `#[cfg(feature = "tool-computer-use")]`
 // so the default build never links enigo or xcap.
 //
 // API wire format follows Anthropic's computer_20250124 spec:
@@ -46,11 +46,11 @@ const DISPLAY_WIDTH_PX: u32 = 1920;
 const DISPLAY_HEIGHT_PX: u32 = 1080;
 
 /// Maximum dimensions the API accepts for screenshots.
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 const MAX_SCREENSHOT_WIDTH: u32 = 1366;
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 const MAX_SCREENSHOT_HEIGHT: u32 = 768;
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 const JPEG_QUALITY: u8 = 75;
 
 // ---------------------------------------------------------------------------
@@ -180,15 +180,15 @@ pub fn computer_use_api_definition() -> Value {
 // Action dispatch (feature-gated)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(feature = "computer-use"))]
+#[cfg(not(feature = "tool-computer-use"))]
 async fn execute_action(_params: ComputerUseInput) -> ToolResult {
     ToolResult::error(
-        "The computer-use feature is not enabled in this build. \
-         Recompile with --features cc-tools/computer-use to enable it.",
+        "The computer-use tool feature is not enabled in this build. \
+         Recompile with --features mangocode-tools/tool-computer-use to enable it.",
     )
 }
 
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 async fn execute_action(params: ComputerUseInput) -> ToolResult {
     use enigo::{Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 
@@ -440,7 +440,7 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
 // Screenshot helper (feature-gated)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 fn take_screenshot() -> ToolResult {
     use base64::Engine as _;
 
@@ -505,7 +505,7 @@ fn take_screenshot() -> ToolResult {
 // Parses xdotool-style sequences like "ctrl+c", "Return", "super+shift+s".
 // Each '+'-delimited token is mapped to an enigo Key or modifier.
 
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 fn press_key_sequence(
     enigo: &mut enigo::Enigo,
     sequence: &str,
@@ -572,7 +572,7 @@ fn press_key_sequence(
     Ok(())
 }
 
-#[cfg(feature = "computer-use")]
+#[cfg(feature = "tool-computer-use")]
 fn parse_key(s: &str) -> Result<enigo::Key, Box<dyn std::error::Error + Send + Sync>> {
     use enigo::Key;
 

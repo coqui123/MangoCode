@@ -10,11 +10,11 @@ path = "src/main.rs"
 [dependencies]
 mangocode-core = { workspace = true, features = ["voice"] }
 mangocode-api = { workspace = true }
-mangocode-acp = { workspace = true }
-mangocode-tools = { workspace = true }
-mangocode-query = { workspace = true }
-mangocode-tui = { workspace = true }
-mangocode-commands = { workspace = true }
+mangocode-acp = { workspace = true, default-features = false }
+mangocode-tools = { workspace = true, default-features = false }
+mangocode-query = { workspace = true, default-features = false }
+mangocode-tui = { workspace = true, default-features = false }
+mangocode-commands = { workspace = true, default-features = false }
 mangocode-mcp = { workspace = true }
 mangocode-bridge = { workspace = true }
 mangocode-plugins = { workspace = true }
@@ -45,5 +45,94 @@ urlencoding = "2"
 chrono = { workspace = true }
 
 [features]
-browser = ["mangocode-tools/browser"]
-computer-use = ["mangocode-tools/computer-use"]
+default = ["proactive", "default-tools"]
+browser = ["tool-browser"]
+computer-use = ["tool-computer-use"]
+proactive = [
+    "mangocode-acp/proactive",
+    "mangocode-commands/proactive",
+    "mangocode-core/proactive",
+    "mangocode-query/proactive",
+    "mangocode-tui/proactive",
+]
+default-tools = [
+    "mangocode-acp/default-tools",
+    "mangocode-commands/default-tools",
+    "mangocode-query/default-tools",
+    "mangocode-tools/default-tools",
+    "mangocode-tui/default-tools",
+    "tool-agent",
+    "tool-team-create",
+    "tool-team-delete",
+]
+default-tools-no-web-research = [
+    "mangocode-acp/default-tools-no-web-research",
+    "mangocode-commands/default-tools-no-web-research",
+    "mangocode-query/default-tools-no-web-research",
+    "mangocode-tools/default-tools-no-web-research",
+    "mangocode-tui/default-tools-no-web-research",
+    "tool-agent",
+    "tool-team-create",
+    "tool-team-delete",
+]
+full-tools = [
+    "default-tools",
+    "mangocode-tools/full-tools",
+    "tool-browser",
+    "tool-computer-use",
+]
+tool-agent = ["mangocode-acp/tool-agent", "mangocode-commands/tool-agent", "mangocode-query/tool-agent", "mangocode-tools/tool-agent", "mangocode-tui/tool-agent"]
+tool-apply-patch = ["mangocode-acp/tool-apply-patch", "mangocode-commands/tool-apply-patch", "mangocode-query/tool-apply-patch", "mangocode-tools/tool-apply-patch", "mangocode-tui/tool-apply-patch"]
+tool-ask-user = ["mangocode-acp/tool-ask-user", "mangocode-commands/tool-ask-user", "mangocode-query/tool-ask-user", "mangocode-tools/tool-ask-user", "mangocode-tui/tool-ask-user"]
+tool-bash = ["mangocode-acp/tool-bash", "mangocode-commands/tool-bash", "mangocode-query/tool-bash", "mangocode-tools/tool-bash", "mangocode-tui/tool-bash"]
+tool-batch-edit = ["mangocode-acp/tool-batch-edit", "mangocode-commands/tool-batch-edit", "mangocode-query/tool-batch-edit", "mangocode-tools/tool-batch-edit", "mangocode-tui/tool-batch-edit"]
+tool-brief = ["mangocode-acp/tool-brief", "mangocode-commands/tool-brief", "mangocode-query/tool-brief", "mangocode-tools/tool-brief", "mangocode-tui/tool-brief"]
+tool-browser = ["mangocode-acp/tool-browser", "mangocode-commands/tool-browser", "mangocode-query/tool-browser", "mangocode-tools/tool-browser", "mangocode-tui/tool-browser"]
+tool-computer-use = ["mangocode-acp/tool-computer-use", "mangocode-commands/tool-computer-use", "mangocode-query/tool-computer-use", "mangocode-tools/tool-computer-use", "mangocode-tui/tool-computer-use"]
+tool-config = ["mangocode-acp/tool-config", "mangocode-commands/tool-config", "mangocode-query/tool-config", "mangocode-tools/tool-config", "mangocode-tui/tool-config"]
+tool-cron-create = ["mangocode-acp/tool-cron-create", "mangocode-commands/tool-cron-create", "mangocode-query/tool-cron-create", "mangocode-tools/tool-cron-create", "mangocode-tui/tool-cron-create"]
+tool-cron-delete = ["mangocode-acp/tool-cron-delete", "mangocode-commands/tool-cron-delete", "mangocode-query/tool-cron-delete", "mangocode-tools/tool-cron-delete", "mangocode-tui/tool-cron-delete"]
+tool-cron-list = ["mangocode-acp/tool-cron-list", "mangocode-commands/tool-cron-list", "mangocode-query/tool-cron-list", "mangocode-tools/tool-cron-list", "mangocode-tui/tool-cron-list"]
+tool-create-goal = ["mangocode-acp/tool-create-goal", "mangocode-commands/tool-create-goal", "mangocode-query/tool-create-goal", "mangocode-tools/tool-create-goal", "mangocode-tui/tool-create-goal"]
+tool-deep-read = ["mangocode-acp/tool-deep-read", "mangocode-commands/tool-deep-read", "mangocode-query/tool-deep-read", "mangocode-tools/tool-deep-read", "mangocode-tui/tool-deep-read"]
+tool-doc-read = ["mangocode-acp/tool-doc-read", "mangocode-commands/tool-doc-read", "mangocode-query/tool-doc-read", "mangocode-tools/tool-doc-read", "mangocode-tui/tool-doc-read"]
+tool-doc-search = ["mangocode-acp/tool-doc-search", "mangocode-commands/tool-doc-search", "mangocode-query/tool-doc-search", "mangocode-tools/tool-doc-search", "mangocode-tui/tool-doc-search"]
+tool-edit = ["mangocode-acp/tool-edit", "mangocode-commands/tool-edit", "mangocode-query/tool-edit", "mangocode-tools/tool-edit", "mangocode-tui/tool-edit"]
+tool-enter-plan-mode = ["mangocode-acp/tool-enter-plan-mode", "mangocode-commands/tool-enter-plan-mode", "mangocode-query/tool-enter-plan-mode", "mangocode-tools/tool-enter-plan-mode", "mangocode-tui/tool-enter-plan-mode"]
+tool-enter-worktree = ["mangocode-acp/tool-enter-worktree", "mangocode-commands/tool-enter-worktree", "mangocode-query/tool-enter-worktree", "mangocode-tools/tool-enter-worktree", "mangocode-tui/tool-enter-worktree"]
+tool-exit-plan-mode = ["mangocode-acp/tool-exit-plan-mode", "mangocode-commands/tool-exit-plan-mode", "mangocode-query/tool-exit-plan-mode", "mangocode-tools/tool-exit-plan-mode", "mangocode-tui/tool-exit-plan-mode"]
+tool-exit-worktree = ["mangocode-acp/tool-exit-worktree", "mangocode-commands/tool-exit-worktree", "mangocode-query/tool-exit-worktree", "mangocode-tools/tool-exit-worktree", "mangocode-tui/tool-exit-worktree"]
+tool-get-goal = ["mangocode-acp/tool-get-goal", "mangocode-commands/tool-get-goal", "mangocode-query/tool-get-goal", "mangocode-tools/tool-get-goal", "mangocode-tui/tool-get-goal"]
+tool-glob = ["mangocode-acp/tool-glob", "mangocode-commands/tool-glob", "mangocode-query/tool-glob", "mangocode-tools/tool-glob", "mangocode-tui/tool-glob"]
+tool-grep = ["mangocode-acp/tool-grep", "mangocode-commands/tool-grep", "mangocode-query/tool-grep", "mangocode-tools/tool-grep", "mangocode-tui/tool-grep"]
+tool-list-mcp-resources = ["mangocode-acp/tool-list-mcp-resources", "mangocode-commands/tool-list-mcp-resources", "mangocode-query/tool-list-mcp-resources", "mangocode-tools/tool-list-mcp-resources", "mangocode-tui/tool-list-mcp-resources"]
+tool-lsp = ["mangocode-acp/tool-lsp", "mangocode-commands/tool-lsp", "mangocode-query/tool-lsp", "mangocode-tools/tool-lsp", "mangocode-tui/tool-lsp"]
+tool-mcp-auth = ["mangocode-acp/tool-mcp-auth", "mangocode-commands/tool-mcp-auth", "mangocode-query/tool-mcp-auth", "mangocode-tools/tool-mcp-auth", "mangocode-tui/tool-mcp-auth"]
+tool-notebook-edit = ["mangocode-acp/tool-notebook-edit", "mangocode-commands/tool-notebook-edit", "mangocode-query/tool-notebook-edit", "mangocode-tools/tool-notebook-edit", "mangocode-tui/tool-notebook-edit"]
+tool-powershell = ["mangocode-acp/tool-powershell", "mangocode-commands/tool-powershell", "mangocode-query/tool-powershell", "mangocode-tools/tool-powershell", "mangocode-tui/tool-powershell"]
+tool-pr-watch = ["mangocode-acp/tool-pr-watch", "mangocode-commands/tool-pr-watch", "mangocode-query/tool-pr-watch", "mangocode-tools/tool-pr-watch", "mangocode-tui/tool-pr-watch"]
+tool-read = ["mangocode-acp/tool-read", "mangocode-commands/tool-read", "mangocode-query/tool-read", "mangocode-tools/tool-read", "mangocode-tui/tool-read"]
+tool-read-mcp-resource = ["mangocode-acp/tool-read-mcp-resource", "mangocode-commands/tool-read-mcp-resource", "mangocode-query/tool-read-mcp-resource", "mangocode-tools/tool-read-mcp-resource", "mangocode-tui/tool-read-mcp-resource"]
+tool-remote-trigger = ["mangocode-acp/tool-remote-trigger", "mangocode-commands/tool-remote-trigger", "mangocode-query/tool-remote-trigger", "mangocode-tools/tool-remote-trigger", "mangocode-tui/tool-remote-trigger"]
+tool-rendered-fetch = ["mangocode-acp/tool-rendered-fetch", "mangocode-commands/tool-rendered-fetch", "mangocode-query/tool-rendered-fetch", "mangocode-tools/tool-rendered-fetch", "mangocode-tui/tool-rendered-fetch"]
+tool-repl = ["mangocode-acp/tool-repl", "mangocode-commands/tool-repl", "mangocode-query/tool-repl", "mangocode-tools/tool-repl", "mangocode-tui/tool-repl"]
+tool-send-message = ["mangocode-acp/tool-send-message", "mangocode-commands/tool-send-message", "mangocode-query/tool-send-message", "mangocode-tools/tool-send-message", "mangocode-tui/tool-send-message"]
+tool-skill = ["mangocode-acp/tool-skill", "mangocode-commands/tool-skill", "mangocode-query/tool-skill", "mangocode-tools/tool-skill", "mangocode-tui/tool-skill"]
+tool-sleep = ["mangocode-acp/tool-sleep", "mangocode-commands/tool-sleep", "mangocode-query/tool-sleep", "mangocode-tools/tool-sleep", "mangocode-tui/tool-sleep"]
+tool-structured-output = ["mangocode-acp/tool-structured-output", "mangocode-commands/tool-structured-output", "mangocode-query/tool-structured-output", "mangocode-tools/tool-structured-output", "mangocode-tui/tool-structured-output"]
+tool-task-create = ["mangocode-acp/tool-task-create", "mangocode-commands/tool-task-create", "mangocode-query/tool-task-create", "mangocode-tools/tool-task-create", "mangocode-tui/tool-task-create"]
+tool-task-get = ["mangocode-acp/tool-task-get", "mangocode-commands/tool-task-get", "mangocode-query/tool-task-get", "mangocode-tools/tool-task-get", "mangocode-tui/tool-task-get"]
+tool-task-list = ["mangocode-acp/tool-task-list", "mangocode-commands/tool-task-list", "mangocode-query/tool-task-list", "mangocode-tools/tool-task-list", "mangocode-tui/tool-task-list"]
+tool-task-output = ["mangocode-acp/tool-task-output", "mangocode-commands/tool-task-output", "mangocode-query/tool-task-output", "mangocode-tools/tool-task-output", "mangocode-tui/tool-task-output"]
+tool-task-stop = ["mangocode-acp/tool-task-stop", "mangocode-commands/tool-task-stop", "mangocode-query/tool-task-stop", "mangocode-tools/tool-task-stop", "mangocode-tui/tool-task-stop"]
+tool-task-update = ["mangocode-acp/tool-task-update", "mangocode-commands/tool-task-update", "mangocode-query/tool-task-update", "mangocode-tools/tool-task-update", "mangocode-tui/tool-task-update"]
+tool-team-create = ["mangocode-acp/tool-team-create", "mangocode-commands/tool-team-create", "mangocode-query/tool-team-create", "mangocode-tools/tool-team-create", "mangocode-tui/tool-team-create"]
+tool-team-delete = ["mangocode-acp/tool-team-delete", "mangocode-commands/tool-team-delete", "mangocode-query/tool-team-delete", "mangocode-tools/tool-team-delete", "mangocode-tui/tool-team-delete"]
+tool-todo-write = ["mangocode-acp/tool-todo-write", "mangocode-commands/tool-todo-write", "mangocode-query/tool-todo-write", "mangocode-tools/tool-todo-write", "mangocode-tui/tool-todo-write"]
+tool-tool-log-read = ["mangocode-acp/tool-tool-log-read", "mangocode-commands/tool-tool-log-read", "mangocode-query/tool-tool-log-read", "mangocode-tools/tool-tool-log-read", "mangocode-tui/tool-tool-log-read"]
+tool-tool-search = ["mangocode-acp/tool-tool-search", "mangocode-commands/tool-tool-search", "mangocode-query/tool-tool-search", "mangocode-tools/tool-tool-search", "mangocode-tui/tool-tool-search"]
+tool-update-goal = ["mangocode-acp/tool-update-goal", "mangocode-commands/tool-update-goal", "mangocode-query/tool-update-goal", "mangocode-tools/tool-update-goal", "mangocode-tui/tool-update-goal"]
+tool-view-image = ["mangocode-acp/tool-view-image", "mangocode-commands/tool-view-image", "mangocode-query/tool-view-image", "mangocode-tools/tool-view-image", "mangocode-tui/tool-view-image"]
+tool-web-fetch = ["mangocode-acp/tool-web-fetch", "mangocode-commands/tool-web-fetch", "mangocode-query/tool-web-fetch", "mangocode-tools/tool-web-fetch", "mangocode-tui/tool-web-fetch"]
+tool-web-search = ["mangocode-acp/tool-web-search", "mangocode-commands/tool-web-search", "mangocode-query/tool-web-search", "mangocode-tools/tool-web-search", "mangocode-tui/tool-web-search"]
+tool-write = ["mangocode-acp/tool-write", "mangocode-commands/tool-write", "mangocode-query/tool-write", "mangocode-tools/tool-write", "mangocode-tui/tool-write"]

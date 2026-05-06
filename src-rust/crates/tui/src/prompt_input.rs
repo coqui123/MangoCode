@@ -1499,7 +1499,7 @@ pub fn apply_vim_command(
 // ---------------------------------------------------------------------------
 
 /// Typeahead source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeaheadSource {
     SlashCommand,
     FileRef,
@@ -1550,6 +1550,30 @@ pub fn compute_typeahead(
     }
 
     suggestions
+}
+
+/// Return the active `@...` token immediately before the cursor.
+///
+/// The tuple is `(start_byte, end_byte, query_without_at)`.
+pub fn active_mention_span(input: &str, cursor: usize) -> Option<(usize, usize, String)> {
+    let cursor = cursor.min(input.len());
+    if !input.is_char_boundary(cursor) {
+        return None;
+    }
+
+    let before_cursor = &input[..cursor];
+    let start = before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    let token = &input[start..cursor];
+    if !token.starts_with('@') {
+        return None;
+    }
+
+    Some((start, cursor, token[1..].to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2968,6 +2992,28 @@ impl PromptInputState {
         }
     }
 
+    /// Replace suggestions with file-reference candidates for an active `@...` token.
+    pub fn set_file_ref_suggestions(&mut self, suggestions: Vec<TypeaheadSuggestion>) {
+        if suggestions.is_empty() {
+            if self
+                .suggestions
+                .iter()
+                .any(|s| s.source == TypeaheadSource::FileRef)
+            {
+                self.suggestions.clear();
+                self.suggestion_index = None;
+            }
+            return;
+        }
+
+        self.suggestions = suggestions;
+        let idx = self
+            .suggestion_index
+            .unwrap_or(0)
+            .min(self.suggestions.len() - 1);
+        self.suggestion_index = Some(idx);
+    }
+
     /// Select the next suggestion.
     pub fn suggestion_next(&mut self) {
         if self.suggestions.is_empty() {
@@ -2997,8 +3043,31 @@ impl PromptInputState {
     pub fn accept_suggestion(&mut self) {
         if let Some(idx) = self.suggestion_index {
             if let Some(s) = self.suggestions.get(idx) {
-                self.text = s.text.clone();
-                self.cursor = self.text.len();
+                if s.source == TypeaheadSource::FileRef {
+                    if let Some((start, end, _)) = active_mention_span(&self.text, self.cursor) {
+                        let next_whitespace_len = self.text[end..]
+                            .chars()
+                            .next()
+                            .filter(|ch| ch.is_whitespace())
+                            .map(char::len_utf8);
+                        let replacement = if next_whitespace_len.is_some() {
+                            s.text.clone()
+                        } else {
+                            format!("{} ", s.text)
+                        };
+                        self.text.replace_range(start..end, &replacement);
+                        self.cursor = start + replacement.len();
+                        if let Some(len) = next_whitespace_len {
+                            self.cursor = (self.cursor + len).min(self.text.len());
+                        }
+                    } else {
+                        self.text = s.text.clone();
+                        self.cursor = self.text.len();
+                    }
+                } else {
+                    self.text = s.text.clone();
+                    self.cursor = self.text.len();
+                }
                 self.suggestions.clear();
                 self.suggestion_index = None;
                 self.update_token_estimate();
@@ -3812,6 +3881,37 @@ mod tests {
         s.accept_suggestion();
         assert_eq!(s.text, "/help");
         assert_eq!(s.cursor, 5);
+        assert!(s.suggestions.is_empty());
+    }
+
+    #[test]
+    fn active_mention_span_detects_current_token() {
+        let text = "open @src/ma now";
+        let cursor = "open @src/ma".len();
+        assert_eq!(
+            active_mention_span(text, cursor),
+            Some((5, cursor, "src/ma".to_string()))
+        );
+        assert_eq!(active_mention_span("ask @", 5), Some((4, 5, String::new())));
+        assert_eq!(active_mention_span(text, text.len()), None);
+    }
+
+    #[test]
+    fn accept_file_ref_suggestion_replaces_only_mention_token() {
+        let mut s = PromptInputState::new();
+        s.text = "open @src/ma now".to_string();
+        s.cursor = "open @src/ma".len();
+        s.set_file_ref_suggestions(vec![TypeaheadSuggestion {
+            text: "@file:src/main.rs".to_string(),
+            description: "src/main.rs".to_string(),
+            source: TypeaheadSource::FileRef,
+        }]);
+
+        s.accept_suggestion();
+
+        assert_eq!(s.text, "open @file:src/main.rs now");
+        assert_eq!(s.cursor, "open @file:src/main.rs ".len());
+        assert_eq!(active_mention_span(&s.text, s.cursor), None);
         assert!(s.suggestions.is_empty());
     }
 

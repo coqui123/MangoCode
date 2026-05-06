@@ -34,6 +34,7 @@ static WORKTREE_SESSION: Lazy<Arc<RwLock<Option<WorktreeSession>>>> =
 // EnterWorktreeTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-enter-worktree")]
 pub struct EnterWorktreeTool;
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +52,7 @@ struct EnterWorktreeInput {
     post_create_command: Option<String>,
 }
 
+#[cfg(feature = "tool-enter-worktree")]
 #[async_trait]
 impl Tool for EnterWorktreeTool {
     fn name(&self) -> &str {
@@ -270,6 +272,7 @@ impl Tool for EnterWorktreeTool {
 // ExitWorktreeTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-exit-worktree")]
 pub struct ExitWorktreeTool;
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +289,7 @@ fn default_action() -> String {
     "keep".to_string()
 }
 
+#[cfg(feature = "tool-exit-worktree")]
 #[async_trait]
 impl Tool for ExitWorktreeTool {
     fn name(&self) -> &str {

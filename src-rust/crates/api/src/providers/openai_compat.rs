@@ -25,7 +25,9 @@ use crate::provider_types::{
 
 // Re-use the message transformation helpers from openai.rs.
 use super::openai::OpenAiProvider;
-use super::openai_compat_providers::{discover_installed_ollama_models, ollama_native_base_from_env};
+use super::openai_compat_providers::{
+    discover_installed_ollama_models, ollama_native_base_from_env,
+};
 use super::request_options::merge_openai_compatible_options;
 
 // ---------------------------------------------------------------------------
@@ -93,10 +95,7 @@ pub struct ProviderQuirks {
 }
 
 fn env_flag_truthy(v: &str) -> bool {
-    matches!(
-        v,
-        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-    )
+    matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
 }
 
 /// Strip `<think>...</think>` blocks from a complete (non-streaming) text
@@ -277,7 +276,7 @@ impl ThinkTagSplitter {
                 continue;
             }
             let suf = &s_lower[s_lower.len() - n..];
-            if close.starts_with(suf) {
+            if Self::could_be_think_close(suf) {
                 return n;
             }
         }
@@ -553,18 +552,15 @@ impl OpenAiCompatProvider {
                     for part in parts {
                         if let Some(text) = part.as_str() {
                             result.push_str(text);
-                        } else if let Some(text) = part
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                        {
+                        } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                             result.push_str(text);
-                        } else if let Some(subparts) = part.get("parts").and_then(|p| p.as_array()) {
+                        } else if let Some(subparts) = part.get("parts").and_then(|p| p.as_array())
+                        {
                             for subpart in subparts {
                                 if let Some(text) = subpart.as_str() {
                                     result.push_str(text);
-                                } else if let Some(text) = subpart
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
+                                } else if let Some(text) =
+                                    subpart.get("text").and_then(|t| t.as_str())
                                 {
                                     result.push_str(text);
                                 }
@@ -935,8 +931,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let provider_id = self.id.clone();
         let request_model = request.model.clone();
         let reasoning_field = self.quirks.reasoning_field.clone();
-        let inline_think_tags =
-            self.quirks.inline_think_tags || self.id == ProviderId::OLLAMA;
+        let inline_think_tags = self.quirks.inline_think_tags || self.id == ProviderId::OLLAMA;
         let dump_sse = std::env::var("MANGOCODE_DUMP_OPENAI_COMPAT_SSE")
             .ok()
             .map(|v| env_flag_truthy(&v))
@@ -1316,12 +1311,15 @@ impl LlmProvider for OpenAiCompatProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         if self.id == ProviderId::OLLAMA {
             let base = ollama_native_base_from_env();
-            let installed = discover_installed_ollama_models(&base, std::time::Duration::from_secs(3)).await.map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to discover local Ollama models: {}", e),
-                status: None,
-                body: None,
-            })?;
+            let installed =
+                discover_installed_ollama_models(&base, std::time::Duration::from_secs(3))
+                    .await
+                    .map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("Failed to discover local Ollama models: {}", e),
+                        status: None,
+                        body: None,
+                    })?;
             let provider_id = self.id.clone();
             return Ok(installed
                 .into_iter()
@@ -1574,6 +1572,22 @@ mod tests {
     }
 
     #[test]
+    fn think_splitter_close_prefix_helper_matches_split_boundary() {
+        assert!(ThinkTagSplitter::could_be_think_close("</thi"));
+        assert!(ThinkTagSplitter::could_be_think_close("</THI"));
+        assert!(!ThinkTagSplitter::could_be_think_close("</thought"));
+
+        let mut s = ThinkTagSplitter::new();
+        let a = s.push("<think>reasoning</THI");
+        assert_eq!(a.reasoning, "reasoning");
+        assert!(a.visible.is_empty());
+
+        let b = s.push("NK>visible");
+        assert_eq!(b.visible, "visible");
+        assert!(b.reasoning.is_empty());
+    }
+
+    #[test]
     fn think_splitter_emits_visible_after_close_tag() {
         let mut s = ThinkTagSplitter::new();
         let r = s.push("<think>r</think>visible-only");
@@ -1649,12 +1663,18 @@ mod tests {
 
     #[test]
     fn ollama_tool_gate_recognizes_known_models() {
-        assert!(OpenAiCompatProvider::ollama_model_supports_tools("llama3.2"));
-        assert!(OpenAiCompatProvider::ollama_model_supports_tools("qwen2.5:14b"));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools(
+            "llama3.2"
+        ));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools(
+            "qwen2.5:14b"
+        ));
         assert!(OpenAiCompatProvider::ollama_model_supports_tools(
             "SimonPu/qwen3:30B-Thinking-2507-Q4_K_XL"
         ));
-        assert!(OpenAiCompatProvider::ollama_model_supports_tools("gpt-oss:20b"));
+        assert!(OpenAiCompatProvider::ollama_model_supports_tools(
+            "gpt-oss:20b"
+        ));
     }
 
     #[test]

@@ -7,6 +7,7 @@ edition.workspace = true
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
 mangocode-mcp = { workspace = true }
+mangocode-tool-runtime = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -47,5 +48,172 @@ portable-pty = "0.9"
 nix = { workspace = true }
 
 [features]
-computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
-browser = ["dep:chromiumoxide"]
+default = ["default-tools"]
+
+# Backwards-compatible aliases for the previously optional tools.
+computer-use = ["tool-computer-use"]
+browser = ["tool-browser"]
+
+# Convenience tool sets.
+default-tools = [
+    "tool-agent",
+    "tool-apply-patch",
+    "tool-ask-user",
+    "tool-bash",
+    "tool-batch-edit",
+    "tool-brief",
+    "tool-config",
+    "tool-cron-create",
+    "tool-cron-delete",
+    "tool-cron-list",
+    "tool-create-goal",
+    "tool-deep-read",
+    "tool-doc-read",
+    "tool-doc-search",
+    "tool-edit",
+    "tool-enter-plan-mode",
+    "tool-enter-worktree",
+    "tool-exit-plan-mode",
+    "tool-exit-worktree",
+    "tool-get-goal",
+    "tool-glob",
+    "tool-grep",
+    "tool-list-mcp-resources",
+    "tool-lsp",
+    "tool-mcp-auth",
+    "tool-notebook-edit",
+    "tool-powershell",
+    "tool-pr-watch",
+    "tool-read",
+    "tool-read-mcp-resource",
+    "tool-remote-trigger",
+    "tool-rendered-fetch",
+    "tool-repl",
+    "tool-send-message",
+    "tool-skill",
+    "tool-sleep",
+    "tool-structured-output",
+    "tool-task-create",
+    "tool-task-get",
+    "tool-task-list",
+    "tool-task-output",
+    "tool-task-stop",
+    "tool-task-update",
+    "tool-team-create",
+    "tool-team-delete",
+    "tool-todo-write",
+    "tool-tool-log-read",
+    "tool-tool-search",
+    "tool-update-goal",
+    "tool-view-image",
+    "tool-web-fetch",
+    "tool-web-search",
+    "tool-write",
+]
+default-tools-no-web-research = [
+    "tool-agent",
+    "tool-apply-patch",
+    "tool-ask-user",
+    "tool-bash",
+    "tool-batch-edit",
+    "tool-brief",
+    "tool-config",
+    "tool-cron-create",
+    "tool-cron-delete",
+    "tool-cron-list",
+    "tool-create-goal",
+    "tool-edit",
+    "tool-enter-plan-mode",
+    "tool-enter-worktree",
+    "tool-exit-plan-mode",
+    "tool-exit-worktree",
+    "tool-get-goal",
+    "tool-glob",
+    "tool-grep",
+    "tool-list-mcp-resources",
+    "tool-lsp",
+    "tool-mcp-auth",
+    "tool-notebook-edit",
+    "tool-powershell",
+    "tool-pr-watch",
+    "tool-read",
+    "tool-read-mcp-resource",
+    "tool-remote-trigger",
+    "tool-repl",
+    "tool-send-message",
+    "tool-skill",
+    "tool-sleep",
+    "tool-structured-output",
+    "tool-task-create",
+    "tool-task-get",
+    "tool-task-list",
+    "tool-task-output",
+    "tool-task-stop",
+    "tool-task-update",
+    "tool-team-create",
+    "tool-team-delete",
+    "tool-todo-write",
+    "tool-tool-log-read",
+    "tool-tool-search",
+    "tool-update-goal",
+    "tool-view-image",
+    "tool-write",
+]
+full-tools = ["default-tools", "tool-browser", "tool-computer-use"]
+
+# Individual built-in tool flags.
+tool-agent = []
+tool-apply-patch = []
+tool-ask-user = []
+tool-bash = []
+tool-batch-edit = []
+tool-brief = []
+tool-browser = ["dep:chromiumoxide"]
+tool-computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
+tool-config = []
+tool-cron-create = []
+tool-cron-delete = []
+tool-cron-list = []
+tool-create-goal = []
+tool-deep-read = []
+tool-doc-read = []
+tool-doc-search = []
+tool-edit = []
+tool-enter-plan-mode = []
+tool-enter-worktree = []
+tool-exit-plan-mode = []
+tool-exit-worktree = []
+tool-get-goal = []
+tool-glob = []
+tool-grep = []
+tool-list-mcp-resources = []
+tool-lsp = []
+tool-mcp-auth = []
+tool-notebook-edit = []
+tool-powershell = []
+tool-pr-watch = []
+tool-read = []
+tool-read-mcp-resource = []
+tool-remote-trigger = []
+tool-rendered-fetch = []
+tool-repl = []
+tool-send-message = []
+tool-skill = []
+tool-sleep = []
+tool-structured-output = []
+tool-task-create = []
+tool-task-get = []
+tool-task-list = []
+tool-task-output = []
+tool-task-stop = []
+tool-task-update = []
+tool-team-create = []
+tool-team-delete = []
+tool-todo-write = []
+tool-tool-log-read = []
+tool-tool-search = []
+tool-update-goal = []
+tool-view-image = []
+tool-web-fetch = []
+tool-web-search = []
+tool-write = []

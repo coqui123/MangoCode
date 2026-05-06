@@ -1,6 +1,7 @@
 // slash_commands.rs — Structured slash-command registry for prompt UX.
 
 use once_cell::sync::Lazy;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct SlashCommandSpec {
@@ -24,6 +25,11 @@ pub static PROMPT_SLASH_COMMANDS: Lazy<Vec<SlashCommandSpec>> = Lazy::new(|| {
         SlashCommandSpec {
             name: "compact".into(),
             description: "Compact the conversation context".into(),
+            group: "Core".into(),
+        },
+        SlashCommandSpec {
+            name: "goal".into(),
+            description: "Set or inspect the persistent session goal".into(),
             group: "Core".into(),
         },
         SlashCommandSpec {
@@ -58,7 +64,12 @@ pub static PROMPT_SLASH_COMMANDS: Lazy<Vec<SlashCommandSpec>> = Lazy::new(|| {
         },
         SlashCommandSpec {
             name: "changes".into(),
-            description: "Inspect changes from the current session".into(),
+            description: "Inspect the latest file-changing turn".into(),
+            group: "Core".into(),
+        },
+        SlashCommandSpec {
+            name: "changes-export".into(),
+            description: "Export latest turn changes as a patch bundle".into(),
             group: "Core".into(),
         },
         SlashCommandSpec {
@@ -259,11 +270,10 @@ pub fn prompt_slash_commands(
     skills_config: &mangocode_core::config::SkillsConfig,
 ) -> Vec<SlashCommandSpec> {
     let mut commands = PROMPT_SLASH_COMMANDS.clone();
-    let builtins: std::collections::HashSet<String> =
-        commands.iter().map(|cmd| cmd.name.clone()).collect();
+    let mut seen: HashSet<String> = commands.iter().map(|cmd| cmd.name.clone()).collect();
 
     for skill in mangocode_core::discover_skills(project_root, skills_config).into_values() {
-        if builtins.contains(&skill.name) {
+        if !seen.insert(skill.name.clone()) {
             continue;
         }
 
@@ -274,6 +284,68 @@ pub fn prompt_slash_commands(
         });
     }
 
+    if let Some(registry) = mangocode_plugins::global_plugin_registry() {
+        append_plugin_commands(
+            &mut commands,
+            &mut seen,
+            registry
+                .all_command_defs()
+                .into_iter()
+                .map(|cmd| (cmd.name, cmd.description)),
+        );
+    }
+
     commands.sort_by(|a, b| a.group.cmp(&b.group).then(a.name.cmp(&b.name)));
     commands
+}
+
+fn append_plugin_commands<I>(
+    commands: &mut Vec<SlashCommandSpec>,
+    seen: &mut HashSet<String>,
+    defs: I,
+) where
+    I: IntoIterator<Item = (String, String)>,
+{
+    for (name, description) in defs {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+
+        commands.push(SlashCommandSpec {
+            name,
+            description,
+            group: "Plugins".into(),
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_plugin_commands_skips_existing_names() {
+        let mut commands = vec![SlashCommandSpec {
+            name: "help".into(),
+            description: "Show help".into(),
+            group: "Core".into(),
+        }];
+        let mut seen = commands
+            .iter()
+            .map(|cmd| cmd.name.clone())
+            .collect::<HashSet<_>>();
+
+        append_plugin_commands(
+            &mut commands,
+            &mut seen,
+            [
+                ("plugin-build".to_string(), "Build from plugin".to_string()),
+                ("help".to_string(), "Shadow help".to_string()),
+            ],
+        );
+
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().any(|cmd| cmd.name == "plugin-build"));
+        assert_eq!(commands.iter().filter(|cmd| cmd.name == "help").count(), 1);
+    }
 }

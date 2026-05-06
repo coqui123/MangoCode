@@ -18,6 +18,10 @@ pub use session_share::{export_session_text, share_session};
 pub mod sqlite_storage;
 pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
 
+// Persistent local thread goals.
+pub mod goals;
+pub use goals::{ThreadGoal, ThreadGoalStatus};
+
 // Durable local harness events/checkpoints/traces.
 pub mod harness;
 pub mod layered_memory;
@@ -744,6 +748,7 @@ pub mod config {
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,

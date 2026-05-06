@@ -113,20 +113,19 @@ fn is_local_ollama_host(host: &str) -> bool {
 }
 
 fn ollama_model_store_dir() -> Option<PathBuf> {
-    let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
     // Allow forcing a local-store scan regardless of the configured host
     // (useful when OLLAMA_HOST points to a remote proxy or is unset).
     let force_local = std::env::var("MANGOCODE_OLLAMA_FORCE_LOCAL_STORE").unwrap_or_default();
-    if force_local != "1" && force_local.to_lowercase() != "true" {
-        if !is_local_ollama_host(&host) {
-            return None;
-        }
+    if force_local != "1" && force_local.to_lowercase() != "true" && !is_local_ollama_host(&host) {
+        return None;
     }
 
     let mut path = dirs::home_dir()?;
     path.push(".ollama");
     path.push("models");
-    
+
     // If the normal home-based models dir exists, use it.
     if path.exists() {
         return Some(path);
@@ -137,7 +136,8 @@ fn ollama_model_store_dir() -> Option<PathBuf> {
     // env var to discover the models.
     #[allow(unused_mut)]
     let mut windows_fallback = PathBuf::from(r"C:\Users\alexa\.ollama\models");
-    let manifest_fallback = PathBuf::from(r"C:\Users\alexa\.ollama\models\manifests\registry.ollama.ai");
+    let manifest_fallback =
+        PathBuf::from(r"C:\Users\alexa\.ollama\models\manifests\registry.ollama.ai");
     if cfg!(windows) {
         if windows_fallback.exists() {
             return Some(windows_fallback);
@@ -166,11 +166,18 @@ fn discover_installed_ollama_models_from_local_store() -> Vec<OllamaInstalledMod
     // (legacy layout) and files (manifests) as model entries.
     let mut installed = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let candidates = vec![models_dir.clone(), models_dir.join("manifests").join("registry.ollama.ai")];
+    let candidates = vec![
+        models_dir.clone(),
+        models_dir.join("manifests").join("registry.ollama.ai"),
+    ];
     // Walk the candidate path up to two levels deep so we capture layouts
     // like `manifests/registry.ollama.ai/<author>/<model-file>` and produce
     // names like `<author>/<model>`.
-    fn push_model_name(installed: &mut Vec<OllamaInstalledModel>, seen: &mut std::collections::HashSet<String>, name: String) {
+    fn push_model_name(
+        installed: &mut Vec<OllamaInstalledModel>,
+        seen: &mut std::collections::HashSet<String>,
+        name: String,
+    ) {
         if name.is_empty() || seen.contains(&name) {
             return;
         }
@@ -290,13 +297,13 @@ struct OllamaTagsResponse {
 pub fn parse_ollama_tags_response(body: &str) -> Vec<OllamaInstalledModel> {
     serde_json::from_str::<OllamaTagsResponse>(body)
         .ok()
-        .and_then(|r| {
+        .map(|r| {
             if !r.models.is_empty() {
-                Some(r.models)
+                r.models
             } else if !r.tags.is_empty() {
-                Some(r.tags)
+                r.tags
             } else {
-                Some(Vec::new())
+                Vec::new()
             }
         })
         .or_else(|| serde_json::from_str::<Vec<OllamaInstalledModel>>(body).ok())

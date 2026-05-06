@@ -15,6 +15,15 @@
 //   "*/5 * * * *"   = every 5 minutes
 //   "30 14 * * 1"   = every Monday at 14:30
 
+#![cfg_attr(
+    not(any(
+        feature = "tool-cron-create",
+        feature = "tool-cron-delete",
+        feature = "tool-cron-list"
+    )),
+    allow(dead_code, unused_imports)
+)]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, Timelike};
@@ -244,6 +253,7 @@ fn cron_to_human(expr: &str) -> String {
 // CronCreate
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-cron-create")]
 pub struct CronCreateTool;
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +270,7 @@ fn default_true() -> bool {
     true
 }
 
+#[cfg(feature = "tool-cron-create")]
 #[async_trait]
 impl Tool for CronCreateTool {
     fn name(&self) -> &str {
@@ -377,6 +388,7 @@ impl Tool for CronCreateTool {
 // CronDelete
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-cron-delete")]
 pub struct CronDeleteTool;
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +396,7 @@ struct CronDeleteInput {
     id: String,
 }
 
+#[cfg(feature = "tool-cron-delete")]
 #[async_trait]
 impl Tool for CronDeleteTool {
     fn name(&self) -> &str {
@@ -439,8 +452,10 @@ impl Tool for CronDeleteTool {
 // CronList
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-cron-list")]
 pub struct CronListTool;
 
+#[cfg(feature = "tool-cron-list")]
 #[async_trait]
 impl Tool for CronListTool {
     fn name(&self) -> &str {

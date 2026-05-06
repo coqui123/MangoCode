@@ -76,6 +76,14 @@ impl DialogSelectState {
         self.visible = false;
     }
 
+    pub fn set_items(&mut self, items: Vec<SelectItem>) {
+        self.items = items;
+        self.selected_index = 0;
+        self.refilter();
+        self.last_render_area.set(Rect::default());
+        self.row_to_item.borrow_mut().clear();
+    }
+
     pub fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;

@@ -24,6 +24,12 @@ pub struct FileHistoryEntry {
     pub before_text: Option<String>,
     /// UTF-8 text snapshot after the modification when available.
     pub after_text: Option<String>,
+    /// Whether the file existed before the modification.
+    #[serde(default = "default_true")]
+    pub before_exists: bool,
+    /// Whether the file existed after the modification.
+    #[serde(default = "default_true")]
+    pub after_exists: bool,
     /// Whether either side of the change was non-UTF-8.
     #[serde(default)]
     pub binary: bool,
@@ -54,6 +60,10 @@ pub struct TurnFileSnapshot {
     pub path: PathBuf,
     pub before_text: Option<String>,
     pub after_text: Option<String>,
+    #[serde(default = "default_true")]
+    pub before_exists: bool,
+    #[serde(default = "default_true")]
+    pub after_exists: bool,
     pub binary: bool,
     pub turn_index: usize,
 }
@@ -72,12 +82,42 @@ impl FileHistory {
         turn_index: usize,
         tool_name: &str,
     ) {
+        self.record_modification_with_existence(
+            path,
+            before_content,
+            after_content,
+            (true, true),
+            turn_index,
+            tool_name,
+        );
+    }
+
+    /// Record a modification while preserving file create/delete state.
+    pub fn record_modification_with_existence(
+        &mut self,
+        path: PathBuf,
+        before_content: &[u8],
+        after_content: &[u8],
+        existence: (bool, bool),
+        turn_index: usize,
+        tool_name: &str,
+    ) {
+        let (before_exists, after_exists) = existence;
         let before_hash = sha256_hex(before_content);
         let after_hash = sha256_hex(after_content);
         let timestamp_ms = current_time_ms();
-        let before_text = String::from_utf8(before_content.to_vec()).ok();
-        let after_text = String::from_utf8(after_content.to_vec()).ok();
-        let binary = before_text.is_none() || after_text.is_none();
+        let before_text = if before_exists {
+            String::from_utf8(before_content.to_vec()).ok()
+        } else {
+            None
+        };
+        let after_text = if after_exists {
+            String::from_utf8(after_content.to_vec()).ok()
+        } else {
+            None
+        };
+        let binary =
+            (before_exists && before_text.is_none()) || (after_exists && after_text.is_none());
 
         let idx = self.entries.len();
         self.entries.push(FileHistoryEntry {
@@ -86,6 +126,8 @@ impl FileHistory {
             after_hash,
             before_text,
             after_text,
+            before_exists,
+            after_exists,
             binary,
             turn_index,
             timestamp_ms,
@@ -166,12 +208,15 @@ impl FileHistory {
                 .entry(entry.path.clone())
                 .and_modify(|snapshot| {
                     snapshot.after_text = entry.after_text.clone();
+                    snapshot.after_exists = entry.after_exists;
                     snapshot.binary |= entry.binary;
                 })
                 .or_insert_with(|| TurnFileSnapshot {
                     path: entry.path.clone(),
                     before_text: entry.before_text.clone(),
                     after_text: entry.after_text.clone(),
+                    before_exists: entry.before_exists,
+                    after_exists: entry.after_exists,
                     binary: entry.binary,
                     turn_index,
                 });
@@ -207,6 +252,10 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +324,43 @@ mod tests {
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].before_text.as_deref(), Some("one"));
         assert_eq!(snapshots[0].after_text.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn snapshots_preserve_creation_and_deletion_state() {
+        let mut fh = FileHistory::new();
+        let created = PathBuf::from("/created.rs");
+        let deleted = PathBuf::from("/deleted.rs");
+        fh.record_modification_with_existence(
+            created.clone(),
+            b"",
+            b"new",
+            (false, true),
+            5,
+            "FileWrite",
+        );
+        fh.record_modification_with_existence(
+            deleted.clone(),
+            b"old",
+            b"",
+            (true, false),
+            5,
+            "ApplyPatch",
+        );
+
+        let snapshots = fh.snapshots_for_turn(5);
+        assert_eq!(snapshots.len(), 2);
+        let created_snapshot = snapshots.iter().find(|s| s.path == created).unwrap();
+        assert!(!created_snapshot.before_exists);
+        assert!(created_snapshot.after_exists);
+        assert!(created_snapshot.before_text.is_none());
+        assert_eq!(created_snapshot.after_text.as_deref(), Some("new"));
+
+        let deleted_snapshot = snapshots.iter().find(|s| s.path == deleted).unwrap();
+        assert!(deleted_snapshot.before_exists);
+        assert!(!deleted_snapshot.after_exists);
+        assert_eq!(deleted_snapshot.before_text.as_deref(), Some("old"));
+        assert!(deleted_snapshot.after_text.is_none());
     }
 
     #[test]

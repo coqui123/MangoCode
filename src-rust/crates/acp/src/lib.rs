@@ -3,7 +3,7 @@
 //! JSON-RPC 2.0 over stdio. The server is local-only and runs the native
 //! MangoCode query loop directly; it does not proxy to any hosted service.
 
-use mangocode_core::config::{PermissionMode, Settings};
+use mangocode_core::config::{Config, PermissionMode, Settings};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::file_history::FileHistory;
 use mangocode_core::types::{ContentBlock, Message, MessageContent, Role};
@@ -203,7 +203,7 @@ async fn handle_request(
     match req.method.as_str() {
         "initialize" => Ok(initialize_result(req.params)),
         "authenticate" => Ok(json!({ "authenticated": true })),
-        "tool/list" => Ok(tool_list_json()),
+        "tool/list" => tool_list_json(req.params, state).await,
         "model/list" => Ok(model_list_json()),
         "session/list" => Ok(json!({ "sessions": list_sessions_json().await })),
         "session/new" | "session/create" => create_session(req.params, state).await,
@@ -619,15 +619,7 @@ async fn build_runtime(
     out_tx: OutboundTx,
     state: Arc<AcpServerState>,
 ) -> anyhow::Result<QueryRuntime> {
-    let settings = Settings::load_hierarchical(cwd).await;
-    let mut config = settings.effective_config();
-    config.project_dir = Some(cwd.to_path_buf());
-    if let Some(model) = model_override.filter(|model| !model.trim().is_empty()) {
-        config.model = Some(model);
-    }
-    if let Some(mode) = mode_override {
-        config.permission_mode = mode;
-    }
+    let mut config = acp_effective_config(cwd, model_override, mode_override, true).await;
 
     let model_registry = mangocode_api::ModelRegistry::new();
     if config.model.is_none() {
@@ -661,6 +653,7 @@ async fn build_runtime(
 
     let cost_tracker = CostTracker::new();
     let current_turn = Arc::new(AtomicUsize::new(0));
+    let mcp_manager = connect_acp_mcp_manager(&config).await;
     let permission_handler: Arc<dyn PermissionHandler> = Arc::new(AcpPermissionHandler {
         session_id: session_id.to_string(),
         mode: config.permission_mode.clone(),
@@ -677,14 +670,16 @@ async fn build_runtime(
         file_history: Arc::new(ParkingMutex::new(FileHistory::new())),
         current_turn,
         non_interactive: false,
-        mcp_manager: None,
+        mcp_manager: mcp_manager.clone(),
         config: config.clone(),
     };
 
-    static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    SWARM_INIT.get_or_init(mangocode_query::init_team_swarm_runner);
-    let mut tools = mangocode_tools::all_tools();
-    tools.push(Box::new(mangocode_query::AgentTool));
+    #[cfg(any(feature = "tool-team-create", feature = "tool-team-delete"))]
+    {
+        static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWARM_INIT.get_or_init(mangocode_query::init_team_swarm_runner);
+    }
+    let tools = build_acp_tools(mcp_manager, &config);
 
     let mut query_config =
         mangocode_query::QueryConfig::from_config_with_registry(&config, &model_registry);
@@ -699,6 +694,70 @@ async fn build_runtime(
         query_config,
         cost_tracker,
     })
+}
+
+async fn acp_effective_config(
+    cwd: &Path,
+    model_override: Option<String>,
+    mode_override: Option<PermissionMode>,
+    install_plugin_globals: bool,
+) -> Config {
+    let settings = Settings::load_hierarchical(cwd).await;
+    let mut config = settings.effective_config();
+    config.project_dir = Some(cwd.to_path_buf());
+    if let Some(model) = model_override.filter(|model| !model.trim().is_empty()) {
+        config.model = Some(model);
+    }
+    if let Some(mode) = mode_override {
+        config.permission_mode = mode;
+    }
+
+    let plugin_registry = mangocode_plugins::load_plugins(cwd, &[]).await;
+    if install_plugin_globals {
+        mangocode_plugins::set_global_hooks(plugin_registry.build_hook_registry());
+        mangocode_plugins::set_global_registry(plugin_registry.clone());
+    }
+
+    let mut existing_names: std::collections::HashSet<String> = config
+        .mcp_servers
+        .iter()
+        .map(|server| server.name.clone())
+        .collect();
+    for mcp_server in plugin_registry.all_mcp_servers() {
+        if existing_names.insert(mcp_server.name.clone()) {
+            config.mcp_servers.push(mcp_server);
+        }
+    }
+
+    config
+}
+
+async fn connect_acp_mcp_manager(config: &Config) -> Option<Arc<mangocode_mcp::McpManager>> {
+    if config.mcp_servers.is_empty() {
+        return None;
+    }
+
+    let manager = Arc::new(mangocode_mcp::McpManager::connect_all(&config.mcp_servers).await);
+    manager.clone().spawn_notification_poll_loop();
+    Some(manager)
+}
+
+fn build_acp_tools(
+    mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    config: &Config,
+) -> Vec<Box<dyn mangocode_tools::Tool>> {
+    let mut tools: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools();
+    #[cfg(feature = "tool-agent")]
+    tools.push(Box::new(mangocode_query::AgentTool));
+    if let Some(manager) = mcp_manager {
+        mangocode_tools::extend_with_mcp_tools(&mut tools, manager);
+    }
+
+    mangocode_tools::filter_tools_by_name_config(
+        tools,
+        &config.allowed_tools,
+        &config.disallowed_tools,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,22 +1194,61 @@ fn message_text(message: &Message) -> String {
     }
 }
 
-fn tool_list_json() -> Value {
-    json!({
-        "tools": [
-            { "name": "Bash",        "description": "Execute shell commands" },
-            { "name": "Read",        "description": "Read file contents" },
-            { "name": "Edit",        "description": "Edit file contents" },
-            { "name": "Write",       "description": "Write file contents" },
-            { "name": "Glob",        "description": "Find files by pattern" },
-            { "name": "Grep",        "description": "Search file contents" },
-            { "name": "WebSearch",   "description": "Search the web" },
-            { "name": "BatchEdit",   "description": "Edit multiple files atomically" },
-            { "name": "ApplyPatch",  "description": "Apply unified diff patch" },
-            { "name": "Lsp",         "description": "Language server protocol integration" },
-            { "name": "Agent",       "description": "Spawn a local MangoCode sub-agent" }
-        ]
-    })
+async fn tool_list_json(
+    params: Option<Value>,
+    state: Arc<AcpServerState>,
+) -> anyhow::Result<Value> {
+    let params = params.unwrap_or(Value::Null);
+    let (cwd, model_override, mode_override) = if let Some(session_id) = params_session_id(&params)
+    {
+        let session_arc = {
+            state
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Unknown session: {}", session_id))?
+        };
+        let session = session_arc.lock().await;
+        (
+            session.cwd.clone(),
+            session.model_override.clone(),
+            session.permission_mode.clone(),
+        )
+    } else {
+        (
+            params
+                .get("cwd")
+                .or_else(|| params.get("workingDirectory"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            params
+                .get("model")
+                .or_else(|| params.get("modelId"))
+                .or_else(|| params.get("model_id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            params
+                .get("modeId")
+                .or_else(|| params.get("mode_id"))
+                .or_else(|| params.get("mode"))
+                .and_then(Value::as_str)
+                .and_then(parse_permission_mode),
+        )
+    };
+
+    let config = acp_effective_config(&cwd, model_override, mode_override, false).await;
+    let mcp_manager = connect_acp_mcp_manager(&config).await;
+    let tools = build_acp_tools(mcp_manager, &config);
+    Ok(tool_list_value_from_tools(&tools))
+}
+
+fn tool_list_value_from_tools(tools: &[Box<dyn mangocode_tools::Tool>]) -> Value {
+    let mut specs = mangocode_tools::build_registry_plan(tools).specs;
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    json!({ "tools": specs })
 }
 
 fn model_list_json() -> Value {
@@ -1282,6 +1380,150 @@ mod tests {
             "selectedOptionId": "allow-always"
         })));
         assert_eq!(decision, PermissionDecision::AllowPermanently);
+    }
+
+    #[cfg(all(feature = "tool-bash", feature = "tool-tool-search"))]
+    #[test]
+    fn acp_tool_filter_respects_config_aliases() {
+        let mut tools = mangocode_tools::all_tools();
+        #[cfg(feature = "tool-agent")]
+        tools.push(Box::new(mangocode_query::AgentTool));
+
+        let filtered = mangocode_tools::filter_tools_by_name_config(
+            tools,
+            &["shell_command".to_string(), "ToolSearch".to_string()],
+            &["container.exec".to_string()],
+        );
+
+        assert!(filtered.iter().any(|tool| tool.name() == "ToolSearch"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Bash"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Read"));
+    }
+
+    #[test]
+    fn acp_tool_list_matches_runtime_registry() {
+        #[allow(unused_mut)]
+        let mut runtime_tools = mangocode_tools::all_tools();
+        #[cfg(feature = "tool-agent")]
+        runtime_tools.push(Box::new(mangocode_query::AgentTool));
+        let expected = mangocode_tools::build_registry_plan(&runtime_tools)
+            .specs
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let advertised = tool_list_value_from_tools(&runtime_tools);
+        let tools = advertised["tools"]
+            .as_array()
+            .expect("tools/list should return a tools array");
+        let actual = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(actual, expected);
+
+        let default_tool_set_enabled = cfg!(any(
+            feature = "default-tools",
+            feature = "default-tools-no-web-research",
+            feature = "full-tools"
+        ));
+        let tool_search_enabled =
+            default_tool_set_enabled || cfg!(feature = "tool-tool-search");
+        let view_image_enabled =
+            default_tool_set_enabled || cfg!(feature = "tool-view-image");
+        let get_goal_enabled = default_tool_set_enabled || cfg!(feature = "tool-get-goal");
+        let create_goal_enabled =
+            default_tool_set_enabled || cfg!(feature = "tool-create-goal");
+        let update_goal_enabled =
+            default_tool_set_enabled || cfg!(feature = "tool-update-goal");
+        let agent_enabled = default_tool_set_enabled || cfg!(feature = "tool-agent");
+
+        for (name, should_exist) in [
+            ("ToolSearch", tool_search_enabled),
+            ("ViewImage", view_image_enabled),
+            ("get_goal", get_goal_enabled),
+            ("create_goal", create_goal_enabled),
+            ("update_goal", update_goal_enabled),
+            ("Agent", agent_enabled),
+        ] {
+            assert_eq!(
+                actual.contains(name),
+                should_exist,
+                "ACP advertised tool presence should match feature gate for {name}"
+            );
+        }
+
+        #[allow(unused_variables)]
+        let aliases_for = |name: &str| -> Vec<String> {
+            tools
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .and_then(|tool| tool["aliases"].as_array())
+                .expect("tool should include aliases")
+                .iter()
+                .filter_map(|alias| alias.as_str().map(str::to_string))
+                .collect()
+        };
+        if default_tool_set_enabled || cfg!(feature = "tool-bash") {
+            assert!(aliases_for("Bash").contains(&"shell_command".to_string()));
+        }
+        if view_image_enabled {
+            assert!(aliases_for("ViewImage").contains(&"view_image".to_string()));
+        }
+        if tool_search_enabled {
+            assert!(aliases_for("ToolSearch").contains(&"tool_search".to_string()));
+        }
+        if agent_enabled {
+            assert!(aliases_for("Agent").contains(&"spawn_agent".to_string()));
+        }
+    }
+
+    #[cfg(any(
+        feature = "tool-tool-search",
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools"
+    ))]
+    #[tokio::test]
+    async fn acp_tool_list_uses_session_runtime_config() {
+        let dir = std::env::temp_dir().join(format!("mangocode-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".mangocode")).unwrap();
+        std::fs::write(
+            dir.join(".mangocode").join("settings.json"),
+            r#"{ "config": { "allowed_tools": ["ToolSearch"], "disallowed_tools": ["Bash"] } }"#,
+        )
+        .unwrap();
+
+        let state = Arc::new(AcpServerState::default());
+        create_session(
+            Some(json!({
+                "sessionId": "tool-list-session",
+                "cwd": dir.display().to_string()
+            })),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+
+        let advertised = tool_list_json(
+            Some(json!({ "sessionId": "tool-list-session" })),
+            state.clone(),
+        )
+        .await
+        .unwrap();
+        let tools = advertised["tools"]
+            .as_array()
+            .expect("tools/list should return a tools array");
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(names.contains("ToolSearch"));
+        assert!(!names.contains("Bash"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

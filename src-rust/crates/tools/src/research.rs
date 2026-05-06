@@ -4,6 +4,16 @@
 //! fallback poaches the adaptive-browser pattern as a native HTTP +
 //! script-aware extraction pass without requiring users to install sidecars.
 
+#![cfg_attr(
+    not(all(
+        feature = "tool-doc-search",
+        feature = "tool-doc-read",
+        feature = "tool-deep-read",
+        feature = "tool-rendered-fetch"
+    )),
+    allow(dead_code)
+)]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -96,15 +106,20 @@ fn default_max_sources() -> usize {
     5
 }
 
+#[cfg(feature = "tool-doc-read")]
 pub struct DocReadTool;
+#[cfg(feature = "tool-deep-read")]
 pub struct DeepReadTool;
+#[cfg(feature = "tool-doc-search")]
 pub struct DocSearchTool;
+#[cfg(feature = "tool-rendered-fetch")]
 pub struct RenderedFetchTool;
 
 fn default_source_preference() -> String {
     "official".to_string()
 }
 
+#[cfg(feature = "tool-doc-search")]
 #[async_trait]
 impl Tool for DocSearchTool {
     fn name(&self) -> &str {
@@ -193,6 +208,7 @@ impl Tool for DocSearchTool {
     }
 }
 
+#[cfg(feature = "tool-doc-read")]
 #[async_trait]
 impl Tool for DocReadTool {
     fn name(&self) -> &str {
@@ -247,6 +263,7 @@ impl Tool for DocReadTool {
     }
 }
 
+#[cfg(feature = "tool-deep-read")]
 #[async_trait]
 impl Tool for DeepReadTool {
     fn name(&self) -> &str {
@@ -339,6 +356,7 @@ impl Tool for DeepReadTool {
     }
 }
 
+#[cfg(feature = "tool-rendered-fetch")]
 #[async_trait]
 impl Tool for RenderedFetchTool {
     fn name(&self) -> &str {

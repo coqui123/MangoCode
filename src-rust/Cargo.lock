@@ -3304,6 +3304,8 @@ dependencies = [
  "chrono",
  "mangocode-api",
  "mangocode-core",
+ "mangocode-mcp",
+ "mangocode-plugins",
  "mangocode-query",
  "mangocode-tools",
  "parking_lot",
@@ -3474,6 +3476,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangocode-file-search"
+version = "0.0.7"
+dependencies = [
+ "glob",
+ "serde",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
 name = "mangocode-mcp"
 version = "0.0.7"
 dependencies = [
@@ -3561,6 +3573,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangocode-tool-runtime"
+version = "0.0.7"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mangocode-tools"
 version = "0.0.7"
 dependencies = [
@@ -3580,6 +3600,7 @@ dependencies = [
  "mangocode-api",
  "mangocode-core",
  "mangocode-mcp",
+ "mangocode-tool-runtime",
  "nix 0.29.0",
  "once_cell",
  "open",
@@ -3620,9 +3641,12 @@ dependencies = [
  "image",
  "mangocode-api",
  "mangocode-core",
+ "mangocode-file-search",
  "mangocode-mcp",
+ "mangocode-plugins",
  "mangocode-query",
  "mangocode-tools",
+ "mangocode-turn-diff",
  "notify-rust",
  "once_cell",
  "parking_lot",
@@ -3638,6 +3662,19 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "mangocode-turn-diff"
+version = "0.0.7"
+dependencies = [
+ "chrono",
+ "hex",
+ "mangocode-core",
+ "serde",
+ "sha2",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]

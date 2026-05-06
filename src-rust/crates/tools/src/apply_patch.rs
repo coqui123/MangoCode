@@ -38,9 +38,18 @@ struct Hunk {
 /// All hunks for a single file.
 #[derive(Debug)]
 struct FilePatch {
-    /// Target path (from `+++ b/<path>` or `+++ <path>`).
+    /// Target path. For delete patches (`+++ /dev/null`) this is the old path.
     path: String,
+    /// Whether this patch deletes the target file.
+    is_delete: bool,
     hunks: Vec<Hunk>,
+}
+
+struct PendingPatchWrite {
+    path: std::path::PathBuf,
+    existed: bool,
+    original_bytes: Vec<u8>,
+    new_content: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +61,7 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
     let mut file_patches: Vec<FilePatch> = Vec::new();
     let mut current_file: Option<FilePatch> = None;
     let mut current_hunk: Option<Hunk> = None;
+    let mut pending_old_path: Option<String> = None;
 
     for line in patch.lines() {
         if line.starts_with("--- ") {
@@ -64,13 +74,18 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
             if let Some(f) = current_file.take() {
                 file_patches.push(f);
             }
-            // Don't extract the path here — we do it from the +++ line.
+            pending_old_path = parse_diff_path(line.strip_prefix("--- ").unwrap_or(line));
         } else if line.starts_with("+++ ") {
-            // Extract target path, stripping the "b/" prefix if present.
+            // Prefer the new path, but use the old path for delete patches.
             let raw = line.strip_prefix("+++ ").unwrap_or(line);
-            let path = raw.trim_start_matches("b/").trim().to_string();
+            let new_path = parse_diff_path(raw);
+            let is_delete = new_path.is_none();
+            let path = new_path
+                .or_else(|| pending_old_path.clone())
+                .ok_or_else(|| "File diff is missing both old and new paths".to_string())?;
             current_file = Some(FilePatch {
                 path,
+                is_delete,
                 hunks: Vec::new(),
             });
         } else if line.starts_with("@@ ") {
@@ -111,6 +126,20 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
     }
 
     Ok(file_patches)
+}
+
+fn parse_diff_path(raw: &str) -> Option<String> {
+    let token = raw.split_whitespace().next().unwrap_or("").trim();
+    if token.is_empty() || token == "/dev/null" {
+        return None;
+    }
+    Some(strip_single_diff_prefix(token).to_string())
+}
+
+fn strip_single_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
 }
 
 /// Extract the original-file start line (1-based in the header, converted to
@@ -235,6 +264,16 @@ fn find_context_position(lines: &[String], expected: &[&str], hint: usize) -> Op
     None
 }
 
+async fn rollback_applied_patch_writes(applied: &[&PendingPatchWrite]) {
+    for write in applied.iter().rev() {
+        if write.existed {
+            let _ = tokio::fs::write(&write.path, &write.original_bytes).await;
+        } else if write.path.exists() {
+            let _ = tokio::fs::remove_file(&write.path).await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementation
 // ---------------------------------------------------------------------------
@@ -268,7 +307,8 @@ impl Tool for ApplyPatchTool {
                     "description": "If true, validate the patch without applying it (default: false)"
                 }
             },
-            "required": ["patch"]
+            "required": ["patch"],
+            "additionalProperties": false
         })
     }
 
@@ -312,15 +352,16 @@ impl Tool for ApplyPatchTool {
         let mut total_added: i64 = 0;
         let mut total_removed: i64 = 0;
         let mut file_summaries: Vec<Value> = Vec::new();
-        // (path, original, new_content) — built during validation, used for writes
-        let mut to_write: Vec<(std::path::PathBuf, Vec<u8>, String)> = Vec::new();
+        // Built during validation, used for writes after every hunk is known-good.
+        let mut to_write: Vec<PendingPatchWrite> = Vec::new();
 
         for fp in &file_patches {
             let path = ctx.resolve_path(&fp.path);
             debug!(path = %path.display(), "ApplyPatch processing file");
 
             // Read current content (or empty string for new files).
-            let original_content = if path.exists() {
+            let existed = path.exists();
+            let original_content = if existed {
                 match tokio::fs::read_to_string(&path).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -372,14 +413,31 @@ impl Tool for ApplyPatchTool {
                 s
             };
 
+            if fp.is_delete && !new_content.is_empty() {
+                return ToolResult::error(format!(
+                    "Delete patch for {} did not remove all content",
+                    fp.path
+                ));
+            }
+
             file_summaries.push(json!({
                 "path": fp.path,
                 "hunks": fp.hunks.len(),
                 "lines_added": file_added,
                 "lines_removed": file_removed,
+                "deleted": fp.is_delete,
             }));
 
-            to_write.push((path, original_content.into_bytes(), new_content));
+            to_write.push(PendingPatchWrite {
+                path,
+                existed,
+                original_bytes: original_content.into_bytes(),
+                new_content: if fp.is_delete {
+                    None
+                } else {
+                    Some(new_content)
+                },
+            });
         }
 
         // ----------------------------------------------------------------
@@ -405,14 +463,42 @@ impl Tool for ApplyPatchTool {
         // Write all modified files
         // ----------------------------------------------------------------
 
-        for (path, original_bytes, new_content) in &to_write {
-            if let Err(e) = tokio::fs::write(path, new_content).await {
-                return ToolResult::error(format!("Failed to write {}: {}", path.display(), e));
+        let mut applied: Vec<&PendingPatchWrite> = Vec::new();
+        for write in &to_write {
+            let write_result = if let Some(new_content) = &write.new_content {
+                if let Some(parent) = write.path.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        Err(e)
+                    } else {
+                        tokio::fs::write(&write.path, new_content).await
+                    }
+                } else {
+                    tokio::fs::write(&write.path, new_content).await
+                }
+            } else if write.path.exists() {
+                tokio::fs::remove_file(&write.path).await
+            } else {
+                Ok(())
+            };
+
+            if let Err(e) = write_result {
+                rollback_applied_patch_writes(&applied).await;
+                return ToolResult::error(format!(
+                    "Failed to write {}: {}",
+                    write.path.display(),
+                    e
+                ));
             }
-            ctx.record_file_change(
-                path.clone(),
-                original_bytes,
-                new_content.as_bytes(),
+            applied.push(write);
+        }
+
+        for write in &to_write {
+            let after_bytes = write.new_content.as_deref().unwrap_or("").as_bytes();
+            ctx.record_file_change_with_existence(
+                write.path.clone(),
+                &write.original_bytes,
+                after_bytes,
+                (write.existed, write.new_content.is_some()),
                 self.name(),
             );
         }
@@ -505,5 +591,133 @@ mod tests {
         assert_eq!(fps.len(), 2);
         assert_eq!(fps[0].path, "a.rs");
         assert_eq!(fps[1].path, "b.rs");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_delete_uses_old_path() {
+        let patch = "\
+--- a/remove.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "remove.txt");
+        assert!(fps[0].is_delete);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_strips_only_one_diff_prefix() {
+        let patch = "\
+--- a/a/remove.txt
++++ b/a/remove.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "a/remove.txt");
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_deletes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove.txt");
+        tokio::fs::write(&path, "gone\n").await.unwrap();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            permission_mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            permission_handler: std::sync::Arc::new(
+                mangocode_core::permissions::AutoPermissionHandler {
+                    mode: mangocode_core::config::PermissionMode::BypassPermissions,
+                },
+            ),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "apply-patch-delete-test".to_string(),
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(9)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+        };
+
+        let result = ApplyPatchTool
+            .execute(
+                json!({
+                    "patch": "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(!path.exists());
+        let history = ctx.file_history.lock();
+        assert_eq!(history.get_entries_for_turn(9).len(), 1);
+        assert_eq!(
+            history.get_entries_for_turn(9)[0].before_text.as_deref(),
+            Some("gone\n")
+        );
+        assert_eq!(
+            history.get_entries_for_turn(9)[0].after_text.as_deref(),
+            None
+        );
+        assert!(!history.get_entries_for_turn(9)[0].after_exists);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_rollback_does_not_record_failed_partial_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let blocker = dir.path().join("blocked_parent");
+        tokio::fs::write(&first, "old\n").await.unwrap();
+        tokio::fs::write(&blocker, "not a directory").await.unwrap();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            permission_mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            permission_handler: std::sync::Arc::new(
+                mangocode_core::permissions::AutoPermissionHandler {
+                    mode: mangocode_core::config::PermissionMode::BypassPermissions,
+                },
+            ),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "apply-patch-partial-failure-test".to_string(),
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(12)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+        };
+
+        let result = ApplyPatchTool
+            .execute(
+                json!({
+                    "patch": "\
+--- a/first.txt
++++ b/first.txt
+@@ -1 +1 @@
+-old
++new
+--- /dev/null
++++ b/blocked_parent/child.txt
+@@ -0,0 +1 @@
++child
+"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(tokio::fs::read_to_string(&first).await.unwrap(), "old\n");
+        assert!(ctx.file_history.lock().get_entries_for_turn(12).is_empty());
     }
 }

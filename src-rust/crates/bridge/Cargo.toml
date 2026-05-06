@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
-mangocode-query = { workspace = true }
+mangocode-query = { workspace = true, default-features = false }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

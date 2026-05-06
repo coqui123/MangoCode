@@ -98,18 +98,24 @@ impl Tool for FileWriteTool {
             return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
         }
 
-        ctx.record_file_change(
-            path.clone(),
-            &before_content,
-            params.content.as_bytes(),
-            self.name(),
-        );
-
         // Run any configured formatter for this file type.
         crate::try_format_file(&path.to_string_lossy(), ctx).await;
 
-        let line_count = params.content.lines().count();
-        let byte_count = params.content.len();
+        let (final_content, after_exists) = match tokio::fs::read(&path).await {
+            Ok(bytes) => (bytes, true),
+            Err(_) => (params.content.as_bytes().to_vec(), path.exists()),
+        };
+        ctx.record_file_change_with_existence(
+            path.clone(),
+            &before_content,
+            &final_content,
+            (existed, after_exists),
+            self.name(),
+        );
+
+        let final_text = String::from_utf8_lossy(&final_content);
+        let line_count = final_text.lines().count();
+        let byte_count = final_content.len();
 
         let action = if is_new { "Created" } else { "Wrote" };
         ToolResult::success(format!(

@@ -367,10 +367,35 @@ cd src-rust
 - `/model` - model selection
 - `/mcp` - MCP server status and actions
 - `/permissions` - permission mode and policy details
+- `/goal` - set, inspect, pause, resume, or clear the persistent local session goal
+- `/changes` - inspect the latest captured file-changing turn
+- `/changes-export` - export the latest captured file-changing turn as a patch bundle
 - `/tasks` - background task status
 - `/status` - runtime/session status
 - `/doctor` - diagnostics and setup checks
 - `/review` - review-oriented workflow
+
+Runtime tool discovery is available through `ToolSearch`. Local image inspection uses `ViewImage`. Persistent goals use `get_goal`, `create_goal`, and `update_goal` when the active model needs to inspect, create, or complete an explicit session goal.
+
+## Build-Time Tool Selection
+
+Runtime `allowed_tools` and `disallowed_tools` settings hide or deny tools for a session, but the tool implementations still ship in the binary. For smaller or policy-constrained builds, MangoCode also supports Cargo feature-gated built-in tools.
+
+The default build enables `default-tools`, which preserves the normal built-in tool set. To build MangoCode without native web search and Mango Research tools while still allowing external MCP server tools, use:
+
+```powershell
+cd src-rust
+cargo build -p mangocode --no-default-features --features default-tools-no-web-research
+```
+
+Individual built-in tools can also be selected with `tool-*` features. For example, a minimal read/search discovery build can use:
+
+```powershell
+cd src-rust
+cargo build -p mangocode --no-default-features --features "tool-read,tool-grep,tool-glob,tool-tool-search"
+```
+
+External MCP server tools are still registered through the MCP bridge when native MCP helper tools such as `ListMcpResources`, `ReadMcpResource`, or `mcp__auth` are disabled.
 
 ## Configuration And Data Locations
 

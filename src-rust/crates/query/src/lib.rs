@@ -8,6 +8,11 @@
 // 5. Handles auto-compact when the context window fills up
 // 6. Manages stop conditions (end_turn, max_turns, cancellation)
 
+#[cfg(any(
+    feature = "tool-agent",
+    feature = "tool-team-create",
+    feature = "tool-team-delete"
+))]
 pub mod agent_tool;
 pub mod execution_scratchpad;
 pub use execution_scratchpad::ScratchpadState;
@@ -23,7 +28,10 @@ pub mod ollama;
 pub mod proactive;
 pub mod session_memory;
 pub mod skill_prefetch;
-pub use agent_tool::{init_team_swarm_runner, AgentTool};
+#[cfg(feature = "tool-agent")]
+pub use agent_tool::AgentTool;
+#[cfg(any(feature = "tool-team-create", feature = "tool-team-delete"))]
+pub use agent_tool::init_team_swarm_runner;
 pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
 pub use compact::{
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
@@ -64,6 +72,10 @@ use mangocode_core::session_tracing::{
     start_tool_span_with_ids,
 };
 use mangocode_core::types::{ContentBlock, Message, ToolResultContent, UsageInfo};
+use mangocode_tools::runtime::{
+    plan_execution_batches, preview_json, preview_text, ApprovalDecision, ToolCallPlan,
+    ToolCallSource, ToolDispatchTrace, ToolErrorKind, ToolHandlerKind, ToolInvocation,
+};
 use mangocode_tools::{Tool, ToolContext, ToolResult};
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -1423,6 +1435,8 @@ pub async fn run_query_loop(
     pending_messages: Option<&mut Vec<String>>,
 ) -> QueryOutcome {
     let file_history_start = tool_ctx.file_history.lock().len();
+    let goal_turn_started = std::time::Instant::now();
+    let goal_accounting_id = current_accountable_goal_id(&tool_ctx.session_id);
     let (harness_turn_id, harness_recorder) = mangocode_core::harness::start_turn(
         &tool_ctx.session_id,
         Some(&config.model),
@@ -1468,6 +1482,14 @@ pub async fn run_query_loop(
         Some((harness_recorder.clone(), harness_turn_id.clone())),
     )
     .await;
+
+    account_goal_for_outcome(
+        tool_ctx,
+        &outcome,
+        goal_accounting_id.as_deref(),
+        goal_turn_started.elapsed().as_secs().min(i64::MAX as u64) as i64,
+        event_tx.as_ref(),
+    );
 
     harness_recorder.record(
         "messages.snapshot",
@@ -1546,6 +1568,109 @@ pub async fn run_query_loop(
     mangocode_core::harness::finish_turn(&tool_ctx.session_id, &harness_turn_id);
     let _ = tokio::time::timeout(Duration::from_secs(2), event_forwarder).await;
     outcome
+}
+
+fn account_goal_for_outcome(
+    tool_ctx: &ToolContext,
+    outcome: &QueryOutcome,
+    goal_accounting_id: Option<&str>,
+    elapsed_seconds: i64,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    let store = match mangocode_core::goals::open_default_goal_store() {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(error = %e, "Failed to open goal store for accounting");
+            return;
+        }
+    };
+    account_goal_for_outcome_with_store(
+        &store,
+        &tool_ctx.session_id,
+        outcome,
+        goal_accounting_id,
+        elapsed_seconds,
+        event_tx,
+    );
+}
+
+fn account_goal_for_outcome_with_store(
+    store: &mangocode_core::sqlite_storage::SqliteSessionStore,
+    session_id: &str,
+    outcome: &QueryOutcome,
+    goal_accounting_id: Option<&str>,
+    elapsed_seconds: i64,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    match outcome {
+        QueryOutcome::EndTurn { usage, .. } | QueryOutcome::MaxTokens { usage, .. } => {
+            let token_delta = mangocode_core::goals::goal_token_delta(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+            );
+            let account_result = if let Some(goal_id) = goal_accounting_id {
+                store.account_thread_goal_usage_for_goal_id(
+                    session_id,
+                    goal_id,
+                    elapsed_seconds,
+                    token_delta,
+                )
+            } else {
+                store.account_thread_goal_usage(session_id, elapsed_seconds, token_delta)
+            };
+            match account_result {
+                Ok(Some(goal))
+                    if goal.status == mangocode_core::goals::ThreadGoalStatus::BudgetLimited =>
+                {
+                    if let Some(tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(
+                            "Goal token budget reached. Goal is now limited by budget.".to_string(),
+                        ));
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Failed to account goal usage"),
+            }
+        }
+        QueryOutcome::Cancelled => {
+            if let Err(e) = store.pause_active_thread_goal(session_id) {
+                warn!(error = %e, "Failed to pause active goal after cancellation");
+            }
+        }
+        QueryOutcome::Error(_) | QueryOutcome::BudgetExceeded { .. } => {}
+    }
+}
+
+fn current_accountable_goal_id(session_id: &str) -> Option<String> {
+    let store = mangocode_core::goals::open_default_goal_store().ok()?;
+    current_accountable_goal_id_with_store(&store, session_id)
+}
+
+fn current_accountable_goal_id_with_store(
+    store: &mangocode_core::sqlite_storage::SqliteSessionStore,
+    session_id: &str,
+) -> Option<String> {
+    let goal = store.get_thread_goal(session_id).ok()??;
+    matches!(
+        goal.status,
+        mangocode_core::goals::ThreadGoalStatus::Active
+            | mangocode_core::goals::ThreadGoalStatus::BudgetLimited
+    )
+    .then_some(goal.goal_id)
+}
+
+fn render_goal_prompt_for_session(session_id: &str) -> Option<String> {
+    let store = mangocode_core::goals::open_default_goal_store().ok()?;
+    render_goal_prompt_for_session_with_store(&store, session_id)
+}
+
+fn render_goal_prompt_for_session_with_store(
+    store: &mangocode_core::sqlite_storage::SqliteSessionStore,
+    session_id: &str,
+) -> Option<String> {
+    let goal = store.get_thread_goal(session_id).ok()??;
+    mangocode_core::goals::render_goal_system_prompt(&goal)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1817,6 +1942,16 @@ async fn run_query_loop_inner(
                         None => nudge,
                     });
                 }
+            }
+
+            // Goal context is safe to include in every permission mode. Plan
+            // mode still controls tool execution; this only keeps the model
+            // aware of the user's persistent local objective.
+            if let Some(goal_prompt) = render_goal_prompt_for_session(&tool_ctx.session_id) {
+                patched.append_system_prompt = Some(match patched.append_system_prompt {
+                    Some(existing) => format!("{}\n\n{}", existing, goal_prompt),
+                    None => goal_prompt,
+                });
             }
 
             // Intent-based skill injection (trigger match → deps → templates + QA blocks).
@@ -2735,17 +2870,12 @@ async fn run_query_loop_inner(
                     // Some OpenAI-compatible providers report finish_reason="stop"
                     // even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
-                        // Parallel dispatch for non-Agent tools (same approach as the streaming tool executor path).
-                        struct PreparedTool {
-                            id: String,
-                            name: String,
-                            input: Value,
-                            blocked_result: Option<ToolResult>,
-                        }
-
                         let mut prepared: Vec<PreparedTool> =
                             Vec::with_capacity(tool_use_blocks.len());
                         for (id, name, input) in tool_use_blocks {
+                            let canonical_name = mangocode_tools::resolve_tool(tools, &name)
+                                .map(|tool| tool.name().to_string())
+                                .unwrap_or_else(|| name.clone());
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolStart {
                                     tool_name: name.clone(),
@@ -2758,7 +2888,7 @@ async fn run_query_loop_inner(
                             let hooks = &tool_ctx.config.hooks;
                             let hook_ctx = mangocode_core::hooks::HookContext {
                                 event: "PreToolUse".to_string(),
-                                tool_name: Some(name.clone()),
+                                tool_name: Some(canonical_name.clone()),
                                 tool_input: Some(input.clone()),
                                 tool_output: None,
                                 is_error: None,
@@ -2774,6 +2904,11 @@ async fn run_query_loop_inner(
                             .await;
                             end_hook_span(pre_hook_span);
 
+                            let plugin_pre_outcome = mangocode_plugins::run_global_pre_tool_hook(
+                                &canonical_name,
+                                &input,
+                            );
+
                             let blocked_result =
                                 if let mangocode_core::hooks::HookOutcome::Blocked(reason) =
                                     pre_outcome
@@ -2783,9 +2918,17 @@ async fn run_query_loop_inner(
                                         "Blocked by hook: {}",
                                         reason
                                     )))
+                                } else if let mangocode_plugins::HookOutcome::Deny(reason) =
+                                    plugin_pre_outcome
+                                {
+                                    warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                                    Some(mangocode_tools::ToolResult::error(format!(
+                                        "Blocked by plugin hook: {}",
+                                        reason
+                                    )))
                                 } else {
                                     check_critic(
-                                        &name,
+                                        &canonical_name,
                                         &input,
                                         &tool_ctx.working_dir,
                                         messages,
@@ -2804,7 +2947,8 @@ async fn run_query_loop_inner(
 
                         let has_agent_tool = prepared.iter().any(|p| {
                             p.blocked_result.is_none()
-                                && p.name == mangocode_core::constants::TOOL_NAME_AGENT
+                                && canonical_tool_name(tools, &p.name)
+                                    == mangocode_core::constants::TOOL_NAME_AGENT
                         });
                         let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool {
                             Some(messages.clone())
@@ -2812,62 +2956,31 @@ async fn run_query_loop_inner(
                             None
                         };
 
-                        let exec_futures: Vec<_> = prepared
-                            .iter()
-                            .map(|p| {
-                                let event_tx_for_exec = event_tx.clone();
-                                let harness_recorder_for_exec = harness_context
-                                    .as_ref()
-                                    .map(|(recorder, _)| recorder.clone());
-                                let harness_turn_for_exec =
-                                    harness_context.as_ref().map(|(_, turn_id)| turn_id.clone());
-                                if let Some(r) = p.blocked_result.clone() {
-                                    futures::future::Either::Left(async move { (r, 0_u64) })
-                                } else {
-                                    let id = p.id.clone();
-                                    let name = p.name.clone();
-                                    let input = p.input.clone();
-                                    let parent_msgs =
-                                        if name == mangocode_core::constants::TOOL_NAME_AGENT {
-                                            parent_msgs_snapshot.clone()
-                                        } else {
-                                            None
-                                        };
-                                    futures::future::Either::Right(async move {
-                                        let tool_started = std::time::Instant::now();
-                                        let result = execute_tool(ExecuteToolRequest {
-                                            client,
-                                            query_config: config,
-                                            tool_id: &id,
-                                            name: &name,
-                                            input: &input,
-                                            tools,
-                                            ctx: tool_ctx,
-                                            event_tx: event_tx_for_exec.as_ref(),
-                                            parent_messages: parent_msgs,
-                                            harness_recorder: harness_recorder_for_exec,
-                                            harness_turn_id: harness_turn_for_exec,
-                                        })
-                                        .await;
-                                        (result, tool_started.elapsed().as_millis() as u64)
-                                    })
-                                }
-                            })
-                            .collect();
-
-                        let exec_results: Vec<(ToolResult, u64)> =
-                            futures::future::join_all(exec_futures).await;
+                        let exec_results: Vec<(ToolResult, u64)> = execute_prepared_tools(
+                            &prepared,
+                            parent_msgs_snapshot,
+                            client,
+                            config,
+                            tools,
+                            tool_ctx,
+                            event_tx.as_ref(),
+                            &harness_context,
+                        )
+                        .await;
 
                         let mut tool_results: Vec<ContentBlock> =
                             Vec::with_capacity(prepared.len());
                         for (p, (result, tool_duration_ms)) in
                             prepared.iter().zip(exec_results.into_iter())
                         {
+                            let canonical_name = mangocode_tools::resolve_tool(tools, &p.name)
+                                .map(|tool| tool.name().to_string())
+                                .unwrap_or_else(|| p.name.clone());
                             // Run PostToolUse hooks
                             let hooks = &tool_ctx.config.hooks;
                             let post_ctx = mangocode_core::hooks::HookContext {
                                 event: "PostToolUse".to_string(),
-                                tool_name: Some(p.name.clone()),
+                                tool_name: Some(canonical_name.clone()),
                                 tool_input: Some(p.input.clone()),
                                 tool_output: Some(result.content.clone()),
                                 is_error: Some(result.is_error),
@@ -2883,10 +2996,17 @@ async fn run_query_loop_inner(
                             .await;
                             end_hook_span(post_hook_span);
 
+                            mangocode_plugins::run_global_post_tool_hook(
+                                &canonical_name,
+                                &p.input,
+                                &result.content,
+                                result.is_error,
+                            );
+
                             let result = if !result.is_error {
                                 maybe_inject_lsp_diagnostics(
                                     result,
-                                    &p.name,
+                                    &canonical_name,
                                     &p.input,
                                     &tool_ctx.working_dir,
                                 )
@@ -2895,13 +3015,13 @@ async fn run_query_loop_inner(
                                 result
                             };
 
-                            if !result.is_error && tool_invalidates_git_context(p.name.as_str()) {
+                            if !result.is_error && tool_invalidates_git_context(&canonical_name) {
                                 mark_git_context_dirty(&tool_ctx.session_id);
                             }
 
                             capture_post_tool_memory(
                                 tool_ctx,
-                                &p.name,
+                                &canonical_name,
                                 &p.input,
                                 &result.content,
                                 result.is_error,
@@ -3398,6 +3518,7 @@ async fn run_query_loop_inner(
                 // Some(task), we spawn a background subagent via AgentTool so
                 // the spawn doesn't call run_query_loop recursively from within
                 // its own future (which would make the future !Send).
+                #[cfg(feature = "tool-agent")]
                 {
                     let memory_dir = memory_dir_for_working_dir(&tool_ctx.working_dir);
                     let conversations_dir =
@@ -3491,15 +3612,6 @@ async fn run_query_loop_inner(
                 //
                 // This Matches the StreamingToolExecutor pattern.                // ---------------------------------------------------------------------------
 
-                // Intermediate record produced during Phase 1.
-                struct PreparedTool {
-                    id: String,
-                    name: String,
-                    input: Value,
-                    /// None means the pre-hook blocked execution; the String is the error reason.
-                    blocked_result: Option<ToolResult>,
-                }
-
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
@@ -3508,6 +3620,9 @@ async fn run_query_loop_inner(
                         let id = id.clone();
                         let name = name.clone();
                         let input = input.clone();
+                        let canonical_name = mangocode_tools::resolve_tool(tools, &name)
+                            .map(|tool| tool.name().to_string())
+                            .unwrap_or_else(|| name.clone());
 
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
@@ -3521,7 +3636,7 @@ async fn run_query_loop_inner(
                         let hooks = &tool_ctx.config.hooks;
                         let hook_ctx = mangocode_core::hooks::HookContext {
                             event: "PreToolUse".to_string(),
-                            tool_name: Some(name.clone()),
+                            tool_name: Some(canonical_name.clone()),
                             tool_input: Some(input.clone()),
                             tool_output: None,
                             is_error: None,
@@ -3538,7 +3653,7 @@ async fn run_query_loop_inner(
                         end_hook_span(pre_hook_span);
 
                         let plugin_pre_outcome =
-                            mangocode_plugins::run_global_pre_tool_hook(&name, &input);
+                            mangocode_plugins::run_global_pre_tool_hook(&canonical_name, &input);
 
                         let blocked_result = if let mangocode_core::hooks::HookOutcome::Blocked(
                             reason,
@@ -3559,7 +3674,7 @@ async fn run_query_loop_inner(
                             )))
                         } else {
                             check_critic(
-                                &name,
+                                &canonical_name,
                                 &input,
                                 &tool_ctx.working_dir,
                                 messages,
@@ -3577,15 +3692,15 @@ async fn run_query_loop_inner(
                     }
                 }
 
-                // Phase 2: build execution futures for non-blocked tools and join them.
+                // Phase 2: execute tools with capability-aware scheduling.
                 // Blocked tools yield a ready future with the pre-computed error result.
-                // Non-blocked tools execute concurrently via join_all.
-                // Each async block owns its cloned name/input so there are no lifetime issues.
+                // Safe read-only tools may run concurrently; mutating or stateful tools serialize.
 
                 // Clone parent messages once (lazily) if any prepared tool is an Agent.
                 let has_agent_tool = prepared.iter().any(|p| {
                     p.blocked_result.is_none()
-                        && p.name == mangocode_core::constants::TOOL_NAME_AGENT
+                        && canonical_tool_name(tools, &p.name)
+                            == mangocode_core::constants::TOOL_NAME_AGENT
                 });
                 let parent_msgs_snapshot: Option<Vec<Message>> = if has_agent_tool {
                     Some(messages.clone())
@@ -3593,57 +3708,25 @@ async fn run_query_loop_inner(
                     None
                 };
 
-                let exec_futures: Vec<_> = prepared
-                    .iter()
-                    .map(|p| {
-                        let event_tx_for_exec = event_tx.clone();
-                        let harness_recorder_for_exec = harness_context
-                            .as_ref()
-                            .map(|(recorder, _)| recorder.clone());
-                        let harness_turn_for_exec =
-                            harness_context.as_ref().map(|(_, turn_id)| turn_id.clone());
-                        if let Some(r) = p.blocked_result.clone() {
-                            futures::future::Either::Left(async move { (r, 0_u64) })
-                        } else {
-                            let id = p.id.clone();
-                            let name = p.name.clone();
-                            let input = p.input.clone();
-                            let parent_msgs = if name == mangocode_core::constants::TOOL_NAME_AGENT
-                            {
-                                parent_msgs_snapshot.clone()
-                            } else {
-                                None
-                            };
-                            futures::future::Either::Right(async move {
-                                let tool_started = std::time::Instant::now();
-                                let result = execute_tool(ExecuteToolRequest {
-                                    client,
-                                    query_config: config,
-                                    tool_id: &id,
-                                    name: &name,
-                                    input: &input,
-                                    tools,
-                                    ctx: tool_ctx,
-                                    event_tx: event_tx_for_exec.as_ref(),
-                                    parent_messages: parent_msgs,
-                                    harness_recorder: harness_recorder_for_exec,
-                                    harness_turn_id: harness_turn_for_exec,
-                                })
-                                .await;
-                                (result, tool_started.elapsed().as_millis() as u64)
-                            })
-                        }
-                    })
-                    .collect();
-
-                // Run all tool futures concurrently; join_all preserves order.
-                let exec_results: Vec<(ToolResult, u64)> =
-                    futures::future::join_all(exec_futures).await;
+                let exec_results: Vec<(ToolResult, u64)> = execute_prepared_tools(
+                    &prepared,
+                    parent_msgs_snapshot,
+                    client,
+                    config,
+                    tools,
+                    tool_ctx,
+                    event_tx.as_ref(),
+                    &harness_context,
+                )
+                .await;
 
                 // Phase 3: post-hooks, event emission, and result block assembly.
                 let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                 for (p, (result, tool_duration_ms)) in prepared.iter().zip(exec_results.into_iter())
                 {
+                    let canonical_name = mangocode_tools::resolve_tool(tools, &p.name)
+                        .map(|tool| tool.name().to_string())
+                        .unwrap_or_else(|| p.name.clone());
                     if let Some(metrics) = &tool_ctx.session_metrics {
                         metrics.increment_tool_use();
                         metrics.add_tool_duration(tool_duration_ms);
@@ -3651,7 +3734,7 @@ async fn run_query_loop_inner(
                     let hooks = &tool_ctx.config.hooks;
                     let post_ctx = mangocode_core::hooks::HookContext {
                         event: "PostToolUse".to_string(),
-                        tool_name: Some(p.name.clone()),
+                        tool_name: Some(canonical_name.clone()),
                         tool_input: Some(p.input.clone()),
                         tool_output: Some(result.content.clone()),
                         is_error: Some(result.is_error),
@@ -3668,21 +3751,33 @@ async fn run_query_loop_inner(
                     end_hook_span(post_hook_span);
 
                     mangocode_plugins::run_global_post_tool_hook(
-                        &p.name,
+                        &canonical_name,
                         &p.input,
                         &result.content,
                         result.is_error,
                     );
+
+                    let result = if !result.is_error {
+                        maybe_inject_lsp_diagnostics(
+                            result,
+                            &canonical_name,
+                            &p.input,
+                            &tool_ctx.working_dir,
+                        )
+                        .await
+                    } else {
+                        result
+                    };
 
                     capture_post_tool_memory(
                         tool_ctx,
-                        &p.name,
+                        &canonical_name,
                         &p.input,
                         &result.content,
                         result.is_error,
                     );
 
-                    if !result.is_error && tool_invalidates_git_context(&p.name) {
+                    if !result.is_error && tool_invalidates_git_context(&canonical_name) {
                         mark_git_context_dirty(&tool_ctx.session_id);
                     }
 
@@ -3963,7 +4058,16 @@ fn critic_missing_key_warning(tool_name: &str, tool_input: &Value, fallback: boo
     "Permission critic is enabled but no API key is configured. Configure an API key for critic enforcement, or disable with /critic off. Warning-only mode is active, so execution continues.".to_string()
 }
 
+#[derive(Clone)]
+struct PreparedTool {
+    id: String,
+    name: String,
+    input: Value,
+    blocked_result: Option<ToolResult>,
+}
+
 /// Execute a single tool invocation.
+#[cfg_attr(not(feature = "tool-agent"), allow(dead_code))]
 struct ExecuteToolRequest<'a> {
     client: &'a mangocode_api::AnthropicClient,
     query_config: &'a QueryConfig,
@@ -3985,15 +4089,205 @@ struct ToolPreSnapshot {
     before_content: Option<Vec<u8>>,
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_prepared_tools(
+    prepared: &[PreparedTool],
+    parent_messages_snapshot: Option<Vec<Message>>,
+    client: &mangocode_api::AnthropicClient,
+    config: &QueryConfig,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    harness_context: &Option<(mangocode_core::harness::HarnessRecorder, String)>,
+) -> Vec<(ToolResult, u64)> {
+    let plans = prepared
+        .iter()
+        .map(|p| {
+            if p.blocked_result.is_some() {
+                ToolCallPlan::blocked(p.name.clone())
+            } else {
+                let capabilities = mangocode_tools::resolve_tool(tools, &p.name)
+                    .map(|tool| tool.capabilities(&p.input))
+                    .unwrap_or_else(mangocode_tools::runtime::ToolCapabilities::mutating);
+                ToolCallPlan::new(p.name.clone(), capabilities)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut results = Vec::with_capacity(prepared.len());
+    for batch in plan_execution_batches(&plans) {
+        if batch.len() == 1 {
+            let idx = batch[0];
+            results.push(
+                execute_prepared_tool(
+                    &prepared[idx],
+                    parent_messages_snapshot.clone(),
+                    client,
+                    config,
+                    tools,
+                    tool_ctx,
+                    event_tx,
+                    harness_context,
+                )
+                .await,
+            );
+            continue;
+        }
+
+        let exec_futures = batch.into_iter().map(|idx| {
+            execute_prepared_tool(
+                &prepared[idx],
+                parent_messages_snapshot.clone(),
+                client,
+                config,
+                tools,
+                tool_ctx,
+                event_tx,
+                harness_context,
+            )
+        });
+        results.extend(futures::future::join_all(exec_futures).await);
+    }
+
+    results
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_prepared_tool(
+    prepared: &PreparedTool,
+    parent_messages_snapshot: Option<Vec<Message>>,
+    client: &mangocode_api::AnthropicClient,
+    config: &QueryConfig,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    harness_context: &Option<(mangocode_core::harness::HarnessRecorder, String)>,
+) -> (ToolResult, u64) {
+    if let Some(result) = prepared.blocked_result.clone() {
+        trace_tool_dispatch(prepared, tools, &result, 0, ApprovalDecision::Denied);
+        return (result, 0);
+    }
+
+    let harness_recorder = harness_context
+        .as_ref()
+        .map(|(recorder, _)| recorder.clone());
+    let harness_turn_id = harness_context.as_ref().map(|(_, turn_id)| turn_id.clone());
+    let parent_messages = if canonical_tool_name(tools, &prepared.name)
+        == mangocode_core::constants::TOOL_NAME_AGENT
+    {
+        parent_messages_snapshot
+    } else {
+        None
+    };
+
+    let tool_started = std::time::Instant::now();
+    let result = execute_tool(ExecuteToolRequest {
+        client,
+        query_config: config,
+        tool_id: &prepared.id,
+        name: &prepared.name,
+        input: &prepared.input,
+        tools,
+        ctx: tool_ctx,
+        event_tx,
+        parent_messages,
+        harness_recorder,
+        harness_turn_id,
+    })
+    .await;
+    let duration_ms = tool_started.elapsed().as_millis() as u64;
+    trace_tool_dispatch(
+        prepared,
+        tools,
+        &result,
+        duration_ms,
+        ApprovalDecision::Unknown,
+    );
+    (result, duration_ms)
+}
+
+fn canonical_tool_name(tools: &[Box<dyn Tool>], requested: &str) -> String {
+    mangocode_tools::resolve_tool(tools, requested)
+        .map(|tool| tool.name().to_string())
+        .unwrap_or_else(|| requested.to_string())
+}
+
+fn trace_tool_dispatch(
+    prepared: &PreparedTool,
+    tools: &[Box<dyn Tool>],
+    result: &ToolResult,
+    duration_ms: u64,
+    approval_decision: ApprovalDecision,
+) {
+    let resolved = mangocode_tools::resolve_tool(tools, &prepared.name);
+    let canonical_name = resolved.map(|tool| tool.name().to_string());
+    let (tool_source, capabilities) = resolved
+        .map(|tool| {
+            let spec = tool.to_runtime_spec();
+            (spec.handler_kind, tool.capabilities(&prepared.input))
+        })
+        .unwrap_or_else(|| {
+            (
+                ToolHandlerKind::Unavailable,
+                mangocode_tools::runtime::ToolCapabilities::mutating(),
+            )
+        });
+    let mut envelope = result.to_envelope();
+    envelope.duration_ms = Some(duration_ms);
+    envelope.affected_paths = capabilities.affected_paths.clone();
+    if result.is_error && canonical_name.is_none() {
+        envelope.error_kind = Some(ToolErrorKind::UnknownTool);
+    }
+
+    let trace = ToolDispatchTrace {
+        invocation: ToolInvocation {
+            id: prepared.id.clone(),
+            requested_name: prepared.name.clone(),
+            canonical_name,
+            input: prepared.input.clone(),
+            source: ToolCallSource::Model,
+            parent_tool_id: None,
+        },
+        requester: Some("query_loop".to_string()),
+        tool_source,
+        input_preview: preview_json(&prepared.input, 600),
+        approval_decision,
+        sandbox_policy: capabilities.sandbox_preference,
+        network_policy: if capabilities.network_targets.is_empty() {
+            None
+        } else {
+            Some(capabilities.network_targets.join(", "))
+        },
+        duration_ms: envelope.duration_ms,
+        success: envelope.success,
+        affected_paths: envelope.affected_paths,
+        raw_log_path: envelope.raw_log_path,
+        output_preview: preview_text(&envelope.text, 600),
+        error_kind: envelope.error_kind,
+    };
+
+    if let Ok(trace_json) = serde_json::to_string(&trace) {
+        info!(
+            target: "mangocode_tool_dispatch",
+            tool_id = %prepared.id,
+            requested_tool = %prepared.name,
+            trace = %trace_json,
+            "tool dispatch trace"
+        );
+    }
+}
+
 async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
+    let requested_canonical_name = canonical_tool_name(req.tools, req.name);
     let tool_span = start_tool_span_with_ids(
-        req.name,
+        &requested_canonical_name,
         Some(&req.ctx.session_id),
         req.harness_turn_id.as_deref(),
         Some(req.tool_id),
     );
 
-    if req.name == mangocode_core::constants::TOOL_NAME_AGENT {
+    #[cfg(feature = "tool-agent")]
+    if requested_canonical_name == mangocode_core::constants::TOOL_NAME_AGENT {
         let parent_msgs = req.parent_messages.as_deref();
         let result = Box::pin(crate::agent_tool::execute_with_runtime(
             req.input.clone(),
@@ -4017,7 +4311,7 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
         return result;
     }
 
-    if req.name == "LSP" {
+    if requested_canonical_name == "LSP" {
         if let Some(tx) = req.event_tx {
             let file_path = req.input.get("file").and_then(|v| v.as_str()).map(|file| {
                 let path = std::path::Path::new(file);
@@ -4056,18 +4350,23 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
         }
     }
 
-    let tool = req.tools.iter().find(|t| t.name() == req.name);
+    let tool = mangocode_tools::resolve_tool(req.tools, req.name);
 
     match tool {
         Some(tool) => {
-            debug!(tool = req.name, "Executing tool");
-            let snapshots = collect_tool_pre_snapshots(req.ctx, req.name, req.input);
+            let canonical_name = tool.name();
+            debug!(
+                tool = canonical_name,
+                requested_tool = req.name,
+                "Executing tool"
+            );
+            let snapshots = collect_tool_pre_snapshots(req.ctx, canonical_name, req.input);
             let result = tool.execute(req.input.clone(), req.ctx).await;
             if !result.is_error {
                 persist_tool_snapshots(
                     req.ctx,
                     req.tool_id,
-                    req.name,
+                    canonical_name,
                     snapshots,
                     req.harness_recorder.as_ref(),
                     req.harness_turn_id.as_deref(),
@@ -4086,7 +4385,8 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
         }
         None => {
             warn!(tool = req.name, "Unknown tool requested");
-            let result = ToolResult::error(format!("Unknown tool: {}", req.name));
+            let result =
+                ToolResult::error(mangocode_tools::unknown_tool_message(req.tools, req.name));
             end_tool_span(tool_span, false, Some(result.content.as_str()));
             result
         }
@@ -4190,16 +4490,15 @@ fn persist_tool_snapshots(
                 &snapshot.path,
                 snapshot.before_content.as_deref(),
             );
-            if let Ok(after_content) = std::fs::read(&snapshot.path) {
-                mangocode_core::harness::record_file_change_with_tool(
-                    &ctx.session_id,
-                    Some(tool_id),
-                    &snapshot.path,
-                    snapshot.before_content.as_deref(),
-                    &after_content,
-                    tool_name,
-                );
-            }
+            let after_content = std::fs::read(&snapshot.path).ok();
+            mangocode_core::harness::record_file_change_with_tool_optional(
+                &ctx.session_id,
+                Some(tool_id),
+                &snapshot.path,
+                snapshot.before_content.as_deref(),
+                after_content.as_deref(),
+                tool_name,
+            );
         }
         let text_snapshot = snapshot
             .before_content
@@ -4212,18 +4511,35 @@ fn persist_tool_snapshots(
 }
 
 fn extract_apply_patch_paths(patch: &str) -> Vec<String> {
-    patch
-        .lines()
-        .filter_map(|line| {
-            let raw = line.strip_prefix("+++ ")?;
-            let path = raw.trim_start_matches("b/").trim();
-            if path == "/dev/null" || path.is_empty() {
-                None
-            } else {
-                Some(path.to_string())
-            }
-        })
-        .collect()
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        let raw = line
+            .strip_prefix("+++ ")
+            .or_else(|| line.strip_prefix("--- "));
+        let Some(raw) = raw else {
+            continue;
+        };
+        if let Some(path) = parse_apply_patch_path(raw) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn parse_apply_patch_path(raw: &str) -> Option<String> {
+    let token = raw.split_whitespace().next().unwrap_or("").trim();
+    if token.is_empty() || token == "/dev/null" {
+        return None;
+    }
+    Some(strip_single_apply_patch_prefix(token).to_string())
+}
+
+fn strip_single_apply_patch_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
 }
 
 /// Load persisted todos for `session_id` and return a nudge string if any are
@@ -4374,6 +4690,7 @@ fn memory_dir_for_working_dir(working_dir: &std::path::Path) -> std::path::PathB
     memory_root_for_working_dir(working_dir).join("memory")
 }
 
+#[cfg(feature = "tool-agent")]
 fn conversations_dir_for_working_dir(working_dir: &std::path::Path) -> std::path::PathBuf {
     memory_root_for_working_dir(working_dir).join("conversations")
 }
@@ -4565,6 +4882,29 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn extract_apply_patch_paths_keeps_delete_old_path() {
+        let patch = "\
+--- a/remove.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+        assert_eq!(extract_apply_patch_paths(patch), vec!["remove.txt"]);
+    }
+
+    #[test]
+    fn extract_apply_patch_paths_strips_only_one_diff_prefix() {
+        let patch = "\
+--- a/a/keep-prefix.txt
++++ b/a/keep-prefix.txt
+@@ -1 +1 @@
+-old
++new
+";
+        assert_eq!(extract_apply_patch_paths(patch), vec!["a/keep-prefix.txt"]);
+    }
+
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
             model: "claude-sonnet-4-6".to_string(),
@@ -4593,6 +4933,121 @@ mod tests {
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
         }
+    }
+
+    fn temp_goal_store() -> (
+        tempfile::TempDir,
+        mangocode_core::sqlite_storage::SqliteSessionStore,
+    ) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = dir.path().join("sessions.db");
+        let store =
+            mangocode_core::sqlite_storage::SqliteSessionStore::open(&db).expect("open store");
+        (dir, store)
+    }
+
+    #[test]
+    fn goal_prompt_helpers_read_active_local_goal() {
+        let (_dir, store) = temp_goal_store();
+        let goal = store
+            .replace_thread_goal(
+                "session-1",
+                "ship <goal> & report",
+                mangocode_core::goals::ThreadGoalStatus::Active,
+                Some(100),
+            )
+            .unwrap();
+
+        assert_eq!(
+            current_accountable_goal_id_with_store(&store, "session-1").as_deref(),
+            Some(goal.goal_id.as_str())
+        );
+        let prompt = render_goal_prompt_for_session_with_store(&store, "session-1").unwrap();
+        assert!(prompt.contains("ship &lt;goal&gt; &amp; report"));
+        assert!(!prompt.contains("ship <goal> & report"));
+
+        store
+            .update_thread_goal(
+                "session-1",
+                Some(mangocode_core::goals::ThreadGoalStatus::Paused),
+                None,
+            )
+            .unwrap();
+        assert!(current_accountable_goal_id_with_store(&store, "session-1").is_none());
+        assert!(render_goal_prompt_for_session_with_store(&store, "session-1").is_none());
+    }
+
+    #[test]
+    fn account_goal_for_outcome_accounts_uncached_tokens_and_reports_budget_limit() {
+        let (_dir, store) = temp_goal_store();
+        let goal = store
+            .replace_thread_goal(
+                "session-1",
+                "ship local goals",
+                mangocode_core::goals::ThreadGoalStatus::Active,
+                Some(10),
+            )
+            .unwrap();
+        let outcome = QueryOutcome::EndTurn {
+            message: Message::assistant("done"),
+            usage: UsageInfo {
+                input_tokens: 12,
+                output_tokens: 3,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 5,
+            },
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        account_goal_for_outcome_with_store(
+            &store,
+            "session-1",
+            &outcome,
+            Some(&goal.goal_id),
+            7,
+            Some(&tx),
+        );
+
+        let saved = store.get_thread_goal("session-1").unwrap().unwrap();
+        assert_eq!(
+            saved.status,
+            mangocode_core::goals::ThreadGoalStatus::BudgetLimited
+        );
+        assert_eq!(saved.tokens_used, 10);
+        assert_eq!(saved.time_used_seconds, 7);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            QueryEvent::Status(message) if message.contains("Goal token budget reached")
+        ));
+    }
+
+    #[test]
+    fn account_goal_for_outcome_pauses_active_goal_on_cancelled() {
+        let (_dir, store) = temp_goal_store();
+        store
+            .replace_thread_goal(
+                "session-1",
+                "ship local goals",
+                mangocode_core::goals::ThreadGoalStatus::Active,
+                None,
+            )
+            .unwrap();
+
+        account_goal_for_outcome_with_store(
+            &store,
+            "session-1",
+            &QueryOutcome::Cancelled,
+            None,
+            3,
+            None,
+        );
+
+        let saved = store.get_thread_goal("session-1").unwrap().unwrap();
+        assert_eq!(
+            saved.status,
+            mangocode_core::goals::ThreadGoalStatus::Paused
+        );
+        assert_eq!(saved.tokens_used, 0);
     }
 
     // ---- build_system_prompt tests ------------------------------------------

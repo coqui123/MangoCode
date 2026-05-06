@@ -1,5 +1,7 @@
 // TodoWrite tool: task / todo list management.
 
+#![cfg_attr(not(feature = "tool-todo-write"), allow(dead_code, unused_imports))]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -103,6 +105,7 @@ impl std::fmt::Display for TodoStatus {
 // Input types
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-todo-write")]
 pub struct TodoWriteTool;
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +161,7 @@ fn validate_transition(id: &str, old: &TodoStatus, new: &TodoStatus) -> Result<(
 // Tool implementation
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-todo-write")]
 #[async_trait]
 impl Tool for TodoWriteTool {
     fn name(&self) -> &str {

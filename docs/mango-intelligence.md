@@ -73,6 +73,15 @@ cargo run -p mangocode --features browser
 
 Without the browser feature, MangoCode still uses HTTP extraction plus native script-data extraction.
 
+If you want to replace MangoCode's native public web search and research tools with an external MCP research/search server, build without the native web/research tool features:
+
+```powershell
+cd src-rust
+cargo build -p mangocode --no-default-features --features default-tools-no-web-research
+```
+
+This removes `WebSearch`, `WebFetch`, `DocSearch`, `DocRead`, `DeepRead`, and `RenderedFetch` from the built-in tool registry. Connected MCP server tools remain available through MangoCode's MCP bridge.
+
 Lifecycle hooks now also support `SessionStart`, `PreCompact`, `PostCompact`, and `SessionEnd` in addition to the existing tool and stop events, so memory and external automations can track full-session behavior instead of only individual tool calls.
 
 ## Tool Output Compression

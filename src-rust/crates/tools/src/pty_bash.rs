@@ -648,14 +648,7 @@ fn reduce_output(
     output_mode: OutputMode,
 ) -> ToolResult {
     let reduced = reduce_command_output(command, &output, exit_code, output_mode);
-    if exit_code != 0 {
-        ToolResult::error(format!(
-            "Command exited with code {}\n{}",
-            exit_code, reduced.content
-        ))
-    } else {
-        ToolResult::success(reduced.content)
-    }
+    reduced.into_tool_result(exit_code, "Command exited with code")
 }
 
 // ---------------------------------------------------------------------------
@@ -778,8 +771,7 @@ impl Tool for PtyBashTool {
                         };
 
                         if !state_lines.is_empty() {
-                            if let Some((new_cwd, env_delta)) =
-                                parse_shell_state_block(&state_lines.to_vec())
+                            if let Some((new_cwd, env_delta)) = parse_shell_state_block(state_lines)
                             {
                                 let mut state = shell_state_arc.lock();
                                 state.cwd = Some(bash_path_to_windows_path(new_cwd));
@@ -834,9 +826,7 @@ impl Tool for PtyBashTool {
                     };
 
                     if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(&state_lines.to_vec())
-                        {
+                        if let Some((new_cwd, env_delta)) = parse_shell_state_block(state_lines) {
                             let mut state = shell_state_arc.lock();
                             state.cwd = Some(new_cwd);
                             for (k, v) in env_delta {
@@ -901,9 +891,7 @@ impl Tool for PtyBashTool {
 
                     // Update persistent shell state
                     if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(&state_lines.to_vec())
-                        {
+                        if let Some((new_cwd, env_delta)) = parse_shell_state_block(state_lines) {
                             let mut state = shell_state_arc.lock();
                             state.cwd = Some(new_cwd);
                             for (k, v) in env_delta {

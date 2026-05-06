@@ -6,9 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::goals::{ThreadGoal, ThreadGoalStatus};
 use crate::harness::{
     CheckpointBackend, CheckpointKind, HarnessCheckpoint, HarnessEvent, HarnessTurnStatus,
 };
+use rusqlite::OptionalExtension;
 
 /// A persistent SQLite session + message store.
 pub struct SqliteSessionStore {
@@ -88,6 +90,18 @@ impl SqliteSessionStore {
             );
             CREATE INDEX IF NOT EXISTS idx_harness_checkpoints_session
                 ON harness_checkpoints(session_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS thread_goals (
+                session_id         TEXT PRIMARY KEY NOT NULL,
+                goal_id            TEXT NOT NULL,
+                objective          TEXT NOT NULL,
+                status             TEXT NOT NULL CHECK(status IN ('active', 'paused', 'budget_limited', 'complete')),
+                token_budget       INTEGER,
+                tokens_used        INTEGER NOT NULL DEFAULT 0,
+                time_used_seconds  INTEGER NOT NULL DEFAULT 0,
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            );
             ",
         )?;
 
@@ -201,6 +215,10 @@ impl SqliteSessionStore {
     /// Delete a session and all of its messages.
     pub fn delete_session(&self, session_id: &str) -> anyhow::Result<()> {
         self.conn.execute(
+            "DELETE FROM thread_goals WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        self.conn.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             rusqlite::params![session_id],
         )?;
@@ -209,6 +227,238 @@ impl SqliteSessionStore {
             rusqlite::params![session_id],
         )?;
         Ok(())
+    }
+
+    pub fn get_thread_goal(&self, session_id: &str) -> anyhow::Result<Option<ThreadGoal>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, goal_id, objective, status, token_budget,
+                        tokens_used, time_used_seconds, created_at, updated_at
+                 FROM thread_goals
+                 WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                goal_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn replace_thread_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        status: ThreadGoalStatus,
+        token_budget: Option<i64>,
+    ) -> anyhow::Result<ThreadGoal> {
+        crate::goals::validate_goal_budget(token_budget)?;
+        let objective = crate::goals::validate_goal_objective(objective)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let goal_id = uuid::Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO thread_goals
+             (session_id, goal_id, objective, status, token_budget,
+              tokens_used, time_used_seconds, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?6)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 goal_id = excluded.goal_id,
+                 objective = excluded.objective,
+                 status = excluded.status,
+                 token_budget = excluded.token_budget,
+                 tokens_used = 0,
+                 time_used_seconds = 0,
+                 created_at = excluded.created_at,
+                 updated_at = excluded.updated_at",
+            rusqlite::params![
+                session_id,
+                goal_id,
+                objective,
+                status.as_str(),
+                token_budget,
+                now
+            ],
+        )?;
+        self.get_thread_goal(session_id)?
+            .ok_or_else(|| anyhow::anyhow!("failed to read saved goal"))
+    }
+
+    pub fn insert_thread_goal(
+        &self,
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> anyhow::Result<Option<ThreadGoal>> {
+        crate::goals::validate_goal_budget(token_budget)?;
+        let objective = crate::goals::validate_goal_objective(objective)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let goal_id = uuid::Uuid::new_v4().to_string();
+        let inserted = self.conn.execute(
+            "INSERT OR IGNORE INTO thread_goals
+             (session_id, goal_id, objective, status, token_budget,
+              tokens_used, time_used_seconds, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'active', ?4, 0, 0, ?5, ?5)",
+            rusqlite::params![session_id, goal_id, objective, token_budget, now],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        self.get_thread_goal(session_id)
+    }
+
+    pub fn update_thread_goal(
+        &self,
+        session_id: &str,
+        status: Option<ThreadGoalStatus>,
+        token_budget: Option<Option<i64>>,
+    ) -> anyhow::Result<Option<ThreadGoal>> {
+        if let Some(budget) = token_budget.flatten() {
+            crate::goals::validate_goal_budget(Some(budget))?;
+        }
+        let Some(existing) = self.get_thread_goal(session_id)? else {
+            return Ok(None);
+        };
+
+        let budget_changed = token_budget.is_some();
+        let mut new_status = status.unwrap_or(existing.status);
+        let new_budget = token_budget.unwrap_or(existing.token_budget);
+        if existing.status == ThreadGoalStatus::Complete
+            && status.is_some_and(|status| status != ThreadGoalStatus::Complete)
+        {
+            new_status = ThreadGoalStatus::Complete;
+        }
+        if existing.status == ThreadGoalStatus::BudgetLimited
+            && status == Some(ThreadGoalStatus::Paused)
+        {
+            new_status = ThreadGoalStatus::BudgetLimited;
+        }
+        if existing.status == ThreadGoalStatus::BudgetLimited && status.is_none() && budget_changed
+        {
+            let still_limited = new_budget
+                .map(|budget| existing.tokens_used >= budget)
+                .unwrap_or(false);
+            if !still_limited {
+                new_status = ThreadGoalStatus::Active;
+            }
+        }
+        if new_status == ThreadGoalStatus::Active {
+            if let Some(budget) = new_budget {
+                if existing.tokens_used >= budget {
+                    new_status = ThreadGoalStatus::BudgetLimited;
+                }
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE thread_goals
+             SET status = ?1,
+                 token_budget = ?2,
+                 updated_at = ?3
+             WHERE session_id = ?4",
+            rusqlite::params![new_status.as_str(), new_budget, now, session_id],
+        )?;
+        self.get_thread_goal(session_id)
+    }
+
+    pub fn pause_active_thread_goal(&self, session_id: &str) -> anyhow::Result<Option<ThreadGoal>> {
+        let Some(existing) = self.get_thread_goal(session_id)? else {
+            return Ok(None);
+        };
+        if existing.status != ThreadGoalStatus::Active {
+            return Ok(Some(existing));
+        }
+        self.update_thread_goal(session_id, Some(ThreadGoalStatus::Paused), None)
+    }
+
+    pub fn delete_thread_goal(&self, session_id: &str) -> anyhow::Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM thread_goals WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(deleted > 0)
+    }
+
+    pub fn account_thread_goal_usage(
+        &self,
+        session_id: &str,
+        time_delta_seconds: i64,
+        token_delta: i64,
+    ) -> anyhow::Result<Option<ThreadGoal>> {
+        self.account_thread_goal_usage_inner(
+            session_id,
+            None,
+            false,
+            time_delta_seconds,
+            token_delta,
+        )
+    }
+
+    pub fn account_thread_goal_usage_for_goal_id(
+        &self,
+        session_id: &str,
+        expected_goal_id: &str,
+        time_delta_seconds: i64,
+        token_delta: i64,
+    ) -> anyhow::Result<Option<ThreadGoal>> {
+        self.account_thread_goal_usage_inner(
+            session_id,
+            Some(expected_goal_id),
+            true,
+            time_delta_seconds,
+            token_delta,
+        )
+    }
+
+    fn account_thread_goal_usage_inner(
+        &self,
+        session_id: &str,
+        expected_goal_id: Option<&str>,
+        include_complete: bool,
+        time_delta_seconds: i64,
+        token_delta: i64,
+    ) -> anyhow::Result<Option<ThreadGoal>> {
+        let Some(existing) = self.get_thread_goal(session_id)? else {
+            return Ok(None);
+        };
+        if expected_goal_id.is_some_and(|goal_id| existing.goal_id != goal_id) {
+            return Ok(Some(existing));
+        }
+        let can_account = matches!(
+            existing.status,
+            ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+        ) || (include_complete && existing.status == ThreadGoalStatus::Complete);
+        if !can_account {
+            return Ok(Some(existing));
+        }
+
+        let tokens_used = existing.tokens_used.saturating_add(token_delta.max(0));
+        let time_used_seconds = existing
+            .time_used_seconds
+            .saturating_add(time_delta_seconds.max(0));
+        let mut status = existing.status;
+        if status == ThreadGoalStatus::Active {
+            if let Some(budget) = existing.token_budget {
+                if tokens_used >= budget {
+                    status = ThreadGoalStatus::BudgetLimited;
+                }
+            }
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE thread_goals
+             SET status = ?1,
+                 tokens_used = ?2,
+                 time_used_seconds = ?3,
+                 updated_at = ?4
+             WHERE session_id = ?5",
+            rusqlite::params![
+                status.as_str(),
+                tokens_used,
+                time_used_seconds,
+                now,
+                session_id
+            ],
+        )?;
+        self.get_thread_goal(session_id)
     }
 
     pub fn append_harness_event(&self, event: &HarnessEvent) -> anyhow::Result<i64> {
@@ -428,6 +678,25 @@ fn checkpoint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarnessCheck
     })
 }
 
+fn goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ThreadGoal> {
+    let status: String = row.get(3)?;
+    let status = ThreadGoalStatus::try_from(status.as_str()).map_err(|err| {
+        let err = std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string());
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    Ok(ThreadGoal {
+        session_id: row.get(0)?,
+        goal_id: row.get(1)?,
+        objective: row.get(2)?,
+        status,
+        token_budget: row.get(4)?,
+        tokens_used: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+        time_used_seconds: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +726,176 @@ mod tests {
         assert_eq!(events[0].1.event_id, "event-1");
         assert_eq!(events[0].1.turn_id.as_deref(), Some("turn-1"));
         assert_eq!(events[0].1.tool_call_id.as_deref(), Some("tool-1"));
+    }
+
+    #[test]
+    fn thread_goal_lifecycle_and_budget_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&db).unwrap();
+
+        let goal = store
+            .replace_thread_goal(
+                "session-1",
+                "ship local goals",
+                ThreadGoalStatus::Active,
+                Some(10),
+            )
+            .unwrap();
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+        assert_eq!(goal.tokens_used, 0);
+
+        let goal = store
+            .account_thread_goal_usage("session-1", 5, 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+        assert_eq!(goal.tokens_used, 7);
+        assert_eq!(goal.time_used_seconds, 5);
+
+        let goal = store
+            .account_thread_goal_usage("session-1", 2, 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
+        assert_eq!(goal.tokens_used, 10);
+
+        let goal = store
+            .update_thread_goal("session-1", Some(ThreadGoalStatus::Paused), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
+
+        assert!(store.delete_thread_goal("session-1").unwrap());
+        assert!(store.get_thread_goal("session-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn raising_or_clearing_goal_budget_reactivates_limited_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&db).unwrap();
+
+        store
+            .replace_thread_goal(
+                "session-1",
+                "finish within budget",
+                ThreadGoalStatus::Active,
+                Some(10),
+            )
+            .unwrap();
+        let limited = store
+            .account_thread_goal_usage("session-1", 1, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(limited.status, ThreadGoalStatus::BudgetLimited);
+
+        let still_limited = store
+            .update_thread_goal("session-1", None, Some(Some(5)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_limited.status, ThreadGoalStatus::BudgetLimited);
+
+        let active = store
+            .update_thread_goal("session-1", None, Some(Some(20)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, ThreadGoalStatus::Active);
+
+        store
+            .account_thread_goal_usage("session-1", 1, 10)
+            .unwrap()
+            .unwrap();
+        let active = store
+            .update_thread_goal("session-1", None, Some(None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, ThreadGoalStatus::Active);
+        assert_eq!(active.token_budget, None);
+    }
+
+    #[test]
+    fn insert_thread_goal_does_not_replace_existing_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&db).unwrap();
+
+        let first = store
+            .insert_thread_goal("session-1", "first objective", None)
+            .unwrap()
+            .unwrap();
+        let second = store
+            .insert_thread_goal("session-1", "second objective", None)
+            .unwrap();
+
+        assert!(second.is_none());
+        let saved = store.get_thread_goal("session-1").unwrap().unwrap();
+        assert_eq!(saved.goal_id, first.goal_id);
+        assert_eq!(saved.objective, "first objective");
+    }
+
+    #[test]
+    fn expected_goal_accounting_counts_completion_turn_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&db).unwrap();
+
+        let goal = store
+            .replace_thread_goal(
+                "session-1",
+                "finish objective",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .update_thread_goal("session-1", Some(ThreadGoalStatus::Complete), None)
+            .unwrap();
+
+        let accounted = store
+            .account_thread_goal_usage_for_goal_id("session-1", &goal.goal_id, 4, 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accounted.status, ThreadGoalStatus::Complete);
+        assert_eq!(accounted.tokens_used, 20);
+        assert_eq!(accounted.time_used_seconds, 4);
+
+        let replacement = store
+            .replace_thread_goal("session-1", "new objective", ThreadGoalStatus::Active, None)
+            .unwrap();
+        let unchanged = store
+            .account_thread_goal_usage_for_goal_id("session-1", &goal.goal_id, 4, 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.goal_id, replacement.goal_id);
+        assert_eq!(unchanged.tokens_used, 0);
+    }
+
+    #[test]
+    fn completed_goal_cannot_be_resumed_or_paused_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&db).unwrap();
+
+        store
+            .replace_thread_goal(
+                "session-1",
+                "finish objective",
+                ThreadGoalStatus::Complete,
+                None,
+            )
+            .unwrap();
+
+        let resumed = store
+            .update_thread_goal("session-1", Some(ThreadGoalStatus::Active), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, ThreadGoalStatus::Complete);
+
+        let paused = store
+            .update_thread_goal("session-1", Some(ThreadGoalStatus::Paused), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused.status, ThreadGoalStatus::Complete);
     }
 }

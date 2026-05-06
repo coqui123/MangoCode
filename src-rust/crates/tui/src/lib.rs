@@ -920,6 +920,10 @@ mod tests {
             removed: 1,
             binary: false,
             is_new_file: false,
+            is_deleted_file: false,
+            patch_id: Some("turn-1-testpatch".to_string()),
+            turn_index: Some(1),
+            tool_names: vec!["FileEdit".to_string()],
             hunks: vec![diff_viewer::DiffHunk {
                 old_range: (1, 1),
                 new_range: (1, 2),

@@ -519,11 +519,7 @@ impl HybridTerminal {
                 break;
             }
             queue_base_style(&mut self.stdout)?;
-            queue!(
-                self.stdout,
-                MoveTo(0, row),
-                Clear(ClearType::CurrentLine)
-            )?;
+            queue!(self.stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
         self.stdout.flush()
     }

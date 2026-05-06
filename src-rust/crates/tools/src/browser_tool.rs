@@ -1,9 +1,11 @@
+#![cfg_attr(not(feature = "tool-browser"), allow(unused_imports))]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+#[cfg(feature = "tool-browser")]
 #[derive(Debug, Clone, Deserialize)]
 struct BrowserInput {
     action: String,
@@ -13,8 +15,10 @@ struct BrowserInput {
     script: Option<String>,
 }
 
+#[cfg(feature = "tool-browser")]
 pub struct BrowserTool;
 
+#[cfg(feature = "tool-browser")]
 #[async_trait]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
@@ -58,19 +62,12 @@ impl Tool for BrowserTool {
     }
 }
 
-#[cfg(not(feature = "browser"))]
-async fn execute_browser_action(_params: BrowserInput, _ctx: &ToolContext) -> ToolResult {
-    ToolResult::error(
-        "The browser feature is not enabled in this build. Recompile with --features mangocode-tools/browser to enable it.",
-    )
-}
-
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 static BROWSER_SESSIONS: once_cell::sync::Lazy<
     dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<BrowserSession>>>,
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 async fn execute_browser_action(params: BrowserInput, ctx: &ToolContext) -> ToolResult {
     if params.action == "close" {
         return match close_browser_session(&ctx.session_id).await {
@@ -108,7 +105,7 @@ async fn execute_browser_action(params: BrowserInput, ctx: &ToolContext) -> Tool
     }
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 pub async fn rendered_extract_for_research(url: &str) -> Result<String, String> {
     match rendered_extract_for_research_once("__mangocode_research__", url).await {
         Ok(markdown) => Ok(markdown),
@@ -127,12 +124,12 @@ pub async fn rendered_extract_for_research(url: &str) -> Result<String, String> 
     }
 }
 
-#[cfg(not(feature = "browser"))]
+#[cfg(not(feature = "tool-browser"))]
 pub async fn rendered_extract_for_research(_url: &str) -> Result<String, String> {
-    Err("browser feature is not enabled".to_string())
+    Err("browser tool feature is not enabled".to_string())
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 async fn browser_session(
     session_id: &str,
 ) -> Result<std::sync::Arc<tokio::sync::Mutex<BrowserSession>>, String> {
@@ -171,7 +168,7 @@ async fn browser_session(
     Ok(session)
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 async fn close_browser_session(session_id: &str) -> Result<bool, String> {
     let Some((_, session)) = BROWSER_SESSIONS.remove(session_id) else {
         return Ok(false);
@@ -180,20 +177,20 @@ async fn close_browser_session(session_id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 async fn reset_browser_session(session_id: &str) -> Result<(), String> {
     let _ = close_browser_session(session_id).await?;
     Ok(())
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 async fn rendered_extract_for_research_once(session_id: &str, url: &str) -> Result<String, String> {
     let session = browser_session(session_id).await?;
     let mut guard = session.lock().await;
     guard.extract_research_markdown(url).await
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 fn is_recoverable_browser_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     [
@@ -209,7 +206,7 @@ fn is_recoverable_browser_error(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 struct BrowserSession {
     browser: chromiumoxide::browser::Browser,
     page: Option<chromiumoxide::Page>,
@@ -217,7 +214,7 @@ struct BrowserSession {
     handler_task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 impl BrowserSession {
     async fn close(&mut self) {
         self.page = None;
@@ -560,7 +557,7 @@ impl BrowserSession {
     }
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 fn truncate_browser_text(text: &str, max: usize) -> String {
     if text.len() <= max {
         text.to_string()
@@ -573,7 +570,7 @@ fn truncate_browser_text(text: &str, max: usize) -> String {
     }
 }
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 const BROWSER_RECIPES_SCRIPT: &str = r#"
 (function(){
   const visible = el => {
@@ -622,7 +619,7 @@ const BROWSER_RECIPES_SCRIPT: &str = r#"
 })()
 "#;
 
-#[cfg(feature = "browser")]
+#[cfg(feature = "tool-browser")]
 const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
 (function(){
   const recipes = (function(){

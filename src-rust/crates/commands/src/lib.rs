@@ -139,6 +139,7 @@ pub struct HooksCommand;
 pub struct McpCommand;
 pub struct PermissionsCommand;
 pub struct PlanCommand;
+pub struct GoalCommand;
 pub struct TasksCommand;
 pub struct SessionCommand;
 pub struct ThinkingCommand;
@@ -197,6 +198,84 @@ pub struct AgentCommand;
 pub struct SearchCommand;
 pub struct ForkCommand;
 pub struct CriticCommand;
+
+fn same_mcp_server_config(
+    left: &mangocode_core::config::McpServerConfig,
+    right: &mangocode_core::config::McpServerConfig,
+) -> bool {
+    serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
+}
+
+fn sync_plugin_mcp_servers_into_config(
+    config: &mut Config,
+    old_registry: Option<&mangocode_plugins::PluginRegistry>,
+    registry: &mangocode_plugins::PluginRegistry,
+) -> bool {
+    let mut changed = false;
+    let old_servers = old_registry
+        .map(|registry| registry.all_mcp_servers())
+        .unwrap_or_default();
+    let new_servers = registry.all_mcp_servers();
+    let old_by_name: std::collections::HashMap<String, mangocode_core::config::McpServerConfig> =
+        old_servers
+            .iter()
+            .map(|server| (server.name.clone(), server.clone()))
+            .collect();
+    let new_names: std::collections::HashSet<String> = new_servers
+        .iter()
+        .map(|server| server.name.clone())
+        .collect();
+
+    for old_server in &old_servers {
+        if new_names.contains(&old_server.name) {
+            continue;
+        }
+
+        if let Some(position) = config.mcp_servers.iter().position(|candidate| {
+            candidate.name == old_server.name && same_mcp_server_config(candidate, old_server)
+        }) {
+            config.mcp_servers.remove(position);
+            changed = true;
+        }
+    }
+
+    for server in new_servers {
+        if let Some(existing) = config
+            .mcp_servers
+            .iter_mut()
+            .find(|candidate| candidate.name == server.name)
+        {
+            let owned_by_previous_plugin = old_by_name
+                .get(&server.name)
+                .map(|old_server| same_mcp_server_config(existing, old_server))
+                .unwrap_or(false);
+            if owned_by_previous_plugin && !same_mcp_server_config(existing, &server) {
+                *existing = server;
+                changed = true;
+            }
+        } else {
+            config.mcp_servers.push(server);
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+fn plugin_reload_result(
+    ctx: &CommandContext,
+    old_registry: &mangocode_plugins::PluginRegistry,
+    registry: &mangocode_plugins::PluginRegistry,
+    message: String,
+) -> CommandResult {
+    let mut new_config = ctx.config.clone();
+    if sync_plugin_mcp_servers_into_config(&mut new_config, Some(old_registry), registry) {
+        CommandResult::ConfigChangeMessage(new_config, message)
+    } else {
+        CommandResult::Message(message)
+    }
+}
+
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -481,7 +560,7 @@ fn command_category(name: &str) -> &'static str {
             "Sessions & Remote"
         }
         "help" | "exit" | "feedback" | "bug" => "General",
-        "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" | "proactive" => {
+        "think-back" | "thinkback-play" | "thinking" | "plan" | "goal" | "tasks" | "proactive" => {
             "AI & Thinking"
         }
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
@@ -2177,11 +2256,7 @@ impl SlashCommand for PluginCommand {
         // fresh disk scan so the command still works without the global being set.
         async fn get_registry(project_dir: &std::path::Path) -> mangocode_plugins::PluginRegistry {
             if let Some(global) = mangocode_plugins::global_plugin_registry() {
-                let mut reg = mangocode_plugins::PluginRegistry::new();
-                for p in global.all() {
-                    reg.insert(p.clone());
-                }
-                reg
+                global
             } else {
                 mangocode_plugins::load_plugins(project_dir, &[]).await
             }
@@ -2269,13 +2344,22 @@ impl SlashCommand for PluginCommand {
                 }
             }
             mangocode_plugins::PluginSubCommand::Reload => {
+                if mangocode_core::feature_gates::is_bare_mode() {
+                    return CommandResult::Message(
+                        "Plugin reload skipped because bare mode is active.".to_string(),
+                    );
+                }
                 let old_registry = get_registry(&project_dir).await;
                 let (new_registry, diff) =
                     mangocode_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
-                CommandResult::Message(mangocode_plugins::format_reload_summary(
+                mangocode_plugins::set_global_hooks(new_registry.build_hook_registry());
+                mangocode_plugins::set_global_registry(new_registry.clone());
+                plugin_reload_result(
+                    ctx,
+                    &old_registry,
                     &new_registry,
-                    &diff,
-                ))
+                    mangocode_plugins::format_reload_summary(&new_registry, &diff),
+                )
             }
             mangocode_plugins::PluginSubCommand::Help => CommandResult::Message(
                 "Plugin commands:\n\
@@ -2308,16 +2392,30 @@ impl SlashCommand for ReloadPluginsCommand {
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if mangocode_core::feature_gates::is_bare_mode() {
+            return CommandResult::Message(
+                "Plugin reload skipped because bare mode is active.".to_string(),
+            );
+        }
+
         let project_dir = ctx.working_dir.clone();
 
-        let old_registry = mangocode_plugins::load_plugins(&project_dir, &[]).await;
+        let old_registry = if let Some(global) = mangocode_plugins::global_plugin_registry() {
+            global
+        } else {
+            mangocode_plugins::load_plugins(&project_dir, &[]).await
+        };
         let (new_registry, diff) =
             mangocode_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
+        mangocode_plugins::set_global_hooks(new_registry.build_hook_registry());
+        mangocode_plugins::set_global_registry(new_registry.clone());
 
-        CommandResult::Message(mangocode_plugins::format_reload_summary(
+        plugin_reload_result(
+            ctx,
+            &old_registry,
             &new_registry,
-            &diff,
-        ))
+            mangocode_plugins::format_reload_summary(&new_registry, &diff),
+        )
     }
 }
 
@@ -3579,20 +3677,15 @@ impl SlashCommand for InitCommand {
 
 // ---- /review -------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum ReviewMode {
     Quick,
+    #[default]
     Balanced,
     Deep,
     Security,
     Architecture,
     Testing,
-}
-
-impl Default for ReviewMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 impl ReviewMode {
@@ -3886,7 +3979,7 @@ fn summarize_review_diff(diff: &str) -> ReviewDiffSummary {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             let path = parts
                 .get(1)
-                .map(|part| part.trim_start_matches("b/"))
+                .map(|part| strip_single_git_diff_prefix(part))
                 .unwrap_or("(unknown)")
                 .to_string();
             current = Some(ReviewChangedFile {
@@ -3924,6 +4017,12 @@ fn summarize_review_diff(diff: &str) -> ReviewDiffSummary {
     }
 
     summary
+}
+
+fn strip_single_git_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
 }
 
 fn format_review_file_summary(diff_source: &str, summary: &ReviewDiffSummary) -> String {
@@ -4481,7 +4580,7 @@ impl SlashCommand for ReviewCommand {
             .filter_map(|l| {
                 // "diff --git a/foo/bar.rs b/foo/bar.rs"  -> "foo/bar.rs"
                 let parts: Vec<&str> = l.split(' ').collect();
-                parts.get(3).map(|p| p.trim_start_matches("b/"))
+                parts.get(3).map(|p| strip_single_git_diff_prefix(p))
             })
             .collect();
 
@@ -5815,6 +5914,184 @@ impl SlashCommand for PlanCommand {
              write any files until the plan has been reviewed and approved.",
             task_desc
         ))
+    }
+}
+
+#[async_trait]
+impl SlashCommand for GoalCommand {
+    fn name(&self) -> &str {
+        "goal"
+    }
+
+    fn description(&self) -> &str {
+        "Set, view, pause, resume, or clear the persistent local session goal"
+    }
+
+    fn help(&self) -> &str {
+        "Usage:\n  /goal\n  /goal <objective> [--budget <tokens>]\n  /goal pause\n  /goal resume\n  /goal clear\n  /goal budget <tokens|clear>\n\n\
+         Goals are stored locally in ~/.mangocode/sessions.db for the current session. \
+         The model can inspect the goal with get_goal, create one with create_goal when explicitly asked, \
+         and mark it complete with update_goal."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let store = match mangocode_core::goals::open_default_goal_store() {
+            Ok(store) => store,
+            Err(e) => return CommandResult::Error(format!("Failed to open goal store: {}", e)),
+        };
+        execute_goal_command_with_store(&store, ctx.session_id.as_str(), args)
+    }
+}
+
+fn execute_goal_command_with_store(
+    store: &mangocode_core::sqlite_storage::SqliteSessionStore,
+    session_id: &str,
+    args: &str,
+) -> CommandResult {
+    let trimmed = args.trim();
+
+    if trimmed.is_empty() {
+        return match store.get_thread_goal(session_id) {
+            Ok(Some(goal)) => {
+                CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
+            }
+            Ok(None) => CommandResult::Message(
+                "No goal is set. Use /goal <objective> to create one.".to_string(),
+            ),
+            Err(e) => CommandResult::Error(format!("Failed to read goal: {}", e)),
+        };
+    }
+
+    let parts = split_command_args(trimmed);
+    let first = parts
+        .first()
+        .map(|part| part.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match first.as_str() {
+        "clear" => match store.delete_thread_goal(session_id) {
+            Ok(true) => CommandResult::Message("Goal cleared.".to_string()),
+            Ok(false) => CommandResult::Message("No goal is set.".to_string()),
+            Err(e) => CommandResult::Error(format!("Failed to clear goal: {}", e)),
+        },
+        "pause" => match store.update_thread_goal(
+            session_id,
+            Some(mangocode_core::goals::ThreadGoalStatus::Paused),
+            None,
+        ) {
+            Ok(Some(goal)) => {
+                CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
+            }
+            Ok(None) => CommandResult::Message("No goal is set.".to_string()),
+            Err(e) => CommandResult::Error(format!("Failed to pause goal: {}", e)),
+        },
+        "resume" => match store.update_thread_goal(
+            session_id,
+            Some(mangocode_core::goals::ThreadGoalStatus::Active),
+            None,
+        ) {
+            Ok(Some(goal)) => {
+                CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
+            }
+            Ok(None) => CommandResult::Message("No goal is set.".to_string()),
+            Err(e) => CommandResult::Error(format!("Failed to resume goal: {}", e)),
+        },
+        "budget" => {
+            let Some(value) = parts.get(1) else {
+                return CommandResult::Error("Usage: /goal budget <tokens|clear>".to_string());
+            };
+            let budget =
+                if value.eq_ignore_ascii_case("clear") || value.eq_ignore_ascii_case("none") {
+                    None
+                } else {
+                    match value.parse::<i64>() {
+                        Ok(n) if n > 0 => Some(n),
+                        _ => {
+                            return CommandResult::Error(
+                                "Goal budget must be a positive integer, or 'clear'.".to_string(),
+                            )
+                        }
+                    }
+                };
+            match store.update_thread_goal(session_id, None, Some(budget)) {
+                Ok(Some(goal)) => {
+                    CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
+                }
+                Ok(None) => CommandResult::Message("No goal is set.".to_string()),
+                Err(e) => CommandResult::Error(format!("Failed to update goal budget: {}", e)),
+            }
+        }
+        _ => {
+            let (objective, token_budget) = match parse_goal_objective_args(trimmed) {
+                Ok(parsed) => parsed,
+                Err(e) => return CommandResult::Error(e),
+            };
+            let existing = match store.get_thread_goal(session_id) {
+                Ok(goal) => goal,
+                Err(e) => {
+                    return CommandResult::Error(format!("Failed to read current goal: {}", e))
+                }
+            };
+            let result = if existing
+                .as_ref()
+                .is_some_and(|goal| goal.objective == objective && !goal.status.is_terminal())
+            {
+                store
+                    .update_thread_goal(
+                        session_id,
+                        Some(mangocode_core::goals::ThreadGoalStatus::Active),
+                        token_budget.map(Some),
+                    )
+                    .and_then(|goal| {
+                        goal.ok_or_else(|| anyhow::anyhow!("goal disappeared during update"))
+                    })
+            } else {
+                store.replace_thread_goal(
+                    session_id,
+                    &objective,
+                    mangocode_core::goals::ThreadGoalStatus::Active,
+                    token_budget,
+                )
+            };
+            match result {
+                Ok(goal) => {
+                    CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
+                }
+                Err(e) => CommandResult::Error(format!("Failed to set goal: {}", e)),
+            }
+        }
+    }
+}
+
+fn parse_goal_objective_args(args: &str) -> Result<(String, Option<i64>), String> {
+    let mut objective_parts = Vec::new();
+    let mut token_budget = None;
+    let parts = split_command_args(args);
+    let mut i = 0;
+    while i < parts.len() {
+        let part = &parts[i];
+        if let Some(raw) = part.strip_prefix("--budget=") {
+            token_budget = Some(parse_goal_budget_arg(raw)?);
+        } else if part == "--budget" {
+            i += 1;
+            let Some(raw) = parts.get(i) else {
+                return Err("Usage: /goal <objective> --budget <tokens>".to_string());
+            };
+            token_budget = Some(parse_goal_budget_arg(raw)?);
+        } else {
+            objective_parts.push(part.clone());
+        }
+        i += 1;
+    }
+    let objective = mangocode_core::goals::validate_goal_objective(&objective_parts.join(" "))
+        .map_err(|e| e.to_string())?;
+    Ok((objective, token_budget))
+}
+
+fn parse_goal_budget_arg(raw: &str) -> Result<i64, String> {
+    match raw.parse::<i64>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("Goal budget must be a positive integer.".to_string()),
     }
 }
 
@@ -10528,6 +10805,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(PermissionsCommand),
         Box::new(CriticCommand),
         Box::new(PlanCommand),
+        Box::new(GoalCommand),
         Box::new(TasksCommand),
         Box::new(SessionCommand),
         Box::new(ForkCommand),
@@ -10846,9 +11124,14 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
         }
     }
 
-    // Then check plugin-defined slash commands.
-    let project_dir = ctx.working_dir.clone();
-    let registry = mangocode_plugins::load_plugins(&project_dir, &[]).await;
+    // Then check plugin-defined slash commands. Prefer the live registry so
+    // --bare and runtime reload state are honored consistently.
+    let registry = if let Some(global) = mangocode_plugins::global_plugin_registry() {
+        global
+    } else {
+        let project_dir = ctx.working_dir.clone();
+        mangocode_plugins::load_plugins(&project_dir, &[]).await
+    };
     for cmd_def in registry.all_command_defs() {
         if cmd_def.name == cmd_name {
             let adapter = PluginSlashCommandAdapter { def: cmd_def };
@@ -10885,6 +11168,37 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             model_registry: None,
+        }
+    }
+
+    fn plugin_with_mcp(
+        plugin_name: &str,
+        server_name: &str,
+        command: &str,
+    ) -> mangocode_plugins::LoadedPlugin {
+        mangocode_plugins::LoadedPlugin {
+            name: plugin_name.to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/{plugin_name}")),
+            source: mangocode_plugins::PluginSource::Project,
+            source_id: format!("{plugin_name}@project"),
+            manifest: mangocode_plugins::PluginManifest {
+                name: plugin_name.to_string(),
+                mcp_servers: vec![mangocode_plugins::PluginMcpServer {
+                    name: server_name.to_string(),
+                    command: Some(command.to_string()),
+                    args: vec!["--stdio".to_string()],
+                    env: Default::default(),
+                    url: None,
+                    server_type: "stdio".to_string(),
+                }],
+                ..Default::default()
+            },
+            enabled: true,
+            commands_path: None,
+            agents_path: None,
+            skills_path: None,
+            output_styles_path: None,
+            hooks_config: None,
         }
     }
 
@@ -10961,6 +11275,7 @@ mod tests {
             "hooks",
             "permissions",
             "plan",
+            "goal",
             "tasks",
             "session",
             "login",
@@ -10989,6 +11304,115 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn goal_command_updates_existing_limited_goal_when_budget_raised() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = mangocode_core::sqlite_storage::SqliteSessionStore::open(&db).unwrap();
+        let session_id = "goal-command-session";
+
+        let result =
+            execute_goal_command_with_store(&store, session_id, "ship local goals --budget 10");
+        assert!(matches!(result, CommandResult::Message(_)));
+
+        let limited = store
+            .account_thread_goal_usage(session_id, 3, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            limited.status,
+            mangocode_core::goals::ThreadGoalStatus::BudgetLimited
+        );
+        let original_goal_id = limited.goal_id.clone();
+
+        let result =
+            execute_goal_command_with_store(&store, session_id, "ship local goals --budget 20");
+        assert!(matches!(result, CommandResult::Message(_)));
+
+        let updated = store.get_thread_goal(session_id).unwrap().unwrap();
+        assert_eq!(updated.goal_id, original_goal_id);
+        assert_eq!(updated.objective, "ship local goals");
+        assert_eq!(updated.tokens_used, 10);
+        assert_eq!(updated.token_budget, Some(20));
+        assert_eq!(
+            updated.status,
+            mangocode_core::goals::ThreadGoalStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_merge_plugin_mcp_servers_adds_new_server() {
+        let mut registry = mangocode_plugins::PluginRegistry::new();
+        registry.insert(plugin_with_mcp("toolbox", "toolbox-mcp", "node"));
+        let mut config = mangocode_core::config::Config::default();
+
+        assert!(sync_plugin_mcp_servers_into_config(
+            &mut config,
+            None,
+            &registry
+        ));
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, "toolbox-mcp");
+        assert_eq!(config.mcp_servers[0].command.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn test_merge_plugin_mcp_servers_replaces_existing_server() {
+        let mut old_registry = mangocode_plugins::PluginRegistry::new();
+        old_registry.insert(plugin_with_mcp("toolbox", "toolbox-mcp", "old-node"));
+        let mut registry = mangocode_plugins::PluginRegistry::new();
+        registry.insert(plugin_with_mcp("toolbox", "toolbox-mcp", "node"));
+        let mut config = mangocode_core::config::Config::default();
+        config
+            .mcp_servers
+            .push(mangocode_core::config::McpServerConfig {
+                name: "toolbox-mcp".to_string(),
+                command: Some("old-node".to_string()),
+                args: vec!["--stdio".to_string()],
+                env: Default::default(),
+                url: None,
+                headers: Default::default(),
+                pipedream: None,
+                server_type: "stdio".to_string(),
+            });
+
+        assert!(sync_plugin_mcp_servers_into_config(
+            &mut config,
+            Some(&old_registry),
+            &registry
+        ));
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].command.as_deref(), Some("node"));
+        assert_eq!(config.mcp_servers[0].args, vec!["--stdio".to_string()]);
+    }
+
+    #[test]
+    fn test_sync_plugin_mcp_servers_removes_removed_plugin_server() {
+        let mut old_registry = mangocode_plugins::PluginRegistry::new();
+        old_registry.insert(plugin_with_mcp("toolbox", "toolbox-mcp", "node"));
+        let registry = mangocode_plugins::PluginRegistry::new();
+        let mut config = mangocode_core::config::Config::default();
+        config
+            .mcp_servers
+            .push(mangocode_core::config::McpServerConfig {
+                name: "toolbox-mcp".to_string(),
+                command: Some("node".to_string()),
+                args: vec!["--stdio".to_string()],
+                env: Default::default(),
+                url: None,
+                headers: Default::default(),
+                pipedream: None,
+                server_type: "stdio".to_string(),
+            });
+
+        assert!(sync_plugin_mcp_servers_into_config(
+            &mut config,
+            Some(&old_registry),
+            &registry
+        ));
+        assert!(config.mcp_servers.is_empty());
     }
 
     // ---- Command execution tests --------------------------------------------
@@ -11238,6 +11662,22 @@ index 3333333..4444444 100644
         assert_eq!(summary.files[0].path, "src/foo.rs");
         assert_eq!(summary.files[0].additions, 2);
         assert_eq!(summary.files[0].deletions, 1);
+    }
+
+    #[test]
+    fn test_summarize_review_diff_strips_only_one_git_prefix() {
+        let diff = "\
+diff --git a/b/src/foo.rs b/b/src/foo.rs
+index 1111111..2222222 100644
+--- a/b/src/foo.rs
++++ b/b/src/foo.rs
+@@ -1 +1 @@
+-old_line();
++new_line();
+";
+        let summary = summarize_review_diff(diff);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "b/src/foo.rs");
     }
 
     #[test]

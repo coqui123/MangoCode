@@ -119,6 +119,26 @@ async fn build_session_system_prompt(
 mod tests {
     use super::*;
 
+    fn test_tool_context(config: Config) -> ToolContext {
+        ToolContext {
+            working_dir: PathBuf::from("test-workspace"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: CostTracker::new(),
+            session_metrics: None,
+            session_id: "cli-test".to_string(),
+            file_history: Arc::new(ParkingMutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+        }
+    }
+
     #[test]
     fn prompt_append_in_headless_skips_existing_fragment() {
         let mut parts = vec!["Base prompt.\n\nUse the repo root carefully.".to_string()];
@@ -146,60 +166,205 @@ mod tests {
         push_system_prompt_append(&mut parts, "Use the repo root carefully.", true);
         assert_eq!(parts.len(), 1);
     }
+
+    #[test]
+    fn allowed_tool_filter_accepts_runtime_aliases() {
+        let tools = build_tools_with_mcp(None, &["shell_command".to_string()], &[]);
+        assert!(tools.iter().any(|tool| tool.name() == "Bash"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Read"));
+    }
+
+    #[test]
+    fn disallowed_tool_filter_accepts_runtime_aliases() {
+        let tools = build_tools_with_mcp(None, &[], &["apply_patch".to_string()]);
+        assert!(!tools.iter().any(|tool| tool.name() == "ApplyPatch"));
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+    }
+
+    struct TestDynamicReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for TestDynamicReadOnlyTool {
+        fn name(&self) -> &str {
+            "DynamicReadOnly"
+        }
+
+        fn description(&self) -> &str {
+            "A dynamic read-only test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("dynamic ok")
+        }
+    }
+
+    #[test]
+    fn shared_agent_filter_preserves_live_dynamic_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestDynamicReadOnlyTool)]);
+        let _held_reference = tools.clone();
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "DynamicReadOnly"));
+    }
+
+    #[test]
+    fn read_only_agent_filter_preserves_live_none_permission_tools() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        assert!(filtered
+            .iter()
+            .any(|tool| tool.name() == mangocode_core::constants::TOOL_NAME_AGENT));
+        assert!(filtered.iter().any(|tool| tool.name() == "Read"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[test]
+    fn search_only_agent_filter_keeps_tool_search() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "search-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "ToolSearch"));
+        assert!(filtered.iter().any(|tool| tool.name() == "Grep"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Write"));
+    }
+
+    #[test]
+    fn agent_filter_visibility_config_matches_filtered_runtime_tools() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let mut config = Config::default();
+
+        mangocode_tools::restrict_config_to_available_tools(&mut config, filtered.as_ref());
+
+        assert!(config.allowed_tools.iter().any(|name| name == "ToolSearch"));
+        assert!(config.allowed_tools.iter().any(|name| name == "Read"));
+        assert!(!config.allowed_tools.iter().any(|name| name == "Bash"));
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn dynamic_tool_rebuild_preserves_named_agent_filter() {
+        let query_config = mangocode_query::QueryConfig {
+            agent_definition: Some(mangocode_core::config::AgentDefinition {
+                access: "read-only".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let tools = build_tools_for_query_config(None, &Config::default(), &query_config);
+
+        assert!(tools.iter().any(|tool| tool.name() == "ToolSearch"));
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name() == mangocode_core::constants::TOOL_NAME_AGENT));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[test]
+    fn interactive_visibility_resync_survives_base_config_overwrite() {
+        let query_config = mangocode_query::QueryConfig {
+            agent_definition: Some(mangocode_core::config::AgentDefinition {
+                access: "read-only".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tools = build_tools_for_query_config(None, &Config::default(), &query_config);
+        let mut tool_ctx = test_tool_context(Config::default());
+
+        sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
+        assert!(!tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "Bash"));
+
+        tool_ctx.config = Config::default();
+        assert!(tool_ctx.config.allowed_tools.is_empty());
+
+        sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
+        assert!(tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "ToolSearch"));
+        assert!(!tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "Bash"));
+    }
 }
 
 // ---------------------------------------------------------------------------
 // MCP tool wrapper: makes MCP server tools look like native cc-tools.
 // ---------------------------------------------------------------------------
 
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager_tool_name: String,
-    manager: Arc<mangocode_mcp::McpManager>,
+struct SharedToolRef {
+    tools: Arc<Vec<Box<dyn Tool>>>,
+    index: usize,
+}
+
+impl SharedToolRef {
+    fn inner(&self) -> &dyn Tool {
+        self.tools[self.index].as_ref()
+    }
 }
 
 #[async_trait]
-impl Tool for McpToolWrapper {
+impl Tool for SharedToolRef {
     fn name(&self) -> &str {
-        &self.tool_def.name
+        self.inner().name()
     }
 
     fn description(&self) -> &str {
-        &self.tool_def.description
+        self.inner().description()
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
+        self.inner().permission_level()
     }
 
     fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
+        self.inner().input_schema()
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("mcp__{}__", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
+    fn aliases(&self) -> Vec<String> {
+        self.inner().aliases()
+    }
 
-        let args = if input.is_null() { None } else { Some(input) };
+    fn capabilities(
+        &self,
+        input: &serde_json::Value,
+    ) -> mangocode_tools::runtime::ToolCapabilities {
+        self.inner().capabilities(input)
+    }
 
-        match self.manager.call_tool(&self.manager_tool_name, args).await {
-            Ok(result) => {
-                let text = mangocode_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
-        }
+    fn to_definition(&self) -> ToolDefinition {
+        self.inner().to_definition()
+    }
+
+    fn to_runtime_spec(&self) -> mangocode_tools::runtime::ToolSpec {
+        self.inner().to_runtime_spec()
+    }
+
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        self.inner().execute(input, ctx).await
     }
 }
 
@@ -626,6 +791,21 @@ fn merge_mcp_servers(config: &mut Config, servers: Vec<McpServerConfig>) {
         } else {
             config.mcp_servers.push(server);
         }
+    }
+}
+
+fn mcp_server_configs_equal(left: &[McpServerConfig], right: &[McpServerConfig]) -> bool {
+    serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
+}
+
+fn make_permission_handler(
+    is_headless: bool,
+    mode: &PermissionMode,
+) -> Arc<dyn mangocode_core::PermissionHandler> {
+    if is_headless {
+        Arc::new(AutoPermissionHandler { mode: mode.clone() })
+    } else {
+        Arc::new(InteractivePermissionHandler { mode: mode.clone() })
     }
 }
 
@@ -1214,15 +1394,7 @@ async fn main() -> anyhow::Result<()> {
     // Interactive mode uses InteractivePermissionHandler which allows writes in Default mode
     // (the user is watching the TUI so they can intervene). Headless/print mode uses
     // AutoPermissionHandler which denies writes in Default mode for safety.
-    let permission_handler: Arc<dyn mangocode_core::PermissionHandler> = if is_headless {
-        Arc::new(AutoPermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
-    } else {
-        Arc::new(InteractivePermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
-    };
+    let permission_handler = make_permission_handler(is_headless, &config.permission_mode);
     let cost_tracker = CostTracker::new();
     let session_metrics = mangocode_core::analytics::SessionMetrics::new();
     // Use --session-id if provided, otherwise generate a fresh UUID.
@@ -1235,6 +1407,40 @@ async fn main() -> anyhow::Result<()> {
         mangocode_core::file_history::FileHistory::new(),
     ));
     let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Load plugins before MCP startup so plugin-provided MCP servers are
+    // present in the in-memory config when the manager and tool wrappers are
+    // constructed.
+    let plugin_registry = if cli.bare {
+        info!("Plugins skipped because --bare was requested");
+        mangocode_plugins::PluginRegistry::new()
+    } else {
+        mangocode_plugins::load_plugins(&cwd, &[]).await
+    };
+    {
+        let plugin_cmd_count = plugin_registry.all_command_defs().len();
+        let plugin_hook_count = plugin_registry
+            .build_hook_registry()
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>();
+        info!(
+            plugins = plugin_registry.enabled_count(),
+            commands = plugin_cmd_count,
+            hooks = plugin_hook_count,
+            "Plugins loaded"
+        );
+        mangocode_plugins::set_global_hooks(plugin_registry.build_hook_registry());
+        mangocode_plugins::set_global_registry(plugin_registry.clone());
+
+        let mut existing_names: std::collections::HashSet<String> =
+            config.mcp_servers.iter().map(|s| s.name.clone()).collect();
+        for mcp_server in plugin_registry.all_mcp_servers() {
+            if existing_names.insert(mcp_server.name.clone()) {
+                config.mcp_servers.push(mcp_server);
+            }
+        }
+    }
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
@@ -1257,6 +1463,7 @@ async fn main() -> anyhow::Result<()> {
     // sub-agents.  Must be called before any tool execution begins.
     // The function is idempotent if already registered (panics only on double-call,
     // but we guard with a std::sync::OnceLock internally).
+    #[cfg(any(feature = "tool-team-create", feature = "tool-team-delete"))]
     {
         static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         SWARM_INIT.get_or_init(mangocode_query::init_team_swarm_runner);
@@ -1270,34 +1477,6 @@ async fn main() -> anyhow::Result<()> {
         &config.allowed_tools,
         &config.disallowed_tools,
     );
-
-    // Load plugins and register any plugin-provided MCP servers into the
-    // in-memory config (does not modify the settings file on disk).
-    let plugin_registry = mangocode_plugins::load_plugins(&cwd, &[]).await;
-    {
-        let plugin_cmd_count = plugin_registry.all_command_defs().len();
-        let plugin_hook_count = plugin_registry
-            .build_hook_registry()
-            .values()
-            .map(|v| v.len())
-            .sum::<usize>();
-        info!(
-            plugins = plugin_registry.enabled_count(),
-            commands = plugin_cmd_count,
-            hooks = plugin_hook_count,
-            "Plugins loaded"
-        );
-
-        // Register plugin MCP servers into the in-memory config so they are
-        // picked up by any subsequent MCP manager construction.
-        let existing_names: std::collections::HashSet<String> =
-            config.mcp_servers.iter().map(|s| s.name.clone()).collect();
-        for mcp_server in plugin_registry.all_mcp_servers() {
-            if !existing_names.contains(&mcp_server.name) {
-                config.mcp_servers.push(mcp_server);
-            }
-        }
-    }
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -1390,6 +1569,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tools
     };
+
+    sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -1485,47 +1666,19 @@ fn build_tools_with_mcp(
     disallowed_tools: &[String],
 ) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
     let mut v: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools();
+    #[cfg(feature = "tool-agent")]
     v.push(Box::new(mangocode_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, original_tool_def) in manager_arc.all_tool_definitions() {
-            let internal_prefix = format!("{}_", server_name);
-            let bare_tool_name = original_tool_def
-                .name
-                .strip_prefix(&internal_prefix)
-                .unwrap_or(&original_tool_def.name)
-                .to_string();
-
-            let compat_tool_name = format!("mcp__{}__{}", server_name, bare_tool_name);
-            let manager_tool_name = original_tool_def.name.clone();
-            let tool_def = ToolDefinition {
-                name: compat_tool_name,
-                description: original_tool_def.description,
-                input_schema: original_tool_def.input_schema,
-            };
-
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager_tool_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
-        }
+        mangocode_tools::extend_with_mcp_tools(&mut v, manager_arc.clone());
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
-    if !allowed_tools.is_empty() {
-        let allowed: HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-        v.retain(|t| allowed.contains(t.name()));
-    }
-
-    if !disallowed_tools.is_empty() {
-        let denied: HashSet<&str> = disallowed_tools.iter().map(|s| s.as_str()).collect();
-        v.retain(|t| !denied.contains(t.name()));
-    }
-
-    Arc::new(v)
+    Arc::new(mangocode_tools::filter_tools_by_name_config(
+        v,
+        allowed_tools,
+        disallowed_tools,
+    ))
 }
 
 /// Filter the tool list based on the agent's access level.
@@ -1536,40 +1689,103 @@ fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
     access: &str,
 ) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
-    use mangocode_tools::PermissionLevel as PL;
     match access {
-        "read-only" => {
-            // Collect names of tools that are read-only, then rebuild from all_tools
-            // (Box<dyn Tool> is not Clone so we can't directly filter-and-keep).
-            let allowed_names: Vec<String> = tools
-                .iter()
-                .filter(|t| {
-                    matches!(t.permission_level(), PL::ReadOnly | PL::None)
-                        || t.name() == "AskUserQuestion"
-                })
-                .map(|t| t.name().to_string())
-                .collect();
-            let filtered: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools()
-                .into_iter()
-                .filter(|t| allowed_names.iter().any(|n| n == t.name()))
-                .collect();
-            Arc::new(filtered)
-        }
-        "search-only" => {
-            const SEARCH_TOOLS: &[&str] = &["Grep", "Glob", "Read", "WebSearch", "WebFetch"];
-            let filtered: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools()
-                .into_iter()
-                .filter(|t| SEARCH_TOOLS.contains(&t.name()))
-                .collect();
-            Arc::new(filtered)
-        }
+        "read-only" => filter_live_tools_for_agent(tools, tool_allowed_for_read_only_agent),
+        "search-only" => filter_live_tools_for_agent(tools, tool_allowed_for_search_only_agent),
         _ => tools, // "full" — allow all tools unchanged
+    }
+}
+
+fn agent_access_filters_tools(access: &str) -> bool {
+    matches!(access, "read-only" | "search-only")
+}
+
+fn query_agent_restricted_access(query_config: &mangocode_query::QueryConfig) -> Option<&str> {
+    query_config
+        .agent_definition
+        .as_ref()
+        .map(|definition| definition.access.as_str())
+        .filter(|access| agent_access_filters_tools(access))
+}
+
+fn apply_query_agent_tool_filter(
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    query_config: &mangocode_query::QueryConfig,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    if let Some(access) = query_agent_restricted_access(query_config) {
+        filter_tools_for_agent(tools, access)
+    } else {
+        tools
+    }
+}
+
+fn build_tools_for_query_config(
+    mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    config: &Config,
+    query_config: &mangocode_query::QueryConfig,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager, &config.allowed_tools, &config.disallowed_tools);
+    apply_query_agent_tool_filter(tools, query_config)
+}
+
+fn sync_tool_context_visibility_for_query_agent(
+    tool_ctx: &mut ToolContext,
+    tools: &Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    query_config: &mangocode_query::QueryConfig,
+) {
+    if query_agent_restricted_access(query_config).is_some() {
+        mangocode_tools::sync_tool_context_to_available_tools(tool_ctx, tools.as_ref());
     }
 }
 
 // ---------------------------------------------------------------------------
 // Headless mode: read prompt from arg/stdin, run, print response
 // ---------------------------------------------------------------------------
+
+fn filter_live_tools_for_agent(
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    predicate: fn(&dyn mangocode_tools::Tool) -> bool,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    match Arc::try_unwrap(tools) {
+        Ok(mut live_tools) => {
+            live_tools.retain(|tool| predicate(tool.as_ref()));
+            Arc::new(live_tools)
+        }
+        Err(shared_tools) => {
+            let filtered = shared_tools
+                .iter()
+                .enumerate()
+                .filter(|(_, tool)| predicate(tool.as_ref()))
+                .map(|(index, _)| {
+                    Box::new(SharedToolRef {
+                        tools: shared_tools.clone(),
+                        index,
+                    }) as Box<dyn Tool>
+                })
+                .collect();
+            Arc::new(filtered)
+        }
+    }
+}
+
+fn tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    use mangocode_tools::PermissionLevel as PL;
+    matches!(tool.permission_level(), PL::ReadOnly | PL::None) || tool.name() == "AskUserQuestion"
+}
+
+fn tool_allowed_for_search_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    const SEARCH_TOOLS: &[&str] = &[
+        "Grep",
+        "Glob",
+        "Read",
+        "WebSearch",
+        "WebFetch",
+        "ToolSearch",
+    ];
+    SEARCH_TOOLS
+        .iter()
+        .any(|allowed| mangocode_tools::tool_name_matches(tool, allowed))
+}
 
 async fn run_headless(
     cli: &Cli,
@@ -2415,6 +2631,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     }
 
     app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    app.session_id = Some(session.id.clone());
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
@@ -2578,6 +2795,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
     let mut tools_arc = tools;
+    sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools_arc, &base_query_config);
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -2868,6 +3086,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
                                     );
+                                    app.session_id = Some(session.id.clone());
+                                    app.session_title = session.title.clone();
+                                    app.remote_session_url = session.remote_session_url.clone();
                                     app.status_message =
                                         Some(format!("Resumed session {}.", &session.id[..8]));
                                     terminal.reset_transcript(&app, &messages)?;
@@ -2878,6 +3099,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     tool_ctx.config.project_dir = Some(new_dir.clone());
                                     cmd_ctx.config.project_dir = Some(new_dir.clone());
                                     app.config.project_dir = Some(new_dir.clone());
+                                    app.refresh_prompt_slash_commands();
                                     base_query_config.working_directory =
                                         Some(new_dir.display().to_string());
                                     base_query_config.system_prompt = Some(
@@ -2932,6 +3154,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
                                     base_query_config.system_prompt = Some(
                                         build_session_system_prompt(
                                             tool_ctx.working_dir.clone(),
@@ -2944,7 +3174,25 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
                                     app.config = new_cfg.clone();
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
                                     // Sync model name shown in the TUI header.
                                     if let Some(ref model) = new_cfg.model {
                                         app.model_name = model.clone();
@@ -2963,6 +3211,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.status_message = Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
                                     base_query_config.system_prompt = Some(
                                         build_session_system_prompt(
                                             tool_ctx.working_dir.clone(),
@@ -2975,6 +3231,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
                                     // Sync model name + fast_mode visual indicator.
                                     if let Some(ref model) = new_cfg.model {
                                         app.model_name = model.clone();
@@ -2983,7 +3242,26 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         // model reset to None means fast mode off.
                                         app.fast_mode = false;
                                     }
-                                    app.config = new_cfg;
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        mangocode_core::config::PermissionMode::Plan
+                                    );
+                                    app.config = new_cfg.clone();
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
                                     app.status_message = Some(msg);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
@@ -3059,6 +3337,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     matches!(cmd_args.trim(), "on" | "vim");
                             }
 
+                            if handled_by_cli
+                                && (cmd_name == "reload-plugins"
+                                    || (matches!(cmd_name.as_str(), "plugin" | "plugins")
+                                        && cmd_args.trim_start().starts_with("reload")))
+                            {
+                                app.refresh_prompt_slash_commands();
+                            }
+
                             if !handled_by_cli && !handled_by_tui {
                                 app.status_message =
                                     Some(format!("Unknown command: /{}", cmd_name));
@@ -3076,10 +3362,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             }
                         }
 
-                        // Fire UserPromptSubmit hook without blocking query launch.
-                        let hook_handle = if !config.hooks.is_empty() {
-                            let hooks = config.hooks.clone();
+                        // Fire UserPromptSubmit hooks before the prompt is committed.
+                        // Blocking hooks are submission gates; non-blocking failures still allow.
+                        let has_prompt_submit_hooks = !cmd_ctx.config.hooks.is_empty()
+                            || mangocode_plugins::has_global_hooks_for_event(
+                                mangocode_plugins::HookEventKind::UserPromptSubmit,
+                            );
+                        if has_prompt_submit_hooks {
+                            let hooks = cmd_ctx.config.hooks.clone();
                             let working_dir = tool_ctx.working_dir.clone();
+                            let session_id_for_plugin_hooks = tool_ctx.session_id.clone();
                             let hook_ctx = mangocode_core::hooks::HookContext {
                                 event: "UserPromptSubmit".to_string(),
                                 tool_name: None,
@@ -3088,25 +3380,69 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 is_error: None,
                                 session_id: Some(tool_ctx.session_id.clone()),
                             };
-                            Some(tokio::spawn(async move {
-                                tokio::time::timeout(
-                                    Duration::from_secs(5),
-                                    mangocode_core::hooks::run_hooks(
-                                        &hooks,
-                                        mangocode_core::config::HookEvent::UserPromptSubmit,
-                                        &hook_ctx,
-                                        &working_dir,
-                                    ),
-                                )
-                                .await
-                                .unwrap_or_else(|_| {
-                                    eprintln!("Hooks timed out after 5s, continuing query");
-                                    mangocode_core::hooks::HookOutcome::Allowed
-                                })
-                            }))
-                        } else {
-                            None
-                        };
+                            let core_outcome = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                mangocode_core::hooks::run_hooks(
+                                    &hooks,
+                                    mangocode_core::config::HookEvent::UserPromptSubmit,
+                                    &hook_ctx,
+                                    &working_dir,
+                                ),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                eprintln!("Hooks timed out after 5s, continuing query");
+                                mangocode_core::hooks::HookOutcome::Allowed
+                            });
+
+                            match core_outcome {
+                                mangocode_core::hooks::HookOutcome::Blocked(reason) => {
+                                    app.status_message =
+                                        Some(format!("Prompt blocked by hook: {reason}"));
+                                    continue;
+                                }
+                                mangocode_core::hooks::HookOutcome::Modified(modified)
+                                    if !modified.trim().is_empty() =>
+                                {
+                                    input = modified;
+                                }
+                                _ => {}
+                            }
+
+                            if mangocode_plugins::has_global_hooks_for_event(
+                                mangocode_plugins::HookEventKind::UserPromptSubmit,
+                            ) {
+                                let prompt_for_plugin_hooks = input.clone();
+                                let plugin_hook = tokio::task::spawn_blocking(move || {
+                                    mangocode_plugins::run_global_user_prompt_submit_hook(
+                                        &prompt_for_plugin_hooks,
+                                        Some(&session_id_for_plugin_hooks),
+                                    )
+                                });
+                                match tokio::time::timeout(Duration::from_secs(5), plugin_hook)
+                                    .await
+                                {
+                                    Ok(Ok(mangocode_plugins::HookOutcome::Deny(reason))) => {
+                                        app.status_message = Some(format!(
+                                            "Prompt blocked by plugin hook: {reason}"
+                                        ));
+                                        continue;
+                                    }
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(err)) => {
+                                        warn!(
+                                            error = %err,
+                                            "Plugin UserPromptSubmit hook task failed"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            "Plugin UserPromptSubmit hooks timed out after 5s, continuing query"
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         // Regular user message (with optional image/document attachments)
                         let pending_imgs = app.prompt_input.clear_images();
@@ -3244,9 +3580,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 None,
                             )
                             .await;
-                            if let Some(hook_handle) = hook_handle {
-                                let _ = hook_handle.await;
-                            }
                             // Write updated messages (with tool calls + assistant response) back
                             *msgs_arc_clone.lock().await = msgs;
                             outcome
@@ -3259,6 +3592,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
                     let expanded_before = app.expanded_tool_outputs.clone();
                     let model_picker_was_visible = app.model_picker.visible;
+                    let config_before_key = cmd_ctx.config.clone();
                     app.handle_key_event(key);
                     if model_picker_was_visible
                         && !app.model_picker.visible
@@ -3269,8 +3603,32 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
                         terminal.reset_transcript(&app, &messages)?;
                     }
-                    cmd_ctx.config = app.config.clone();
-                    tool_ctx.config = app.config.clone();
+                    let app_config = app.config.clone();
+                    let reconnect_mcp = !mcp_server_configs_equal(
+                        &config_before_key.mcp_servers,
+                        &app_config.mcp_servers,
+                    );
+                    let rebuild_tools = config_before_key.allowed_tools != app_config.allowed_tools
+                        || config_before_key.disallowed_tools != app_config.disallowed_tools;
+                    cmd_ctx.config = app_config.clone();
+                    tool_ctx.config = app_config.clone();
+                    tool_ctx.permission_mode = app_config.permission_mode.clone();
+                    tool_ctx.permission_handler =
+                        make_permission_handler(false, &app_config.permission_mode);
+                    if reconnect_mcp {
+                        app.pending_mcp_reconnect = true;
+                    } else if rebuild_tools {
+                        tools_arc = build_tools_for_query_config(
+                            tool_ctx.mcp_manager.clone(),
+                            &app_config,
+                            &base_query_config,
+                        );
+                    }
+                    sync_tool_context_visibility_for_query_agent(
+                        &mut tool_ctx,
+                        &tools_arc,
+                        &base_query_config,
+                    );
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
                     }
@@ -4047,10 +4405,15 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(
+            tools_arc = build_tools_for_query_config(
                 new_mcp_manager.clone(),
-                &cmd_ctx.config.allowed_tools,
-                &cmd_ctx.config.disallowed_tools,
+                &cmd_ctx.config,
+                &base_query_config,
+            );
+            sync_tool_context_visibility_for_query_agent(
+                &mut tool_ctx,
+                &tools_arc,
+                &base_query_config,
             );
             if app.mcp_view.open {
                 app.refresh_mcp_view();

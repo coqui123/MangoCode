@@ -5,6 +5,14 @@
 //
 // These require an MCP manager to be configured in ToolContext.mcp_manager.
 
+#![cfg_attr(
+    not(all(
+        feature = "tool-list-mcp-resources",
+        feature = "tool-read-mcp-resource"
+    )),
+    allow(dead_code)
+)]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -15,6 +23,7 @@ use tracing::debug;
 // ListMcpResourcesTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-list-mcp-resources")]
 pub struct ListMcpResourcesTool;
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +32,7 @@ struct ListMcpResourcesInput {
     server: Option<String>,
 }
 
+#[cfg(feature = "tool-list-mcp-resources")]
 #[async_trait]
 impl Tool for ListMcpResourcesTool {
     fn name(&self) -> &str {
@@ -85,6 +95,7 @@ impl Tool for ListMcpResourcesTool {
 // ReadMcpResourceTool
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-read-mcp-resource")]
 pub struct ReadMcpResourceTool;
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +104,7 @@ struct ReadMcpResourceInput {
     uri: String,
 }
 
+#[cfg(feature = "tool-read-mcp-resource")]
 #[async_trait]
 impl Tool for ReadMcpResourceTool {
     fn name(&self) -> &str {

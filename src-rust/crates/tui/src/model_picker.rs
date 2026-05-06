@@ -1571,7 +1571,10 @@ mod tests {
     fn ollama_entries_empty_returns_pull_hint() {
         let entries = ollama_entries_from_installed(&[]);
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].description.to_lowercase().contains("ollama pull"));
+        assert!(entries[0]
+            .description
+            .to_lowercase()
+            .contains("ollama pull"));
     }
 
     // 21. Ollama unreachable → fallback list begins with a diagnostic entry,

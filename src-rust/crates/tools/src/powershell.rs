@@ -421,14 +421,7 @@ impl Tool for PowerShellTool {
                 let reduced =
                     reduce_command_output(&params.command, &output, exit_code, output_mode);
 
-                if exit_code != 0 {
-                    ToolResult::error(format!(
-                        "PowerShell exited with code {}\n{}",
-                        exit_code, reduced.content
-                    ))
-                } else {
-                    ToolResult::success(reduced.content)
-                }
+                reduced.into_tool_result(exit_code, "PowerShell exited with code")
             }
             Err(_) => {
                 let _ = child.kill().await;

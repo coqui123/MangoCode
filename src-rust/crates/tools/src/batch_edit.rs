@@ -164,12 +164,6 @@ impl Tool for BatchEditTool {
             match tokio::fs::write(path, new_content).await {
                 Ok(()) => {
                     written.push((path_str.clone(), original.clone()));
-                    ctx.record_file_change(
-                        path.to_path_buf(),
-                        original.as_bytes(),
-                        new_content.as_bytes(),
-                        self.name(),
-                    );
                 }
                 Err(e) => {
                     // Attempt rollback of already-written files.
@@ -197,6 +191,15 @@ impl Tool for BatchEditTool {
             }
         }
 
+        for (path_str, original, new_content) in &prepared {
+            ctx.record_file_change(
+                std::path::PathBuf::from(path_str),
+                original.as_bytes(),
+                new_content.as_bytes(),
+                self.name(),
+            );
+        }
+
         // ----------------------------------------------------------------
         // Build success response
         // ----------------------------------------------------------------
@@ -219,5 +222,90 @@ impl Tool for BatchEditTool {
             "files_modified": file_count,
             "files": prepared.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_context(root: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_dir: root.to_path_buf(),
+            permission_mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            permission_handler: Arc::new(mangocode_core::permissions::AutoPermissionHandler {
+                mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            }),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "batch-edit-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(14)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_partial_write_rolls_back_without_file_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let read_only = dir.path().join("read_only.txt");
+        tokio::fs::write(&first, "old first").await.unwrap();
+        tokio::fs::write(&read_only, "old second").await.unwrap();
+
+        let mut permissions = std::fs::metadata(&read_only).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&read_only, permissions).unwrap();
+
+        let ctx = test_context(dir.path());
+        let result = BatchEditTool
+            .execute(
+                json!({
+                    "edits": [
+                        {
+                            "file_path": "first.txt",
+                            "old_string": "old first",
+                            "new_string": "new first"
+                        },
+                        {
+                            "file_path": "read_only.txt",
+                            "old_string": "old second",
+                            "new_string": "new second"
+                        }
+                    ]
+                }),
+                &ctx,
+            )
+            .await;
+
+        let mut permissions = std::fs::metadata(&read_only).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(windows)]
+        {
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+        }
+        std::fs::set_permissions(&read_only, permissions).unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(
+            tokio::fs::read_to_string(&first).await.unwrap(),
+            "old first"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&read_only).await.unwrap(),
+            "old second"
+        );
+        assert!(ctx.file_history.lock().get_entries_for_turn(14).is_empty());
     }
 }

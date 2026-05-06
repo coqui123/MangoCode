@@ -344,6 +344,42 @@ struct AgentInput {
     run_in_background: bool,
 }
 
+fn build_subagent_tools(
+    parent_ctx: &ToolContext,
+    allowed: Option<&[String]>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = mangocode_tools::all_tools();
+    if let Some(manager) = parent_ctx.mcp_manager.clone() {
+        mangocode_tools::extend_with_mcp_tools(&mut tools, manager);
+    }
+
+    tools
+        .into_iter()
+        .filter(|tool| tool.name() != mangocode_core::constants::TOOL_NAME_AGENT)
+        .filter(|tool| {
+            allowed
+                .map(|names| {
+                    names
+                        .iter()
+                        .any(|name| mangocode_tools::tool_name_matches(tool.as_ref(), name))
+                })
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn build_subagent_context(
+    parent_ctx: &ToolContext,
+    agent_tools: &[Box<dyn Tool>],
+    working_dir: PathBuf,
+) -> ToolContext {
+    let mut agent_ctx = parent_ctx.clone();
+    agent_ctx.working_dir = working_dir;
+    agent_ctx.config.project_dir = Some(agent_ctx.working_dir.clone());
+    mangocode_tools::sync_tool_context_to_available_tools(&mut agent_ctx, agent_tools);
+    agent_ctx
+}
+
 #[async_trait]
 impl Tool for AgentTool {
     fn name(&self) -> &str {
@@ -449,18 +485,7 @@ impl Tool for AgentTool {
         let (provider_registry, model_registry) =
             build_provider_and_model_registries(ctx, credential, use_bearer_auth);
 
-        // Build the tool list for the sub-agent.
-        // Always exclude AgentTool itself to prevent unbounded recursion.
-        let all = mangocode_tools::all_tools();
-        let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
-            all.into_iter()
-                .filter(|t| allowed.contains(&t.name().to_string()))
-                .collect()
-        } else {
-            all.into_iter()
-                .filter(|t| t.name() != mangocode_core::constants::TOOL_NAME_AGENT)
-                .collect()
-        };
+        let agent_tools = build_subagent_tools(ctx, params.tools.as_deref());
 
         // Resolve model: explicit override > default.
         let model = params
@@ -564,13 +589,15 @@ impl Tool for AgentTool {
             _ => (ctx.working_dir.display().to_string(), None, None, None),
         };
 
+        let agent_ctx = build_subagent_context(ctx, &agent_tools, PathBuf::from(&working_dir_str));
+
         let skill_index =
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::SkillIndex::default()));
-        let prefetch_root = ctx
+        let prefetch_root = agent_ctx
             .config
             .project_dir
             .clone()
-            .unwrap_or_else(|| ctx.working_dir.clone());
+            .unwrap_or_else(|| agent_ctx.working_dir.clone());
         let skill_index_bg = skill_index.clone();
         tokio::spawn(async move {
             crate::prefetch_skills(&prefetch_root, skill_index_bg).await;
@@ -582,11 +609,11 @@ impl Tool for AgentTool {
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt,
             append_system_prompt,
-            output_style: ctx.config.effective_output_style(),
-            output_style_prompt: ctx.config.resolve_output_style_prompt(),
-            working_directory: Some(working_dir_str),
+            output_style: agent_ctx.config.effective_output_style(),
+            output_style_prompt: agent_ctx.config.resolve_output_style_prompt(),
+            working_directory: Some(agent_ctx.working_dir.display().to_string()),
             thinking_budget: None,
-            qwen_preserve_thinking: ctx.config.preserve_thinking,
+            qwen_preserve_thinking: agent_ctx.config.preserve_thinking,
             temperature: None,
             tool_result_budget: 50_000,
             effort_level: None,
@@ -599,9 +626,9 @@ impl Tool for AgentTool {
             agent_definition: None,
             model_registry: Some(model_registry),
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::from_provider_id(
-                ctx.config.provider.as_deref().unwrap_or(""),
+                agent_ctx.config.provider.as_deref().unwrap_or(""),
             ),
-            skills: ctx.config.skills.clone(),
+            skills: agent_ctx.config.skills.clone(),
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
         };
@@ -615,7 +642,7 @@ impl Tool for AgentTool {
                 prompt: params.prompt.clone(),
                 agent_tools_bg: agent_tools,
                 client_bg: client.clone(),
-                ctx_bg: ctx.clone(),
+                ctx_bg: agent_ctx.clone(),
                 config_bg: query_config,
                 git_root,
                 worktree_path,
@@ -633,20 +660,22 @@ impl Tool for AgentTool {
             client.as_ref(),
             &mut messages,
             &agent_tools,
-            ctx,
+            &agent_ctx,
             &query_config,
-            ctx.cost_tracker.clone(),
+            agent_ctx.cost_tracker.clone(),
             None, // no event forwarding for sub-agents
             cancel,
             None, // no pending message queue for sub-agents
         )
         .await;
         crate::finish_session_lifecycle(
-            ctx,
+            &agent_ctx,
             format!(
                 "Session ended for sub-agent {} after {} turns.",
-                ctx.session_id,
-                ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+                agent_ctx.session_id,
+                agent_ctx
+                    .current_turn
+                    .load(std::sync::atomic::Ordering::Relaxed)
             ),
         )
         .await;
@@ -869,18 +898,7 @@ pub async fn execute_with_runtime(
 
     info!(description = %params.description, "Spawning sub-agent");
 
-    // Build the tool list for the sub-agent.
-    // Always exclude AgentTool itself to prevent unbounded recursion.
-    let all = mangocode_tools::all_tools();
-    let agent_tools: Vec<Box<dyn Tool>> = if let Some(ref allowed) = params.tools {
-        all.into_iter()
-            .filter(|t| allowed.contains(&t.name().to_string()))
-            .collect()
-    } else {
-        all.into_iter()
-            .filter(|t| t.name() != mangocode_core::constants::TOOL_NAME_AGENT)
-            .collect()
-    };
+    let agent_tools = build_subagent_tools(ctx, params.tools.as_deref());
 
     // Resolve model: explicit override > parent query model > default.
     let model = params
@@ -1031,15 +1049,17 @@ pub async fn execute_with_runtime(
         }
     };
 
+    let agent_ctx = build_subagent_context(ctx, &agent_tools, PathBuf::from(&working_dir_str));
+
     let mut query_config = parent_query_config.clone();
     query_config.model = model;
     query_config.max_tokens = mangocode_core::constants::DEFAULT_MAX_TOKENS;
     query_config.max_turns = params.max_turns.unwrap_or(10);
     query_config.system_prompt = agent_system_prompt;
     query_config.append_system_prompt = agent_append_system_prompt;
-    query_config.output_style = ctx.config.effective_output_style();
-    query_config.output_style_prompt = ctx.config.resolve_output_style_prompt();
-    query_config.working_directory = Some(working_dir_str);
+    query_config.output_style = agent_ctx.config.effective_output_style();
+    query_config.output_style_prompt = agent_ctx.config.resolve_output_style_prompt();
+    query_config.working_directory = Some(agent_ctx.working_dir.display().to_string());
     query_config.command_queue = None;
     query_config.agent_name = None;
     query_config.agent_definition = None;
@@ -1071,7 +1091,7 @@ pub async fn execute_with_runtime(
             prompt: params.prompt.clone(),
             agent_tools_bg: agent_tools,
             client_bg,
-            ctx_bg: ctx.clone(),
+            ctx_bg: agent_ctx.clone(),
             config_bg: query_config,
             git_root,
             worktree_path,
@@ -1127,20 +1147,22 @@ pub async fn execute_with_runtime(
         runtime_client,
         &mut messages,
         &agent_tools,
-        ctx,
+        &agent_ctx,
         &query_config,
-        ctx.cost_tracker.clone(),
+        agent_ctx.cost_tracker.clone(),
         event_tx.clone(),
         cancel,
         None,
     )
     .await;
     crate::finish_session_lifecycle(
-        ctx,
+        &agent_ctx,
         format!(
             "Session ended for teammate agent {} after {} turns.",
-            ctx.session_id,
-            ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+            agent_ctx.session_id,
+            agent_ctx
+                .current_turn
+                .load(std::sync::atomic::Ordering::Relaxed)
         ),
     )
     .await;
@@ -1369,20 +1391,14 @@ pub fn init_team_swarm_runner() {
                 let (provider_registry, model_registry) =
                     build_provider_and_model_registries(&ctx, credential, use_bearer_auth);
 
-                // Build the tool list, filtering to the allowlist if provided.
-                let all = mangocode_tools::all_tools();
-                let agent_tools: Vec<Box<dyn mangocode_tools::Tool>> =
-                    if let Some(ref allowed) = tools {
-                        all.into_iter()
-                            .filter(|t| allowed.contains(&t.name().to_string()))
-                            .collect()
-                    } else {
-                        all.into_iter()
-                            .filter(|t| t.name() != mangocode_core::constants::TOOL_NAME_AGENT)
-                            .collect()
-                    };
+                let agent_tools = build_subagent_tools(&ctx, tools.as_deref());
+                let agent_ctx = Arc::new(build_subagent_context(
+                    ctx.as_ref(),
+                    &agent_tools,
+                    ctx.working_dir.clone(),
+                ));
 
-                let model = ctx.config.effective_model().to_string();
+                let model = agent_ctx.config.effective_model().to_string();
 
                 let system_prompt = system.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
@@ -1395,9 +1411,9 @@ pub fn init_team_swarm_runner() {
                     max_tokens: mangocode_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
-                    working_directory: Some(ctx.working_dir.display().to_string()),
-                    output_style: ctx.config.effective_output_style(),
-                    output_style_prompt: ctx.config.resolve_output_style_prompt(),
+                    working_directory: Some(agent_ctx.working_dir.display().to_string()),
+                    output_style: agent_ctx.config.effective_output_style(),
+                    output_style_prompt: agent_ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(provider_registry),
                     model_registry: Some(model_registry),
                     ..Default::default()
@@ -1409,20 +1425,22 @@ pub fn init_team_swarm_runner() {
                     client.as_ref(),
                     &mut messages,
                     &agent_tools,
-                    &ctx,
+                    &agent_ctx,
                     &query_config,
-                    ctx.cost_tracker.clone(),
+                    agent_ctx.cost_tracker.clone(),
                     None,
                     cancel,
                     None,
                 )
                 .await;
                 crate::finish_session_lifecycle(
-                    &ctx,
+                    &agent_ctx,
                     format!(
                         "Session ended for registered agent runner {} after {} turns.",
-                        ctx.session_id,
-                        ctx.current_turn.load(std::sync::atomic::Ordering::Relaxed)
+                        agent_ctx.session_id,
+                        agent_ctx
+                            .current_turn
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     ),
                 )
                 .await;
@@ -1438,6 +1456,105 @@ pub fn init_team_swarm_runner() {
 #[cfg(test)]
 mod tests {
     use super::attach_parent_to_event;
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob"),
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    use super::{build_subagent_context, build_subagent_tools};
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob"),
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    use mangocode_tools::ToolContext;
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob"),
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    use std::path::PathBuf;
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob"),
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    use std::sync::Arc;
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob"),
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    fn test_context() -> ToolContext {
+        ToolContext {
+            working_dir: PathBuf::from("parent-workspace"),
+            permission_mode: mangocode_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(mangocode_core::permissions::AutoPermissionHandler {
+                mode: mangocode_core::config::PermissionMode::Default,
+            }),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "agent-tool-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+        }
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-glob")
+    ))]
+    #[test]
+    fn subagent_tool_allowlist_accepts_runtime_aliases() {
+        let parent_ctx = test_context();
+        let allowed = vec!["read_file".to_string(), "glob".to_string()];
+        let tools = build_subagent_tools(&parent_ctx, Some(&allowed));
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(tools.iter().any(|tool| tool.name() == "Glob"));
+        assert!(!tools.iter().any(|tool| tool.name() == "ToolSearch"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-read", feature = "tool-tool-search")
+    ))]
+    #[test]
+    fn subagent_context_matches_runtime_tools_and_working_directory() {
+        let parent_ctx = test_context();
+        let allowed = vec!["Read".to_string(), "ToolSearch".to_string()];
+        let tools = build_subagent_tools(&parent_ctx, Some(&allowed));
+
+        let agent_ctx =
+            build_subagent_context(&parent_ctx, &tools, PathBuf::from("agent-worktree"));
+
+        assert_eq!(agent_ctx.working_dir, PathBuf::from("agent-worktree"));
+        assert_eq!(
+            agent_ctx.config.project_dir,
+            Some(PathBuf::from("agent-worktree"))
+        );
+        assert_eq!(agent_ctx.config.allowed_tools, vec!["Read", "ToolSearch"]);
+        assert!(agent_ctx.config.disallowed_tools.is_empty());
+    }
 
     #[test]
     fn attaches_parent_to_plain_stream_events() {

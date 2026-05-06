@@ -553,9 +553,9 @@ async fn ollama_stream_extracts_inline_think_tags_as_reasoning() {
     while let Some(event) = stream.next().await {
         match event.expect("stream item") {
             mangocode_api::StreamEvent::TextDelta { text, .. } => visible.push_str(&text),
-            mangocode_api::StreamEvent::ReasoningDelta {
-                reasoning: r, ..
-            } => reasoning.push_str(&r),
+            mangocode_api::StreamEvent::ReasoningDelta { reasoning: r, .. } => {
+                reasoning.push_str(&r)
+            }
             mangocode_api::StreamEvent::MessageStop => break,
             _ => {}
         }

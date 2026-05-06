@@ -412,6 +412,24 @@ pub fn record_file_change_with_tool(
     after_content: &[u8],
     tool_name: &str,
 ) {
+    record_file_change_with_tool_optional(
+        session_id,
+        tool_call_id,
+        path,
+        before_content,
+        Some(after_content),
+        tool_name,
+    );
+}
+
+pub fn record_file_change_with_tool_optional(
+    session_id: &str,
+    tool_call_id: Option<&str>,
+    path: &Path,
+    before_content: Option<&[u8]>,
+    after_content: Option<&[u8]>,
+    tool_name: &str,
+) {
     let Some(active) = ACTIVE_TURNS.lock().get(session_id).cloned() else {
         return;
     };
@@ -423,7 +441,7 @@ pub fn record_file_change_with_tool(
         tool_call_id,
         path,
         before_content,
-        Some(after_content),
+        after_content,
         tool_name,
     );
 }
@@ -707,12 +725,12 @@ fn capture_git_checkpoint(
 fn capture_git_tree(repo_root: &Path, index_path: &Path) -> anyhow::Result<String> {
     let has_head = git_status(repo_root, &["rev-parse", "--verify", "HEAD"]);
     if has_head {
-        run_git_with_index(repo_root, &index_path, &["read-tree", "HEAD"])?;
+        run_git_with_index(repo_root, index_path, &["read-tree", "HEAD"])?;
     } else {
-        run_git_with_index(repo_root, &index_path, &["read-tree", "--empty"])?;
+        run_git_with_index(repo_root, index_path, &["read-tree", "--empty"])?;
     }
-    run_git_with_index(repo_root, &index_path, &["add", "-A", "--", "."])?;
-    git_output_with_index(repo_root, &index_path, &["write-tree"])
+    run_git_with_index(repo_root, index_path, &["add", "-A", "--", "."])?;
+    git_output_with_index(repo_root, index_path, &["write-tree"])
 }
 
 fn restore_git_checkpoint(repo_root: &Path, git_ref: &str) -> anyhow::Result<()> {
@@ -1091,5 +1109,43 @@ mod tests {
 
         finish_turn(&session_id, &second_turn);
         assert!(active_turn_id(&session_id).is_none());
+    }
+
+    #[test]
+    fn optional_file_change_records_deletion_event() {
+        let session_id = format!("test-session-{}", Uuid::new_v4());
+        let recorder = HarnessRecorder {
+            session_id: session_id.clone(),
+            store: Arc::new(Mutex::new(None)),
+        };
+        let turn_id = Uuid::new_v4().to_string();
+        let mut rx = subscribe_events();
+        ACTIVE_TURNS.lock().insert(
+            session_id.clone(),
+            vec![ActiveTurn {
+                turn_id: turn_id.clone(),
+                recorder,
+            }],
+        );
+
+        let path = Path::new("deleted.txt");
+        record_file_change_with_tool_optional(
+            &session_id,
+            Some("tool-1"),
+            path,
+            Some(b"before"),
+            None,
+            "ApplyPatch",
+        );
+
+        let event = rx.try_recv().expect("file.changed event should be emitted");
+        assert_eq!(event.event_type, "file.changed");
+        assert_eq!(event.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert_eq!(event.tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(event.payload["after_existed"], false);
+        assert_eq!(event.payload["before_text"], "before");
+        assert!(event.payload["after_text"].is_null());
+
+        finish_turn(&session_id, &turn_id);
     }
 }

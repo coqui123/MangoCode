@@ -4,6 +4,7 @@
 //! Keyboard: ↑↓ navigate files, Tab switch pane, t toggle diff type, Esc close.
 
 use mangocode_core::file_history::FileHistory;
+use mangocode_turn_diff::patches_for_turn;
 use once_cell::sync::Lazy;
 use ratatui::{
     buffer::Buffer,
@@ -72,6 +73,14 @@ pub struct FileDiffStats {
     pub binary: bool,
     /// Is this a newly created file (no previous version)?
     pub is_new_file: bool,
+    /// Is this a deleted file (no current version)?
+    pub is_deleted_file: bool,
+    /// Stable patch id assigned for turn-scoped changes.
+    pub patch_id: Option<String>,
+    /// Conversation turn index that produced this patch.
+    pub turn_index: Option<usize>,
+    /// Tool names that contributed to this patch.
+    pub tool_names: Vec<String>,
     /// All hunks for this file.
     pub hunks: Vec<DiffHunk>,
 }
@@ -264,27 +273,42 @@ pub fn build_turn_diff(
     turn_index: usize,
     project_root: &std::path::Path,
 ) -> Vec<FileDiffStats> {
-    file_history
-        .snapshots_for_turn(turn_index)
+    patches_for_turn(file_history, turn_index, project_root)
         .into_iter()
-        .map(|snapshot| {
-            let path = relative_diff_path(&snapshot.path, project_root);
-            if snapshot.binary {
-                return FileDiffStats {
-                    path,
+        .filter_map(|patch| {
+            let is_new_file = !patch.before_exists && patch.after_exists;
+            let is_deleted_file = patch.before_exists && !patch.after_exists;
+            let mut file = if patch.binary {
+                FileDiffStats {
+                    path: patch.relative_path.clone(),
                     added: 0,
                     removed: 0,
                     binary: true,
-                    is_new_file: false,
+                    is_new_file,
+                    is_deleted_file,
+                    patch_id: None,
+                    turn_index: None,
+                    tool_names: Vec::new(),
                     hunks: Vec::new(),
-                };
-            }
+                }
+            } else {
+                let before = patch.before_text.as_deref().unwrap_or("");
+                let after = patch.after_text.as_deref().unwrap_or("");
+                build_file_diff_from_snapshots(patch.relative_path.clone(), before, after)
+            };
 
-            let before = snapshot.before_text.as_deref().unwrap_or("");
-            let after = snapshot.after_text.as_deref().unwrap_or("");
-            build_file_diff_from_snapshots(path, before, after)
+            file.is_new_file = is_new_file;
+            file.is_deleted_file = is_deleted_file;
+            file.patch_id = Some(patch.id.0);
+            file.turn_index = Some(patch.turn_index);
+            file.tool_names = patch.tool_names;
+
+            if file.binary || !file.hunks.is_empty() || is_new_file || is_deleted_file {
+                Some(file)
+            } else {
+                None
+            }
         })
-        .filter(|file| file.binary || !file.hunks.is_empty())
         .collect()
 }
 
@@ -296,13 +320,6 @@ pub fn build_latest_turn_diff(
         return Vec::new();
     };
     build_turn_diff(file_history, turn_index, project_root)
-}
-
-fn relative_diff_path(path: &std::path::Path, project_root: &std::path::Path) -> String {
-    path.strip_prefix(project_root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn build_file_diff_from_snapshots(path: String, before: &str, after: &str) -> FileDiffStats {
@@ -373,6 +390,10 @@ fn build_file_diff_from_snapshots(path: String, before: &str, after: &str) -> Fi
         removed,
         binary: false,
         is_new_file: before.is_empty() && !after.is_empty(),
+        is_deleted_file: !before.is_empty() && after.is_empty(),
+        patch_id: None,
+        turn_index: None,
+        tool_names: Vec::new(),
         hunks,
     }
 }
@@ -423,11 +444,19 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiffStats> {
                 removed: 0,
                 binary: false,
                 is_new_file: false,
+                is_deleted_file: false,
+                patch_id: None,
+                turn_index: None,
+                tool_names: Vec::new(),
                 hunks: Vec::new(),
             });
         } else if raw_line.starts_with("new file mode") {
             if let Some(f) = current_file.as_mut() {
                 f.is_new_file = true;
+            }
+        } else if raw_line.starts_with("deleted file mode") {
+            if let Some(f) = current_file.as_mut() {
+                f.is_deleted_file = true;
             }
         } else if raw_line.starts_with("Binary files ") {
             if let Some(f) = current_file.as_mut() {
@@ -597,6 +626,33 @@ pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buf
     render_diff_detail(state, panes[1], buf);
 }
 
+fn short_patch_id(id: &str) -> String {
+    let suffix = id.rsplit('-').next().unwrap_or(id);
+    format!("#{}", suffix.chars().take(8).collect::<String>())
+}
+
+fn truncate_path_tail(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+
+    let tail = path
+        .chars()
+        .rev()
+        .take(max_chars - 1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("…{tail}")
+}
+
 fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
     let focused = state.active_pane == DiffPane::FileList;
     let border_style = if focused {
@@ -626,12 +682,13 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         let selected = abs_idx == state.selected_file;
 
         // Truncate path to fit
-        let avail = inner.width.saturating_sub(10) as usize;
-        let path = if file.path.len() > avail {
-            format!("…{}", &file.path[file.path.len() - avail..])
-        } else {
-            file.path.clone()
-        };
+        let patch_badge = file
+            .patch_id
+            .as_ref()
+            .map(|id| format!(" {}", short_patch_id(id)))
+            .unwrap_or_default();
+        let avail = inner.width.saturating_sub(10 + patch_badge.len() as u16) as usize;
+        let path = truncate_path_tail(&file.path, avail);
 
         let is_collapsed = *state.collapsed.get(abs_idx).unwrap_or(&false);
         let collapse_char = if is_collapsed { "\u{25b8}" } else { "\u{25be}" }; // ▸ / ▾
@@ -639,6 +696,8 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
             ("[binary]".to_string(), Color::DarkGray)
         } else if file.is_new_file {
             (format!("[new] +{}", file.added), Color::Yellow)
+        } else if file.is_deleted_file {
+            (format!("[deleted] -{}", file.removed), Color::Red)
         } else {
             (
                 format!("+{} -{}", file.added, file.removed),
@@ -666,6 +725,7 @@ fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
                 path,
                 base_style.fg(if selected { Color::White } else { Color::Gray }),
             ),
+            Span::styled(patch_badge, Style::default().fg(Color::Cyan)),
         ]);
         let row_area = Rect {
             x: inner.x,
@@ -732,7 +792,11 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         None => return,
     };
 
-    let title = format!(" {} ", file.path);
+    let title = match (&file.patch_id, file.turn_index) {
+        (Some(id), Some(turn)) => format!(" {} [{} turn {}] ", file.path, id, turn),
+        (Some(id), None) => format!(" {} [{}] ", file.path, id),
+        _ => format!(" {} ", file.path),
+    };
     Block::default()
         .title(title.as_str())
         .borders(Borders::ALL)
@@ -1071,6 +1135,10 @@ mod tests {
             removed,
             binary: false,
             is_new_file: is_new,
+            is_deleted_file: false,
+            patch_id: None,
+            turn_index: None,
+            tool_names: Vec::new(),
             hunks: Vec::new(),
         }
     }
@@ -1109,6 +1177,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_unified_diff_deleted_file_flag() {
+        let text = "diff --git a/old.rs b/old.rs\n\
+                    deleted file mode 100644\n\
+                    index 1234567..0000000\n\
+                    --- a/old.rs\n\
+                    +++ /dev/null\n\
+                    @@ -1,1 +0,0 @@\n\
+                    -fn old() {}\n";
+        let files = parse_unified_diff(text);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_deleted_file);
+        assert_eq!(files[0].removed, 1);
+    }
+
+    #[test]
     fn build_file_diff_from_snapshots_new_file_when_before_empty() {
         let file = build_file_diff_from_snapshots("src/new.rs".to_string(), "", "fn hello() {}\n");
         assert!(
@@ -1127,6 +1210,71 @@ mod tests {
             "fn new() {}\n",
         );
         assert!(!file.is_new_file);
+    }
+
+    #[test]
+    fn build_file_diff_from_snapshots_deleted_when_after_empty() {
+        let file = build_file_diff_from_snapshots("src/old.rs".to_string(), "fn old() {}\n", "");
+        assert!(file.is_deleted_file);
+        assert_eq!(file.removed, 1);
+    }
+
+    #[test]
+    fn build_turn_diff_attaches_patch_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let mut history = FileHistory::new();
+        history.record_modification(path, b"fn old() {}\n", b"fn new() {}\n", 7, "FileEdit");
+
+        let files = build_turn_diff(&history, 7, dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].turn_index, Some(7));
+        assert!(files[0]
+            .patch_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("turn-7-")));
+        assert_eq!(files[0].tool_names, vec!["FileEdit".to_string()]);
+    }
+
+    #[test]
+    fn build_turn_diff_uses_existence_state_for_new_file_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("created.rs");
+        let deleted = dir.path().join("deleted.rs");
+        let existing_empty = dir.path().join("existing_empty.rs");
+
+        let mut history = FileHistory::new();
+        history.record_modification_with_existence(
+            created,
+            b"",
+            b"fn created() {}\n",
+            (false, true),
+            8,
+            "FileWrite",
+        );
+        history.record_modification_with_existence(
+            deleted,
+            b"",
+            b"",
+            (true, false),
+            8,
+            "ApplyPatch",
+        );
+        history.record_modification(existing_empty, b"", b"fn filled() {}\n", 8, "FileWrite");
+
+        let files = build_turn_diff(&history, 8, dir.path());
+        assert_eq!(files.len(), 3);
+        let created = files.iter().find(|file| file.path == "created.rs").unwrap();
+        assert!(created.is_new_file);
+        let deleted = files.iter().find(|file| file.path == "deleted.rs").unwrap();
+        assert!(deleted.is_deleted_file);
+        let existing = files
+            .iter()
+            .find(|file| file.path == "existing_empty.rs")
+            .unwrap();
+        assert!(!existing.is_new_file);
     }
 
     #[test]
@@ -1183,6 +1331,10 @@ mod tests {
             removed: 1,
             binary: false,
             is_new_file: false,
+            is_deleted_file: false,
+            patch_id: None,
+            turn_index: None,
+            tool_names: Vec::new(),
             hunks: vec![DiffHunk {
                 old_range: (1, 1),
                 new_range: (1, 1),
@@ -1253,6 +1405,13 @@ mod tests {
     }
 
     #[test]
+    fn truncate_path_tail_is_char_boundary_safe() {
+        assert_eq!(truncate_path_tail("src/über/long_file.rs", 8), "…file.rs");
+        assert_eq!(truncate_path_tail("abc", 0), "");
+        assert_eq!(truncate_path_tail("abc", 1), "…");
+    }
+
+    #[test]
     fn file_stats_binary_renders_badge() {
         // Verify the binary badge logic in render_file_list: binary=true → "[binary]"
         let file = FileDiffStats {
@@ -1261,6 +1420,10 @@ mod tests {
             removed: 0,
             binary: true,
             is_new_file: false,
+            is_deleted_file: false,
+            patch_id: None,
+            turn_index: None,
+            tool_names: Vec::new(),
             hunks: Vec::new(),
         };
         let (stats, _color) = if file.binary {
@@ -1269,6 +1432,11 @@ mod tests {
             (
                 format!("[new] +{}", file.added),
                 ratatui::style::Color::Yellow,
+            )
+        } else if file.is_deleted_file {
+            (
+                format!("[deleted] -{}", file.removed),
+                ratatui::style::Color::Red,
             )
         } else {
             (
@@ -1289,6 +1457,11 @@ mod tests {
                 format!("[new] +{}", file.added),
                 ratatui::style::Color::Yellow,
             )
+        } else if file.is_deleted_file {
+            (
+                format!("[deleted] -{}", file.removed),
+                ratatui::style::Color::Red,
+            )
         } else {
             (
                 format!("+{} -{}", file.added, file.removed),
@@ -1297,6 +1470,32 @@ mod tests {
         };
         assert_eq!(stats, "[new] +42");
         assert_eq!(color, ratatui::style::Color::Yellow);
+    }
+
+    #[test]
+    fn file_stats_deleted_file_renders_badge() {
+        let mut file = make_file("src/old.rs", 0, 7, false);
+        file.is_deleted_file = true;
+        let (stats, color) = if file.binary {
+            ("[binary]".to_string(), ratatui::style::Color::DarkGray)
+        } else if file.is_new_file {
+            (
+                format!("[new] +{}", file.added),
+                ratatui::style::Color::Yellow,
+            )
+        } else if file.is_deleted_file {
+            (
+                format!("[deleted] -{}", file.removed),
+                ratatui::style::Color::Red,
+            )
+        } else {
+            (
+                format!("+{} -{}", file.added, file.removed),
+                ratatui::style::Color::DarkGray,
+            )
+        };
+        assert_eq!(stats, "[deleted] -7");
+        assert_eq!(color, ratatui::style::Color::Red);
     }
 
     #[test]

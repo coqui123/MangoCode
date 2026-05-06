@@ -16,7 +16,9 @@ use crate::overlays::{
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::privacy_screen::PrivacyScreen;
-use crate::prompt_input::{InputMode, PromptInputState, VimMode};
+use crate::prompt_input::{
+    active_mention_span, InputMode, PromptInputState, TypeaheadSource, TypeaheadSuggestion, VimMode,
+};
 use crate::render;
 use crate::session_browser::SessionBrowserState;
 use crate::settings_screen::SettingsScreen;
@@ -37,11 +39,13 @@ use mangocode_core::keybindings::{
     UserKeybindings,
 };
 use mangocode_core::types::{ContentBlock, Message, Role};
+use mangocode_file_search::{FileSearchIndex, SearchKind};
 use mangocode_query::QueryEvent;
 use mangocode_tools;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::io::Stdout;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -292,6 +296,19 @@ impl GoToLineDialog {
             None
         }
     }
+}
+
+fn command_palette_items(commands: &[SlashCommandSpec]) -> Vec<SelectItem> {
+    commands
+        .iter()
+        .map(|cmd| SelectItem {
+            id: format!("/{}", cmd.name),
+            title: format!("/{}", cmd.name),
+            description: cmd.description.clone(),
+            category: cmd.group.clone(),
+            badge: None,
+        })
+        .collect()
 }
 
 /// Status of an active or completed tool call.
@@ -666,6 +683,8 @@ pub struct App {
     pub plugin_hints: Vec<PluginHintBanner>,
     /// Optional session title shown in the status bar.
     pub session_title: Option<String>,
+    /// Stable local session id used for session-scoped artifacts.
+    pub session_id: Option<String>,
     /// Remote session URL (set when bridge connects; readable by commands).
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
@@ -676,6 +695,8 @@ pub struct App {
     pub file_history: Option<Arc<parking_lot::Mutex<FileHistory>>>,
     /// Shared query-loop turn counter for turn-local diff reconstruction.
     pub current_turn: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Lazy fuzzy index backing `@file`, `@folder`, `@symbol`, and `@recent` prompt mentions.
+    pub file_search_index: Option<FileSearchIndex>,
 
     // ---- Visual mode indicators -------------------------------------------
     /// Plan mode — input border turns blue, [PLAN] shown in status bar.
@@ -1130,11 +1151,13 @@ impl App {
             notifications: NotificationQueue::new(),
             plugin_hints: Vec::new(),
             session_title: None,
+            session_id: None,
             remote_session_url: None,
             mcp_manager: None,
             pending_mcp_reconnect: false,
             file_history: None,
             current_turn: None,
+            file_search_index: None,
             plan_mode: false,
             away_summary: None,
             stall_start: None,
@@ -1555,17 +1578,10 @@ impl App {
                 DialogSelectState::new("OpenAI Codex Account", items)
             },
             command_palette: {
-                let items: Vec<SelectItem> = prompt_slash_commands
-                    .iter()
-                    .map(|cmd| SelectItem {
-                        id: format!("/{}", cmd.name),
-                        title: format!("/{}", cmd.name),
-                        description: cmd.description.clone(),
-                        category: cmd.group.clone(),
-                        badge: None,
-                    })
-                    .collect();
-                DialogSelectState::new("Command Palette", items)
+                DialogSelectState::new(
+                    "Command Palette",
+                    command_palette_items(&prompt_slash_commands),
+                )
             },
             prompt_slash_commands,
             home_dir_warning: false,
@@ -2121,6 +2137,21 @@ impl App {
                 let root = self.project_root();
                 self.refresh_turn_diff_from_history();
                 self.diff_viewer.open_turn(&root);
+                true
+            }
+            "changes-export" => {
+                match self.export_current_turn_patch_bundle() {
+                    Ok(path) => self.notifications.push(
+                        NotificationKind::Success,
+                        format!("Exported patch bundle to {}", path.display()),
+                        Some(5),
+                    ),
+                    Err(err) => self.notifications.push(
+                        NotificationKind::Warning,
+                        format!("Could not export changes: {err}"),
+                        Some(6),
+                    ),
+                }
                 true
             }
             "search" | "find" => {
@@ -2900,7 +2931,139 @@ impl App {
         self.prompt_input.mode = self.prompt_mode();
         self.prompt_input
             .update_suggestions(&self.prompt_slash_commands);
+        self.refresh_mention_suggestions();
         self.sync_legacy_prompt_fields();
+    }
+
+    pub fn refresh_prompt_slash_commands(&mut self) {
+        self.file_search_index = None;
+        let project_root = self
+            .config
+            .project_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.prompt_slash_commands = prompt_slash_commands(&project_root, &self.config.skills);
+        self.command_palette
+            .set_items(command_palette_items(&self.prompt_slash_commands));
+        self.refresh_prompt_input();
+    }
+
+    fn prompt_has_active_suggestions(&self) -> bool {
+        let has_slash_suggestion = self.prompt_input.text.starts_with('/')
+            && self
+                .prompt_input
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.source == TypeaheadSource::SlashCommand);
+        let has_file_ref_suggestion =
+            active_mention_span(&self.prompt_input.text, self.prompt_input.cursor).is_some()
+                && self
+                    .prompt_input
+                    .suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.source == TypeaheadSource::FileRef);
+
+        has_slash_suggestion || has_file_ref_suggestion
+    }
+
+    fn refresh_mention_suggestions(&mut self) {
+        if self.prompt_input.text.starts_with('/') {
+            self.prompt_input.set_file_ref_suggestions(Vec::new());
+            return;
+        }
+
+        let Some((_, _, query)) =
+            active_mention_span(&self.prompt_input.text, self.prompt_input.cursor)
+        else {
+            self.prompt_input.set_file_ref_suggestions(Vec::new());
+            return;
+        };
+
+        let suggestions = self.compute_mention_suggestions(&query);
+        self.prompt_input.set_file_ref_suggestions(suggestions);
+    }
+
+    fn compute_mention_suggestions(&mut self, query: &str) -> Vec<TypeaheadSuggestion> {
+        let (kind, raw_query) = Self::mention_query_parts(query);
+        let Some(index) = self.ensure_file_search_index() else {
+            return Vec::new();
+        };
+
+        index
+            .search(raw_query, kind, 8)
+            .into_iter()
+            .map(|hit| {
+                let entry = hit.entry;
+                let text = match kind {
+                    SearchKind::File => format!("@file:{}", entry.relative_path),
+                    SearchKind::Folder => format!("@folder:{}", entry.relative_path),
+                    SearchKind::Symbol => format!(
+                        "@symbol:{}@{}",
+                        entry.symbol_name.as_deref().unwrap_or(&entry.relative_path),
+                        entry.relative_path
+                    ),
+                    SearchKind::Recent => format!("@recent:{}", entry.relative_path),
+                    SearchKind::Any => match entry.kind {
+                        SearchKind::Folder => format!("@folder:{}", entry.relative_path),
+                        SearchKind::Symbol => format!(
+                            "@symbol:{}@{}",
+                            entry.symbol_name.as_deref().unwrap_or(&entry.relative_path),
+                            entry.relative_path
+                        ),
+                        _ => format!("@file:{}", entry.relative_path),
+                    },
+                };
+                let description = match entry.kind {
+                    SearchKind::Folder => format!("folder {}", entry.relative_path),
+                    SearchKind::Symbol => format!("symbol in {}", entry.relative_path),
+                    _ if kind == SearchKind::Recent => format!("recent {}", entry.relative_path),
+                    _ => entry.relative_path.clone(),
+                };
+                TypeaheadSuggestion {
+                    text,
+                    description,
+                    source: TypeaheadSource::FileRef,
+                }
+            })
+            .collect()
+    }
+
+    fn mention_query_parts(query: &str) -> (SearchKind, &str) {
+        if let Some(rest) = query.strip_prefix("file:") {
+            (SearchKind::File, rest)
+        } else if let Some(rest) = query.strip_prefix("folder:") {
+            (SearchKind::Folder, rest)
+        } else if let Some(rest) = query.strip_prefix("symbol:") {
+            (SearchKind::Symbol, rest)
+        } else if let Some(rest) = query.strip_prefix("recent:") {
+            (SearchKind::Recent, rest)
+        } else {
+            (SearchKind::Any, query)
+        }
+    }
+
+    fn ensure_file_search_index(&mut self) -> Option<&FileSearchIndex> {
+        if self.file_search_index.is_none() {
+            self.file_search_index = self.rebuild_file_search_index();
+        }
+        self.file_search_index.as_ref()
+    }
+
+    fn rebuild_file_search_index(&self) -> Option<FileSearchIndex> {
+        let root = self.project_root();
+        let mut index = FileSearchIndex::build_limited(&root, 20_000).ok()?;
+        index.add_lightweight_symbols(512, 4096);
+
+        if let Some(file_history) = self.file_history.as_ref() {
+            let history = file_history.lock();
+            let recent_entries = history.entries().iter().rev().take(256).collect::<Vec<_>>();
+            for entry in recent_entries.into_iter().rev() {
+                index.mark_recent(&entry.path);
+            }
+        }
+
+        Some(index)
     }
 
     pub fn set_prompt_text(&mut self, text: String) {
@@ -2965,6 +3128,7 @@ impl App {
     ) {
         self.file_history = Some(file_history);
         self.current_turn = Some(current_turn);
+        self.file_search_index = None;
         self.refresh_turn_diff_from_history();
     }
 
@@ -3034,27 +3198,54 @@ impl App {
     }
 
     fn refresh_turn_diff_from_history(&mut self) {
+        self.file_search_index = None;
         let Some(file_history) = self.file_history.as_ref() else {
             self.diff_viewer.set_turn_diff(Vec::new());
             return;
         };
-        let Some(current_turn) = self.current_turn.as_ref() else {
-            self.diff_viewer.set_turn_diff(Vec::new());
-            return;
-        };
-
-        let turn_index = current_turn.load(std::sync::atomic::Ordering::Relaxed);
-        if turn_index == 0 {
-            self.diff_viewer.set_turn_diff(Vec::new());
-            return;
-        }
 
         let root = self.project_root();
         let files = {
             let history = file_history.lock();
+            let Some(turn_index) = history.latest_turn_index() else {
+                self.diff_viewer.set_turn_diff(Vec::new());
+                return;
+            };
             build_turn_diff(&history, turn_index, &root)
         };
         self.diff_viewer.set_turn_diff(files);
+    }
+
+    fn export_current_turn_patch_bundle(&self) -> anyhow::Result<std::path::PathBuf> {
+        let file_history = self
+            .file_history
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("file history is not attached"))?;
+
+        let root = self.project_root();
+        let session_id = self
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("session id is not attached"))?;
+        let (turn_index, bundle) = {
+            let history = file_history.lock();
+            let Some(turn_index) = history.latest_turn_index() else {
+                anyhow::bail!("no turn changes have been captured yet");
+            };
+            (
+                turn_index,
+                mangocode_turn_diff::export_patch_bundle(session_id, &history, turn_index, &root),
+            )
+        };
+        if bundle.file_list.is_empty() {
+            anyhow::bail!("no changes captured for turn {turn_index}");
+        }
+
+        let dir = root.join(".mangocode").join("patch-bundles");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("turn-{turn_index}.patch.json"));
+        fs::write(&path, serde_json::to_vec_pretty(&bundle)?)?;
+        Ok(path)
     }
 
     // -------------------------------------------------------------------
@@ -4282,7 +4473,7 @@ impl App {
                 self.sync_legacy_prompt_fields();
             }
             KeyCode::Tab if !self.is_streaming => {
-                if !self.prompt_input.suggestions.is_empty() {
+                if self.prompt_has_active_suggestions() {
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
@@ -4320,9 +4511,8 @@ impl App {
                 }
 
                 // If a slash-command suggestion is selected, accept it instead of submitting.
-                if !self.prompt_input.suggestions.is_empty()
+                if self.prompt_has_active_suggestions()
                     && self.prompt_input.suggestion_index.is_some()
-                    && self.prompt_input.text.starts_with('/')
                 {
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
@@ -4353,9 +4543,7 @@ impl App {
 
             // ---- Input history navigation ------------------------------
             KeyCode::Up => {
-                if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
-                {
+                if self.prompt_has_active_suggestions() {
                     self.prompt_input.suggestion_prev();
                 } else if !self.prompt_input.history.is_empty() {
                     self.prompt_input.history_up();
@@ -4363,9 +4551,7 @@ impl App {
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
-                {
+                if self.prompt_has_active_suggestions() {
                     self.prompt_input.suggestion_next();
                 } else if self.prompt_input.history_pos.is_some() {
                     self.prompt_input.history_down();
@@ -4823,7 +5009,7 @@ impl App {
             }
             "submit" => !self.is_streaming,
             "indent" => {
-                if !self.is_streaming && !self.prompt_input.suggestions.is_empty() {
+                if !self.is_streaming && self.prompt_has_active_suggestions() {
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
@@ -4834,9 +5020,7 @@ impl App {
             }
             "historyPrev" => {
                 // Slash-command suggestions take priority over history.
-                if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
-                {
+                if self.prompt_has_active_suggestions() {
                     self.prompt_input.suggestion_prev();
                     self.refresh_prompt_input();
                 } else if !self.prompt_input.history.is_empty() {
@@ -4847,9 +5031,7 @@ impl App {
             }
             "historyNext" => {
                 // Slash-command suggestions take priority over history.
-                if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
-                {
+                if self.prompt_has_active_suggestions() {
                     self.prompt_input.suggestion_next();
                     self.refresh_prompt_input();
                 } else if self.prompt_input.history_pos.is_some() {
@@ -5012,9 +5194,8 @@ impl App {
             "sendMessage" => {
                 // Ctrl+M: Send message (alternative to Enter)
                 // Keep slash-command suggestion behavior aligned with Enter.
-                if !self.prompt_input.suggestions.is_empty()
+                if self.prompt_has_active_suggestions()
                     && self.prompt_input.suggestion_index.is_some()
-                    && self.prompt_input.text.starts_with('/')
                 {
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
@@ -6158,6 +6339,7 @@ impl App {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use std::path::PathBuf;
 
     fn make_app() -> App {
         let config = Config::default();
@@ -6218,8 +6400,10 @@ mod tests {
 
     #[test]
     fn test_model_picker_infers_provider_from_model_name_when_unset() {
-        let mut config = Config::default();
-        config.model = Some("ollama/llama3.2".to_string());
+        let config = Config {
+            model: Some("ollama/llama3.2".to_string()),
+            ..Default::default()
+        };
         let cost_tracker = mangocode_core::cost::CostTracker::new();
         let app = App::new(config, cost_tracker);
 
@@ -6600,5 +6784,137 @@ mod tests {
         let should_submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!should_submit);
         assert_eq!(app.prompt_input.text, "hello");
+    }
+
+    #[test]
+    fn test_tab_ignores_stale_file_ref_suggestion_without_active_mention() {
+        let mut app = make_app();
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = 0;
+        app.prompt_input.suggestions = vec![TypeaheadSuggestion {
+            text: "@file:src/main.rs".to_string(),
+            description: "src/main.rs".to_string(),
+            source: TypeaheadSource::FileRef,
+        }];
+        app.prompt_input.suggestion_index = Some(0);
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "hello");
+    }
+
+    #[test]
+    fn test_tab_ignores_stale_slash_suggestion_for_active_mention() {
+        let mut app = make_app();
+        app.prompt_input.text = "open @src".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.prompt_input.suggestions = vec![TypeaheadSuggestion {
+            text: "/help".to_string(),
+            description: "Show help".to_string(),
+            source: TypeaheadSource::SlashCommand,
+        }];
+        app.prompt_input.suggestion_index = Some(0);
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "open @src");
+    }
+
+    #[test]
+    fn test_prompt_update_clears_stale_file_ref_suggestions_without_active_mention() {
+        let mut app = make_app();
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.prompt_input.suggestions = vec![TypeaheadSuggestion {
+            text: "@file:src/main.rs".to_string(),
+            description: "src/main.rs".to_string(),
+            source: TypeaheadSource::FileRef,
+        }];
+        app.prompt_input.suggestion_index = Some(0);
+
+        app.refresh_prompt_input();
+
+        assert!(app.prompt_input.suggestions.is_empty());
+        assert!(app.prompt_input.suggestion_index.is_none());
+    }
+
+    #[test]
+    fn test_changes_uses_latest_file_changing_turn_not_current_turn() {
+        let mut app = make_app();
+        let file_history = Arc::new(parking_lot::Mutex::new(FileHistory::new()));
+        let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        file_history.lock().record_modification(
+            PathBuf::from("src/lib.rs"),
+            b"fn before() {}\n",
+            b"fn after() {}\n",
+            1,
+            "FileEdit",
+        );
+        app.attach_turn_diff_state(file_history, current_turn);
+
+        assert!(app.intercept_slash_command("changes"));
+        assert_eq!(app.diff_viewer.files.len(), 1);
+        assert_eq!(app.diff_viewer.files[0].turn_index, Some(1));
+        assert_eq!(app.diff_viewer.files[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn test_changes_export_uses_session_id_and_latest_changed_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app();
+        app.config.project_dir = Some(dir.path().to_path_buf());
+        app.session_id = Some("session-abc".to_string());
+        let file_history = Arc::new(parking_lot::Mutex::new(FileHistory::new()));
+        let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        file_history.lock().record_modification(
+            dir.path().join("README.md"),
+            b"before\n",
+            b"after\n",
+            1,
+            "FileWrite",
+        );
+        app.attach_turn_diff_state(file_history, current_turn);
+
+        let path = app.export_current_turn_patch_bundle().unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(value["session_id"], "session-abc");
+        assert_eq!(value["turn_index"], 1);
+        assert_eq!(value["file_list"], serde_json::json!(["README.md"]));
+    }
+
+    #[test]
+    fn test_file_ref_index_rebuilds_after_project_root_change() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("alpha.rs"), "").unwrap();
+        std::fs::write(second.path().join("beta.rs"), "").unwrap();
+
+        let mut app = make_app();
+        app.config.project_dir = Some(first.path().to_path_buf());
+        app.set_prompt_text("open @alp".to_string());
+        assert!(app
+            .prompt_input
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.text == "@file:alpha.rs"));
+
+        app.config.project_dir = Some(second.path().to_path_buf());
+        app.refresh_prompt_slash_commands();
+        app.set_prompt_text("open @bet".to_string());
+
+        assert!(app
+            .prompt_input
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.text == "@file:beta.rs"));
+        assert!(!app
+            .prompt_input
+            .suggestions
+            .iter()
+            .any(|suggestion| suggestion.text == "@file:alpha.rs"));
     }
 }

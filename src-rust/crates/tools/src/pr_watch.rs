@@ -1,3 +1,5 @@
+#![cfg_attr(not(feature = "tool-pr-watch"), allow(dead_code, unused_imports))]
+
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -7,6 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "tool-pr-watch")]
 pub struct PrWatchTool;
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +96,7 @@ impl CheckSummary {
     }
 }
 
+#[cfg(feature = "tool-pr-watch")]
 #[async_trait]
 impl Tool for PrWatchTool {
     fn name(&self) -> &str {

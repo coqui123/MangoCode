@@ -1,0 +1,12 @@
+[package]
+name = "mangocode-file-search"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glob = { workspace = true }
+serde = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

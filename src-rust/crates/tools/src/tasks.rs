@@ -4,6 +4,18 @@
 // Tasks have id, subject, description, status, owner, blocks/blocked-by dependencies,
 // and optional output.
 
+#![cfg_attr(
+    not(any(
+        feature = "tool-task-create",
+        feature = "tool-task-get",
+        feature = "tool-task-list",
+        feature = "tool-task-output",
+        feature = "tool-task-stop",
+        feature = "tool-task-update"
+    )),
+    allow(dead_code, unused_imports)
+)]
+
 use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -116,6 +128,7 @@ pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> = Lazy::new(|| Arc::new(
 // TaskCreate
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-create")]
 pub struct TaskCreateTool;
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +139,7 @@ struct TaskCreateInput {
     metadata: Option<Value>,
 }
 
+#[cfg(feature = "tool-task-create")]
 #[async_trait]
 impl Tool for TaskCreateTool {
     fn name(&self) -> &str {
@@ -177,6 +191,7 @@ impl Tool for TaskCreateTool {
 // TaskGet
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-get")]
 pub struct TaskGetTool;
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +200,7 @@ struct TaskGetInput {
     task_id: String,
 }
 
+#[cfg(feature = "tool-task-get")]
 #[async_trait]
 impl Tool for TaskGetTool {
     fn name(&self) -> &str {
@@ -228,6 +244,7 @@ impl Tool for TaskGetTool {
 // TaskUpdate
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-update")]
 pub struct TaskUpdateTool;
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +269,7 @@ struct TaskUpdateInput {
     output: Option<String>,
 }
 
+#[cfg(feature = "tool-task-update")]
 #[async_trait]
 impl Tool for TaskUpdateTool {
     fn name(&self) -> &str {
@@ -373,8 +391,10 @@ impl Tool for TaskUpdateTool {
 // TaskList
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-list")]
 pub struct TaskListTool;
 
+#[cfg(feature = "tool-task-list")]
 #[async_trait]
 impl Tool for TaskListTool {
     fn name(&self) -> &str {
@@ -426,6 +446,7 @@ impl Tool for TaskListTool {
 // TaskStop
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-stop")]
 pub struct TaskStopTool;
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +455,7 @@ struct TaskStopInput {
     task_id: String,
 }
 
+#[cfg(feature = "tool-task-stop")]
 #[async_trait]
 impl Tool for TaskStopTool {
     fn name(&self) -> &str {
@@ -489,6 +511,7 @@ impl Tool for TaskStopTool {
 // TaskOutput
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-task-output")]
 pub struct TaskOutputTool;
 
 #[derive(Debug, Deserialize)]
@@ -504,6 +527,7 @@ fn default_block() -> bool {
     true
 }
 
+#[cfg(feature = "tool-task-output")]
 #[async_trait]
 impl Tool for TaskOutputTool {
     fn name(&self) -> &str {

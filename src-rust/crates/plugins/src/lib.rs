@@ -69,37 +69,105 @@ pub fn check_plugin_capability(def: &PluginCommandDef) -> Result<(), String> {
 use std::path::Path;
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
-// Global hook registry (set once at startup, read during tool execution)
-// ---------------------------------------------------------------------------
-
-static GLOBAL_HOOK_REGISTRY: OnceLock<HookRegistry> = OnceLock::new();
+use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
-// Global plugin registry (set once at startup, read by commands / tools)
+// Global hook registry (loaded at startup, updateable by /plugin reload)
 // ---------------------------------------------------------------------------
 
-static GLOBAL_PLUGIN_REGISTRY: OnceLock<PluginRegistry> = OnceLock::new();
+static GLOBAL_HOOK_REGISTRY: OnceLock<RwLock<HookRegistry>> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Global plugin registry (loaded at startup, updateable by /plugin reload)
+// ---------------------------------------------------------------------------
+
+static GLOBAL_PLUGIN_REGISTRY: OnceLock<RwLock<PluginRegistry>> = OnceLock::new();
 
 /// Store the fully-loaded `PluginRegistry` into a process-global static so
 /// that slash commands and tools can query it without carrying the registry
 /// through every call frame.
 pub fn set_global_registry(registry: PluginRegistry) {
-    // OnceLock::set fails silently if already initialised (e.g. during tests).
-    let _ = GLOBAL_PLUGIN_REGISTRY.set(registry);
+    let global = GLOBAL_PLUGIN_REGISTRY.get_or_init(|| RwLock::new(PluginRegistry::new()));
+    *global.write() = registry;
 }
 
 /// Access the global `PluginRegistry`, if it has been set.
-pub fn global_plugin_registry() -> Option<&'static PluginRegistry> {
-    GLOBAL_PLUGIN_REGISTRY.get()
+pub fn global_plugin_registry() -> Option<PluginRegistry> {
+    GLOBAL_PLUGIN_REGISTRY
+        .get()
+        .map(|registry| registry.read().clone())
 }
 
 /// Store the hook registry built from loaded plugins into a process-global
 /// static so that `run_global_pre_tool_hook` / `run_global_post_tool_hook`
 /// can access it from anywhere without passing the registry around.
 pub fn set_global_hooks(registry: HookRegistry) {
-    // OnceLock::set fails silently if already initialised (e.g. during tests).
-    let _ = GLOBAL_HOOK_REGISTRY.set(registry);
+    let global = GLOBAL_HOOK_REGISTRY.get_or_init(|| RwLock::new(HookRegistry::new()));
+    *global.write() = registry;
+}
+
+/// Return true when the global plugin hook registry has entries for `event`.
+pub fn has_global_hooks_for_event(event: HookEventKind) -> bool {
+    let Some(registry) = GLOBAL_HOOK_REGISTRY.get() else {
+        return false;
+    };
+    registry
+        .read()
+        .get(&event.to_string())
+        .is_some_and(|hooks| !hooks.is_empty())
+}
+
+/// Run non-tool lifecycle hooks registered by plugins.
+///
+/// Matchers are only meaningful for tool hooks; for lifecycle hooks, empty or
+/// wildcard matchers run and specific tool matchers are ignored.
+pub fn run_global_lifecycle_hook(
+    event: HookEventKind,
+    payload: serde_json::Value,
+) -> hooks::HookOutcome {
+    let registry = match GLOBAL_HOOK_REGISTRY.get() {
+        Some(r) => r.read(),
+        None => return hooks::HookOutcome::Allow,
+    };
+
+    let hooks_for_event = match registry.get(&event.to_string()) {
+        Some(h) => h,
+        None => return hooks::HookOutcome::Allow,
+    };
+    let event_json = payload.to_string();
+
+    for hook in hooks_for_event {
+        if let Some(ref matcher) = hook.matcher {
+            if !matcher.is_empty() && matcher != "*" {
+                continue;
+            }
+        }
+        match hooks::run_hook_sync(hook, &event_json) {
+            hooks::HookOutcome::Deny(reason) => return hooks::HookOutcome::Deny(reason),
+            hooks::HookOutcome::Allow | hooks::HookOutcome::Error(_) => {}
+        }
+    }
+
+    hooks::HookOutcome::Allow
+}
+
+/// Run all `UserPromptSubmit` hooks registered by plugins.
+pub fn run_global_user_prompt_submit_hook(
+    prompt: &str,
+    session_id: Option<&str>,
+) -> hooks::HookOutcome {
+    run_global_lifecycle_hook(
+        HookEventKind::UserPromptSubmit,
+        serde_json::json!({
+            "event": "UserPromptSubmit",
+            "prompt": prompt,
+            "tool_name": null,
+            "tool_input": null,
+            "tool_output": prompt,
+            "is_error": null,
+            "session_id": session_id,
+        }),
+    )
 }
 
 /// Run all `PreToolUse` hooks registered by plugins for the given tool.
@@ -111,7 +179,7 @@ pub fn run_global_pre_tool_hook(
     tool_input: &serde_json::Value,
 ) -> hooks::HookOutcome {
     let registry = match GLOBAL_HOOK_REGISTRY.get() {
-        Some(r) => r,
+        Some(r) => r.read(),
         None => return hooks::HookOutcome::Allow,
     };
 
@@ -153,7 +221,7 @@ pub fn run_global_post_tool_hook(
     is_error: bool,
 ) {
     let registry = match GLOBAL_HOOK_REGISTRY.get() {
-        Some(r) => r,
+        Some(r) => r.read(),
         None => return,
     };
 

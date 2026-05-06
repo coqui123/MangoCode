@@ -13,7 +13,7 @@ use std::collections::HashMap;
 ///
 /// Methods follow the TS pattern: `enabled()` returns only enabled plugins,
 /// `all()` returns every plugin including disabled ones.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PluginRegistry {
     /// All plugins keyed by name.
     plugins: HashMap<String, LoadedPlugin>,
