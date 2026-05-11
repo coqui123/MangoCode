@@ -34,9 +34,9 @@ impl Tool for ToolSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for available tools by name, alias, source, or keyword. Use 'select:ToolName' \
-         for direct lookup. Results are generated from the live registry, including built-ins, \
-         aliases, and connected MCP tools."
+        "Search for runtime-visible tools by name, alias, source, or keyword. Use 'select:ToolName' \
+         for direct lookup. Results are filtered by build features, session visibility config, and \
+         connected MCP tools."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -91,7 +91,7 @@ impl Tool for ToolSearchTool {
 
             if found.is_empty() {
                 return ToolResult::success(format!(
-                    "No matching tools found for: {}. Use a broader ToolSearch query or check whether the relevant plugin, MCP server, or feature flag is enabled.",
+                    "No matching runtime-visible tools found for: {}. Use a broader ToolSearch query or check whether the relevant plugin, MCP server, feature flag, and session visibility config permit it.",
                     missing.join(", ")
                 ));
             }
@@ -119,7 +119,7 @@ impl Tool for ToolSearchTool {
 
         if scored.is_empty() {
             return ToolResult::success(format!(
-                "No tools found matching '{}'. Try broader keywords, an alias such as shell_command or apply_patch, or use 'select:ToolName'.",
+                "No runtime-visible tools found matching '{}'. Try broader keywords, use 'select:ToolName' with a visible tool name or alias, or check whether plugin, MCP, feature flag, and session visibility config allow the expected tool.",
                 query
             ));
         }
@@ -264,14 +264,6 @@ fn format_live_entry(entry: &LiveToolEntry) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(any(
-        feature = "tool-agent",
-        all(
-            feature = "tool-apply-patch",
-            feature = "tool-bash",
-            feature = "tool-read"
-        )
-    ))]
     fn test_context() -> ToolContext {
         ToolContext {
             working_dir: std::path::PathBuf::from("/workspace"),
@@ -327,6 +319,37 @@ mod tests {
 
         assert!(entry_name_matches(&entry, "shell-command"));
         assert!(entry_name_matches(&entry, "container-exec"));
+    }
+
+    #[tokio::test]
+    async fn no_result_message_uses_runtime_visible_wording() {
+        let ctx = test_context();
+        let result = ToolSearchTool
+            .execute(
+                json!({
+                    "query": "definitely-not-a-real-tool-name",
+                    "max_results": 5
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("visible tool name or alias"));
+        assert!(result.content.contains("session visibility config"));
+        assert!(!result.content.contains("shell_command or apply_patch"));
+    }
+
+    #[tokio::test]
+    async fn select_missing_message_mentions_visibility_config() {
+        let ctx = test_context();
+        let result = ToolSearchTool
+            .execute(json!({ "query": "select:DefinitelyMissing" }), &ctx)
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("runtime-visible tools"));
+        assert!(result.content.contains("session visibility config"));
     }
 
     #[cfg(all(

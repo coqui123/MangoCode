@@ -60,18 +60,20 @@ Tools:
 - `DocSearch` finds official or primary docs first and also searches MangoCode's local research index.
 - `DocRead` reads one URL or local doc into clean Markdown with citation metadata.
 - `DeepRead` reads multiple sources and returns a concise research brief with facts, source list, staleness notes, examples, and implementation implications.
-- `RenderedFetch` forces the browser-backed rendered extraction path directly when a docs page is heavily client-rendered or hidden behind tabs/accordions.
+- In `full-tools` or explicit `tool-rendered-fetch` builds, `RenderedFetch` forces the browser-backed rendered extraction path directly when a docs page is heavily client-rendered or hidden behind tabs/accordions.
 
 The source index lives at `~/.mangocode/research/research-v1/source-index.json`. Every successful `DocRead` or fetched research document is indexed, so future searches can reuse trusted docs even when web search is weak or offline.
 
-Rendered browser fallback is optional and uses MangoCode's browser feature build:
+Rendered browser fallback for `DocRead`/`DeepRead` is optional and uses MangoCode's browser-backed extraction build:
 
 ```powershell
 cd src-rust
 cargo run -p mangocode --features browser
 ```
 
-Without the browser feature, MangoCode still uses HTTP extraction plus native script-data extraction.
+Use `--features browser` when you also want the interactive `Browser` tool, or `--features tool-rendered-fetch` when you only want the direct rendered research path. Without either rendered feature, MangoCode still uses HTTP extraction plus native script-data extraction.
+
+The direct `RenderedFetch` tool is only registered by `full-tools` or `tool-rendered-fetch`; the `browser` feature enables rendered fallback and the interactive `Browser` tool without exposing `RenderedFetch` by itself.
 
 If you want to replace MangoCode's native public web search and research tools with an external MCP research/search server, build without the native web/research tool features:
 

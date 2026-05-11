@@ -74,6 +74,21 @@ fn interpreter_for(language: &str) -> Option<(&'static str, Vec<&'static str>)> 
     }
 }
 
+fn normalize_repl_language(value: Option<&str>) -> Result<&'static str, String> {
+    match value.unwrap_or("bash").trim().to_ascii_lowercase().as_str() {
+        "" | "bash" => Ok("bash"),
+        "python" | "python3" => Ok("python"),
+        "javascript" | "node" => Ok("javascript"),
+        other => {
+            let value =
+                serde_json::to_string(other).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid language: {value}. Expected one of: bash, python, javascript"
+            ))
+        }
+    }
+}
+
 /// Build the code block + sentinel emission for the given language.
 fn wrap_code(language: &str, code: &str) -> String {
     match language {
@@ -171,7 +186,7 @@ async fn run_in_session(
                 return Err(format!(
                     "Interpreter timed out after {}s waiting for output.",
                     read_timeout.as_secs()
-                ))
+                ));
             }
             Ok(Err(e)) => return Err(format!("Read error: {}", e)),
             Ok(Ok(0)) => {
@@ -248,7 +263,16 @@ impl Tool for ReplTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let language = params.language.as_deref().unwrap_or("bash").to_lowercase();
+        let language = match normalize_repl_language(params.language.as_deref()) {
+            Ok(language) => language.to_string(),
+            Err(e) => return ToolResult::error(e),
+        };
+
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Run {} REPL code", language), false)
+        {
+            return ToolResult::error(e.to_string());
+        }
 
         debug!(
             session = %ctx.session_id,
@@ -270,5 +294,22 @@ impl Tool for ReplTool {
                 ToolResult::error(format!("REPL error: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repl_language_is_normalized_or_rejected_before_execution() {
+        assert_eq!(normalize_repl_language(None), Ok("bash"));
+        assert_eq!(normalize_repl_language(Some(" PYTHON3 ")), Ok("python"));
+        assert_eq!(normalize_repl_language(Some(" node ")), Ok("javascript"));
+
+        let err = normalize_repl_language(Some("python\nbash"))
+            .expect_err("invalid language must be rejected");
+        assert!(err.contains("Invalid language"));
+        assert!(err.contains("\"python\\nbash\""));
     }
 }

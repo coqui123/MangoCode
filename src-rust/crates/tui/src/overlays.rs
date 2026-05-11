@@ -4,19 +4,48 @@
 //   - MessageSelectorOverlay (/rewind step 1)
 //   - RewindFlowOverlay (/rewind full multi-step flow)
 
+use crate::casefold::{
+    case_insensitive_first_match, lowercase_chars_with_original_starts,
+    original_char_starts_for_range,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const MANGOCODE_ACCENT: Color = Color::Rgb(255, 176, 32); // #FFB020 golden mango
 pub const MANGOCODE_PANEL_BG: Color = Color::Rgb(26, 20, 15); // #1A140F warm dark brown
 pub const MANGOCODE_PANEL_BORDER: Color = Color::Rgb(90, 78, 65); // warm medium brown
 pub const MANGOCODE_TEXT: Color = Color::Rgb(253, 246, 227); // #FDF6E3 cream
 pub const MANGOCODE_MUTED: Color = Color::Rgb(138, 125, 115); // #8A7D73 warm muted
+
+fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "\u{2026}".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width >= max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('\u{2026}');
+    out
+}
 pub const MANGOCODE_OVERLAY_BG: Color = Color::Rgb(18, 14, 10); // #120E0A deep warm brown
 
 // ---------------------------------------------------------------------------
@@ -563,40 +592,28 @@ pub fn subsequence_score(query: &str, target: &str) -> Option<(f32, Vec<usize>)>
         return Some((0.0, Vec::new()));
     }
 
-    let q_lc = query.to_lowercase();
-    let t_lc = target.to_lowercase();
+    let q_chars: Vec<char> = query.to_lowercase().chars().collect();
 
     // --- Fast path: substring match (always wins over subsequence) ----------
-    if let Some(pos) = t_lc.find(q_lc.as_str()) {
-        let position_bonus = 1.0 / (1.0 + pos as f32);
+    if let Some(case_match) = case_insensitive_first_match(target, query) {
+        let position_bonus = 1.0 / (1.0 + case_match.lower_start as f32);
         let score = 1.0 + position_bonus;
-        // Matched positions are the contiguous byte range [pos, pos+q_lc.len())
-        let positions: Vec<usize> = (pos..pos + q_lc.len()).collect();
+        let positions = original_char_starts_for_range(
+            target,
+            case_match.original_start,
+            case_match.original_end,
+        );
         return Some((score, positions));
     }
 
     // --- Subsequence path ---------------------------------------------------
-    let q_chars: Vec<char> = q_lc.chars().collect();
-    let t_chars: Vec<char> = t_lc.chars().collect();
+    let t_chars = lowercase_chars_with_original_starts(target);
 
     let mut q_pos = 0usize;
-    // Map: char index in t_chars -> byte offset in original target
-    let t_byte_offsets: Vec<usize> = {
-        let mut off = 0usize;
-        t_chars
-            .iter()
-            .map(|c| {
-                let o = off;
-                off += c.len_utf8();
-                o
-            })
-            .collect()
-    };
-
     let mut matched_char_indices: Vec<usize> = Vec::with_capacity(q_chars.len());
 
-    for (t_i, &tc) in t_chars.iter().enumerate() {
-        if q_pos < q_chars.len() && tc == q_chars[q_pos] {
+    for (t_i, tc) in t_chars.iter().enumerate() {
+        if q_pos < q_chars.len() && tc.ch == q_chars[q_pos] {
             matched_char_indices.push(t_i);
             q_pos += 1;
         }
@@ -627,10 +644,13 @@ pub fn subsequence_score(query: &str, target: &str) -> Option<(f32, Vec<usize>)>
     let position_bonus = 1.0 / (1.0 + first_match_pos as f32);
     let score = consecutive_run_bonus + position_bonus;
 
-    let byte_positions: Vec<usize> = matched_char_indices
-        .iter()
-        .map(|&ci| t_byte_offsets[ci])
-        .collect();
+    let mut byte_positions: Vec<usize> = Vec::with_capacity(matched_char_indices.len());
+    for ci in matched_char_indices {
+        let original_start = t_chars[ci].original_start;
+        if byte_positions.last().copied() != Some(original_start) {
+            byte_positions.push(original_start);
+        }
+    }
 
     Some((score, byte_positions))
 }
@@ -748,7 +768,7 @@ impl HistorySearchOverlay {
     // ------------------------------------------------------------------
 
     fn recompute_matches(&mut self) {
-        let q = self.query.to_lowercase();
+        let q = self.query.clone();
         let mut scored: Vec<MatchEntry> = self
             .snapshot
             .iter()
@@ -1184,11 +1204,7 @@ pub fn render_message_selector(frame: &mut Frame, overlay: &MessageSelectorOverl
             let tool_tag = if msg.has_tool_use { " [tool]" } else { "" };
 
             let preview_max = dialog_width as usize - 20;
-            let preview = if UnicodeWidthStr::width(msg.preview.as_str()) > preview_max {
-                format!("{}…", &msg.preview[..preview_max.saturating_sub(1)])
-            } else {
-                msg.preview.clone()
-            };
+            let preview = truncate_to_width_with_ellipsis(&msg.preview, preview_max);
 
             let prefix = if is_selected { "  \u{25BA} " } else { "    " };
             let idx_style = if is_selected {
@@ -1709,16 +1725,15 @@ pub fn render_global_search(
 
                 // Highlight query match in text
                 let text_trimmed = result.text.trim();
-                let query_lc = state.query.to_lowercase();
-                let text_spans: Vec<Span<'static>> = if !query_lc.is_empty() {
-                    let text_lc = text_trimmed.to_lowercase();
-                    if let Some(pos) = text_lc.find(query_lc.as_str()) {
-                        let before: String = text_trimmed
-                            .chars()
-                            .take(text_trimmed[..pos].chars().count())
-                            .collect();
-                        let matched: String = text_trimmed[pos..pos + query_lc.len()].to_string();
-                        let after: String = text_trimmed[pos + query_lc.len()..]
+                let text_spans: Vec<Span<'static>> = if !state.query.is_empty() {
+                    if let Some(case_match) =
+                        case_insensitive_first_match(text_trimmed, &state.query)
+                    {
+                        let before = text_trimmed[..case_match.original_start].to_string();
+                        let matched = text_trimmed
+                            [case_match.original_start..case_match.original_end]
+                            .to_string();
+                        let after: String = text_trimmed[case_match.original_end..]
                             .chars()
                             .take(30)
                             .collect();
@@ -1800,6 +1815,14 @@ pub fn render_global_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncates_overlay_preview_on_unicode_char_boundaries() {
+        let truncated = truncate_to_width_with_ellipsis("preview Café 中 message", 13);
+
+        assert!(truncated.ends_with('…'));
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 13);
+    }
 
     // --- HelpOverlay ---------------------------------------------------
 
@@ -1917,6 +1940,20 @@ mod tests {
         // "git" at position 0 in "git commit" → positions 0,1,2
         let (_, positions) = subsequence_score("git", "git commit").unwrap();
         assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn subseq_score_maps_expanding_lowercase_substring_to_original_chars() {
+        let (_, positions) = subsequence_score("i\u{0307}", "x\u{0130}y").unwrap();
+
+        assert_eq!(positions, vec![1]);
+    }
+
+    #[test]
+    fn subseq_score_maps_expanding_lowercase_subsequence_to_original_chars() {
+        let (_, positions) = subsequence_score("iy", "x\u{0130}y").unwrap();
+
+        assert_eq!(positions, vec![1, 3]);
     }
 
     #[test]

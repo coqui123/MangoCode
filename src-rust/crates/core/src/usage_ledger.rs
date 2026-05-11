@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::truncate::truncate_bytes_prefix;
+
 const USAGE_FILE: &str = "usage.json";
 const LEDGER_VERSION: u32 = 1;
 
@@ -161,16 +163,8 @@ impl UsageLedger {
         let start = self.sessions.len().saturating_sub(safe_n);
 
         for record in &self.sessions[start..] {
-            let id_short = if record.session_id.len() > 8 {
-                &record.session_id[..8]
-            } else {
-                &record.session_id
-            };
-            let ts_short = if record.timestamp.len() > 19 {
-                &record.timestamp[..19]
-            } else {
-                &record.timestamp
-            };
+            let id_short = truncate_bytes_prefix(&record.session_id, 8);
+            let ts_short = truncate_bytes_prefix(&record.timestamp, 19);
             let total_tok = record.input_tokens
                 + record.output_tokens
                 + record.cache_creation_tokens
@@ -282,5 +276,35 @@ fn format_tokens(t: u64) -> String {
         format!("{:.1}K", t as f64 / 1_000.0)
     } else {
         format!("{}", t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_history_handles_multibyte_record_prefixes() {
+        let ledger = UsageLedger {
+            total_sessions: 1,
+            total_cost_usd: 0.01,
+            sessions: vec![SessionCostRecord {
+                session_id: "☃☃☃session".to_string(),
+                timestamp: "éééééééééé2026".to_string(),
+                model: "test-model".to_string(),
+                cost_usd: 0.01,
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                duration_ms: 10,
+                working_dir: String::new(),
+            }],
+            ..UsageLedger::default()
+        };
+
+        let history = ledger.format_history(1);
+        assert!(history.contains("☃☃"));
+        assert!(history.contains("ééééééééé"));
     }
 }

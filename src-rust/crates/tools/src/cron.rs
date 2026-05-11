@@ -27,6 +27,7 @@
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Local, Timelike};
+#[cfg(feature = "tool-cron-list")]
 use mangocode_core::truncate::truncate_bytes_with_ellipsis;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
+#[cfg(feature = "tool-cron-create")]
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +192,7 @@ pub async fn pop_due_tasks(dt: &DateTime<Local>) -> Vec<CronTask> {
 // ---------------------------------------------------------------------------
 
 /// Validate that a 5-field cron expression is syntactically correct.
+#[cfg(feature = "tool-cron-create")]
 fn validate_cron(expr: &str) -> bool {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
@@ -225,6 +228,7 @@ fn validate_cron(expr: &str) -> bool {
 }
 
 /// Convert a cron expression to a human-readable description.
+#[cfg(any(feature = "tool-cron-create", feature = "tool-cron-list"))]
 fn cron_to_human(expr: &str) -> String {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
@@ -256,6 +260,7 @@ fn cron_to_human(expr: &str) -> String {
 #[cfg(feature = "tool-cron-create")]
 pub struct CronCreateTool;
 
+#[cfg(feature = "tool-cron-create")]
 #[derive(Debug, Deserialize)]
 struct CronCreateInput {
     cron: String,
@@ -266,6 +271,7 @@ struct CronCreateInput {
     durable: bool,
 }
 
+#[cfg(feature = "tool-cron-create")]
 fn default_true() -> bool {
     true
 }
@@ -288,7 +294,7 @@ impl Tool for CronCreateTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
+        PermissionLevel::Write
     }
 
     fn input_schema(&self) -> Value {
@@ -316,7 +322,7 @@ impl Tool for CronCreateTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: CronCreateInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -327,6 +333,14 @@ impl Tool for CronCreateTool {
                 "Invalid cron expression '{}'. Expected 5 fields: M H DoM Mon DoW.",
                 params.cron
             ));
+        }
+
+        let description = format!(
+            "Create scheduled job {} (recurring={}, durable={})",
+            params.cron, params.recurring, params.durable
+        );
+        if let Err(e) = ctx.check_permission(self.name(), &description, false) {
+            return ToolResult::error(e.to_string());
         }
 
         // Ensure persistent tasks are loaded from disk before we check the count.
@@ -391,6 +405,7 @@ impl Tool for CronCreateTool {
 #[cfg(feature = "tool-cron-delete")]
 pub struct CronDeleteTool;
 
+#[cfg(feature = "tool-cron-delete")]
 #[derive(Debug, Deserialize)]
 struct CronDeleteInput {
     id: String,
@@ -408,7 +423,7 @@ impl Tool for CronDeleteTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
+        PermissionLevel::Write
     }
 
     fn input_schema(&self) -> Value {
@@ -424,11 +439,19 @@ impl Tool for CronDeleteTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: CronDeleteInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Delete scheduled job {}", params.id),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         // Load disk state first so we don't accidentally drop persisted tasks.
         ensure_store_loaded().await;
@@ -522,6 +545,7 @@ impl Tool for CronListTool {
 // ---------------------------------------------------------------------------
 
 /// Persist all durable tasks to `~/.mangocode/scheduled_tasks.json`.
+#[cfg(any(feature = "tool-cron-create", feature = "tool-cron-delete"))]
 async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), String> {
     let durable: Vec<&CronTask> = store.values().filter(|t| t.durable).collect();
     let json = serde_json::to_string_pretty(&durable).map_err(|e| e.to_string())?;
@@ -539,4 +563,58 @@ async fn persist_tasks_to_disk(store: &HashMap<String, CronTask>) -> Result<(), 
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_denying_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/workspace"),
+            permission_mode: mangocode_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(mangocode_core::permissions::AutoPermissionHandler {
+                mode: mangocode_core::config::PermissionMode::Default,
+            }),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "cron-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+        }
+    }
+
+    #[cfg(feature = "tool-cron-create")]
+    #[tokio::test]
+    async fn cron_create_requires_write_permission_before_mutating_store() {
+        let result = CronCreateTool
+            .execute(
+                json!({
+                    "cron": "0 9 * * *",
+                    "prompt": "daily check",
+                    "durable": true,
+                }),
+                &default_denying_context(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+    }
+
+    #[cfg(feature = "tool-cron-delete")]
+    #[tokio::test]
+    async fn cron_delete_requires_write_permission_before_mutating_store() {
+        let result = CronDeleteTool
+            .execute(json!({ "id": "abc123" }), &default_denying_context())
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+    }
 }

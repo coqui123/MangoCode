@@ -28,10 +28,10 @@ pub mod ollama;
 pub mod proactive;
 pub mod session_memory;
 pub mod skill_prefetch;
-#[cfg(feature = "tool-agent")]
-pub use agent_tool::AgentTool;
 #[cfg(any(feature = "tool-team-create", feature = "tool-team-delete"))]
 pub use agent_tool::init_team_swarm_runner;
+#[cfg(feature = "tool-agent")]
+pub use agent_tool::AgentTool;
 pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
 pub use compact::{
     auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
@@ -451,6 +451,12 @@ pub struct QueryConfig {
     /// model receives the correct product branding (e.g. Claude Max OAuth wording).
     /// Set from `app.config.provider` at query-dispatch time — no disk reads needed.
     pub oauth_provider: mangocode_core::system_prompt::OAuthProvider,
+    /// Whether this request is running without an interactive TUI.
+    /// Drives system-prompt prefix selection for SDK/headless variants.
+    pub is_non_interactive: bool,
+    /// Whether an append-system-prompt was explicitly configured, even when
+    /// the caller has already folded its text into `system_prompt`.
+    pub has_append_system_prompt: bool,
     /// Effective skill-discovery config (`settings.json` skills section). Used with
     /// `discover_skills` for intent-based injection each turn.
     pub skills: mangocode_core::config::SkillsConfig,
@@ -487,6 +493,8 @@ impl Default for QueryConfig {
             agent_definition: None,
             model_registry: None,
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
+            is_non_interactive: false,
+            has_append_system_prompt: false,
             skills: mangocode_core::config::SkillsConfig::default(),
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
@@ -496,14 +504,22 @@ impl Default for QueryConfig {
 
 impl QueryConfig {
     pub fn from_config(cfg: &Config) -> Self {
+        let model = cfg.effective_model().to_string();
         Self {
-            model: cfg.effective_model().to_string(),
+            model: model.clone(),
             max_tokens: cfg.effective_max_tokens(),
+            system_prompt: cfg.custom_system_prompt.clone(),
+            append_system_prompt: cfg.append_system_prompt.clone(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
             qwen_preserve_thinking: cfg.preserve_thinking,
+            oauth_provider: oauth_provider_for_config_and_model(cfg, &model),
+            has_append_system_prompt: cfg
+                .append_system_prompt
+                .as_deref()
+                .is_some_and(|append| !append.trim().is_empty()),
             ..Default::default()
         }
     }
@@ -516,19 +532,43 @@ impl QueryConfig {
         cfg: &Config,
         registry: &mangocode_api::ModelRegistry,
     ) -> Self {
+        let model = mangocode_api::effective_model_for_config(cfg, registry);
         // We can't move the Arc here, but we need a clone for the query loop.
         // Callers typically wrap the registry in an Arc already.
         Self {
-            model: mangocode_api::effective_model_for_config(cfg, registry),
+            model: model.clone(),
             max_tokens: cfg.effective_max_tokens(),
+            system_prompt: cfg.custom_system_prompt.clone(),
+            append_system_prompt: cfg.append_system_prompt.clone(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             skills: cfg.skills.clone(),
             qwen_preserve_thinking: cfg.preserve_thinking,
+            oauth_provider: oauth_provider_for_config_and_model(cfg, &model),
+            has_append_system_prompt: cfg
+                .append_system_prompt
+                .as_deref()
+                .is_some_and(|append| !append.trim().is_empty()),
             ..Default::default()
         }
     }
+}
+
+pub(crate) fn oauth_provider_for_config_and_model(
+    cfg: &Config,
+    model: &str,
+) -> mangocode_core::system_prompt::OAuthProvider {
+    if let Some((provider, _)) = mangocode_core::ProviderId::split_known_model_prefix(model) {
+        let model_oauth = mangocode_core::system_prompt::OAuthProvider::from_provider_id(provider);
+        if model_oauth != mangocode_core::system_prompt::OAuthProvider::None {
+            return model_oauth;
+        }
+    }
+
+    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+        cfg.provider.as_deref().unwrap_or(""),
+    )
 }
 
 fn reasoning_effort_for_level(effort_level: mangocode_core::effort::EffortLevel) -> &'static str {
@@ -656,6 +696,124 @@ fn should_enable_qwen_preserve_thinking(
         return false;
     }
     turn_count >= 4 || tool_call_count >= 3
+}
+
+fn load_cached_model_registry() -> mangocode_api::ModelRegistry {
+    let mut registry = mangocode_api::ModelRegistry::new();
+    registry.load_standard_cache();
+    registry
+}
+
+fn model_matches_provider_default(
+    effective_model: &str,
+    configured_provider: Option<&str>,
+    model_registry: &mangocode_api::ModelRegistry,
+) -> bool {
+    let Some(provider) = configured_provider else {
+        return false;
+    };
+
+    let provider_prefix = format!("{}/", provider);
+    let provider_model = effective_model
+        .strip_prefix(&provider_prefix)
+        .unwrap_or(effective_model);
+
+    let matches_effective_or_provider_model =
+        |candidate: &str| candidate == effective_model || candidate == provider_model;
+
+    if model_registry
+        .best_model_for_provider(provider)
+        .as_deref()
+        .is_some_and(matches_effective_or_provider_model)
+    {
+        return true;
+    }
+
+    let default_config = mangocode_core::Config {
+        provider: Some(provider.to_string()),
+        model: None,
+        ..Default::default()
+    };
+    matches_effective_or_provider_model(default_config.effective_model())
+}
+
+fn resolve_provider_and_model_for_dispatch(
+    effective_model: &str,
+    configured_provider: Option<&str>,
+    model_is_explicit: bool,
+    model_registry: &mangocode_api::ModelRegistry,
+) -> (String, String) {
+    if model_is_explicit {
+        if let Some((provider, model_id)) =
+            mangocode_core::ProviderId::split_known_model_prefix(effective_model)
+        {
+            return (provider.to_string(), model_id.to_string());
+        }
+
+        if let Some(detected_provider) = model_registry.find_provider_for_model(effective_model) {
+            return (detected_provider.to_string(), effective_model.to_string());
+        }
+    }
+
+    if let Some(provider) = configured_provider.filter(|provider| *provider != "anthropic") {
+        // If the model is stored in canonical "provider/model" form for the
+        // configured provider, strip only that outer provider prefix. Additional
+        // slashes are model namespaces and must be preserved for gateways.
+        let provider_prefix = format!("{}/", provider);
+        let model_id = effective_model
+            .strip_prefix(&provider_prefix)
+            .unwrap_or(effective_model);
+        return (provider.to_string(), model_id.to_string());
+    }
+
+    if let Some((provider, model_id)) =
+        mangocode_core::ProviderId::split_known_model_prefix(effective_model)
+    {
+        return (provider.to_string(), model_id.to_string());
+    }
+
+    if let Some(detected_provider) = model_registry.find_provider_for_model(effective_model) {
+        return (detected_provider.to_string(), effective_model.to_string());
+    }
+
+    (
+        configured_provider.unwrap_or("anthropic").to_string(),
+        effective_model.to_string(),
+    )
+}
+
+fn resolve_provider_and_model_after_anthropic_normalization(
+    effective_model: &str,
+    anthropic_prefix_was_stripped: bool,
+    configured_provider: Option<&str>,
+    model_is_explicit: bool,
+    model_registry: &mangocode_api::ModelRegistry,
+) -> (String, String) {
+    if anthropic_prefix_was_stripped {
+        return ("anthropic".to_string(), effective_model.to_string());
+    }
+
+    resolve_provider_and_model_for_dispatch(
+        effective_model,
+        configured_provider,
+        model_is_explicit,
+        model_registry,
+    )
+}
+
+fn normalize_explicit_anthropic_model(
+    effective_model: &str,
+    model_is_explicit: bool,
+) -> Option<String> {
+    if !model_is_explicit {
+        return None;
+    }
+
+    mangocode_core::ProviderId::split_known_model_prefix(effective_model).and_then(
+        |(provider, model_id)| {
+            (provider == mangocode_core::ProviderId::ANTHROPIC).then(|| model_id.to_string())
+        },
+    )
 }
 
 fn build_provider_options(
@@ -2030,6 +2188,36 @@ async fn run_query_loop_inner(
             system
         };
 
+        let temp_model_reg;
+        let model_reg: &mangocode_api::ModelRegistry =
+            if let Some(ref shared) = config.model_registry {
+                shared
+            } else {
+                temp_model_reg = load_cached_model_registry();
+                &temp_model_reg
+            };
+        let agent_model = config
+            .agent_definition
+            .as_ref()
+            .and_then(|agent| agent.model.as_deref());
+        let config_model_matches_effective =
+            tool_ctx.config.model.as_deref() == Some(effective_model.as_str());
+        let config_model_is_provider_default = config_model_matches_effective
+            && model_matches_provider_default(
+                &effective_model,
+                tool_ctx.config.provider.as_deref(),
+                model_reg,
+            );
+        let model_is_explicit = (config_model_matches_effective
+            && !config_model_is_provider_default)
+            || agent_model == Some(effective_model.as_str())
+            || used_fallback;
+        let explicit_anthropic_model =
+            normalize_explicit_anthropic_model(&effective_model, model_is_explicit);
+        if let Some(model_id) = explicit_anthropic_model.as_ref() {
+            effective_model = model_id.clone();
+        }
+
         let system_for_provider = system.clone(); // used by non-Anthropic dispatch below
         let mut req_builder = CreateMessageRequest::builder(&effective_model, config.max_tokens)
             .messages(api_messages)
@@ -2076,109 +2264,19 @@ async fn run_query_loop_inner(
             Arc::new(mangocode_api::streaming::NullStreamHandler)
         };
 
-        // Non-Anthropic provider dispatch: if the model is "provider/model"
-        // format and the registry has that provider, use it directly.
-        //
-        // Provider resolution priority:
-        //   1. Explicit "provider/model" format in the model string
-        //   2. config.provider setting (from --provider flag or settings.json)
-        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
+        // Non-Anthropic provider dispatch. Explicit model selections are
+        // allowed to override a stale config.provider; provider defaults still
+        // honor config.provider so gateway namespaces like OpenRouter's
+        // "anthropic/..." remain routed through the configured gateway.
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx
-                .config
-                .provider
-                .as_deref()
-                .filter(|p| *p != "anthropic")
-            {
-                // Explicit non-Anthropic provider in config — use it.
-                // If the stored model is in canonical "provider/model" form,
-                // strip the top-level provider prefix before sending it to the
-                // provider adapter. If it contains an additional slash
-                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
-                let provider_prefix = format!("{}/", p);
-                let model_id = effective_model
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(&effective_model)
-                    .to_string();
-                (p.to_string(), model_id)
-            } else if let Some((p, m)) = effective_model.split_once('/') {
-                // No explicit provider but model has "provider/model" format.
-                // Check whether `p` is a known provider or just a model
-                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    "anthropic",
-                    "anthropic-max",
-                    "openai",
-                    "openai-codex",
-                    "codex",
-                    "google",
-                    "groq",
-                    "mistral",
-                    "deepseek",
-                    "xai",
-                    "cohere",
-                    "perplexity",
-                    "cerebras",
-                    "openrouter",
-                    "togetherai",
-                    "together-ai",
-                    "deepinfra",
-                    "venice",
-                    "github-copilot",
-                    "ollama",
-                    "lmstudio",
-                    "llamacpp",
-                    "azure",
-                    "amazon-bedrock",
-                    "huggingface",
-                    "nvidia",
-                    "fireworks",
-                    "sambanova",
-                ];
-                if known_providers.contains(&p) {
-                    (p.to_string(), m.to_string())
-                } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider =
-                        tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
-                }
-            } else {
-                // No explicit provider set (or set to "anthropic"): try the
-                // model registry to auto-detect provider from the model name.
-                // Use the shared model registry from QueryConfig if available;
-                // otherwise construct a temporary one.
-                let temp_reg;
-                let model_reg: &mangocode_api::ModelRegistry = if let Some(ref shared) =
-                    config.model_registry
-                {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = mangocode_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("mangocode").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
-                    };
-                    &temp_reg
-                };
-                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
-                    let pid_str = detected_pid.to_string();
-                    if pid_str != "anthropic" {
-                        (pid_str, effective_model.clone())
-                    } else {
-                        ("anthropic".to_string(), effective_model.clone())
-                    }
-                } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (p.to_string(), effective_model.clone())
-                }
-            };
+            let (provider_id_str, model_id_str) =
+                resolve_provider_and_model_after_anthropic_normalization(
+                    &effective_model,
+                    explicit_anthropic_model.is_some(),
+                    tool_ctx.config.provider.as_deref(),
+                    model_is_explicit,
+                    model_reg,
+                );
 
             if provider_id_str != "anthropic" {
                 let pid = mangocode_core::provider_id::ProviderId::new(&provider_id_str);
@@ -4593,6 +4691,12 @@ fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        is_non_interactive: config.is_non_interactive,
+        has_append_system_prompt: config.has_append_system_prompt
+            || config
+                .append_system_prompt
+                .as_deref()
+                .is_some_and(|append| !append.trim().is_empty()),
         // oauth_provider is set at query-dispatch time from app.config.provider,
         // so we just thread it through here — no disk reads required.
         oauth_provider: config.oauth_provider,
@@ -4613,6 +4717,12 @@ fn build_system_prompt_with_git_context(config: &QueryConfig, git_context: Strin
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
         git_context,
+        is_non_interactive: config.is_non_interactive,
+        has_append_system_prompt: config.has_append_system_prompt
+            || config
+                .append_system_prompt
+                .as_deref()
+                .is_some_and(|append| !append.trim().is_empty()),
         // Thread through the oauth_provider set at query-dispatch time.
         oauth_provider: config.oauth_provider,
         injected_skills: config.injected_skills.clone(),
@@ -4642,7 +4752,8 @@ fn build_skill_injection_for_turn(
         return (Vec::new(), Vec::new());
     };
 
-    let skill_index = discover_skills(working_dir, skills_config);
+    let skills_config = mangocode_plugins::skills_config_with_plugin_paths(skills_config);
+    let skill_index = discover_skills(working_dir, &skills_config);
     if skill_index.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -4665,12 +4776,30 @@ fn build_skill_injection_for_turn(
 
     let injected_skills: Vec<(String, String)> = skill_context
         .iter()
-        .map(|s| (s.name.clone(), s.template.clone()))
+        .map(|s| (skill_display_name(&s.name), s.template.clone()))
         .collect();
 
     let skill_qa_blocks: Vec<String> = skill_context.iter().filter_map(format_qa_block).collect();
 
     (injected_skills, skill_qa_blocks)
+}
+
+fn skill_display_name(name: &str) -> String {
+    let name = strip_skill_markdown_suffix(name.trim().trim_start_matches('/').trim()).trim();
+    if name.is_empty() {
+        "unnamed".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn strip_skill_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
 }
 
 fn latest_user_query(messages: &[Message]) -> Option<String> {
@@ -4905,6 +5034,49 @@ mod tests {
         assert_eq!(extract_apply_patch_paths(patch), vec!["a/keep-prefix.txt"]);
     }
 
+    #[test]
+    fn skill_display_name_normalizes_slash_prefixed_names() {
+        assert_eq!(skill_display_name(" /ProjectReview "), "ProjectReview");
+        assert_eq!(skill_display_name(" /ProjectReview.MD "), "ProjectReview");
+        assert_eq!(skill_display_name("   "), "unnamed");
+    }
+
+    #[test]
+    fn build_skill_injection_normalizes_discovered_skill_labels() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("base.md"),
+            "---\nname: /Base.MD\ndescription: Base guidance\n---\nBase instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("review.md"),
+            "---\nname: /ProjectReview.MD\ndescription: Project review\ntriggers: [review project]\ndependencies: [/Base.MD]\nqa_required: true\nqa_steps:\n  - Run tests\n---\nReview instructions.",
+        )
+        .unwrap();
+
+        let messages = vec![mangocode_core::types::Message::user(
+            "please review project",
+        )];
+        let (injected, qa_blocks) = build_skill_injection_for_turn(
+            &messages,
+            tmp.path(),
+            &mangocode_core::config::SkillsConfig::default(),
+        );
+
+        assert_eq!(injected.len(), 2);
+        assert_eq!(injected[0].0, "Base");
+        assert!(injected[0].1.contains("Base instructions."));
+        assert_eq!(injected[1].0, "ProjectReview");
+        assert!(injected[1].1.contains("Review instructions."));
+        assert!(!injected.iter().any(|(name, _)| name.ends_with(".MD")));
+        assert_eq!(qa_blocks.len(), 1);
+        assert!(qa_blocks[0].contains("skill: ProjectReview"));
+        assert!(!qa_blocks[0].contains("ProjectReview.MD"));
+    }
+
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
             model: "claude-sonnet-4-6".to_string(),
@@ -4929,10 +5101,77 @@ mod tests {
             agent_definition: None,
             model_registry: None,
             oauth_provider: mangocode_core::system_prompt::OAuthProvider::None,
+            is_non_interactive: false,
+            has_append_system_prompt: append.is_some(),
             skills: mangocode_core::config::SkillsConfig::default(),
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn query_config_from_config_preserves_oauth_provider_identity() {
+        let cfg = CoreConfig {
+            provider: Some("anthropic-max".to_string()),
+            custom_system_prompt: Some("Custom prompt".to_string()),
+            append_system_prompt: Some("Append prompt".to_string()),
+            ..Default::default()
+        };
+        let query_cfg = QueryConfig::from_config(&cfg);
+
+        assert_eq!(
+            query_cfg.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+        assert_eq!(query_cfg.system_prompt.as_deref(), Some("Custom prompt"));
+        assert_eq!(
+            query_cfg.append_system_prompt.as_deref(),
+            Some("Append prompt")
+        );
+        assert!(query_cfg.has_append_system_prompt);
+
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let query_cfg = QueryConfig::from_config_with_registry(&cfg, &registry);
+
+        assert_eq!(
+            query_cfg.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+        assert_eq!(query_cfg.system_prompt.as_deref(), Some("Custom prompt"));
+        assert_eq!(
+            query_cfg.append_system_prompt.as_deref(),
+            Some("Append prompt")
+        );
+        assert!(query_cfg.has_append_system_prompt);
+    }
+
+    #[test]
+    fn query_config_from_config_detects_oauth_provider_from_model_prefix() {
+        let cfg = CoreConfig {
+            model: Some("anthropic-max/claude-opus-4-5".to_string()),
+            ..Default::default()
+        };
+
+        let query_cfg = QueryConfig::from_config(&cfg);
+
+        assert_eq!(
+            query_cfg.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+    }
+
+    #[test]
+    fn oauth_provider_detection_prefers_explicit_model_prefix() {
+        let cfg = CoreConfig {
+            provider: Some("openai-codex".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            oauth_provider_for_config_and_model(&cfg, "anthropic-max/claude-opus-4-5"),
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
     }
 
     fn temp_goal_store() -> (
@@ -5140,6 +5379,60 @@ mod tests {
     }
 
     #[test]
+    fn test_system_prompt_non_interactive_uses_sdk_prefix() {
+        let mut cfg = make_config(None, None);
+        cfg.is_non_interactive = true;
+
+        let prompt = build_system_prompt(&cfg);
+        if let SystemPrompt::Text(text) = prompt {
+            assert!(
+                text.starts_with("You are a Claude agent"),
+                "Non-interactive prompt should use SDK attribution: {}",
+                text
+            );
+        } else {
+            panic!("Expected SystemPrompt::Text");
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_non_interactive_append_uses_sdk_preset_prefix() {
+        let mut cfg = make_config(None, Some("Appended text."));
+        cfg.is_non_interactive = true;
+
+        let prompt = build_system_prompt(&cfg);
+        if let SystemPrompt::Text(text) = prompt {
+            assert!(
+                text.starts_with("You are MangoCode, Anthropic's official CLI for Claude,"),
+                "Non-interactive prompt with append should use SDK preset attribution: {}",
+                text
+            );
+            assert!(text.contains("running within the Claude Agent SDK"));
+        } else {
+            panic!("Expected SystemPrompt::Text");
+        }
+    }
+
+    #[test]
+    fn test_system_prompt_non_interactive_folded_append_uses_sdk_preset_prefix() {
+        let mut cfg = make_config(Some("Prebuilt prompt with appended text."), None);
+        cfg.is_non_interactive = true;
+        cfg.has_append_system_prompt = true;
+
+        let prompt = build_system_prompt(&cfg);
+        if let SystemPrompt::Text(text) = prompt {
+            assert!(
+                text.starts_with("You are MangoCode, Anthropic's official CLI for Claude,"),
+                "Folded append should still use SDK preset attribution: {}",
+                text
+            );
+            assert!(text.contains("running within the Claude Agent SDK"));
+        } else {
+            panic!("Expected SystemPrompt::Text");
+        }
+    }
+
+    #[test]
     fn test_system_prompt_with_custom_output_style_prompt() {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
@@ -5211,6 +5504,190 @@ mod tests {
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
         assert_eq!(options["usage"]["include"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_dispatch_explicit_provider_prefix_overrides_stale_provider() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved = resolve_provider_and_model_for_dispatch(
+            "openai/gpt-4o",
+            Some("openrouter"),
+            true,
+            &registry,
+        );
+
+        assert_eq!(resolved, ("openai".to_string(), "gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_dispatch_explicit_fast_model_uses_anthropic_provider() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved = resolve_provider_and_model_for_dispatch(
+            "claude-haiku-4-5",
+            Some("openai"),
+            true,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            ("anthropic".to_string(), "claude-haiku-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dispatch_provider_default_preserves_gateway_namespace() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved = resolve_provider_and_model_for_dispatch(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            false,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-sonnet-4".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_stored_provider_default_is_not_treated_as_explicit_model() {
+        let registry = mangocode_api::ModelRegistry::new();
+        assert!(model_matches_provider_default(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        ));
+
+        let model_is_explicit = !model_matches_provider_default(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        );
+        let stripped =
+            normalize_explicit_anthropic_model("anthropic/claude-sonnet-4", model_is_explicit);
+        let resolved = resolve_provider_and_model_after_anthropic_normalization(
+            "anthropic/claude-sonnet-4",
+            stripped.is_some(),
+            Some("openrouter"),
+            model_is_explicit,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-sonnet-4".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_prefixed_stored_provider_default_is_not_treated_as_explicit_model() {
+        let registry = mangocode_api::ModelRegistry::new();
+        assert!(model_matches_provider_default(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        ));
+
+        let model_is_explicit = !model_matches_provider_default(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        );
+        let resolved = resolve_provider_and_model_for_dispatch(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            model_is_explicit,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-sonnet-4".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_fast_model_is_not_openai_provider_default() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        assert!(!model_matches_provider_default(
+            "claude-haiku-4-5",
+            Some("openai"),
+            &registry,
+        ));
+    }
+
+    #[test]
+    fn test_dispatch_unknown_slash_prefix_stays_with_configured_provider() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved = resolve_provider_and_model_for_dispatch(
+            "meta-llama/Llama-3.3-70B-Instruct",
+            Some("openrouter"),
+            true,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "meta-llama/Llama-3.3-70B-Instruct".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_normalize_explicit_anthropic_model_strips_provider_prefix() {
+        assert_eq!(
+            normalize_explicit_anthropic_model("anthropic/claude-haiku-4-5", true),
+            Some("claude-haiku-4-5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_provider_default_keeps_gateway_namespace() {
+        assert_eq!(
+            normalize_explicit_anthropic_model("anthropic/claude-sonnet-4", false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_dispatch_stripped_explicit_anthropic_prefix_ignores_stale_provider() {
+        let registry = mangocode_api::ModelRegistry::new();
+        let mut effective_model = "anthropic/custom-deployment".to_string();
+        let stripped = normalize_explicit_anthropic_model(&effective_model, true);
+        if let Some(model_id) = stripped.as_ref() {
+            effective_model = model_id.clone();
+        }
+
+        let resolved = resolve_provider_and_model_after_anthropic_normalization(
+            &effective_model,
+            stripped.is_some(),
+            Some("openai"),
+            true,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            ("anthropic".to_string(), "custom-deployment".to_string())
+        );
     }
 
     #[test]

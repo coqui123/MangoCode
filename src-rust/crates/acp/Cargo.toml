@@ -25,6 +25,9 @@ full-tools = [
     "mangocode-query/full-tools",
     "mangocode-tools/full-tools",
     "tool-agent",
+    "tool-browser",
+    "tool-computer-use",
+    "tool-rendered-fetch",
     "tool-team-create",
     "tool-team-delete",
 ]
@@ -61,7 +64,10 @@ tool-pr-watch = ["mangocode-query/tool-pr-watch", "mangocode-tools/tool-pr-watch
 tool-read = ["mangocode-query/tool-read", "mangocode-tools/tool-read"]
 tool-read-mcp-resource = ["mangocode-query/tool-read-mcp-resource", "mangocode-tools/tool-read-mcp-resource"]
 tool-remote-trigger = ["mangocode-query/tool-remote-trigger", "mangocode-tools/tool-remote-trigger"]
-tool-rendered-fetch = ["mangocode-query/tool-rendered-fetch", "mangocode-tools/tool-rendered-fetch"]
+tool-rendered-fetch = [
+    "mangocode-query/tool-rendered-fetch",
+    "mangocode-tools/tool-rendered-fetch",
+]
 tool-repl = ["mangocode-query/tool-repl", "mangocode-tools/tool-repl"]
 tool-send-message = ["mangocode-query/tool-send-message", "mangocode-tools/tool-send-message"]
 tool-skill = ["mangocode-query/tool-skill", "mangocode-tools/tool-skill"]

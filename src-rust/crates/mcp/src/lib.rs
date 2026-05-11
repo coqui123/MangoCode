@@ -2417,9 +2417,9 @@ pub fn mcp_result_to_string(result: &CallToolResult) -> String {
             McpContent::Image { data, mime_type } => {
                 // Show a short preview (first 32 chars of base64) so the model
                 // knows an image was returned without embedding the full blob.
-                let preview_len = data.len().min(32);
-                let preview = &data[..preview_len];
-                let ellipsis = if data.len() > 32 { "…" } else { "" };
+                let mut chars = data.chars();
+                let preview: String = chars.by_ref().take(32).collect();
+                let ellipsis = if chars.next().is_some() { "…" } else { "" };
                 format!(
                     "[Image: {} | base64 preview: {}{}]",
                     mime_type, preview, ellipsis
@@ -2579,6 +2579,21 @@ mod tests {
         assert!(s.contains("Image:"));
         assert!(s.contains("image/png"));
         assert!(s.contains("abc123"));
+    }
+
+    #[test]
+    fn test_result_to_string_image_preview_preserves_unicode_boundary() {
+        let result = CallToolResult {
+            content: vec![McpContent::Image {
+                data: format!("{}é{}", "a".repeat(31), "b".repeat(8)),
+                mime_type: "image/png".to_string(),
+            }],
+            is_error: false,
+        };
+
+        let s = mcp_result_to_string(&result);
+
+        assert!(s.contains(&format!("{}é…", "a".repeat(31))));
     }
 
     #[test]

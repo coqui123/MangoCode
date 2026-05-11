@@ -3,10 +3,7 @@
 //! Reducers keep the model-facing output small while preserving raw command
 //! logs on disk for follow-up inspection.
 
-#![cfg_attr(
-    not(feature = "tool-tool-log-read"),
-    allow(dead_code, unused_imports)
-)]
+#![cfg_attr(not(feature = "tool-tool-log-read"), allow(dead_code, unused_imports))]
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -443,19 +440,28 @@ fn take_head_tail(output: &str, head: usize, tail: usize) -> String {
     selected.join("\n")
 }
 
-fn truncate_raw(output: &str) -> String {
-    if output.len() <= MAX_RAW_OUTPUT_CHARS {
+pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
         return output.to_string();
     }
-    let prefix = mangocode_core::truncate::truncate_bytes_prefix(output, MAX_RAW_OUTPUT_CHARS / 2);
-    let suffix_start = output.len().saturating_sub(MAX_RAW_OUTPUT_CHARS / 2);
+
+    let half = max_bytes / 2;
+    let prefix = mangocode_core::truncate::truncate_bytes_prefix(output, half);
+    let mut suffix_start = output.len().saturating_sub(half);
+    while suffix_start < output.len() && !output.is_char_boundary(suffix_start) {
+        suffix_start += 1;
+    }
     let suffix = &output[suffix_start..];
     format!(
-        "{}\n\n... ({} characters omitted) ...\n\n{}",
+        "{}\n\n... ({} bytes omitted) ...\n\n{}",
         prefix,
         output.len().saturating_sub(prefix.len() + suffix.len()),
         suffix
     )
+}
+
+fn truncate_raw(output: &str) -> String {
+    truncate_middle_bytes(output, MAX_RAW_OUTPUT_CHARS)
 }
 
 fn save_raw_log(command: &str, output: &str) -> anyhow::Result<PathBuf> {
@@ -526,6 +532,16 @@ mod tests {
         let reduced = reduce_command_output("cargo test", "hello", 0, OutputMode::Raw);
         assert_eq!(reduced.content, "hello");
         assert_eq!(reduced.reducer, "raw");
+    }
+
+    #[test]
+    fn middle_truncation_handles_multibyte_boundaries() {
+        let output = truncate_middle_bytes("abcédefghij", 8);
+
+        assert!(output.starts_with("abc"));
+        assert!(!output.starts_with("abcé"));
+        assert!(output.ends_with("ghij"));
+        assert!(output.contains("bytes omitted"));
     }
 
     #[test]

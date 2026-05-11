@@ -1098,10 +1098,10 @@ pub mod config {
     pub fn default_agents() -> HashMap<String, AgentDefinition> {
         let mut m = HashMap::new();
         m.insert("build".to_string(), AgentDefinition {
-            description: Some("Full-access agent for implementing features and fixing bugs".to_string()),
+            description: Some("Implementation agent for features and fixes using the runtime-visible tool set".to_string()),
             model: None,
             temperature: None,
-            prompt: Some("You are the build agent. You have full access to read, write, and execute. Focus on implementing the requested changes completely and correctly.".to_string()),
+            prompt: Some("You are the build agent. Use the runtime-visible read, write, and execution tools when they are available. Focus on implementing the requested changes completely and correctly.".to_string()),
             access: "full".to_string(),
             visible: true,
             max_turns: None,
@@ -1111,7 +1111,7 @@ pub mod config {
             description: Some("Read-only agent for analyzing code and planning changes".to_string()),
             model: None,
             temperature: None,
-            prompt: Some("You are the plan agent. You can read files and analyze code but cannot write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
+            prompt: Some("You are the plan agent. Use only runtime-visible read and search tools; do not write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
             access: "read-only".to_string(),
             visible: true,
             max_turns: Some(20),
@@ -1121,7 +1121,7 @@ pub mod config {
             description: Some("Fast search-only agent for code exploration".to_string()),
             model: None,
             temperature: None,
-            prompt: Some("You are the explore agent. You can search and read files. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
+            prompt: Some("You are the explore agent. Use runtime-visible search and read tools. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
             access: "search-only".to_string(),
             visible: true,
             max_turns: Some(15),
@@ -1138,7 +1138,10 @@ pub mod config {
         /// (which is Claude-specific).
         pub fn effective_model(&self) -> &str {
             if let Some(ref m) = self.model {
-                return m;
+                let model = m.trim();
+                if !model.is_empty() {
+                    return model;
+                }
             }
             match self.provider.as_deref() {
                 Some("openai") => "gpt-4o",
@@ -1182,19 +1185,28 @@ pub mod config {
             }
         }
 
-        /// Resolve the effective output style for system-prompt assembly.
-        pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
+        fn configured_output_style_name(&self) -> &str {
             self.output_style
                 .as_deref()
-                .map(crate::system_prompt::OutputStyle::parse)
-                .unwrap_or_default()
+                .map(str::trim)
+                .filter(|style| !style.is_empty())
+                .unwrap_or("default")
+        }
+
+        /// Resolve the effective output style for system-prompt assembly.
+        pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
+            crate::system_prompt::OutputStyle::parse(self.configured_output_style_name())
         }
 
         /// Resolve the prompt text for the selected output style, including
-        /// user-defined styles loaded from `~/.mangocode/output-styles/`.
+        /// user-defined styles loaded from global, project, and plugin style
+        /// registries.
         pub fn resolve_output_style_prompt(&self) -> Option<String> {
-            let style_name = self.output_style.as_deref().unwrap_or("default");
-            let styles = crate::output_styles::all_styles(&Settings::config_dir());
+            let style_name = self.configured_output_style_name();
+            let styles = crate::output_styles::all_styles_with_runtime_for_project(
+                &Settings::config_dir(),
+                self.project_dir.as_deref(),
+            );
             crate::output_styles::find_style(&styles, style_name)
                 .map(|style| style.prompt.clone())
                 .filter(|prompt| !prompt.trim().is_empty())
@@ -1901,7 +1913,8 @@ pub mod context {
 
             let mut result = parts.join("\n\n");
             if result.len() > MAX_GIT_CONTEXT_CHARS {
-                result.truncate(MAX_GIT_CONTEXT_CHARS);
+                result = crate::truncate::truncate_bytes_prefix(&result, MAX_GIT_CONTEXT_CHARS)
+                    .to_string();
                 if let Some(last_newline) = result.rfind('\n') {
                     result.truncate(last_newline);
                 }
@@ -2048,23 +2061,38 @@ pub mod permissions {
     /// no explicit rule matches.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum PermissionLevel {
-        /// Read-only operations (Glob, Grep, Read, WebSearch, etc.).
+        /// Local read-only operations (Glob, Grep, Read, etc.).
         Read,
         /// File write/edit operations (Write, Edit).
         Write,
         /// Shell command execution (Bash).
         Execute,
-        /// Outbound network access (WebFetch).
+        /// Outbound network access (WebSearch, WebFetch, research fetch/read,
+        /// and remote session dispatch tools).
         Network,
     }
 
     impl PermissionLevel {
         /// Derive the permission level from a well-known tool name.
         pub fn for_tool(tool_name: &str) -> Self {
+            if tool_name == "mcp__auth" {
+                return Self::Network;
+            }
+
+            if tool_name.starts_with("mcp__") {
+                return Self::Execute;
+            }
+
             match tool_name {
-                "Bash" | "bash" => Self::Execute,
-                "Write" | "Edit" | "NotebookEdit" => Self::Write,
-                "WebFetch" => Self::Network,
+                "Bash" | "bash" | "PowerShell" | "REPL" | "TaskStop" | "PrWatch" | "Browser"
+                | "computer" => Self::Execute,
+                "Write" | "Edit" | "NotebookEdit" | "BatchEdit" | "ApplyPatch" | "Config"
+                | "EnterWorktree" | "ExitWorktree" | "TeamCreate" | "TeamDelete" | "CronCreate"
+                | "CronDelete" => Self::Write,
+                "WebSearch" | "WebFetch" | "DocSearch" | "DocRead" | "DeepRead"
+                | "RenderedFetch" | "RemoteTrigger" | "ListMcpResources" | "ReadMcpResource" => {
+                    Self::Network
+                }
                 _ => Self::Read,
             }
         }
@@ -2209,8 +2237,8 @@ pub mod permissions {
             PermissionLevel::Execute => {
                 let cmd = path.unwrap_or(description);
                 format!(
-                    "Bash wants to run: `{}`\nThis will execute a shell command.",
-                    cmd
+                    "{} wants to run: `{}`\nThis will execute a shell command.",
+                    tool_name, cmd
                 )
             }
             PermissionLevel::Write => {
@@ -2228,8 +2256,8 @@ pub mod permissions {
             PermissionLevel::Network => {
                 let url = path.unwrap_or(description);
                 format!(
-                    "WebFetch wants to fetch: `{}`\nThis will make an outbound HTTP request.",
-                    url
+                    "{} wants to access network: `{}`\nThis will make an outbound HTTP request.",
+                    tool_name, url
                 )
             }
             PermissionLevel::Read => {
@@ -2696,6 +2724,94 @@ pub mod permissions {
         }
 
         #[test]
+        fn default_network_tools_ask() {
+            let m = mgr(PermissionMode::Default);
+            for tool in [
+                "WebSearch",
+                "WebFetch",
+                "DocSearch",
+                "DocRead",
+                "DeepRead",
+                "RenderedFetch",
+                "RemoteTrigger",
+                "mcp__auth",
+                "ListMcpResources",
+                "ReadMcpResource",
+            ] {
+                match m.evaluate(
+                    tool,
+                    "fetch https://example.com",
+                    Some("https://example.com"),
+                ) {
+                    PermissionDecision::Ask { reason } => {
+                        assert!(reason.contains("HTTP request"), "{tool}: {reason}");
+                    }
+                    other => panic!("Expected Ask for {tool}, got {:?}", other),
+                }
+            }
+        }
+
+        #[test]
+        fn classifier_covers_non_read_tool_names() {
+            for tool in [
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "BatchEdit",
+                "ApplyPatch",
+                "Config",
+                "EnterWorktree",
+                "ExitWorktree",
+                "TeamCreate",
+                "TeamDelete",
+                "CronCreate",
+                "CronDelete",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Write,
+                    "{tool}"
+                );
+            }
+
+            for tool in [
+                "Bash",
+                "PowerShell",
+                "REPL",
+                "TaskStop",
+                "PrWatch",
+                "Browser",
+                "computer",
+                "mcp__github__create_issue",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Execute,
+                    "{tool}"
+                );
+            }
+
+            for tool in [
+                "WebSearch",
+                "WebFetch",
+                "DocSearch",
+                "DocRead",
+                "DeepRead",
+                "RenderedFetch",
+                "RemoteTrigger",
+                "mcp__auth",
+                "ListMcpResources",
+                "ReadMcpResource",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Network,
+                    "{tool}"
+                );
+            }
+        }
+
+        #[test]
         fn session_allow_overrides_default() {
             let mut m = mgr(PermissionMode::Default);
             m.add_session_allow("Bash");
@@ -2726,6 +2842,15 @@ pub mod permissions {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
                 m.evaluate("Write", "write file", Some("/tmp/foo")),
+                PermissionDecision::Deny
+            );
+        }
+
+        #[test]
+        fn plan_denies_network() {
+            let m = mgr(PermissionMode::Plan);
+            assert_eq!(
+                m.evaluate("WebSearch", "search web rust", Some("rust")),
                 PermissionDecision::Deny
             );
         }
@@ -2786,6 +2911,18 @@ pub mod permissions {
         }
 
         #[test]
+        fn format_reason_execute_uses_tool_name() {
+            let s = format_permission_reason(
+                "PowerShell",
+                "Get-ChildItem",
+                None,
+                PermissionLevel::Execute,
+            );
+            assert!(s.contains("PowerShell wants to run"));
+            assert!(!s.contains("Bash wants to run"));
+        }
+
+        #[test]
         fn format_reason_write_etc() {
             let s = format_permission_reason(
                 "Write",
@@ -2815,6 +2952,8 @@ pub mod permissions {
 // history module
 // ---------------------------------------------------------------------------
 pub mod history {
+    use crate::config::Config;
+    use crate::provider_id::ProviderId;
     use crate::types::Message;
     use serde::{Deserialize, Serialize};
 
@@ -2908,6 +3047,54 @@ pub mod history {
                 .rev()
                 .find(|m| m.role == crate::types::Role::User)
         }
+    }
+
+    /// Persist the effective model in a provider-aware form so resuming a
+    /// session can route gateway models through the same provider.
+    pub fn canonical_session_model(config: &Config, effective_model: &str) -> String {
+        let effective_model = effective_model.trim();
+        if effective_model.is_empty() {
+            return String::new();
+        }
+
+        let Some(provider) = config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty() && *provider != "anthropic")
+        else {
+            return effective_model.to_string();
+        };
+
+        if config.model.as_deref().map(str::trim) == Some(effective_model) {
+            if let Some((model_provider, _)) = ProviderId::split_known_model_prefix(effective_model)
+            {
+                if model_provider != provider {
+                    return effective_model.to_string();
+                }
+            }
+        }
+
+        let provider_prefix = format!("{}/", provider);
+        if effective_model.starts_with(&provider_prefix) {
+            effective_model.to_string()
+        } else {
+            format!("{}/{}", provider, effective_model)
+        }
+    }
+
+    /// Restore a persisted session model into config, including the provider
+    /// encoded by canonical `"provider/model"` session model values.
+    pub fn apply_session_model_to_config(config: &mut Config, session_model: &str) {
+        let session_model = session_model.trim();
+        if session_model.is_empty() {
+            return;
+        }
+
+        if let Some((provider, _)) = ProviderId::split_known_model_prefix(session_model) {
+            config.provider = Some(provider.to_string());
+        }
+        config.model = Some(session_model.to_string());
     }
 
     // -------------------------------------------------------------------------
@@ -3171,6 +3358,92 @@ pub mod history {
                 false
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod session_model_tests {
+        use super::*;
+
+        #[test]
+        fn canonical_session_model_preserves_gateway_provider_identity() {
+            let config = Config {
+                provider: Some("openrouter".to_string()),
+                model: None,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, "anthropic/claude-sonnet-4"),
+                "openrouter/anthropic/claude-sonnet-4"
+            );
+            assert_eq!(
+                canonical_session_model(&config, "openrouter/meta-llama/Llama-3.3-70B"),
+                "openrouter/meta-llama/Llama-3.3-70B"
+            );
+        }
+
+        #[test]
+        fn canonical_session_model_does_not_wrap_explicit_other_provider_model() {
+            let config = Config {
+                provider: Some("openrouter".to_string()),
+                model: Some("openai/gpt-4o".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, "openai/gpt-4o"),
+                "openai/gpt-4o"
+            );
+        }
+
+        #[test]
+        fn canonical_session_model_trims_and_ignores_blank_model() {
+            let config = Config {
+                provider: Some(" openrouter ".to_string()),
+                model: Some(" openai/gpt-4o ".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, " openai/gpt-4o "),
+                "openai/gpt-4o"
+            );
+            assert_eq!(canonical_session_model(&config, "   "), "");
+        }
+
+        #[test]
+        fn apply_session_model_restores_prefixed_provider() {
+            let mut config = Config {
+                provider: Some("anthropic".to_string()),
+                model: None,
+                ..Default::default()
+            };
+
+            apply_session_model_to_config(&mut config, "openrouter/anthropic/claude-sonnet-4");
+
+            assert_eq!(config.provider.as_deref(), Some("openrouter"));
+            assert_eq!(
+                config.model.as_deref(),
+                Some("openrouter/anthropic/claude-sonnet-4")
+            );
+        }
+
+        #[test]
+        fn apply_session_model_trims_and_ignores_blank_values() {
+            let mut config = Config {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                ..Default::default()
+            };
+
+            apply_session_model_to_config(&mut config, "   ");
+            assert_eq!(config.provider.as_deref(), Some("anthropic"));
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+
+            apply_session_model_to_config(&mut config, " openrouter/openai/gpt-4o ");
+            assert_eq!(config.provider.as_deref(), Some("openrouter"));
+            assert_eq!(config.model.as_deref(), Some("openrouter/openai/gpt-4o"));
+        }
     }
 }
 
@@ -4054,6 +4327,19 @@ mod tests {
     }
 
     #[test]
+    fn default_agent_prompts_do_not_overpromise_hidden_tools() {
+        let agents = crate::config::default_agents();
+        for name in ["build", "plan", "explore"] {
+            let prompt = agents
+                .get(name)
+                .and_then(|agent| agent.prompt.as_deref())
+                .expect("built-in agent should have a prompt");
+            assert!(prompt.contains("runtime-visible"));
+            assert!(!prompt.contains("full access to read, write, and execute"));
+        }
+    }
+
+    #[test]
     fn test_cost_tracker() {
         let tracker = CostTracker::new();
         tracker.add_usage(1000, 500, 200, 100);
@@ -4088,6 +4374,72 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_config_effective_model_trims_and_ignores_blank_override() {
+        let cfg = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some(" gpt-4o ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "gpt-4o");
+
+        let cfg = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_config_effective_output_style_trims_and_resolves_prompt() {
+        let cfg = crate::config::Config {
+            output_style: Some(" formal ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_output_style(),
+            crate::system_prompt::OutputStyle::Formal
+        );
+        assert!(cfg
+            .resolve_output_style_prompt()
+            .unwrap()
+            .contains("formal, professional tone"));
+
+        let cfg = crate::config::Config {
+            output_style: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_output_style(),
+            crate::system_prompt::OutputStyle::Default
+        );
+        assert!(cfg.resolve_output_style_prompt().is_none());
+    }
+
+    #[test]
+    fn test_config_resolves_project_output_style_prompt() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("local.md"),
+            "# Local\nProject-specific style.\n\nUse the project style.",
+        )
+        .unwrap();
+
+        let cfg = crate::config::Config {
+            project_dir: Some(project_dir.path().to_path_buf()),
+            output_style: Some(" LOCAL ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.resolve_output_style_prompt().as_deref(),
+            Some("Use the project style.")
+        );
     }
 
     #[test]

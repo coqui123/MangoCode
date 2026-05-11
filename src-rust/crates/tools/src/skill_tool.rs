@@ -1,30 +1,31 @@
-// SkillTool: execute user-defined skill (prompt template) files programmatically.
+// SkillTool: execute skill prompt templates programmatically.
 //
-// Skills are Markdown files stored in:
-//   <project>/.mangocode/commands/<name>.md   (flat file)
-//   <project>/.mangocode/skills/<name>/SKILL.md  (folder-based, with sub-files)
-//   ~/.mangocode/commands/<name>.md
+// Skills are discovered through the same core loader used by slash commands:
+// project/user .mangocode skill and command dirs, project .agents dirs,
+// configured skills.paths / skills.urls entries, and enabled plugin skill paths.
 //
-// Bundled skills (defined in bundled_skills.rs) are checked first before the
-// disk directories, so they take precedence over same-named .md files.
+// Bundled skills are checked first before discovered skills, so they take
+// precedence over same-named files.
 //
 // The model invokes this tool to expand a skill's prompt inline.
-// Supports $ARGUMENTS placeholder substitution.
+// Supports $ARGUMENTS, $1, and $2 placeholder substitution.
 //
 // Extended operations:
-//   skill="list"              — enumerate all available skills
-//   skill="<name>"            — load primary SKILL.md (or flat .md)
-//   skill="<name>/<sub>"      — load a named sub-file from a folder-based skill
-//                               e.g. skill="rust-review/security"
-//   args="..."                — text substituted for $ARGUMENTS in the template
+//   skill="list"         - enumerate all available skills
+//   skill="<name>"       - load a primary skill
+//   skill="<name>/<sub>" - load a named sub-file from a folder-based skill
+//   args="..."           - text substituted into placeholders
 
 use crate::bundled_skills::{expand_prompt, find_bundled_skill, user_invocable_skills};
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
-use mangocode_core::truncate::truncate_bytes_prefix;
+use mangocode_core::skill_discovery::{
+    format_qa_block, install_skill_scripts, load_skill_with_dependencies, DiscoveredSkill,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use tracing::debug;
 
 pub struct SkillTool;
@@ -44,7 +45,7 @@ impl Tool for SkillTool {
 
     fn description(&self) -> &str {
         "Execute a skill (custom prompt template) by name. \
-         Skills are .md files in .mangocode/commands/ or ~/.mangocode/commands/. \
+         Skills are .md files or SKILL.md folders in project, user, configured URL/path, or plugin sources. \
          Use skill=\"list\" to discover available skills. \
          The expanded skill prompt is returned for you to act on."
     }
@@ -63,7 +64,7 @@ impl Tool for SkillTool {
                 },
                 "args": {
                     "type": "string",
-                    "description": "Arguments passed to the skill — replaces $ARGUMENTS in the template"
+                    "description": "Arguments passed to the skill; replaces $ARGUMENTS, $1, and $2 in the template"
                 }
             },
             "required": ["skill"]
@@ -76,22 +77,21 @@ impl Tool for SkillTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let dirs = skill_search_dirs(ctx);
-
-        if params.skill == "list" {
-            return list_skills(&dirs).await;
+        let skill_input = params.skill.trim();
+        if skill_input.eq_ignore_ascii_case("list") {
+            let discovered = discover_disk_skills(ctx);
+            return list_skills(&discovered);
         }
 
-        // Handle sub-file requests: skill="rust-review/security"
-        let skill_ref = params.skill.trim_end_matches(".md");
+        let skill_ref = normalize_skill_ref(skill_input);
         if let Some((skill_name, sub_name)) = skill_ref.split_once('/') {
-            return load_sub_file(skill_name, sub_name, &dirs, params.args.as_deref()).await;
+            let discovered = discover_disk_skills(ctx);
+            return load_sub_file(skill_name, sub_name, &discovered, params.args.as_deref()).await;
         }
 
         let skill_name = skill_ref;
         debug!(skill = skill_name, "Loading skill");
 
-        // Check bundled skills first — they take precedence over disk files.
         if let Some(bundled) = find_bundled_skill(skill_name) {
             let args = params.args.as_deref().unwrap_or("");
             let prompt = expand_prompt(bundled, args);
@@ -105,8 +105,9 @@ impl Tool for SkillTool {
             return ToolResult::success(prompt);
         }
 
-        let raw = match find_and_read_skill(skill_name, &dirs).await {
-            Some(c) => c,
+        let discovered = discover_disk_skills(ctx);
+        let skill = match find_discovered_skill(skill_name, &discovered) {
+            Some(skill) => skill,
             None => {
                 return ToolResult::error(format!(
                     "Skill '{}' not found. Use skill=\"list\" to see available skills.",
@@ -115,17 +116,12 @@ impl Tool for SkillTool {
             }
         };
 
-        // Strip YAML frontmatter if present (--- ... ---)
-        let content = strip_frontmatter(&raw);
-
-        // Substitute $ARGUMENTS
-        let prompt = if let Some(args) = &params.args {
-            content.replace("$ARGUMENTS", args)
-        } else {
-            content.replace("$ARGUMENTS", "")
-        };
-
-        let prompt = prompt.trim().to_string();
+        let prompt = expand_discovered_skill_prompt(
+            skill,
+            &discovered,
+            params.args.as_deref(),
+            &ctx.working_dir,
+        );
         if prompt.is_empty() {
             return ToolResult::error(format!("Skill '{}' expanded to empty content.", skill_name));
         }
@@ -138,108 +134,95 @@ impl Tool for SkillTool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return all directories that should be searched for skill files, in priority order.
-///
-/// Both `skills/` and `commands/` are included since MangoCode supports both
-/// naming conventions. Folder-based skills live inside the `skills/` dirs.
-fn skill_search_dirs(ctx: &ToolContext) -> Vec<PathBuf> {
-    let mut dirs = vec![
-        ctx.working_dir.join(".mangocode").join("commands"),
-        ctx.working_dir.join(".mangocode").join("skills"),
-        ctx.working_dir.join(".agents").join("skills"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".mangocode").join("commands"));
-        dirs.push(home.join(".mangocode").join("skills"));
-    }
-    dirs
+fn discover_disk_skills(ctx: &ToolContext) -> HashMap<String, DiscoveredSkill> {
+    let skills_config = mangocode_plugins::skills_config_with_plugin_paths(&ctx.config.skills);
+    mangocode_core::discover_skills(&ctx.working_dir, &skills_config)
 }
 
-async fn list_skills(dirs: &[PathBuf]) -> ToolResult {
-    // Start with the bundled skills.
+fn normalize_skill_ref(skill: &str) -> &str {
+    strip_markdown_suffix(skill.trim())
+        .trim_start_matches('/')
+        .trim()
+}
+
+fn strip_markdown_suffix(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &value[..value.len() - 3]
+    } else {
+        value
+    }
+}
+
+fn normalized_skill_name(name: &str) -> Option<&str> {
+    let name = normalize_skill_ref(name);
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalized_skill_lookup_key(name: &str) -> Option<String> {
+    normalized_skill_name(name).map(str::to_lowercase)
+}
+
+fn list_skills(discovered: &HashMap<String, DiscoveredSkill>) -> ToolResult {
     let mut lines: Vec<String> = Vec::new();
     let bundled = user_invocable_skills();
     for (name, desc) in &bundled {
-        lines.push(format!("  {} — {} [bundled]", name, desc));
+        lines.push(format!("  {} - {} [bundled]", name, desc));
     }
-    let bundled_names: Vec<&str> = bundled.iter().map(|(n, _)| *n).collect();
 
-    // Then add disk skills (flat .md files + folder-based skills), skipping bundled names.
-    let mut disk_skills: Vec<(String, PathBuf, Vec<String>)> = Vec::new();
-    for dir in dirs {
-        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-
-                if path.is_dir() {
-                    // Folder-based skill: look for SKILL.md
-                    let skill_md = path.join("SKILL.md");
-                    if skill_md.is_file() {
-                        let dir_name = path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if dir_name.is_empty() || bundled_names.contains(&dir_name.as_str()) {
-                            continue;
-                        }
-                        if disk_skills.iter().any(|(n, _, _)| n == &dir_name) {
-                            continue;
-                        }
-                        // Collect sub-file names
-                        let mut sub_names: Vec<String> = Vec::new();
-                        if let Ok(mut sub) = tokio::fs::read_dir(&path).await {
-                            while let Ok(Some(se)) = sub.next_entry().await {
-                                let sp = se.path();
-                                if sp.is_file()
-                                    && sp.extension().is_some_and(|e| e == "md")
-                                    && sp.file_name().and_then(|s| s.to_str()) != Some("SKILL.md")
-                                {
-                                    if let Some(stem) = sp.file_stem().and_then(|s| s.to_str()) {
-                                        sub_names.push(stem.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        sub_names.sort();
-                        disk_skills.push((dir_name, skill_md, sub_names));
-                    }
-                } else if path.extension().is_some_and(|e| e == "md") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let name = stem.to_string();
-                        // Deduplicate: project-level shadows user-level;
-                        // bundled skills shadow everything.
-                        if !disk_skills.iter().any(|(n, _, _)| n == &name)
-                            && !bundled_names.contains(&name.as_str())
-                        {
-                            disk_skills.push((name, path, vec![]));
-                        }
-                    }
-                }
+    let bundled_names: HashSet<String> = bundled.iter().map(|(n, _)| n.to_lowercase()).collect();
+    let mut disk_skills: Vec<_> = discovered
+        .values()
+        .filter_map(|skill| {
+            let name = normalized_skill_name(&skill.name)?;
+            let lookup_key = name.to_lowercase();
+            if bundled_names.contains(&lookup_key) {
+                return None;
             }
+
+            Some((
+                lookup_key,
+                skill.name.trim().starts_with('/'),
+                name.to_string(),
+                skill,
+            ))
+        })
+        .collect();
+    disk_skills.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.source_path.cmp(&b.3.source_path))
+    });
+
+    let mut seen_disk_skills = HashSet::new();
+    let mut visible_disk_skills = Vec::new();
+    for (lookup_key, _, name, skill) in disk_skills {
+        if seen_disk_skills.insert(lookup_key) {
+            visible_disk_skills.push((name, skill));
         }
     }
 
-    disk_skills.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, path, sub_files) in &disk_skills {
-        let desc = read_skill_description(path).await;
+    for (name, skill) in &visible_disk_skills {
+        let mut sub_files: Vec<String> = skill.sub_files.keys().cloned().collect();
+        sub_files.sort();
         if sub_files.is_empty() {
-            lines.push(format!("  {} — {}", name, desc));
+            lines.push(format!("  {} - {}", name, skill.description));
         } else {
             lines.push(format!(
-                "  {} — {} [sub-files: {}]",
+                "  {} - {} [sub-files: {}]",
                 name,
-                desc,
+                skill.description,
                 sub_files.join(", ")
             ));
         }
     }
 
-    let total = bundled.len() + disk_skills.len();
+    let total = bundled.len() + visible_disk_skills.len();
     if total == 0 {
         return ToolResult::success(
-            "No skills found. Create .md files in .mangocode/commands/ to define skills.\n\
-             Example: .mangocode/commands/review.md"
+            "No skills found. Create skills in .mangocode/skills/ or .mangocode/commands/, \
+             configure skills.paths or skills.urls, or enable a plugin that provides skills."
                 .to_string(),
         );
     }
@@ -251,87 +234,305 @@ async fn list_skills(dirs: &[PathBuf]) -> ToolResult {
     ))
 }
 
-/// Locate and read a skill's primary content (SKILL.md or flat .md file).
-///
-/// Search order per directory:
-///  1. Flat file: `<dir>/<name>.md`
-///  2. Folder-based: `<dir>/<name>/SKILL.md`
-async fn find_and_read_skill(name: &str, dirs: &[PathBuf]) -> Option<String> {
-    for dir in dirs {
-        // Flat file
-        let flat = dir.join(format!("{}.md", name));
-        if let Ok(content) = tokio::fs::read_to_string(&flat).await {
-            return Some(content);
-        }
-        // Folder-based skill
-        let folder_skill = dir.join(name).join("SKILL.md");
-        if let Ok(content) = tokio::fs::read_to_string(&folder_skill).await {
-            return Some(content);
-        }
-    }
-    None
-}
-
-/// Load a named sub-file from a folder-based skill.
-///
-/// Handles `skill="rust-review/security"` — reads `security.md` from the
-/// `rust-review/` skill directory.
+/// Handles `skill="rust-review/security"` by reading the discovered sub-file.
 async fn load_sub_file(
     skill_name: &str,
     sub_name: &str,
-    dirs: &[PathBuf],
+    discovered: &HashMap<String, DiscoveredSkill>,
     args: Option<&str>,
 ) -> ToolResult {
-    let sub_name_clean = sub_name.trim_end_matches(".md");
-    for dir in dirs {
-        let candidate = dir.join(skill_name).join(format!("{}.md", sub_name_clean));
-        if let Ok(raw) = tokio::fs::read_to_string(&candidate).await {
-            let content = strip_frontmatter(&raw);
-            let prompt = if let Some(a) = args {
-                content.replace("$ARGUMENTS", a)
-            } else {
-                content.replace("$ARGUMENTS", "")
-            };
-            let prompt = prompt.trim().to_string();
-            if prompt.is_empty() {
-                return ToolResult::error(format!(
-                    "Sub-file '{}/{}' expanded to empty content.",
-                    skill_name, sub_name_clean
-                ));
+    let sub_name_clean = strip_markdown_suffix(sub_name.trim()).trim();
+    let Some(skill) = find_discovered_skill(skill_name, discovered) else {
+        return ToolResult::error(format!(
+            "Skill '{}' not found. Use skill=\"list\" to discover available skills.",
+            skill_name
+        ));
+    };
+
+    let candidate = skill.sub_files.get(sub_name_clean).or_else(|| {
+        skill
+            .sub_files
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(sub_name_clean))
+            .map(|(_, path)| path)
+    });
+
+    if let Some(path) = candidate {
+        if let Ok(raw) = tokio::fs::read_to_string(path).await {
+            let prompt = expand_template(&strip_frontmatter(&raw), args);
+            if !prompt.is_empty() {
+                return ToolResult::success(prompt);
             }
-            return ToolResult::success(prompt);
+            return ToolResult::error(format!(
+                "Sub-file '{}/{}' expanded to empty content.",
+                skill_name, sub_name_clean
+            ));
         }
     }
+
     ToolResult::error(format!(
         "Sub-file '{}/{}' not found. Use skill=\"list\" to discover available skills.",
         skill_name, sub_name_clean
     ))
 }
 
-async fn read_skill_description(path: &std::path::Path) -> String {
-    let Ok(content) = tokio::fs::read_to_string(path).await else {
-        return "(no description)".to_string();
-    };
-    let body = strip_frontmatter(&content);
-    // First non-empty, non-heading line
-    for line in body.lines() {
-        let t = line.trim().trim_start_matches('#').trim();
-        if !t.is_empty() {
-            return truncate_bytes_prefix(t, 80).to_string();
-        }
+fn find_discovered_skill<'a>(
+    name: &str,
+    discovered: &'a HashMap<String, DiscoveredSkill>,
+) -> Option<&'a DiscoveredSkill> {
+    let key = normalized_skill_lookup_key(name)?;
+    discovered.get(key.as_str()).or_else(|| {
+        discovered
+            .values()
+            .filter(|s| normalized_skill_lookup_key(&s.name).as_deref() == Some(key.as_str()))
+            .min_by(|a, b| {
+                a.name
+                    .trim()
+                    .starts_with('/')
+                    .cmp(&b.name.trim().starts_with('/'))
+                    .then(a.name.cmp(&b.name))
+                    .then(a.source_path.cmp(&b.source_path))
+            })
+    })
+}
+
+fn expand_discovered_skill_prompt(
+    skill: &DiscoveredSkill,
+    discovered: &HashMap<String, DiscoveredSkill>,
+    args: Option<&str>,
+    working_dir: &Path,
+) -> String {
+    let mut loaded = HashSet::new();
+    let mut context = Vec::new();
+    load_skill_with_dependencies(&skill.name, discovered, &mut loaded, &mut context);
+    if context.is_empty() {
+        context.push(skill.clone());
     }
-    "(no description)".to_string()
+
+    let session_scripts_root = working_dir.join(".mangocode").join("skill-scripts");
+    for skill in &context {
+        install_skill_scripts(skill, &session_scripts_root);
+    }
+
+    let mut parts: Vec<String> = context
+        .iter()
+        .map(|s| {
+            let skill_args = if normalized_skill_lookup_key(&s.name)
+                == normalized_skill_lookup_key(&skill.name)
+            {
+                args
+            } else {
+                None
+            };
+            expand_template(&s.template, skill_args)
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let qa_blocks: Vec<String> = context
+        .iter()
+        .filter_map(format_qa_block)
+        .map(|block| block.trim().to_string())
+        .filter(|block| !block.is_empty())
+        .collect();
+    if !qa_blocks.is_empty() {
+        parts.push(qa_blocks.join("\n\n"));
+    }
+
+    parts.join("\n\n")
+}
+
+fn expand_template(template: &str, args: Option<&str>) -> String {
+    let args = args.unwrap_or("");
+    let mut words = args.split_whitespace();
+    let arg1 = words.next().unwrap_or("");
+    let arg2 = words.next().unwrap_or("");
+    template
+        .replace("$ARGUMENTS", args)
+        .replace("$1", arg1)
+        .replace("$2", arg2)
+        .trim()
+        .to_string()
 }
 
 /// Remove YAML frontmatter delimited by `---` at the start of the file.
 fn strip_frontmatter(content: &str) -> String {
     if let Some(after_open) = content.strip_prefix("---") {
-        // Find closing ---
         if let Some(close_pos) = after_open.find("\n---") {
-            // Skip past the closing delimiter and any leading newline
             let rest = &after_open[close_pos + 4..];
-            return rest.trim_start_matches('\n').to_string();
+            return rest.trim_start_matches(['\r', '\n']).to_string();
         }
     }
     content.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_skill(name: &str, template: &str, deps: Vec<&str>) -> DiscoveredSkill {
+        DiscoveredSkill {
+            name: name.to_string(),
+            description: String::new(),
+            template: template.to_string(),
+            source_path: std::path::PathBuf::from(format!("{name}.md")),
+            triggers: Vec::new(),
+            dependencies: deps.into_iter().map(String::from).collect(),
+            sub_files: HashMap::new(),
+            scripts: Vec::new(),
+            qa_required: false,
+            qa_steps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn discovered_skill_lookup_accepts_frontmatter_name_case_insensitively() {
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "review-code".to_string(),
+            test_skill("Review-Code", "Review $ARGUMENTS", vec![]),
+        );
+
+        let skill = find_discovered_skill("review-code", &discovered).unwrap();
+
+        assert_eq!(skill.name, "Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_lookup_normalizes_slash_prefixed_names() {
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "/review-code".to_string(),
+            test_skill("/Review-Code", "Review $ARGUMENTS", vec![]),
+        );
+
+        let skill = find_discovered_skill("/review-code", &discovered).unwrap();
+
+        assert_eq!(skill.name, "/Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_lookup_normalizes_markdown_suffix_case_insensitively() {
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "review-code".to_string(),
+            test_skill("Review-Code", "Review $ARGUMENTS", vec![]),
+        );
+
+        let skill = find_discovered_skill("/review-code.MD", &discovered).unwrap();
+
+        assert_eq!(skill.name, "Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_lookup_prefers_unslashed_duplicate() {
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "/projectreview".to_string(),
+            test_skill("/ProjectReview", "Slash review", vec![]),
+        );
+        discovered.insert(
+            "projectreview".to_string(),
+            test_skill("ProjectReview", "Plain review", vec![]),
+        );
+
+        let skill = find_discovered_skill("/projectreview", &discovered).unwrap();
+
+        assert_eq!(skill.name, "ProjectReview");
+    }
+
+    #[test]
+    fn list_skills_normalizes_and_dedupes_disk_names() {
+        let mut discovered = HashMap::new();
+        let mut plain = test_skill("ProjectReview.MD", "Plain review", vec![]);
+        plain.description = "Plain review".to_string();
+        let mut slash = test_skill("/ProjectReview", "Slash review", vec![]);
+        slash.description = "Slash review".to_string();
+        discovered.insert("projectreview".to_string(), plain);
+        discovered.insert("/projectreview".to_string(), slash);
+
+        let result = list_skills(&discovered);
+
+        assert!(!result.is_error);
+        assert_eq!(result.content.matches("ProjectReview -").count(), 1);
+        assert!(result.content.contains("ProjectReview - Plain review"));
+        assert!(!result.content.contains("ProjectReview.MD - Plain review"));
+        assert!(!result.content.contains("/ProjectReview - Slash review"));
+    }
+
+    #[tokio::test]
+    async fn load_sub_file_normalizes_slash_prefixed_skill_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_file = tmp.path().join("security.md");
+        std::fs::write(&sub_file, "Check security $ARGUMENTS").unwrap();
+        let mut skill = test_skill("/ProjectReview", "Review", vec![]);
+        skill.sub_files.insert("security".to_string(), sub_file);
+        let mut discovered = HashMap::new();
+        discovered.insert("/projectreview".to_string(), skill);
+
+        let result = load_sub_file("/ProjectReview", "security", &discovered, Some("now")).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "Check security now");
+    }
+
+    #[tokio::test]
+    async fn load_sub_file_normalizes_markdown_suffix_case_insensitively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_file = tmp.path().join("security.md");
+        std::fs::write(&sub_file, "Check security").unwrap();
+        let mut skill = test_skill("ProjectReview", "Review", vec![]);
+        skill.sub_files.insert("security".to_string(), sub_file);
+        let mut discovered = HashMap::new();
+        discovered.insert("projectreview".to_string(), skill);
+
+        let result = load_sub_file("ProjectReview", "security.MD", &discovered, None).await;
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "Check security");
+    }
+
+    #[test]
+    fn discovered_skill_expansion_includes_dependencies_first() {
+        let mut discovered = HashMap::new();
+        discovered.insert(
+            "base".to_string(),
+            test_skill("base", "Base $ARGUMENTS", vec![]),
+        );
+        discovered.insert(
+            "review".to_string(),
+            test_skill("review", "Review $ARGUMENTS", vec!["base"]),
+        );
+
+        let skill = find_discovered_skill("review", &discovered).unwrap();
+        let prompt = expand_discovered_skill_prompt(
+            skill,
+            &discovered,
+            Some("diff"),
+            std::path::Path::new("."),
+        );
+
+        assert_eq!(prompt, "Base\n\nReview diff");
+    }
+
+    #[test]
+    fn discovered_skill_expansion_includes_qa_block() {
+        let mut discovered = HashMap::new();
+        let mut review = test_skill("review", "Review $ARGUMENTS", vec![]);
+        review.qa_required = true;
+        review.qa_steps = vec!["Run focused tests".to_string()];
+        discovered.insert("review".to_string(), review.clone());
+
+        let skill = find_discovered_skill("review", &discovered).unwrap();
+        let prompt = expand_discovered_skill_prompt(
+            skill,
+            &discovered,
+            Some("diff"),
+            std::path::Path::new("."),
+        );
+
+        assert!(prompt.contains("Review diff"));
+        assert!(prompt.contains("Required QA"));
+        assert!(prompt.contains("Run focused tests"));
+    }
 }

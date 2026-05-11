@@ -15,7 +15,7 @@
 // Enable/disable via feature flag FLAG_EXECUTION_SCRATCHPAD (default: on).
 // The flag can be toggled at runtime via MANGOCODE_FLAG_EXECUTION_SCRATCHPAD=0.
 
-use mangocode_core::truncate::truncate_bytes_with_ellipsis;
+use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
 use mangocode_core::types::{ContentBlock, Message, MessageContent, Role};
 
 /// How many characters of a tool result to include in the one-line summary.
@@ -74,7 +74,7 @@ impl ScratchpadState {
     pub fn set_plan(&mut self, plan: impl Into<String>) {
         let p = plan.into();
         if p.len() > MAX_PLAN_CHARS {
-            self.current_plan = Some(format!("{}…", &p[..MAX_PLAN_CHARS]));
+            self.current_plan = Some(truncate_bytes_with_ellipsis(&p, MAX_PLAN_CHARS));
         } else {
             self.current_plan = Some(p);
         }
@@ -147,7 +147,7 @@ fn extract_last_tool_result_summary(messages: &[Message]) -> Option<String> {
                 // ToolResult does not carry a tool name — the name lives in the
                 // corresponding ToolUse block. The id is sufficient for the scratchpad.
                 let name_hint = if tool_use_id.len() > 8 {
-                    &tool_use_id[..8]
+                    truncate_bytes_prefix(tool_use_id, 8)
                 } else {
                     tool_use_id.as_str()
                 };
@@ -169,7 +169,7 @@ fn extract_last_tool_result_summary(messages: &[Message]) -> Option<String> {
                 // One-line: strip newlines, truncate.
                 let one_line = text.lines().next().unwrap_or("").trim().to_string();
                 let summary = if one_line.len() > RESULT_SUMMARY_CHARS {
-                    format!("{}…", &one_line[..RESULT_SUMMARY_CHARS])
+                    truncate_bytes_with_ellipsis(&one_line, RESULT_SUMMARY_CHARS)
                 } else {
                     one_line
                 };
@@ -241,7 +241,7 @@ fn extract_next_action_hint(messages: &[Message]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mangocode_core::types::{Message, MessageContent, Role};
+    use mangocode_core::types::{Message, MessageContent, Role, ToolResultContent};
 
     fn text_msg(role: Role, text: &str) -> Message {
         Message {
@@ -285,6 +285,23 @@ mod tests {
         let hint = extract_next_action_hint(&messages);
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("edit the source file"));
+    }
+
+    #[test]
+    fn tool_result_id_preview_handles_multibyte_boundaries() {
+        let messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "☃☃☃tool".to_string(),
+                content: ToolResultContent::Text("ok".to_string()),
+                is_error: None,
+            }]),
+            uuid: None,
+            cost: None,
+        }];
+
+        let summary = extract_last_tool_result_summary(&messages).unwrap();
+        assert_eq!(summary, "☃☃: ok");
     }
 
     #[test]

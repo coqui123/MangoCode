@@ -110,7 +110,7 @@ impl OutputStyle {
 
     /// Parse from a string (case-insensitive).
     pub fn parse(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+        match s.trim().to_lowercase().as_str() {
             "explanatory" => Self::Explanatory,
             "learning" => Self::Learning,
             "concise" => Self::Concise,
@@ -520,7 +520,10 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
 
     // Shell line: on Windows add Unix syntax note
     let shell_line = if cfg!(target_os = "windows") {
-        format!("Shell: {} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)", shell_name)
+        format!(
+            "Shell: {} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)",
+            shell_name
+        )
     } else {
         format!("Shell: {}", shell_name)
     };
@@ -698,15 +701,15 @@ pub fn gather_git_context(working_dir: &str) -> String {
 const CORE_CAPABILITIES: &str = r#"
 ## Capabilities
 
-You have access to powerful tools for software engineering tasks:
-- **Read/Write files**: Read any file, write new files, edit existing files with precise diffs
-- **Execute commands**: Run bash commands, PowerShell scripts, background processes
-- **Search**: Glob patterns, regex grep, web search, file content search
-- **Web**: Fetch URLs, search the internet
-- **Agents**: Spawn parallel sub-agents for complex multi-step work
-- **Memory**: Persistent notes across sessions via the memory system
-- **MCP servers**: Connect to external tools and APIs via Model Context Protocol
-- **Jupyter notebooks**: Read and edit notebook cells
+You can help with software engineering tasks using the tools exposed in the
+current runtime tool list. Tool availability can vary by build features,
+session configuration, permission mode, and connected MCP servers.
+
+Use available tools for reading and editing files, running commands, searching
+code or web resources, managing tasks, coordinating agents, working with MCP
+resources, and handling notebooks. When memory context is injected, consult it
+as persistent project or user knowledge. If a needed capability is not
+available, explain the limitation or choose an available alternative.
 
 ## How to approach tasks
 
@@ -719,11 +722,11 @@ You have access to powerful tools for software engineering tasks:
 const TOOL_USE_GUIDELINES: &str = r#"
 ## Tool use guidelines
 
-- Use dedicated tools (Read, Edit, Glob, Grep) instead of bash equivalents
-- For searches, prefer Grep over `grep`; prefer Glob over `find`
-- Parallelize independent tool calls in a single response
+- Use only tools that are present in the current runtime tool list
+- Prefer dedicated file and search tools over shell commands when available
+- Parallelize independent tool calls when the runtime supports the needed tools
 - For file edits: always read the file first, then make targeted edits
-- Bash commands timeout after 2 minutes; use background mode for long operations
+- For long-running commands, use the runtime's background or task mechanism when available
 "#;
 
 const ACTIONS_SECTION: &str = r#"
@@ -753,9 +756,10 @@ const CYBER_RISK_INSTRUCTION: &str = "";
 const COORDINATOR_SYSTEM_PROMPT: &str = r#"
 ## Coordinator Mode
 
-You are operating as an orchestrator. Spawn parallel worker agents using the Agent tool.
-Each worker prompt must be fully self-contained. Synthesize findings before delegating
-follow-up work. Use TaskCreate/TaskUpdate to track parallel work.
+You are operating as an orchestrator. Use the available coordination tools to
+spawn or communicate with worker agents when those tools are present. Each worker
+prompt must be fully self-contained. Synthesize findings before delegating
+follow-up work. Use task-tracking tools when they are available.
 "#;
 
 // ---------------------------------------------------------------------------
@@ -786,6 +790,13 @@ mod tests {
             prompt.contains("MangoCode"),
             "Default prompt must contain attribution"
         );
+    }
+
+    #[test]
+    fn test_default_prompt_preserves_runtime_tools_and_memory_guidance() {
+        let prompt = build_system_prompt(&default_opts());
+        assert!(prompt.contains("current runtime tool list"));
+        assert!(prompt.contains("memory context is injected"));
     }
 
     #[test]
@@ -903,7 +914,7 @@ mod tests {
     #[test]
     fn test_output_style_parse() {
         assert_eq!(OutputStyle::parse("concise"), OutputStyle::Concise);
-        assert_eq!(OutputStyle::parse("FORMAL"), OutputStyle::Formal);
+        assert_eq!(OutputStyle::parse(" FORMAL "), OutputStyle::Formal);
         assert_eq!(OutputStyle::parse("unknown"), OutputStyle::Default);
     }
 

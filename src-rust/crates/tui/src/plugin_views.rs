@@ -5,6 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A dismissible banner shown at the top of the message area when a plugin
 /// wants to surface a hint or recommendation to the user.
@@ -38,6 +39,31 @@ impl PluginHintBanner {
     }
 }
 
+fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "\u{2026}".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width >= max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Render the first undismissed plugin hint banner into `area`.
 /// Returns the height consumed (0 if nothing rendered).
 pub fn render_plugin_hints(frame: &mut Frame, hints: &[PluginHintBanner], area: Rect) -> u16 {
@@ -61,11 +87,7 @@ pub fn render_plugin_hints(frame: &mut Frame, hints: &[PluginHintBanner], area: 
 
     let inner_width = area.width.saturating_sub(4) as usize;
     let content = format!(" [{}] {} [Esc to dismiss]", hint.plugin_name, hint.message);
-    let display = if content.len() > inner_width {
-        format!("{}…", &content[..inner_width.saturating_sub(1)])
-    } else {
-        content
-    };
+    let display = truncate_to_width_with_ellipsis(&content, inner_width);
 
     let lines = vec![Line::from(vec![Span::styled(
         display,
@@ -374,6 +396,14 @@ mod tests {
         ];
         let visible = hints.iter().find(|h| h.is_visible()).unwrap();
         assert_eq!(visible.plugin_name, "b");
+    }
+
+    #[test]
+    fn truncates_unicode_banner_text_on_char_boundaries() {
+        let truncated = truncate_to_width_with_ellipsis("plugin Café 中 message", 12);
+
+        assert!(truncated.ends_with('…'));
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 12);
     }
 
     fn make_items(n: usize) -> Vec<PluginListItem> {

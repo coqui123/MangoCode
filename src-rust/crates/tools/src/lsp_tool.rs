@@ -8,6 +8,27 @@ use serde_json::Value;
 
 pub struct LspTool;
 
+fn normalize_lsp_action(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hover" => Ok("hover"),
+        "definition" => Ok("definition"),
+        "references" => Ok("references"),
+        "symbols" => Ok("symbols"),
+        "diagnostics" => Ok("diagnostics"),
+        "incoming_calls" => Ok("incoming_calls"),
+        "outgoing_calls" => Ok("outgoing_calls"),
+        "implementations" => Ok("implementations"),
+        "type_definition" => Ok("type_definition"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid action: {value}. Expected one of: hover, definition, references, symbols, diagnostics, incoming_calls, outgoing_calls, implementations, type_definition"
+            ))
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for LspTool {
     fn name(&self) -> &str {
@@ -54,7 +75,10 @@ impl Tool for LspTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         // --- Parse inputs ---------------------------------------------------
         let action = match input.get("action").and_then(|v| v.as_str()) {
-            Some(a) => a.to_string(),
+            Some(a) => match normalize_lsp_action(a) {
+                Ok(action) => action,
+                Err(e) => return ToolResult::error(e),
+            },
             None => return ToolResult::error("'action' is required"),
         };
 
@@ -111,7 +135,7 @@ impl Tool for LspTool {
         }
 
         // --- Dispatch action ------------------------------------------------
-        match action.as_str() {
+        match action {
             "hover" => {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
@@ -285,5 +309,19 @@ impl Tool for LspTool {
                 other
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsp_action_is_normalized_or_rejected() {
+        assert_eq!(normalize_lsp_action(" DEFINITION "), Ok("definition"));
+        let err = normalize_lsp_action("hover\ndiagnostics")
+            .expect_err("invalid action must be rejected");
+        assert!(err.contains("Invalid action"));
+        assert!(err.contains("\"hover\\ndiagnostics\""));
     }
 }

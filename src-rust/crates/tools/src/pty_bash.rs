@@ -274,7 +274,10 @@ exit $__CC_EXIT_CODE
 // ---------------------------------------------------------------------------
 
 async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> ToolResult {
-    let task_name = format!("bg: {}", &command[..command.len().min(60)]);
+    let task_name = format!(
+        "bg: {}",
+        mangocode_core::truncate::truncate_bytes_prefix(&command, 60)
+    );
     let mut task = BackgroundTask::new(&task_name);
     task.pid = None;
     let task_id = global_registry().register(task);

@@ -21,6 +21,22 @@ struct PrWatchInput {
     auto_analyze: Option<bool>,
 }
 
+fn normalize_pr_watch_action(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "watch" => Ok("watch"),
+        "unwatch" => Ok("unwatch"),
+        "list" => Ok("list"),
+        "check" => Ok("check"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid action: {value}. Expected one of: watch, unwatch, list, check"
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WatchedPr {
     pr: u64,
@@ -124,10 +140,21 @@ impl Tool for PrWatchTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let params: PrWatchInput = match serde_json::from_value(input) {
+        let mut params: PrWatchInput = match serde_json::from_value(input) {
             Ok(v) => v,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let action = match normalize_pr_watch_action(&params.action) {
+            Ok(action) => action,
+            Err(e) => return ToolResult::error(e),
+        };
+        params.action = action.to_string();
+
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("PR watch {}", params.action), false)
+        {
+            return ToolResult::error(e.to_string());
+        }
 
         match params.action.as_str() {
             "watch" => watch_pr(params, ctx).await,
@@ -625,4 +652,18 @@ pub async fn heartbeat_scan_watched_prs(
 
     let _ = save_watched_prs(&watched).await;
     alerts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_watch_action_is_normalized_or_rejected() {
+        assert_eq!(normalize_pr_watch_action(" CHECK "), Ok("check"));
+        let err = normalize_pr_watch_action("watch\nunwatch")
+            .expect_err("invalid action must be rejected");
+        assert!(err.contains("Invalid action"));
+        assert!(err.contains("\"watch\\nunwatch\""));
+    }
 }

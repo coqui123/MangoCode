@@ -27,7 +27,7 @@ pub struct SkillDefinition {
     /// Searchable tags — includes explicit `tags:` values **and** all
     /// `triggers:` / `when_to_use:` phrases from the skill frontmatter.
     pub tags: Vec<String>,
-    /// Source: "bundled" | "user" | "plugin:{name}"
+    /// Source: "discovered" | "bundled"
     pub source: String,
     /// Path to the skill file (`.md`) or directory (`SKILL.md` container) on disk.
     pub path: Option<std::path::PathBuf>,
@@ -46,8 +46,13 @@ pub struct SkillIndex {
 
 impl SkillIndex {
     /// Add a skill to the index.
-    pub fn insert(&mut self, skill: SkillDefinition) {
-        self.skills.insert(skill.name.to_lowercase(), skill);
+    pub fn insert(&mut self, mut skill: SkillDefinition) {
+        let Some(name) = normalized_skill_name(&skill.name) else {
+            return;
+        };
+        skill.name = name;
+        let key = skill.name.to_lowercase();
+        self.skills.entry(key).or_insert(skill);
     }
 
     /// Query by partial name, description, or tag match (case-insensitive).
@@ -80,31 +85,40 @@ impl SkillIndex {
     }
 }
 
+fn normalized_skill_name(name: &str) -> Option<String> {
+    let name = strip_markdown_suffix(name.trim().trim_start_matches('/').trim()).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn strip_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
+}
+
 /// Shared handle to the skill index (populated in the background).
 pub type SharedSkillIndex = Arc<RwLock<SkillIndex>>;
 
-/// Scan `project_root` for skill definitions in `.mangocode/skills/` and the
-/// bundled skill list, then write the completed index into `index`.
+/// Scan `project_root`, configured paths, plugin paths, and bundled skills,
+/// then write the completed index into `index`.
 ///
 /// This runs as a `tokio::task::spawn` parallel to model streaming.
-pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
+pub async fn prefetch_skills(
+    project_root: &Path,
+    skills_config: &mangocode_core::config::SkillsConfig,
+    index: SharedSkillIndex,
+) {
     let mut local = SkillIndex::default();
 
-    // 1. User-defined skills: ~/.mangocode/skills/ + {project_root}/.mangocode/skills/
-    let search_dirs: Vec<std::path::PathBuf> = {
-        let mut dirs = Vec::new();
-        if let Some(home) = dirs::home_dir() {
-            dirs.push(home.join(".mangocode").join("skills"));
-            dirs.push(home.join(".mangocode").join("commands"));
-        }
-        dirs.push(project_root.join(".mangocode").join("skills"));
-        dirs.push(project_root.join(".mangocode").join("commands"));
-        dirs.push(project_root.join(".agents").join("skills"));
-        dirs
-    };
-
-    for dir in &search_dirs {
-        index_dir(&mut local, dir);
+    // 1. Plugin, configured, URL-backed, and user-defined skills. Use the same
+    // core discovery path as slash commands so names, priority, dependencies,
+    // sub-files, and git URL caches stay wired consistently.
+    let skills_config = mangocode_plugins::skills_config_with_plugin_paths(skills_config);
+    for skill in mangocode_core::discover_skills(project_root, &skills_config).into_values() {
+        local.insert(skill_definition_from_discovered(skill));
     }
 
     // 2. Bundled skills: check if we ship any in a `skills/` directory next to the binary.
@@ -128,6 +142,21 @@ pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
     *guard = local;
 }
 
+fn skill_definition_from_discovered(skill: mangocode_core::DiscoveredSkill) -> SkillDefinition {
+    let mut sub_file_names: Vec<String> = skill.sub_files.keys().cloned().collect();
+    sub_file_names.sort();
+
+    SkillDefinition {
+        name: skill.name,
+        description: skill.description,
+        tags: skill.triggers,
+        source: "discovered".to_string(),
+        path: Some(skill.source_path),
+        sub_file_names,
+        qa_required: skill.qa_required,
+    }
+}
+
 /// Index all skills (flat `.md` files and folder-based `SKILL.md` directories)
 /// found inside `dir` into `index`.
 fn index_dir(index: &mut SkillIndex, dir: &Path) {
@@ -138,19 +167,19 @@ fn index_dir(index: &mut SkillIndex, dir: &Path) {
         return;
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
+    for path in paths {
         if path.is_dir() {
             // Folder-based skill: look for SKILL.md
-            let skill_md = path.join("SKILL.md");
-            if skill_md.is_file() {
+            if let Some(skill_md) = skill_index_file(&path) {
                 if let Some(skill) = load_skill_from_file(&skill_md) {
                     // Override name to use directory stem when SKILL.md has no `name:` field
                     // (load_skill_from_file handles this via the path stem logic, but we
                     // double-check using the directory name for folder skills).
                     let mut skill = skill;
-                    if skill.name == "SKILL" {
+                    if skill.name.eq_ignore_ascii_case("skill") {
                         if let Some(dir_name) = path.file_name().and_then(|s| s.to_str()) {
                             skill.name = dir_name.to_string();
                         }
@@ -158,11 +187,15 @@ fn index_dir(index: &mut SkillIndex, dir: &Path) {
                     // Collect sub-file names from sibling .md files
                     let mut sub_file_names: Vec<String> = Vec::new();
                     if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for se in sub_entries.flatten() {
-                            let sp = se.path();
+                        let mut sub_paths: Vec<std::path::PathBuf> =
+                            sub_entries.flatten().map(|entry| entry.path()).collect();
+                        sub_paths.sort();
+                        for sp in sub_paths {
                             if sp.is_file()
-                                && sp.extension().and_then(|e| e.to_str()) == Some("md")
-                                && sp.file_name().and_then(|s| s.to_str()) != Some("SKILL.md")
+                                && has_markdown_extension(&sp)
+                                && !is_skill_index_file_name(
+                                    sp.file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                                )
                             {
                                 if let Some(stem) = sp.file_stem().and_then(|s| s.to_str()) {
                                     sub_file_names.push(stem.to_string());
@@ -170,17 +203,52 @@ fn index_dir(index: &mut SkillIndex, dir: &Path) {
                             }
                         }
                     }
+                    sub_file_names.sort();
                     skill.sub_file_names = sub_file_names;
                     skill.path = Some(path);
                     index.insert(skill);
                 }
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        } else if has_markdown_extension(&path) {
             if let Some(skill) = load_skill_from_file(&path) {
                 index.insert(skill);
             }
         }
     }
+}
+
+fn skill_index_file(dir: &Path) -> Option<std::path::PathBuf> {
+    for filename in ["SKILL.md", "skill.md"] {
+        let candidate = dir.join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_skill_index_file_name)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn is_skill_index_file_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("skill.md")
+}
+
+fn has_markdown_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 /// Parse a skill Markdown file into a `SkillDefinition`.
@@ -241,7 +309,11 @@ fn load_skill_from_file(path: &std::path::Path) -> Option<SkillDefinition> {
         // No frontmatter: accept plain markdown skills (common in MangoCode skill packs).
         // - For folder-based skills, SKILL.md should map to the parent directory name.
         // - Prefer a human-readable description derived from the first meaningful markdown line.
-        let name = if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
+        let name = if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_skill_index_file_name)
+        {
             path.parent()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
@@ -367,4 +439,112 @@ pub fn format_skill_listing(index: &SkillIndex) -> String {
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_dir_accepts_case_insensitive_skill_marker_and_markdown_extensions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("rust-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("Skill.MD"),
+            "# Rust Review\nReview carefully.",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("Security.MD"), "# Security\nCheck security.").unwrap();
+        std::fs::write(
+            skill_dir.join("Performance.md"),
+            "# Performance\nCheck performance.",
+        )
+        .unwrap();
+
+        let mut index = SkillIndex::default();
+        index_dir(&mut index, tmp.path());
+
+        let skill = index.search("rust-review").pop().unwrap();
+        assert_eq!(skill.name, "rust-review");
+        assert_eq!(
+            skill.sub_file_names,
+            vec!["Performance".to_string(), "Security".to_string()]
+        );
+    }
+
+    #[test]
+    fn skill_index_normalizes_slash_prefixed_names() {
+        let mut index = SkillIndex::default();
+        index.insert(SkillDefinition {
+            name: " /ProjectReview ".to_string(),
+            description: "Review project".to_string(),
+            tags: vec!["review".to_string()],
+            source: "discovered".to_string(),
+            path: None,
+            sub_file_names: Vec::new(),
+            qa_required: false,
+        });
+
+        let listing = format_skill_listing(&index);
+
+        assert!(listing.contains("/ProjectReview"));
+        assert!(!listing.contains("//ProjectReview"));
+        assert!(index
+            .search("ProjectReview")
+            .iter()
+            .any(|skill| skill.name == "ProjectReview"));
+    }
+
+    #[test]
+    fn skill_index_normalizes_markdown_suffix_case_insensitively() {
+        let mut index = SkillIndex::default();
+        index.insert(SkillDefinition {
+            name: " /ProjectReview.MD ".to_string(),
+            description: "Review project".to_string(),
+            tags: vec!["review".to_string()],
+            source: "discovered".to_string(),
+            path: None,
+            sub_file_names: Vec::new(),
+            qa_required: false,
+        });
+
+        let listing = format_skill_listing(&index);
+
+        assert!(listing.contains("/ProjectReview"));
+        assert!(!listing.contains("/ProjectReview.MD"));
+        assert!(index
+            .search("ProjectReview")
+            .iter()
+            .any(|skill| skill.name == "ProjectReview"));
+    }
+
+    #[test]
+    fn skill_index_keeps_first_normalized_definition() {
+        let mut index = SkillIndex::default();
+        index.insert(SkillDefinition {
+            name: "ProjectReview".to_string(),
+            description: "project definition".to_string(),
+            tags: vec![],
+            source: "discovered".to_string(),
+            path: None,
+            sub_file_names: Vec::new(),
+            qa_required: false,
+        });
+        index.insert(SkillDefinition {
+            name: "/projectreview".to_string(),
+            description: "bundled definition".to_string(),
+            tags: vec![],
+            source: "bundled".to_string(),
+            path: None,
+            sub_file_names: Vec::new(),
+            qa_required: false,
+        });
+
+        let matches = index.search("projectreview");
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "ProjectReview");
+        assert_eq!(matches[0].description, "project definition");
+    }
 }

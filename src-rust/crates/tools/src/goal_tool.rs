@@ -33,6 +33,19 @@ struct UpdateGoalInput {
     status: String,
 }
 
+fn normalize_update_goal_status(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "complete" => Ok("complete"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid status: {value}. Expected one of: complete"
+            ))
+        }
+    }
+}
+
 #[cfg(feature = "tool-get-goal")]
 #[async_trait]
 impl Tool for GetGoalTool {
@@ -164,11 +177,15 @@ impl Tool for UpdateGoalTool {
             Ok(params) => params,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let status = match normalize_update_goal_status(&params.status) {
+            Ok(status) => status,
+            Err(e) => return ToolResult::error(e),
+        };
         let store = match mangocode_core::goals::open_default_goal_store() {
             Ok(store) => store,
             Err(e) => return ToolResult::error(format!("Failed to open goal store: {}", e)),
         };
-        update_goal_with_store(&store, &ctx.session_id, &params.status)
+        update_goal_with_store(&store, &ctx.session_id, status)
     }
 }
 
@@ -302,5 +319,15 @@ mod tests {
         assert!(!completed.is_error, "{}", completed.content);
         let completed_meta = completed.metadata.as_ref().expect("completed metadata");
         assert_eq!(completed_meta["goal"]["status"], "complete");
+    }
+
+    #[test]
+    fn update_goal_status_is_normalized_or_rejected_before_store_work() {
+        assert_eq!(normalize_update_goal_status(" COMPLETE "), Ok("complete"));
+
+        let err = normalize_update_goal_status("complete\npaused")
+            .expect_err("invalid status must be rejected");
+        assert!(err.contains("Invalid status"));
+        assert!(err.contains("\"complete\\npaused\""));
     }
 }

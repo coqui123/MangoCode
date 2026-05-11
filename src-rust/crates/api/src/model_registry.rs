@@ -831,6 +831,23 @@ impl ModelRegistry {
             self.entries.extend(entries);
         }
     }
+
+    /// Load the standard MangoCode models.dev cache from the user cache dir.
+    ///
+    /// `models.json` is the current cache name used by the CLI/TUI fetch path.
+    /// `models_dev.json` is retained as a fallback for older installs.
+    pub fn load_standard_cache(&mut self) {
+        let Some(cache_dir) = dirs::cache_dir() else {
+            return;
+        };
+        let cache_dir = cache_dir.join("mangocode");
+        let primary = cache_dir.join("models.json");
+        if primary.exists() {
+            self.load_cache(&primary);
+            return;
+        }
+        self.load_cache(&cache_dir.join("models_dev.json"));
+    }
 }
 
 impl Default for ModelRegistry {
@@ -855,8 +872,12 @@ pub fn effective_model_for_config(
     config: &mangocode_core::Config,
     registry: &ModelRegistry,
 ) -> String {
-    // Explicit user override — always wins.
-    if config.model.is_some() {
+    // Explicit user override — always wins when it contains a real model ID.
+    if config
+        .model
+        .as_deref()
+        .is_some_and(|model| !model.trim().is_empty())
+    {
         return config.effective_model().to_string();
     }
 
@@ -869,4 +890,98 @@ pub fn effective_model_for_config(
 
     // Fall back to the hardcoded table.
     config.effective_model().to_string()
+}
+
+/// Normalize a user-entered model ID.
+pub fn normalize_model_id(model: &str) -> Option<String> {
+    let model = model.trim();
+    (!model.is_empty()).then(|| model.to_string())
+}
+
+fn infer_provider_for_model_selection(
+    model: &str,
+    registry: Option<&ModelRegistry>,
+) -> Option<String> {
+    if let Some((provider, _)) = mangocode_core::ProviderId::split_known_model_prefix(model) {
+        return Some(provider.to_string());
+    }
+
+    if let Some(provider) = registry.and_then(|registry| registry.find_provider_for_model(model)) {
+        return Some(provider.to_string());
+    }
+
+    let mut fallback = ModelRegistry::new();
+    fallback.load_standard_cache();
+    fallback
+        .find_provider_for_model(model)
+        .map(|provider| provider.to_string())
+}
+
+/// Apply a user-selected model to config, keeping provider/model wiring in sync.
+pub fn apply_model_selection_to_config(
+    config: &mut mangocode_core::Config,
+    model: &str,
+    registry: Option<&ModelRegistry>,
+) -> bool {
+    let Some(model) = normalize_model_id(model) else {
+        return false;
+    };
+
+    if let Some((provider, model_id)) = mangocode_core::ProviderId::split_known_model_prefix(&model)
+        .map(|(provider, model_id)| (provider.to_string(), model_id.to_string()))
+    {
+        config.provider = Some(provider.clone());
+        config.model = Some(if provider == mangocode_core::ProviderId::ANTHROPIC {
+            model_id
+        } else {
+            model
+        });
+        return true;
+    }
+
+    if let Some(provider) = infer_provider_for_model_selection(&model, registry) {
+        config.provider = Some(provider);
+    }
+    config.model = Some(model);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_selection_trims_and_rejects_blank_models() {
+        let mut config = mangocode_core::Config {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!apply_model_selection_to_config(&mut config, "   ", None));
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+
+        assert!(apply_model_selection_to_config(
+            &mut config,
+            " openai/gpt-4o ",
+            None
+        ));
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn model_selection_strips_anthropic_prefix() {
+        let mut config = mangocode_core::Config::default();
+
+        assert!(apply_model_selection_to_config(
+            &mut config,
+            "anthropic/claude-haiku-4-5",
+            None
+        ));
+
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
 }

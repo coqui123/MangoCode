@@ -80,10 +80,12 @@ pub mod remote_trigger;
 #[cfg(feature = "tool-repl")]
 pub mod repl_tool;
 #[cfg(any(
+    feature = "tool-browser",
     feature = "tool-doc-search",
     feature = "tool-doc-read",
     feature = "tool-deep-read",
-    feature = "tool-rendered-fetch"
+    feature = "tool-rendered-fetch",
+    feature = "tool-web-fetch"
 ))]
 pub mod research;
 #[cfg(feature = "tool-send-message")]
@@ -192,7 +194,6 @@ pub use skill_tool::SkillTool;
 pub use sleep::SleepTool;
 #[cfg(feature = "tool-structured-output")]
 pub use synthetic_output::SyntheticOutputTool;
-pub use tasks::{Task, TaskStatus, TASK_STORE};
 #[cfg(feature = "tool-task-create")]
 pub use tasks::TaskCreateTool;
 #[cfg(feature = "tool-task-get")]
@@ -205,11 +206,12 @@ pub use tasks::TaskOutputTool;
 pub use tasks::TaskStopTool;
 #[cfg(feature = "tool-task-update")]
 pub use tasks::TaskUpdateTool;
-pub use team_tool::{register_agent_runner, AgentRunFn};
+pub use tasks::{Task, TaskStatus, TASK_STORE};
 #[cfg(feature = "tool-team-create")]
 pub use team_tool::TeamCreateTool;
 #[cfg(feature = "tool-team-delete")]
 pub use team_tool::TeamDeleteTool;
+pub use team_tool::{register_agent_runner, AgentRunFn};
 #[cfg(feature = "tool-todo-write")]
 pub use todo_write::TodoWriteTool;
 #[cfg(feature = "tool-tool-search")]
@@ -287,8 +289,10 @@ impl ToolResult {
 pub enum PermissionLevel {
     /// No permission needed (read-only, purely informational).
     None,
-    /// Read-only access to the filesystem or network.
+    /// Local read-only access.
     ReadOnly,
+    /// Outbound network access. Non-mutating, but not equivalent to local reads.
+    Network,
     /// Write access to the filesystem.
     Write,
     /// Arbitrary command execution.
@@ -741,13 +745,21 @@ impl Tool for McpToolWrapper {
         }
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let prefix = format!("mcp__{}__", self.server_name);
         let bare_name = self
             .tool_def
             .name
             .strip_prefix(&prefix)
             .unwrap_or(&self.tool_def.name);
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Call MCP tool {} on {}", bare_name, self.server_name),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         let args = if input.is_null() { None } else { Some(input) };
 
@@ -859,11 +871,11 @@ pub fn unknown_tool_message(tools: &[Box<dyn Tool>], requested: &str) -> String 
     let suggestions = plan.suggestions_for(requested, 5);
     if suggestions.is_empty() {
         format!(
-            "Unknown tool: {requested}. Use ToolSearch to discover available tools, or check whether the relevant plugin, MCP server, or feature flag is enabled."
+            "Unknown tool: {requested}. Use ToolSearch to discover runtime-visible tools, or check whether the relevant plugin, MCP server, feature flag, and session visibility config permit it."
         )
     } else {
         format!(
-            "Unknown tool: {requested}. Did you mean {}? You can also use ToolSearch for live tool discovery.",
+            "Unknown tool: {requested}. Did you mean {}? You can also use ToolSearch for runtime-visible tool discovery. If the expected tool is missing, check plugin, MCP, feature flag, and session visibility config.",
             suggestions.join(", ")
         )
     }
@@ -903,7 +915,44 @@ pub fn default_aliases_for_tool(name: &str) -> Vec<String> {
         "Agent" => vec!["agent", "sub_agent", "subagent", "spawn_agent"],
         _ => Vec::new(),
     };
-    mangocode_tool_runtime::dedupe_strings(aliases.into_iter().map(str::to_string))
+    let mut aliases = aliases.into_iter().map(str::to_string).collect::<Vec<_>>();
+    if let Some(alias) = camel_case_tool_alias(name) {
+        aliases.push(alias);
+    }
+    mangocode_tool_runtime::dedupe_strings(aliases)
+}
+
+fn camel_case_tool_alias(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name.contains('_') || name.chars().all(|ch| !ch.is_ascii_lowercase()) {
+        return None;
+    }
+
+    let mut out = String::with_capacity(name.len() + 4);
+    let mut prev_was_lower_or_digit = false;
+    let mut wrote_separator = false;
+    for ch in name.chars() {
+        if ch.is_ascii_uppercase() {
+            if prev_was_lower_or_digit {
+                out.push('_');
+                wrote_separator = true;
+            }
+            out.push(ch.to_ascii_lowercase());
+            prev_was_lower_or_digit = false;
+        } else if ch == '-' || ch == '.' || ch.is_whitespace() {
+            if !out.ends_with('_') && !out.is_empty() {
+                out.push('_');
+                wrote_separator = true;
+            }
+            prev_was_lower_or_digit = false;
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        }
+    }
+
+    let alias = out.trim_matches('_').to_string();
+    (wrote_separator && alias != name.to_ascii_lowercase()).then_some(alias)
 }
 
 pub fn mcp_compat_names(server_name: &str, manager_tool_name: &str) -> (String, Vec<String>) {
@@ -925,7 +974,9 @@ pub fn default_capabilities_for_tool(
     input: &Value,
 ) -> ToolCapabilities {
     let mut capabilities = match permission_level {
-        PermissionLevel::None | PermissionLevel::ReadOnly => ToolCapabilities::read_only(),
+        PermissionLevel::None | PermissionLevel::ReadOnly | PermissionLevel::Network => {
+            ToolCapabilities::read_only()
+        }
         PermissionLevel::Write
         | PermissionLevel::Execute
         | PermissionLevel::Dangerous
@@ -1127,8 +1178,7 @@ mod tests {
     // ---- Tool registry tests ------------------------------------------------
 
     fn any_builtin_tool_feature_enabled() -> bool {
-        cfg!(feature = "tool-agent")
-            || cfg!(feature = "tool-apply-patch")
+        cfg!(feature = "tool-apply-patch")
             || cfg!(feature = "tool-ask-user")
             || cfg!(feature = "tool-bash")
             || cfg!(feature = "tool-batch-edit")
@@ -1321,7 +1371,9 @@ mod tests {
         #[cfg(any(
             feature = "tool-apply-patch",
             feature = "tool-get-goal",
-            feature = "tool-todo-write"
+            feature = "tool-todo-write",
+            feature = "tool-web-fetch",
+            feature = "tool-web-search"
         ))]
         let plan = build_registry_plan(&tools);
         #[cfg(feature = "tool-apply-patch")]
@@ -1330,6 +1382,29 @@ mod tests {
         assert_eq!(plan.canonical_name("update_plan"), Some("TodoWrite"));
         #[cfg(feature = "tool-get-goal")]
         assert_eq!(plan.canonical_name("GetGoal"), Some("get_goal"));
+        #[cfg(feature = "tool-web-search")]
+        assert_eq!(plan.canonical_name("web_search"), Some("WebSearch"));
+        #[cfg(feature = "tool-web-fetch")]
+        assert_eq!(plan.canonical_name("web_fetch"), Some("WebFetch"));
+    }
+
+    #[test]
+    fn default_aliases_include_generated_snake_case_for_camel_tools() {
+        assert!(default_aliases_for_tool("WebSearch")
+            .iter()
+            .any(|alias| alias == "web_search"));
+        assert!(default_aliases_for_tool("WebFetch")
+            .iter()
+            .any(|alias| alias == "web_fetch"));
+        assert!(default_aliases_for_tool("AskUserQuestion")
+            .iter()
+            .any(|alias| alias == "ask_user_question"));
+        assert!(default_aliases_for_tool("ListMcpResources")
+            .iter()
+            .any(|alias| alias == "list_mcp_resources"));
+        assert!(!default_aliases_for_tool("REPL")
+            .iter()
+            .any(|alias| alias == "r_e_p_l"));
     }
 
     #[cfg(all(feature = "tool-bash", feature = "tool-read"))]
@@ -1343,6 +1418,15 @@ mod tests {
 
         assert!(tools.iter().any(|tool| tool.name() == "Read"));
         assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[cfg(feature = "tool-web-search")]
+    #[test]
+    fn test_filter_tools_by_name_config_accepts_generated_snake_case_aliases() {
+        let tools = filter_tools_by_name_config(all_tools(), &["web_search".to_string()], &[]);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "WebSearch");
     }
 
     #[cfg(all(feature = "tool-bash", feature = "tool-tool-search"))]
@@ -1359,6 +1443,50 @@ mod tests {
 
         assert_eq!(config.allowed_tools, vec!["Bash", "ToolSearch"]);
         assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_message_mentions_runtime_visibility_config() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let msg = unknown_tool_message(&tools, "DefinitelyMissing");
+
+        assert!(msg.contains("runtime-visible tools"));
+        assert!(msg.contains("session visibility config"));
+    }
+
+    struct SuggestionOnlyTool;
+
+    #[async_trait::async_trait]
+    impl Tool for SuggestionOnlyTool {
+        fn name(&self) -> &str {
+            "VisibleTool"
+        }
+
+        fn description(&self) -> &str {
+            "A visible test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("ok")
+        }
+    }
+
+    #[test]
+    fn unknown_tool_suggestion_message_mentions_visibility_config() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SuggestionOnlyTool)];
+        let msg = unknown_tool_message(&tools, "VisibleToo");
+
+        assert!(msg.contains("Did you mean VisibleTool"));
+        assert!(msg.contains("runtime-visible tool discovery"));
+        assert!(msg.contains("session visibility config"));
     }
 
     #[test]
@@ -1469,6 +1597,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rendered_fetch_feature_does_not_register_interactive_browser_tool_by_itself() {
+        if cfg!(feature = "tool-rendered-fetch") && !cfg!(feature = "tool-browser") {
+            assert!(find_tool("RenderedFetch").is_some());
+            assert!(find_tool("Browser").is_none());
+        }
+    }
+
+    #[test]
+    fn browser_feature_does_not_register_rendered_fetch_tool_by_itself() {
+        if cfg!(feature = "tool-browser") && !cfg!(feature = "tool-rendered-fetch") {
+            assert!(find_tool("Browser").is_some());
+            assert!(find_tool("RenderedFetch").is_none());
+        }
+    }
+
     // ---- ToolResult tests ---------------------------------------------------
 
     #[test]
@@ -1569,6 +1713,7 @@ mod tests {
     fn test_permission_level_order() {
         // Just verify the variants exist and are distinct
         assert_ne!(PermissionLevel::None, PermissionLevel::ReadOnly);
+        assert_ne!(PermissionLevel::ReadOnly, PermissionLevel::Network);
         assert_ne!(PermissionLevel::Write, PermissionLevel::Execute);
         assert_ne!(PermissionLevel::Execute, PermissionLevel::Dangerous);
     }
@@ -1595,6 +1740,92 @@ mod tests {
     #[cfg(feature = "tool-write")]
     fn test_file_write_permission_level() {
         assert_eq!(FileWriteTool.permission_level(), PermissionLevel::Write);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-cron-create")]
+    fn test_cron_create_permission_level() {
+        assert_eq!(CronCreateTool.permission_level(), PermissionLevel::Write);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-cron-delete")]
+    fn test_cron_delete_permission_level() {
+        assert_eq!(CronDeleteTool.permission_level(), PermissionLevel::Write);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-web-search")]
+    fn test_web_search_permission_level() {
+        assert_eq!(WebSearchTool.permission_level(), PermissionLevel::Network);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-web-fetch")]
+    fn test_web_fetch_permission_level() {
+        assert_eq!(WebFetchTool.permission_level(), PermissionLevel::Network);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-browser")]
+    fn test_browser_permission_level() {
+        assert_eq!(BrowserTool.permission_level(), PermissionLevel::Dangerous);
+    }
+
+    #[test]
+    #[cfg(feature = "tool-remote-trigger")]
+    fn test_remote_trigger_permission_level() {
+        assert_eq!(
+            RemoteTriggerTool.permission_level(),
+            PermissionLevel::Network
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tool-list-mcp-resources")]
+    fn test_list_mcp_resources_permission_level() {
+        assert_eq!(
+            ListMcpResourcesTool.permission_level(),
+            PermissionLevel::Network
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tool-read-mcp-resource")]
+    fn test_read_mcp_resource_permission_level() {
+        assert_eq!(
+            ReadMcpResourceTool.permission_level(),
+            PermissionLevel::Network
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tool-mcp-auth")]
+    fn test_mcp_auth_permission_level() {
+        assert_eq!(McpAuthTool.permission_level(), PermissionLevel::Network);
+    }
+
+    #[test]
+    fn runtime_tools_match_core_permission_classifier() {
+        use mangocode_core::permissions::PermissionLevel as CorePermissionLevel;
+
+        for tool in all_tools() {
+            let core_level = CorePermissionLevel::for_tool(tool.name());
+            let expected = match tool.permission_level() {
+                PermissionLevel::None | PermissionLevel::ReadOnly => CorePermissionLevel::Read,
+                PermissionLevel::Network => CorePermissionLevel::Network,
+                PermissionLevel::Write => CorePermissionLevel::Write,
+                PermissionLevel::Execute
+                | PermissionLevel::Dangerous
+                | PermissionLevel::Forbidden => CorePermissionLevel::Execute,
+            };
+            assert_eq!(
+                core_level,
+                expected,
+                "core permission classifier mismatch for {}",
+                tool.name()
+            );
+        }
     }
 
     // ---- Tool to_definition tests ------------------------------------------

@@ -36,10 +36,10 @@ crossterm = { workspace = true }
 parking_lot = { workspace = true }
 dirs = { workspace = true }
 nix = { workspace = true }
-base64 = "0.22"
-sha2 = "0.10"
-open = "5"
-urlencoding = "2"
+base64 = { workspace = true }
+sha2 = { workspace = true }
+open = { workspace = true }
+urlencoding = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true }
@@ -77,9 +77,14 @@ default-tools-no-web-research = [
 ]
 full-tools = [
     "default-tools",
+    "mangocode-acp/full-tools",
+    "mangocode-commands/full-tools",
+    "mangocode-query/full-tools",
     "mangocode-tools/full-tools",
+    "mangocode-tui/full-tools",
     "tool-browser",
     "tool-computer-use",
+    "tool-rendered-fetch",
 ]
 tool-agent = ["mangocode-acp/tool-agent", "mangocode-commands/tool-agent", "mangocode-query/tool-agent", "mangocode-tools/tool-agent", "mangocode-tui/tool-agent"]
 tool-apply-patch = ["mangocode-acp/tool-apply-patch", "mangocode-commands/tool-apply-patch", "mangocode-query/tool-apply-patch", "mangocode-tools/tool-apply-patch", "mangocode-tui/tool-apply-patch"]
@@ -114,7 +119,13 @@ tool-pr-watch = ["mangocode-acp/tool-pr-watch", "mangocode-commands/tool-pr-watc
 tool-read = ["mangocode-acp/tool-read", "mangocode-commands/tool-read", "mangocode-query/tool-read", "mangocode-tools/tool-read", "mangocode-tui/tool-read"]
 tool-read-mcp-resource = ["mangocode-acp/tool-read-mcp-resource", "mangocode-commands/tool-read-mcp-resource", "mangocode-query/tool-read-mcp-resource", "mangocode-tools/tool-read-mcp-resource", "mangocode-tui/tool-read-mcp-resource"]
 tool-remote-trigger = ["mangocode-acp/tool-remote-trigger", "mangocode-commands/tool-remote-trigger", "mangocode-query/tool-remote-trigger", "mangocode-tools/tool-remote-trigger", "mangocode-tui/tool-remote-trigger"]
-tool-rendered-fetch = ["mangocode-acp/tool-rendered-fetch", "mangocode-commands/tool-rendered-fetch", "mangocode-query/tool-rendered-fetch", "mangocode-tools/tool-rendered-fetch", "mangocode-tui/tool-rendered-fetch"]
+tool-rendered-fetch = [
+    "mangocode-acp/tool-rendered-fetch",
+    "mangocode-commands/tool-rendered-fetch",
+    "mangocode-query/tool-rendered-fetch",
+    "mangocode-tools/tool-rendered-fetch",
+    "mangocode-tui/tool-rendered-fetch",
+]
 tool-repl = ["mangocode-acp/tool-repl", "mangocode-commands/tool-repl", "mangocode-query/tool-repl", "mangocode-tools/tool-repl", "mangocode-tui/tool-repl"]
 tool-send-message = ["mangocode-acp/tool-send-message", "mangocode-commands/tool-send-message", "mangocode-query/tool-send-message", "mangocode-tools/tool-send-message", "mangocode-tui/tool-send-message"]
 tool-skill = ["mangocode-acp/tool-skill", "mangocode-commands/tool-skill", "mangocode-query/tool-skill", "mangocode-tools/tool-skill", "mangocode-tui/tool-skill"]

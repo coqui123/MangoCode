@@ -661,19 +661,22 @@ pub fn render_hook_progress(command: &str, last_line: Option<&str>) -> Vec<Line<
 }
 
 fn truncate_user_prompt_text(text: &str) -> String {
-    if text.len() <= MAX_USER_PROMPT_DISPLAY_CHARS {
+    let char_count = text.chars().count();
+    if char_count <= MAX_USER_PROMPT_DISPLAY_CHARS {
         return text.to_string();
     }
 
-    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
-    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
-    let tail = &text[tail_start..];
+    let head_chars = TRUNCATE_USER_PROMPT_HEAD_CHARS.min(char_count);
+    let tail_start_chars = char_count.saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+    let hidden_chars = tail_start_chars.saturating_sub(head_chars);
+    let head: String = text.chars().take(head_chars).collect();
+    let tail: String = text.chars().skip(tail_start_chars).collect();
     let hidden_lines = text
         .chars()
-        .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
+        .skip(head_chars)
+        .take(hidden_chars)
         .filter(|c| *c == '\n')
-        .count()
-        .saturating_sub(tail.chars().filter(|c| *c == '\n').count());
+        .count();
 
     format!("{head}\n… +{hidden_lines} lines …\n{tail}")
 }
@@ -1242,6 +1245,21 @@ mod tests {
 
         assert!(rendered.contains("question"));
         assert!(rendered.contains(&"a".repeat(40)));
+    }
+
+    #[test]
+    fn render_user_text_truncates_unicode_without_splitting_codepoints() {
+        let text = format!(
+            "{}é{}中{}",
+            "a".repeat(TRUNCATE_USER_PROMPT_HEAD_CHARS - 1),
+            "b".repeat(8_000),
+            "c".repeat(TRUNCATE_USER_PROMPT_TAIL_CHARS - 1),
+        );
+        let truncated = truncate_user_prompt_text(&text);
+
+        assert!(truncated.contains("é"));
+        assert!(truncated.contains("中"));
+        assert!(truncated.contains("… +"));
     }
 
     #[test]

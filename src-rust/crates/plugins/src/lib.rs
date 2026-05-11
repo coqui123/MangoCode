@@ -87,6 +87,7 @@ static GLOBAL_PLUGIN_REGISTRY: OnceLock<RwLock<PluginRegistry>> = OnceLock::new(
 /// that slash commands and tools can query it without carrying the registry
 /// through every call frame.
 pub fn set_global_registry(registry: PluginRegistry) {
+    mangocode_core::output_styles::set_runtime_styles(registry.all_output_styles());
     let global = GLOBAL_PLUGIN_REGISTRY.get_or_init(|| RwLock::new(PluginRegistry::new()));
     *global.write() = registry;
 }
@@ -96,6 +97,28 @@ pub fn global_plugin_registry() -> Option<PluginRegistry> {
     GLOBAL_PLUGIN_REGISTRY
         .get()
         .map(|registry| registry.read().clone())
+}
+
+/// Return a skill-discovery config with enabled plugin skill paths appended.
+///
+/// This is deliberately a runtime view, not a settings mutation: plugin reloads
+/// and `--bare` should affect the active process without persisting plugin paths
+/// into the user's config file.
+pub fn skills_config_with_plugin_paths(
+    skills_config: &mangocode_core::config::SkillsConfig,
+) -> mangocode_core::config::SkillsConfig {
+    let mut merged = skills_config.clone();
+    let Some(registry) = global_plugin_registry() else {
+        return merged;
+    };
+
+    for path in registry.all_skill_paths() {
+        let path = path.to_string_lossy().into_owned();
+        if !merged.paths.iter().any(|existing| existing == &path) {
+            merged.paths.push(path);
+        }
+    }
+    merged
 }
 
 /// Store the hook registry built from loaded plugins into a process-global
@@ -391,13 +414,20 @@ pub fn format_plugin_list(registry: &PluginRegistry) -> String {
         let version = p.manifest.version.as_deref().unwrap_or("(no version)");
         let desc = p.manifest.description.as_deref().unwrap_or("");
 
-        // Count commands and hooks for this plugin.
+        // Count commands, hooks, and styles for this plugin.
         let cmd_count = loader::collect_command_defs(p).len();
         let hook_count = p
             .hooks_config
             .as_ref()
             .map(|hc| hc.events.values().map(|v| v.len()).sum::<usize>())
             .unwrap_or(0);
+        let style_count = {
+            let mut reg = PluginRegistry::new();
+            let mut plugin = (**p).clone();
+            plugin.enabled = true;
+            reg.insert(plugin);
+            reg.all_output_styles().len()
+        };
 
         out.push_str(&format!("  {} [{}] v{}", p.name, status, version));
         if !desc.is_empty() {
@@ -416,6 +446,13 @@ pub fn format_plugin_list(registry: &PluginRegistry) -> String {
                 "{} hook{}",
                 hook_count,
                 if hook_count == 1 { "" } else { "s" }
+            ));
+        }
+        if style_count > 0 {
+            extras.push(format!(
+                "{} style{}",
+                style_count,
+                if style_count == 1 { "" } else { "s" }
             ));
         }
         if !extras.is_empty() {
@@ -471,6 +508,20 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
                 out.push_str(&format!("\nCommands ({}):\n", cmd_defs.len()));
                 for cmd in &cmd_defs {
                     out.push_str(&format!("  /{} — {}\n", cmd.name, cmd.description));
+                }
+            }
+
+            let style_defs = {
+                let mut reg = PluginRegistry::new();
+                let mut plugin = (*p).clone();
+                plugin.enabled = true;
+                reg.insert(plugin);
+                reg.all_output_styles()
+            };
+            if !style_defs.is_empty() {
+                out.push_str(&format!("\nOutput styles ({}):\n", style_defs.len()));
+                for style in &style_defs {
+                    out.push_str(&format!("  {} — {}\n", style.name, style.description));
                 }
             }
 
@@ -655,6 +706,13 @@ pub fn format_reload_summary(registry: &PluginRegistry, diff: &ReloadDiff) -> St
         "{} plugin LSP server{}",
         lsp_count,
         if lsp_count == 1 { "" } else { "s" }
+    ));
+
+    let style_count = registry.all_output_styles().len();
+    parts.push(format!(
+        "{} output style{}",
+        style_count,
+        if style_count == 1 { "" } else { "s" }
     ));
 
     let mut msg = format!("Reloaded: {}", parts.join(" · "));

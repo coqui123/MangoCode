@@ -150,7 +150,10 @@ exit $__CC_EXIT_CODE
 
 /// Execute a command in the background, registering it in the global task registry.
 async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> ToolResult {
-    let task_name = format!("bg: {}", &command[..command.len().min(60)]);
+    let task_name = format!(
+        "bg: {}",
+        mangocode_core::truncate::truncate_bytes_prefix(&command, 60)
+    );
     let mut task = BackgroundTask::new(&task_name);
     task.pid = None; // Will be set after spawn
 
@@ -461,18 +464,9 @@ impl Tool for BashTool {
                     output = "(no output)".to_string();
                 }
 
-                // Truncate very long output
                 const MAX_OUTPUT_LEN: usize = 100_000;
                 if output.len() > MAX_OUTPUT_LEN {
-                    let half = MAX_OUTPUT_LEN / 2;
-                    let start = &output[..half];
-                    let end = &output[output.len() - half..];
-                    output = format!(
-                        "{}\n\n... ({} characters truncated) ...\n\n{}",
-                        start,
-                        output.len() - MAX_OUTPUT_LEN,
-                        end
-                    );
+                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN);
                 }
 
                 let reduced =
@@ -562,15 +556,7 @@ impl BashTool {
                 }
                 const MAX_OUTPUT_LEN: usize = 100_000;
                 if output.len() > MAX_OUTPUT_LEN {
-                    let half = MAX_OUTPUT_LEN / 2;
-                    let start = &output[..half];
-                    let end = &output[output.len() - half..];
-                    output = format!(
-                        "{}\n\n... ({} characters truncated) ...\n\n{}",
-                        start,
-                        output.len() - MAX_OUTPUT_LEN,
-                        end
-                    );
+                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN);
                 }
                 let reduced = reduce_command_output(command, &output, exit_code, output_mode);
                 reduced.into_tool_result(exit_code, "Command exited with code")

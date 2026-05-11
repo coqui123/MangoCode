@@ -85,7 +85,7 @@ impl Tool for FileEditTool {
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e))
+                return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
             }
         };
 

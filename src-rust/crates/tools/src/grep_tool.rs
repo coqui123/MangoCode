@@ -38,6 +38,21 @@ fn default_output_mode() -> String {
     "files_with_matches".to_string()
 }
 
+fn normalize_output_mode(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "content" => Ok("content"),
+        "files_with_matches" => Ok("files_with_matches"),
+        "count" => Ok("count"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid output_mode: {value}. Expected one of: content, files_with_matches, count"
+            ))
+        }
+    }
+}
+
 /// Map file type shorthand to extensions (similar to ripgrep --type).
 fn extensions_for_type(t: &str) -> Vec<&'static str> {
     match t {
@@ -137,6 +152,10 @@ impl Tool for GrepTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let output_mode = match normalize_output_mode(&params.output_mode) {
+            Ok(mode) => mode,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let search_path = params
             .path
@@ -176,7 +195,7 @@ impl Tool for GrepTool {
             return self.search_file(
                 &search_path,
                 &regex,
-                &params.output_mode,
+                output_mode,
                 context_lines,
                 show_line_numbers,
             );
@@ -247,7 +266,7 @@ impl Tool for GrepTool {
                 continue;
             }
 
-            match params.output_mode.as_str() {
+            match output_mode {
                 "files_with_matches" => {
                     results.push(path.display().to_string());
                     match_count += 1;
@@ -277,10 +296,7 @@ impl Tool for GrepTool {
                         match_count += 1;
                     }
                 }
-                _ => {
-                    results.push(path.display().to_string());
-                    match_count += 1;
-                }
+                _ => unreachable!("output_mode is validated before searching"),
             }
 
             if match_count >= head_limit {
@@ -313,7 +329,7 @@ impl GrepTool {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
-                return ToolResult::error(format!("Failed to read {}: {}", path.display(), e))
+                return ToolResult::error(format!("Failed to read {}: {}", path.display(), e));
             }
         };
 
@@ -352,5 +368,19 @@ impl GrepTool {
                 ToolResult::success(results.join("\n"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grep_output_mode_is_normalized_or_rejected() {
+        assert_eq!(normalize_output_mode(" COUNT "), Ok("count"));
+        let err = normalize_output_mode("content\ncount")
+            .expect_err("invalid output mode must be rejected");
+        assert!(err.contains("Invalid output_mode"));
+        assert!(err.contains("\"content\\ncount\""));
     }
 }

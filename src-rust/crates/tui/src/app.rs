@@ -1089,7 +1089,8 @@ impl App {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let prompt_slash_commands = prompt_slash_commands(&project_root, &config.skills);
+        let prompt_slash_commands =
+            prompt_slash_commands(&project_root, &config.skills, &config.commands);
         Self {
             config,
             cost_tracker,
@@ -1197,11 +1198,7 @@ impl App {
             model_registry: {
                 let mut reg = mangocode_api::ModelRegistry::new();
                 // Try to load cached models.dev data from disk.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("mangocode")
-                    .join("models.json");
-                reg.load_cache(&cache_path);
+                reg.load_standard_cache();
                 reg
             },
             model_picker_fetch_pending: false,
@@ -1665,6 +1662,29 @@ impl App {
         }
     }
 
+    pub fn set_voice_enabled(&mut self, enabled: bool) {
+        if enabled {
+            let recorder = mangocode_core::voice::global_voice_recorder();
+            if let Ok(mut r) = recorder.lock() {
+                r.set_enabled(true);
+            }
+            self.voice_recorder = Some(recorder);
+            self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
+            self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+        } else {
+            if let Some(recorder) = self.voice_recorder.as_ref() {
+                if let Ok(mut r) = recorder.lock() {
+                    r.set_enabled(false);
+                }
+            }
+            self.voice_recorder = None;
+            self.voice_recording = false;
+            self.voice_event_rx = None;
+            self.voice_mode_notice.dismiss();
+            self.status_message = Some("Voice mode disabled.".to_string());
+        }
+    }
+
     fn modal_stack(&self) -> Vec<ModalOwner> {
         let mut stack = Vec::new();
 
@@ -1970,37 +1990,35 @@ impl App {
         let _ = settings.save_sync();
     }
 
+    fn persist_fast_mode_setting(enabled: bool) {
+        let path = mangocode_core::config::Settings::config_dir().join("ui-settings.json");
+        let _ = Self::persist_fast_mode_setting_to_path(&path, enabled);
+    }
+
+    fn persist_fast_mode_setting_to_path(
+        path: &std::path::Path,
+        enabled: bool,
+    ) -> std::io::Result<()> {
+        let mut value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("fast_mode".to_string(), serde_json::Value::Bool(enabled));
+        }
+
+        let json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, json)
+    }
+
     fn infer_provider_from_model(model: &str) -> Option<String> {
-        if let Some((provider, _)) = model.split_once('/') {
-            let known = [
-                "anthropic",
-                "openai",
-                "google",
-                "groq",
-                "cerebras",
-                "deepseek",
-                "mistral",
-                "xai",
-                "openrouter",
-                "github-copilot",
-                "openai-codex",
-                "cohere",
-                "perplexity",
-                "togetherai",
-                "together-ai",
-                "deepinfra",
-                "venice",
-                "minimax",
-                "huggingface",
-                "ollama",
-                "lmstudio",
-                "llamacpp",
-                "azure",
-                "amazon-bedrock",
-            ];
-            if known.contains(&provider) {
-                return Some(provider.to_string());
-            }
+        if let Some((provider, _)) = mangocode_core::ProviderId::split_known_model_prefix(model) {
+            return Some(provider.to_string());
         }
 
         if model.starts_with("claude") {
@@ -2034,12 +2052,18 @@ impl App {
 
     /// Update the active model name (also updates config + cost tracker).
     pub fn set_model(&mut self, model: String) {
-        self.cost_tracker.set_model(&model);
-        self.model_name = model.clone();
-        self.config.model = Some(model.clone());
-        if let Some(provider) = Self::infer_provider_from_model(&model) {
-            self.config.provider = Some(provider);
+        if !mangocode_api::apply_model_selection_to_config(
+            &mut self.config,
+            &model,
+            Some(&self.model_registry),
+        ) {
+            return;
         }
+
+        let effective_model =
+            mangocode_api::effective_model_for_config(&self.config, &self.model_registry);
+        self.cost_tracker.set_model(&effective_model);
+        self.model_name = effective_model;
     }
 
     fn active_model_picker_provider(&self) -> String {
@@ -2094,10 +2118,18 @@ impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
+        self.intercept_slash_command_with_args(cmd, "")
+    }
+
+    /// Handle slash commands that should open UI screens, preserving any args
+    /// that are meaningful to the target overlay.
+    pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        let cmd = cmd.trim().trim_start_matches('/').to_lowercase();
         self.close_secondary_views();
-        match cmd {
+        match cmd.as_str() {
             "config" | "settings" => {
-                self.settings_screen.open();
+                let live_config = self.config.clone();
+                self.settings_screen.open(&live_config);
                 true
             }
             "theme" => {
@@ -2111,7 +2143,7 @@ impl App {
                 self.theme_screen.open(current);
                 true
             }
-            "privacy-settings" | "privacy" => {
+            "privacy" => {
                 self.privacy_screen.open();
                 true
             }
@@ -2128,7 +2160,7 @@ impl App {
                 self.open_agents_menu();
                 true
             }
-            "diff" | "review" => {
+            "diff" => {
                 let root = self.project_root();
                 self.diff_viewer.open(&root);
                 true
@@ -2156,6 +2188,11 @@ impl App {
             }
             "search" | "find" => {
                 self.global_search.open();
+                let query = args.trim();
+                if !query.is_empty() {
+                    self.global_search.query = query.to_string();
+                    self.refresh_global_search();
+                }
                 true
             }
             "survey" | "feedback" => {
@@ -2180,13 +2217,7 @@ impl App {
 
                 // Reload cache from disk in case the background models.dev fetch
                 // has written new data since we last opened the picker.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("mangocode")
-                    .join("models.json");
-                if cache_path.exists() {
-                    self.model_registry.load_cache(&cache_path);
-                }
+                self.model_registry.load_standard_cache();
 
                 // Get models from the registry (models.dev data); falls back to
                 // hardcoded when the registry has no data for this provider.
@@ -2227,92 +2258,15 @@ impl App {
                 self.should_quit = true;
                 true
             }
-            "vim" => {
-                self.prompt_input.vim_enabled = !self.prompt_input.vim_enabled;
-                let status = if self.prompt_input.vim_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                self.status_message = Some(format!("Vim mode {}.", status));
-                self.refresh_prompt_input();
-                true
-            }
-            "fast" => {
-                self.fast_mode = !self.fast_mode;
-                let status = if self.fast_mode {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                self.status_message = Some(format!("Fast mode {}.", status));
-                true
-            }
-            "plan" => {
-                use mangocode_core::config::PermissionMode;
-                self.plan_mode = !self.plan_mode;
-                self.config.permission_mode = if self.plan_mode {
-                    PermissionMode::Plan
-                } else {
-                    PermissionMode::Default
-                };
-                self.status_message = Some(if self.plan_mode {
-                    "Plan mode ON — MangoCode will plan before acting.".to_string()
-                } else {
-                    "Plan mode OFF.".to_string()
-                });
-                // Allow CLI path to also run (sends UserMessage to MangoCode).
-                false
-            }
+            "vim" | "vi" => false,
+            "fast" | "speed" => false,
+            "plan" => false,
             "compact" => {
                 // Handled by execute_command in the CLI loop (real LLM compaction).
                 false
             }
-            "copy" => {
-                // Copy last assistant message to clipboard. Attempt arboard; fall back to notification.
-                let last = self
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == Role::Assistant)
-                    .map(|m| m.get_all_text());
-                if let Some(text) = last {
-                    // Try xclip/xsel/pbcopy/clip.exe for clipboard; fall back to notification.
-                    let copied = try_copy_to_clipboard(&text);
-                    if copied {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            format!(
-                                "Last response: {} chars (clipboard unavailable)",
-                                text.len()
-                            ),
-                            Some(5),
-                        );
-                    }
-                } else {
-                    self.notifications.push(
-                        NotificationKind::Warning,
-                        "No assistant message to copy.".to_string(),
-                        Some(3),
-                    );
-                }
-                true
-            }
-            "output-style" => {
-                self.output_style = match self.output_style.as_str() {
-                    "auto" => "stream".to_string(),
-                    "stream" => "verbose".to_string(),
-                    _ => "auto".to_string(),
-                };
-                self.status_message = Some(format!("Output style: {}.", self.output_style));
-                true
-            }
+            "copy" => false,
+            "output-style" => false,
             "effort" => {
                 // Only cycle the visual indicator when called with no args (arg-based
                 // effort changes are handled by execute_command + main.rs sync).
@@ -2329,24 +2283,7 @@ impl App {
                 ));
                 true
             }
-            "voice" => {
-                let was_on = self.voice_recorder.is_some();
-                if was_on {
-                    self.voice_recorder = None;
-                    self.voice_mode_notice.dismiss();
-                    self.status_message = Some("Voice mode disabled.".to_string());
-                } else {
-                    let recorder = mangocode_core::voice::global_voice_recorder();
-                    if let Ok(mut r) = recorder.lock() {
-                        r.set_enabled(true);
-                    }
-                    self.voice_recorder = Some(recorder);
-                    self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message =
-                        Some("Voice mode enabled. Press Alt+V to record.".to_string());
-                }
-                true
-            }
+            "voice" => false,
             "doctor" => {
                 // Handled by execute_command (DoctorCommand).
                 false
@@ -2367,21 +2304,11 @@ impl App {
                 self.context_viz.toggle();
                 true
             }
-            "rename" => {
-                self.session_browser.open(vec![]);
-                self.session_browser.start_rename();
-                true
-            }
             "init" | "login" | "logout" => {
                 // Handled by execute_command (CLI-level operations).
                 false
             }
-            "keybindings" => {
-                // Open settings on KeyBindings tab
-                self.settings_screen.open();
-                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
-                true
-            }
+            "keybindings" => false,
             "help" => {
                 // Open the help overlay (same as pressing F1).
                 if !self.help_overlay.visible {
@@ -2927,7 +2854,7 @@ impl App {
         self.history_index = self.prompt_input.history_pos;
     }
 
-    fn refresh_prompt_input(&mut self) {
+    pub fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
         self.prompt_input
             .update_suggestions(&self.prompt_slash_commands);
@@ -2943,7 +2870,8 @@ impl App {
             .clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
-        self.prompt_slash_commands = prompt_slash_commands(&project_root, &self.config.skills);
+        self.prompt_slash_commands =
+            prompt_slash_commands(&project_root, &self.config.skills, &self.config.commands);
         self.command_palette
             .set_items(command_palette_items(&self.prompt_slash_commands));
         self.refresh_prompt_input();
@@ -3732,6 +3660,7 @@ impl App {
                         // while fast mode was active, turn fast mode off.
                         if self.fast_mode && model_id != FAST_MODE_MODEL {
                             self.fast_mode = false;
+                            Self::persist_fast_mode_setting(false);
                         }
                         if let Some(e) = effort {
                             self.effort_level = e;
@@ -6170,8 +6099,10 @@ impl App {
                                 }
                                 self.prompt_input.paste(&text);
                                 self.refresh_prompt_input();
-                                self.status_message =
-                                    Some(format!("Transcribed: {}", &text[..text.len().min(60)]));
+                                self.status_message = Some(format!(
+                                    "Transcribed: {}",
+                                    mangocode_core::truncate::truncate_bytes_prefix(&text, 60)
+                                ));
                             }
                             // Clear the channel once we have the result.
                             self.voice_event_rx = None;
@@ -6237,12 +6168,12 @@ impl App {
                         if should_submit {
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
-                                let cmd = {
-                                    let (c, _) =
-                                        crate::input::parse_slash_command(&self.prompt_input.text);
-                                    c.to_string()
-                                };
-                                if self.intercept_slash_command(&cmd) {
+                                let slash_input = self.prompt_input.text.clone();
+                                let (cmd, args) = crate::input::parse_slash_command(&slash_input);
+                                if !crate::input::slash_command_with_args_skips_tui_intercept(
+                                    cmd, args,
+                                ) && self.intercept_slash_command_with_args(cmd, args)
+                                {
                                     self.clear_prompt();
                                     continue;
                                 }
@@ -6411,12 +6342,11 @@ mod tests {
     }
 
     #[test]
-    fn test_vim_slash_command_toggles_vim() {
+    fn test_vim_slash_command_is_cli_owned() {
         let mut app = make_app();
         assert!(!app.prompt_input.vim_enabled);
-        assert!(app.intercept_slash_command("vim"));
-        assert!(app.prompt_input.vim_enabled);
-        assert!(app.intercept_slash_command("vim"));
+        assert!(!app.intercept_slash_command("vim"));
+        assert!(!app.intercept_slash_command("vi"));
         assert!(!app.prompt_input.vim_enabled);
     }
 
@@ -6429,24 +6359,91 @@ mod tests {
     }
 
     #[test]
-    fn test_fast_slash_command_toggles_fast_mode() {
+    fn test_find_slash_command_prefills_search_query() {
+        let mut app = make_app();
+        assert!(!app.global_search.open);
+        assert!(app.intercept_slash_command_with_args("find", "needle"));
+        assert!(app.global_search.open);
+        assert_eq!(app.global_search.query, "needle");
+    }
+
+    #[test]
+    fn test_tui_slash_commands_are_case_insensitive() {
+        let mut app = make_app();
+        assert!(!app.privacy_screen.visible);
+        assert!(app.intercept_slash_command("/Privacy"));
+        assert!(app.privacy_screen.visible);
+
+        let mut app = make_app();
+        assert!(!app.global_search.open);
+        assert!(app.intercept_slash_command_with_args("/Find", "needle"));
+        assert!(app.global_search.open);
+        assert_eq!(app.global_search.query, "needle");
+    }
+
+    #[test]
+    fn test_tui_reserved_slash_commands_are_intercepted_by_tui() {
+        for key in crate::slash_commands::TUI_SLASH_COMMAND_RESERVED_KEYS {
+            let mut app = make_app();
+            assert!(
+                app.intercept_slash_command(key),
+                "TUI reserved slash command was not intercepted: /{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fast_mode_setting_persistence_preserves_other_ui_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui-settings.json");
+        std::fs::write(
+            &path,
+            r#"{"fast_mode":true,"voice_enabled":true,"editor_mode":"vim"}"#,
+        )
+        .unwrap();
+
+        App::persist_fast_mode_setting_to_path(&path, false).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["fast_mode"], serde_json::Value::Bool(false));
+        assert_eq!(value["voice_enabled"], serde_json::Value::Bool(true));
+        assert_eq!(
+            value["editor_mode"],
+            serde_json::Value::String("vim".into())
+        );
+    }
+
+    #[test]
+    fn test_side_effecting_commands_are_cli_commands() {
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command("review"));
+        assert!(!app.intercept_slash_command("privacy-settings"));
+        assert!(!app.intercept_slash_command("rename"));
+        assert!(!app.intercept_slash_command("keybindings"));
+        assert!(!app.intercept_slash_command("plan"));
+        assert!(!app.intercept_slash_command("fast"));
+        assert!(!app.intercept_slash_command("speed"));
+        assert!(!app.intercept_slash_command("voice"));
+        assert!(!app.intercept_slash_command("output-style"));
+        assert!(!app.intercept_slash_command("copy"));
+        assert!(!app.plan_mode);
+    }
+
+    #[test]
+    fn test_fast_slash_command_is_cli_owned() {
         let mut app = make_app();
         assert!(!app.fast_mode);
-        assert!(app.intercept_slash_command("fast"));
-        assert!(app.fast_mode);
-        assert!(app.intercept_slash_command("fast"));
+        assert!(!app.intercept_slash_command("fast"));
+        assert!(!app.intercept_slash_command("speed"));
         assert!(!app.fast_mode);
     }
 
     #[test]
-    fn test_output_style_cycles() {
+    fn test_output_style_slash_command_is_cli_owned() {
         let mut app = make_app();
         assert_eq!(app.output_style, "auto");
-        assert!(app.intercept_slash_command("output-style"));
-        assert_eq!(app.output_style, "stream");
-        assert!(app.intercept_slash_command("output-style"));
-        assert_eq!(app.output_style, "verbose");
-        assert!(app.intercept_slash_command("output-style"));
+        assert!(!app.intercept_slash_command("output-style"));
         assert_eq!(app.output_style, "auto");
     }
 

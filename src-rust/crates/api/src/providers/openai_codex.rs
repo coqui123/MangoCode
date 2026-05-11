@@ -86,12 +86,17 @@ impl OpenAiCodexProvider {
     }
 
     fn truncate_debug_payload(value: &Value) -> String {
-        let mut body = value.to_string();
-        if body.len() > 800 {
-            body.truncate(800);
-            body.push_str("...");
+        Self::truncate_payload_with_ellipsis(&value.to_string(), 800)
+    }
+
+    fn truncate_payload_with_ellipsis(text: &str, max_bytes: usize) -> String {
+        if text.len() <= max_bytes {
+            return text.to_string();
         }
-        body
+        format!(
+            "{}...",
+            mangocode_core::truncate::truncate_bytes_prefix(text, max_bytes)
+        )
     }
 
     /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
@@ -531,11 +536,7 @@ impl LlmProvider for OpenAiCodexProvider {
             let message = if text.trim().is_empty() {
                 format!("Codex API error ({})", status)
             } else {
-                let mut body = text.trim().to_string();
-                if body.len() > 600 {
-                    body.truncate(600);
-                    body.push_str("...");
-                }
+                let body = Self::truncate_payload_with_ellipsis(text.trim(), 600);
                 format!("Codex API error ({}): {}", status, body)
             };
             return Err(ProviderError::Other {
@@ -567,11 +568,7 @@ impl LlmProvider for OpenAiCodexProvider {
             serde_json::from_str(&text).map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: {
-                    let mut body = text.trim().to_string();
-                    if body.len() > 600 {
-                        body.truncate(600);
-                        body.push_str("...");
-                    }
+                    let body = Self::truncate_payload_with_ellipsis(text.trim(), 600);
                     if body.is_empty() {
                         format!("Codex JSON parse error: {}", e)
                     } else {
@@ -688,6 +685,14 @@ mod tests {
             format!("{}", p.id()),
             mangocode_core::ProviderId::OPENAI_CODEX
         );
+    }
+
+    #[test]
+    fn truncates_codex_payload_on_utf8_boundary() {
+        let body = format!("{}é{}", "a".repeat(599), "b".repeat(8));
+        let truncated = OpenAiCodexProvider::truncate_payload_with_ellipsis(&body, 600);
+
+        assert_eq!(truncated, format!("{}...", "a".repeat(599)));
     }
 
     #[tokio::test]

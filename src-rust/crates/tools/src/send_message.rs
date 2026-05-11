@@ -117,7 +117,7 @@ impl Tool for SendMessageTool {
 
         let preview = params.summary.as_deref().unwrap_or_else(|| {
             let s = params.message.as_str();
-            &s[..s.len().min(60)]
+            mangocode_core::truncate::truncate_bytes_prefix(s, 60)
         });
 
         if params.to == "*" {

@@ -21,8 +21,9 @@ impl Tool for ExitPlanModeTool {
     }
 
     fn description(&self) -> &str {
-        "Exit plan mode and return to normal execution mode where all tools \
-         are available. Optionally provide a summary of the plan."
+        "Exit plan mode and return to normal execution mode where runtime-visible \
+         tools are available subject to feature flags, session config, and permissions. \
+         Optionally provide a summary of the plan."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -51,7 +52,8 @@ impl Tool for ExitPlanModeTool {
         let msg = if let Some(summary) = &params.summary {
             format!("Exited plan mode. Plan summary: {}", summary)
         } else {
-            "Exited plan mode. All tools are now available.".to_string()
+            "Exited plan mode. Runtime-visible tools are now available subject to permissions."
+                .to_string()
         };
 
         ToolResult::success(msg).with_metadata(json!({

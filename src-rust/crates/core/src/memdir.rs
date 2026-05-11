@@ -439,9 +439,8 @@ pub fn truncate_entrypoint_content(raw: &str) -> EntrypointTruncation {
     };
 
     if truncated.len() > MAX_ENTRYPOINT_BYTES {
-        let cut_at = truncated[..MAX_ENTRYPOINT_BYTES]
-            .rfind('\n')
-            .unwrap_or(MAX_ENTRYPOINT_BYTES);
+        let prefix = crate::truncate::truncate_bytes_prefix(&truncated, MAX_ENTRYPOINT_BYTES);
+        let cut_at = prefix.rfind('\n').unwrap_or(prefix.len());
         truncated.truncate(cut_at);
     }
 

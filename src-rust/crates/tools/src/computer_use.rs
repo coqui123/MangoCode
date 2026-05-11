@@ -37,6 +37,44 @@ pub struct ComputerUseInput {
     pub amount: Option<u32>,
 }
 
+fn normalize_computer_action(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "screenshot" => Ok("screenshot"),
+        "mouse_move" => Ok("mouse_move"),
+        "left_click" => Ok("left_click"),
+        "right_click" => Ok("right_click"),
+        "double_click" => Ok("double_click"),
+        "left_click_drag" => Ok("left_click_drag"),
+        "type_text" => Ok("type_text"),
+        "key" => Ok("key"),
+        "scroll" => Ok("scroll"),
+        "get_cursor_position" => Ok("get_cursor_position"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid action: {value}. Expected one of: screenshot, mouse_move, left_click, right_click, double_click, left_click_drag, type_text, key, scroll, get_cursor_position"
+            ))
+        }
+    }
+}
+
+fn normalize_scroll_direction(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "up" => Ok("up"),
+        "down" => Ok("down"),
+        "left" => Ok("left"),
+        "right" => Ok("right"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid direction: {value}. Expected one of: up, down, left, right"
+            ))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Display size constants used in the API description.
 // These should match (or be updated to match) the actual primary monitor.
@@ -137,10 +175,22 @@ impl Tool for ComputerUseTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let params: ComputerUseInput = match serde_json::from_value(input) {
+        let mut params: ComputerUseInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid computer-use input: {}", e)),
         };
+        let action = match normalize_computer_action(&params.action) {
+            Ok(action) => action,
+            Err(e) => return ToolResult::error(e),
+        };
+        params.action = action.to_string();
+        if let Some(direction) = params.direction.as_deref() {
+            let direction = match normalize_scroll_direction(direction) {
+                Ok(direction) => direction,
+                Err(e) => return ToolResult::error(e),
+            };
+            params.direction = Some(direction.to_string());
+        }
 
         // Permission gate
         let desc = format!("computer: {}", params.action);
@@ -303,13 +353,13 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
             let [sx, sy] = match params.start_coordinate {
                 Some(c) => c,
                 None => {
-                    return ToolResult::error("left_click_drag requires 'start_coordinate' field")
+                    return ToolResult::error("left_click_drag requires 'start_coordinate' field");
                 }
             };
             let [ex, ey] = match params.end_coordinate {
                 Some(c) => c,
                 None => {
-                    return ToolResult::error("left_click_drag requires 'end_coordinate' field")
+                    return ToolResult::error("left_click_drag requires 'end_coordinate' field");
                 }
             };
             match Enigo::new(&Settings::default()) {
@@ -410,7 +460,7 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                             return ToolResult::error(format!(
                                 "scroll: unknown direction '{}'. Use up/down/left/right",
                                 other
-                            ))
+                            ));
                         }
                     };
                     match result {
@@ -805,5 +855,21 @@ mod tests {
         assert_eq!(def["name"], "computer");
         assert!(def["display_width_px"].as_u64().unwrap() > 0);
         assert!(def["display_height_px"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn computer_action_and_direction_are_normalized_or_rejected() {
+        assert_eq!(normalize_computer_action(" SCROLL "), Ok("scroll"));
+        assert_eq!(normalize_scroll_direction(" LEFT "), Ok("left"));
+
+        let action_err = normalize_computer_action("screenshot\nkey")
+            .expect_err("invalid action must be rejected");
+        let direction_err =
+            normalize_scroll_direction("up\ndown").expect_err("invalid direction must be rejected");
+
+        assert!(action_err.contains("Invalid action"));
+        assert!(action_err.contains("\"screenshot\\nkey\""));
+        assert!(direction_err.contains("Invalid direction"));
+        assert!(direction_err.contains("\"up\\ndown\""));
     }
 }

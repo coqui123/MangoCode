@@ -7,6 +7,7 @@ edition.workspace = true
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
 mangocode-mcp = { workspace = true }
+mangocode-plugins = { workspace = true }
 mangocode-tool-runtime = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -87,7 +88,6 @@ default-tools = [
     "tool-read",
     "tool-read-mcp-resource",
     "tool-remote-trigger",
-    "tool-rendered-fetch",
     "tool-repl",
     "tool-send-message",
     "tool-skill",
@@ -159,7 +159,12 @@ default-tools-no-web-research = [
     "tool-view-image",
     "tool-write",
 ]
-full-tools = ["default-tools", "tool-browser", "tool-computer-use"]
+full-tools = [
+    "default-tools",
+    "tool-browser",
+    "tool-computer-use",
+    "tool-rendered-fetch",
+]
 
 # Individual built-in tool flags.
 tool-agent = []
@@ -195,7 +200,7 @@ tool-pr-watch = []
 tool-read = []
 tool-read-mcp-resource = []
 tool-remote-trigger = []
-tool-rendered-fetch = []
+tool-rendered-fetch = ["dep:chromiumoxide"]
 tool-repl = []
 tool-send-message = []
 tool-skill = []

@@ -85,7 +85,7 @@ impl Tool for FileWriteTool {
                         "Failed to read existing file {}: {}",
                         path.display(),
                         e
-                    ))
+                    ));
                 }
             }
         } else {

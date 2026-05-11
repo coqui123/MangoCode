@@ -16,6 +16,28 @@ struct BrowserInput {
 }
 
 #[cfg(feature = "tool-browser")]
+fn normalize_browser_action(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "navigate" => Ok("navigate"),
+        "screenshot" => Ok("screenshot"),
+        "extract_text" => Ok("extract_text"),
+        "extract_markdown" => Ok("extract_markdown"),
+        "click" => Ok("click"),
+        "type" => Ok("type"),
+        "evaluate" => Ok("evaluate"),
+        "expand" => Ok("expand"),
+        "close" => Ok("close"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid action: {value}. Expected one of: navigate, screenshot, extract_text, extract_markdown, click, type, evaluate, expand, close"
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "tool-browser")]
 pub struct BrowserTool;
 
 #[cfg(feature = "tool-browser")]
@@ -48,10 +70,15 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let params: BrowserInput = match serde_json::from_value(input) {
+        let mut params: BrowserInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid Browser input: {}", e)),
         };
+        let action = match normalize_browser_action(&params.action) {
+            Ok(action) => action,
+            Err(e) => return ToolResult::error(e),
+        };
+        params.action = action.to_string();
 
         let desc = format!("browser: {}", params.action);
         if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
@@ -62,7 +89,7 @@ impl Tool for BrowserTool {
     }
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 static BROWSER_SESSIONS: once_cell::sync::Lazy<
     dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<BrowserSession>>>,
 > = once_cell::sync::Lazy::new(dashmap::DashMap::new);
@@ -105,7 +132,7 @@ async fn execute_browser_action(params: BrowserInput, ctx: &ToolContext) -> Tool
     }
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 pub async fn rendered_extract_for_research(url: &str) -> Result<String, String> {
     match rendered_extract_for_research_once("__mangocode_research__", url).await {
         Ok(markdown) => Ok(markdown),
@@ -124,12 +151,12 @@ pub async fn rendered_extract_for_research(url: &str) -> Result<String, String> 
     }
 }
 
-#[cfg(not(feature = "tool-browser"))]
+#[cfg(not(any(feature = "tool-browser", feature = "tool-rendered-fetch")))]
 pub async fn rendered_extract_for_research(_url: &str) -> Result<String, String> {
     Err("browser tool feature is not enabled".to_string())
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 async fn browser_session(
     session_id: &str,
 ) -> Result<std::sync::Arc<tokio::sync::Mutex<BrowserSession>>, String> {
@@ -168,7 +195,7 @@ async fn browser_session(
     Ok(session)
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 async fn close_browser_session(session_id: &str) -> Result<bool, String> {
     let Some((_, session)) = BROWSER_SESSIONS.remove(session_id) else {
         return Ok(false);
@@ -177,20 +204,20 @@ async fn close_browser_session(session_id: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 async fn reset_browser_session(session_id: &str) -> Result<(), String> {
     let _ = close_browser_session(session_id).await?;
     Ok(())
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 async fn rendered_extract_for_research_once(session_id: &str, url: &str) -> Result<String, String> {
     let session = browser_session(session_id).await?;
     let mut guard = session.lock().await;
     guard.extract_research_markdown(url).await
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 fn is_recoverable_browser_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     [
@@ -206,7 +233,7 @@ fn is_recoverable_browser_error(error: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 struct BrowserSession {
     browser: chromiumoxide::browser::Browser,
     page: Option<chromiumoxide::Page>,
@@ -214,7 +241,7 @@ struct BrowserSession {
     handler_task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 impl BrowserSession {
     async fn close(&mut self) {
         self.page = None;
@@ -223,6 +250,7 @@ impl BrowserSession {
         self.handler_task.abort();
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn run_action(&mut self, input: &BrowserInput) -> Result<String, String> {
         match input.action.as_str() {
             "navigate" => {
@@ -273,8 +301,26 @@ impl BrowserSession {
     }
 
     async fn extract_research_markdown(&mut self, url: &str) -> Result<String, String> {
-        let page = self.navigate(url).await?;
-        self.extract_adaptive_markdown(&page).await
+        let url = crate::research::resolve_public_research_navigation_url(url).await?;
+        let page = self.navigate(&url).await?;
+        self.refresh_current_url(&page).await;
+        self.ensure_research_page_url_is_public()?;
+
+        let markdown = self.extract_adaptive_markdown(&page).await?;
+        self.refresh_current_url(&page).await;
+        self.ensure_research_page_url_is_public()?;
+        Ok(markdown)
+    }
+
+    fn ensure_research_page_url_is_public(&self) -> Result<(), String> {
+        let Some(url) = self.current_url.as_deref() else {
+            return Ok(());
+        };
+        if crate::research::normalize_public_research_url(url).is_some() {
+            Ok(())
+        } else {
+            Err("Rendered browser navigation ended at an unsafe or unsupported URL.".to_string())
+        }
     }
 
     async fn page_for(&mut self, url: Option<&str>) -> Result<chromiumoxide::Page, String> {
@@ -355,6 +401,7 @@ impl BrowserSession {
         }
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn screenshot(&mut self, url: Option<&str>) -> Result<String, String> {
         use base64::Engine as _;
         use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
@@ -374,6 +421,7 @@ impl BrowserSession {
         Ok(format!("data:image/png;base64,{}", b64))
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn click(&mut self, input: &BrowserInput) -> Result<String, String> {
         let page = self.page_for(input.url.as_deref()).await?;
         let selector = input
@@ -402,6 +450,7 @@ impl BrowserSession {
         }
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn type_text(&mut self, input: &BrowserInput) -> Result<String, String> {
         let page = self.page_for(input.url.as_deref()).await?;
         let selector = input
@@ -440,6 +489,7 @@ impl BrowserSession {
         }
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn evaluate(&mut self, input: &BrowserInput) -> Result<String, String> {
         let page = self.page_for(input.url.as_deref()).await?;
         let script = input
@@ -460,6 +510,7 @@ impl BrowserSession {
         }
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn extract_inner_text(&self, page: &chromiumoxide::Page) -> Result<String, String> {
         page.evaluate(
             "(function(){ return document && document.body ? document.body.innerText : ''; })()",
@@ -470,6 +521,7 @@ impl BrowserSession {
         .map_err(|e| format!("extract_text decode failed: {}", e))
     }
 
+    #[cfg(feature = "tool-browser")]
     async fn apply_recipes(&self, page: &chromiumoxide::Page) -> Result<String, String> {
         let value: Value = page
             .evaluate(BROWSER_RECIPES_SCRIPT)
@@ -557,7 +609,7 @@ impl BrowserSession {
     }
 }
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 fn truncate_browser_text(text: &str, max: usize) -> String {
     if text.len() <= max {
         text.to_string()
@@ -619,7 +671,7 @@ const BROWSER_RECIPES_SCRIPT: &str = r#"
 })()
 "#;
 
-#[cfg(feature = "tool-browser")]
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
 (function(){
   const recipes = (function(){
@@ -677,3 +729,17 @@ const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
   };
 })()
 "#;
+
+#[cfg(all(test, feature = "tool-browser"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_action_is_normalized_or_rejected() {
+        assert_eq!(normalize_browser_action(" NAVIGATE "), Ok("navigate"));
+        let err = normalize_browser_action("navigate\nclose")
+            .expect_err("invalid action must be rejected");
+        assert!(err.contains("Invalid action"));
+        assert!(err.contains("\"navigate\\nclose\""));
+    }
+}

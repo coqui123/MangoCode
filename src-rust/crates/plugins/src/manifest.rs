@@ -14,6 +14,7 @@
 /// ```
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Author
@@ -349,8 +350,63 @@ impl PluginManifest {
                 self.name
             );
         }
+        validate_manifest_paths("commands", &self.commands)?;
+        validate_manifest_paths("agents", &self.agents)?;
+        validate_manifest_paths("skills", &self.skills)?;
+        validate_manifest_paths("output_styles", &self.output_styles)?;
         Ok(())
     }
+}
+
+fn validate_manifest_paths(field: &str, paths: &[String]) -> anyhow::Result<()> {
+    for path in paths {
+        if let Err(err) = normalize_manifest_relative_path(path) {
+            anyhow::bail!("Invalid {} path '{}': {}", field, path, err);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_manifest_relative_path(raw: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("path cannot be empty");
+    }
+    if trimmed.contains('\0') {
+        anyhow::bail!("path cannot contain NUL bytes");
+    }
+    if looks_like_windows_drive_path(trimmed) {
+        anyhow::bail!("path must be relative to the plugin root");
+    }
+
+    let portable = trimmed.replace('\\', "/");
+    let path = Path::new(&portable);
+    if path.is_absolute() {
+        anyhow::bail!("path must be relative to the plugin root");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => anyhow::bail!("path cannot contain parent directory segments"),
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("path must be relative to the plugin root")
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        Ok(PathBuf::from("."))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
 /// Normalise the raw JSON value so that both camelCase and snake_case
@@ -445,4 +501,57 @@ fn normalize_manifest_json(mut v: serde_json::Value) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_rejects_unsafe_content_paths() {
+        for path in [
+            "../outside.md",
+            "nested/../../outside.md",
+            r"nested\..\outside.md",
+            "/",
+            r"C:\outside.md",
+        ] {
+            let manifest = PluginManifest {
+                name: "unsafe-paths".to_string(),
+                output_styles: vec![path.to_string()],
+                ..Default::default()
+            };
+
+            assert!(
+                manifest.validate().is_err(),
+                "path should be rejected: {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_normalizes_relative_content_paths() {
+        let path = normalize_manifest_relative_path("./extra/styles").unwrap();
+        assert_eq!(path, PathBuf::from("extra").join("styles"));
+        assert_eq!(
+            normalize_manifest_relative_path(r".\extra\styles").unwrap(),
+            PathBuf::from("extra").join("styles")
+        );
+        assert_eq!(
+            normalize_manifest_relative_path(".").unwrap(),
+            PathBuf::from(".")
+        );
+
+        let manifest = PluginManifest {
+            name: "safe-paths".to_string(),
+            commands: vec!["./commands/review.md".to_string()],
+            agents: vec!["agents/helper.md".to_string()],
+            skills: vec!["skills/helper".to_string()],
+            output_styles: vec!["output-styles/formal.md".to_string()],
+            ..Default::default()
+        };
+
+        manifest.validate().unwrap();
+    }
 }

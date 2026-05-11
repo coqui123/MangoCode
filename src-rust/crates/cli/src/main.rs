@@ -36,7 +36,8 @@ pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 use anyhow::Context;
 use async_trait::async_trait;
 use clap::{ArgAction, Parser, ValueEnum};
-use mangocode_core::truncate::truncate_bytes_with_ellipsis;
+use mangocode_core::history::{apply_session_model_to_config, canonical_session_model};
+use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
 use mangocode_core::types::ToolDefinition;
 use mangocode_core::{
     config::{
@@ -64,6 +65,53 @@ fn tui_effort_to_core(effort: mangocode_tui::EffortLevel) -> mangocode_core::eff
         mangocode_tui::EffortLevel::High => mangocode_core::effort::EffortLevel::High,
         mangocode_tui::EffortLevel::Max => mangocode_core::effort::EffortLevel::Max,
     }
+}
+
+fn core_effort_to_tui(effort: mangocode_core::effort::EffortLevel) -> mangocode_tui::EffortLevel {
+    match effort {
+        mangocode_core::effort::EffortLevel::Low => mangocode_tui::EffortLevel::Low,
+        mangocode_core::effort::EffortLevel::Medium => mangocode_tui::EffortLevel::Normal,
+        mangocode_core::effort::EffortLevel::High => mangocode_tui::EffortLevel::High,
+        mangocode_core::effort::EffortLevel::Max => mangocode_tui::EffortLevel::Max,
+    }
+}
+
+fn parse_effort_level_arg(value: &str) -> Option<mangocode_core::effort::EffortLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(mangocode_core::effort::EffortLevel::Medium),
+        other => mangocode_core::effort::EffortLevel::parse(other),
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+struct PersistedUiSettings {
+    editor_mode: Option<String>,
+    fast_mode: Option<bool>,
+    voice_enabled: Option<bool>,
+}
+
+fn load_persisted_ui_settings() -> PersistedUiSettings {
+    let path = Settings::config_dir().join("ui-settings.json");
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<PersistedUiSettings>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn slash_command_with_args_skips_tui(cmd_name: &str, cmd_args: &str) -> bool {
+    mangocode_tui::input::slash_command_with_args_skips_tui_intercept(cmd_name, cmd_args)
+}
+
+fn slash_command_lookup_key(cmd_name: &str) -> String {
+    cmd_name.trim().trim_start_matches('/').to_lowercase()
+}
+
+fn slash_command_first_arg_matches(cmd_args: &str, expected: &[&str]) -> bool {
+    cmd_args.split_whitespace().next().is_some_and(|first| {
+        expected
+            .iter()
+            .any(|value| first.eq_ignore_ascii_case(value))
+    })
 }
 
 fn normalize_prompt_fragment(text: &str) -> String {
@@ -115,10 +163,127 @@ async fn build_session_system_prompt(
     system_parts.join("\n\n")
 }
 
+fn effective_model_for_query_config(
+    config: &Config,
+    query_config: &mangocode_query::QueryConfig,
+) -> String {
+    if let Some(registry) = query_config.model_registry.as_ref() {
+        mangocode_api::effective_model_for_config(config, registry.as_ref())
+    } else {
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        mangocode_api::effective_model_for_config(config, &registry)
+    }
+}
+
+fn append_system_prompt_configured(config: &Config) -> bool {
+    config
+        .append_system_prompt
+        .as_deref()
+        .is_some_and(|append| !append.trim().is_empty())
+}
+
+fn apply_cli_model_override(config: &mut Config, model: Option<&str>) -> anyhow::Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+
+    if mangocode_api::apply_model_selection_to_config(config, model, None) {
+        Ok(())
+    } else {
+        anyhow::bail!("--model requires a non-empty model name")
+    }
+}
+
+fn oauth_provider_for_config_and_model(
+    config: &Config,
+    model: &str,
+) -> mangocode_core::system_prompt::OAuthProvider {
+    if let Some((provider, _)) = mangocode_core::ProviderId::split_known_model_prefix(model) {
+        let model_oauth = mangocode_core::system_prompt::OAuthProvider::from_provider_id(provider);
+        if model_oauth != mangocode_core::system_prompt::OAuthProvider::None {
+            return model_oauth;
+        }
+    }
+
+    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+        config.provider.as_deref().unwrap_or(""),
+    )
+}
+
+fn sync_query_config_for_runtime(
+    query_config: &mut mangocode_query::QueryConfig,
+    config: &Config,
+    working_dir: &std::path::Path,
+    model_registry: &mangocode_api::ModelRegistry,
+) {
+    query_config.model = mangocode_api::effective_model_for_config(config, model_registry);
+    query_config.max_tokens = config.effective_max_tokens();
+    query_config.output_style = config.effective_output_style();
+    query_config.output_style_prompt = config.resolve_output_style_prompt();
+    query_config.working_directory = Some(working_dir.display().to_string());
+    query_config.oauth_provider = oauth_provider_for_config_and_model(config, &query_config.model);
+    query_config.has_append_system_prompt = append_system_prompt_configured(config);
+    query_config.append_system_prompt = None;
+}
+
+fn tui_output_style_for_config(config: &Config) -> String {
+    config
+        .output_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .filter(|style| !style.eq_ignore_ascii_case("default"))
+        .unwrap_or("auto")
+        .to_string()
+}
+
+fn sync_tui_runtime_state_from_config(
+    app: &mut mangocode_tui::App,
+    query_config: &mut mangocode_query::QueryConfig,
+    working_dir: &std::path::Path,
+    model_registry: &mangocode_api::ModelRegistry,
+) {
+    sync_query_config_for_runtime(query_config, &app.config, working_dir, model_registry);
+    let effective_model = query_config.model.clone();
+    if app.model_name != effective_model {
+        app.cost_tracker.set_model(&effective_model);
+        app.model_name = effective_model;
+    }
+    app.output_style = tui_output_style_for_config(&app.config);
+}
+
+fn apply_session_model_if_present(config: &mut Config, session_model: &str) -> bool {
+    let session_model = session_model.trim();
+    if session_model.is_empty() {
+        return false;
+    }
+    apply_session_model_to_config(config, session_model);
+    true
+}
+
+fn sync_session_model_to_runtime_config(
+    config: &mut Config,
+    query_config: &mut mangocode_query::QueryConfig,
+    cost_tracker: &Arc<CostTracker>,
+    session_model: &str,
+) {
+    apply_session_model_if_present(config, session_model);
+    query_config.model = effective_model_for_query_config(config, query_config);
+    query_config.oauth_provider = oauth_provider_for_config_and_model(config, &query_config.model);
+    cost_tracker.set_model(&query_config.model);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-bash", feature = "tool-tool-search")
+    ))]
     fn test_tool_context(config: Config) -> ToolContext {
         ToolContext {
             working_dir: PathBuf::from("test-workspace"),
@@ -168,12 +333,354 @@ mod tests {
     }
 
     #[test]
+    fn bundled_cli_prompt_preserves_runtime_tools_and_memory_guidance() {
+        let prompt = include_str!("system_prompt.txt");
+        assert!(prompt.contains("current runtime tool list"));
+        assert!(prompt.contains("injected memory/context"));
+        assert!(!prompt.contains("## Available tools"));
+    }
+
+    #[tokio::test]
+    async fn session_system_prompt_builder_includes_bundled_prompt() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mangocode-system-prompt-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let prompt = build_session_system_prompt(temp_dir.clone(), &Config::default(), false).await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(prompt.contains("## Tool usage"));
+        assert!(prompt.contains("current runtime tool list"));
+        assert!(prompt.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"));
+    }
+
+    #[test]
+    fn arg_bearing_state_commands_skip_tui_intercepts() {
+        for cmd in [
+            "config",
+            "settings",
+            "model",
+            "theme",
+            "output-style",
+            "mcp",
+            "memory",
+            "hooks",
+            "agents",
+            "diff",
+            "review",
+            "search",
+            "find",
+            "feedback",
+            "survey",
+            "bug",
+            "report",
+            "plan",
+            "resume",
+            "session",
+            "rewind",
+            "rename",
+            "export",
+            "help",
+            "cost",
+            "copy",
+            "vim",
+            "vi",
+            "voice",
+            "fast",
+            "speed",
+            "effort",
+        ] {
+            assert!(slash_command_with_args_skips_tui(cmd, "on"));
+        }
+        assert!(slash_command_with_args_skips_tui("/MODEL", "on"));
+        assert!(slash_command_with_args_skips_tui("Find", "needle"));
+        assert!(!slash_command_with_args_skips_tui("effort", ""));
+        assert!(!slash_command_with_args_skips_tui("context", "unexpected"));
+    }
+
+    #[test]
+    fn slash_command_lookup_key_matches_command_executor_casing() {
+        assert_eq!(slash_command_lookup_key("Effort"), "effort");
+        assert_eq!(slash_command_lookup_key("/VOICE"), "voice");
+        assert_eq!(slash_command_lookup_key("  Plugin  "), "plugin");
+    }
+
+    #[test]
+    fn slash_command_first_arg_matches_reload_aliases_case_insensitively() {
+        assert!(slash_command_first_arg_matches(
+            "reload",
+            &["reload", "refresh"]
+        ));
+        assert!(slash_command_first_arg_matches(
+            "  Refresh now",
+            &["reload", "refresh"]
+        ));
+        assert!(slash_command_first_arg_matches(
+            "RELOAD",
+            &["reload", "refresh"]
+        ));
+        assert!(!slash_command_first_arg_matches(
+            "reloadish",
+            &["reload", "refresh"]
+        ));
+        assert!(!slash_command_first_arg_matches("", &["reload", "refresh"]));
+    }
+
+    #[test]
+    fn canonical_session_model_preserves_gateway_provider_identity() {
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_session_model(&config, "anthropic/claude-sonnet-4"),
+            "openrouter/anthropic/claude-sonnet-4"
+        );
+        assert_eq!(
+            canonical_session_model(&config, "openrouter/meta-llama/Llama-3.3-70B"),
+            "openrouter/meta-llama/Llama-3.3-70B"
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_does_not_wrap_explicit_other_provider_model() {
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_session_model(&config, "openai/gpt-4o"),
+            "openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn cli_model_override_preserves_configured_model_when_absent() {
+        let mut config = Config {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        apply_cli_model_override(&mut config, None).unwrap();
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn cli_model_override_trims_and_updates_provider() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        apply_cli_model_override(&mut config, Some(" openai/gpt-4o ")).unwrap();
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn cli_model_override_rejects_blank_model() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            ..Default::default()
+        };
+
+        let err = apply_cli_model_override(&mut config, Some("   ")).unwrap_err();
+
+        assert!(err.to_string().contains("non-empty model"));
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn apply_session_model_restores_prefixed_provider() {
+        let mut config = Config::default();
+
+        apply_session_model_to_config(&mut config, "openrouter/anthropic/claude-sonnet-4");
+
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn session_model_sync_updates_runtime_query_model() {
+        let mut config = Config::default();
+        let mut query_config = mangocode_query::QueryConfig::default();
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        query_config.model_registry = Some(Arc::new(registry));
+        query_config.model = "claude-opus-4-1-20250805".to_string();
+        let cost_tracker = CostTracker::new();
+
+        sync_session_model_to_runtime_config(
+            &mut config,
+            &mut query_config,
+            &cost_tracker,
+            "openrouter/anthropic/claude-sonnet-4",
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4")
+        );
+        assert_eq!(query_config.model, "openrouter/anthropic/claude-sonnet-4");
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::None
+        );
+
+        sync_session_model_to_runtime_config(
+            &mut config,
+            &mut query_config,
+            &cost_tracker,
+            "anthropic-max/claude-opus-4-5",
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("anthropic-max"));
+        assert_eq!(query_config.model, "anthropic-max/claude-opus-4-5");
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+    }
+
+    #[test]
+    fn blank_session_model_does_not_poison_runtime_config() {
+        let mut config = Config::default();
+        let mut query_config = mangocode_query::QueryConfig::default();
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        query_config.model_registry = Some(Arc::new(registry));
+        let cost_tracker = CostTracker::new();
+
+        assert!(!apply_session_model_if_present(&mut config, "   "));
+        assert!(config.model.is_none());
+
+        sync_session_model_to_runtime_config(&mut config, &mut query_config, &cost_tracker, "   ");
+
+        assert!(config.model.is_none());
+        assert!(!query_config.model.trim().is_empty());
+    }
+
+    #[test]
+    fn runtime_query_config_sync_refreshes_dispatch_fields() {
+        let config = Config {
+            provider: Some("anthropic-max".to_string()),
+            max_tokens: Some(1234),
+            append_system_prompt: Some("Extra instructions".to_string()),
+            ..Default::default()
+        };
+        let mut query_config = mangocode_query::QueryConfig {
+            model: "stale-model".to_string(),
+            max_tokens: 1,
+            append_system_prompt: Some("stale append".to_string()),
+            working_directory: None,
+            ..Default::default()
+        };
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let working_dir = PathBuf::from("runtime-workspace");
+
+        sync_query_config_for_runtime(&mut query_config, &config, &working_dir, &registry);
+
+        assert_ne!(query_config.model, "stale-model");
+        assert_eq!(query_config.max_tokens, 1234);
+        assert_eq!(
+            query_config.working_directory.as_deref(),
+            Some("runtime-workspace")
+        );
+        assert_eq!(query_config.append_system_prompt, None);
+        assert!(query_config.has_append_system_prompt);
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+    }
+
+    #[test]
+    fn tui_runtime_sync_refreshes_all_dispatch_fields() {
+        let config = Config {
+            provider: Some("openai".to_string()),
+            max_tokens: Some(2345),
+            append_system_prompt: Some("Extra runtime context".to_string()),
+            output_style: Some("verbose".to_string()),
+            ..Default::default()
+        };
+        let cost_tracker = CostTracker::new();
+        let mut app = mangocode_tui::App::new(config, cost_tracker);
+        let mut query_config = mangocode_query::QueryConfig {
+            model: "stale-model".to_string(),
+            max_tokens: 1,
+            append_system_prompt: Some("stale append".to_string()),
+            has_append_system_prompt: false,
+            working_directory: None,
+            ..Default::default()
+        };
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let working_dir = PathBuf::from("tui-runtime-workspace");
+
+        sync_tui_runtime_state_from_config(&mut app, &mut query_config, &working_dir, &registry);
+
+        assert_ne!(query_config.model, "stale-model");
+        assert_eq!(app.model_name, query_config.model);
+        assert_eq!(query_config.max_tokens, 2345);
+        assert_eq!(
+            query_config.working_directory.as_deref(),
+            Some("tui-runtime-workspace")
+        );
+        assert!(query_config.has_append_system_prompt);
+        assert_eq!(query_config.append_system_prompt, None);
+        assert_eq!(app.output_style, "verbose");
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::None
+        );
+    }
+
+    #[test]
+    fn tui_output_style_for_config_hides_default_style() {
+        let mut config = Config::default();
+        assert_eq!(tui_output_style_for_config(&config), "auto");
+
+        config.output_style = Some(" default ".to_string());
+        assert_eq!(tui_output_style_for_config(&config), "auto");
+
+        config.output_style = Some("concise".to_string());
+        assert_eq!(tui_output_style_for_config(&config), "concise");
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        feature = "tool-bash"
+    ))]
+    #[test]
     fn allowed_tool_filter_accepts_runtime_aliases() {
         let tools = build_tools_with_mcp(None, &["shell_command".to_string()], &[]);
         assert!(tools.iter().any(|tool| tool.name() == "Bash"));
         assert!(!tools.iter().any(|tool| tool.name() == "Read"));
     }
 
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-apply-patch", feature = "tool-read")
+    ))]
     #[test]
     fn disallowed_tool_filter_accepts_runtime_aliases() {
         let tools = build_tools_with_mcp(None, &[], &["apply_patch".to_string()]);
@@ -210,6 +717,71 @@ mod tests {
         }
     }
 
+    struct TestMutatingNoneTool;
+
+    #[async_trait]
+    impl Tool for TestMutatingNoneTool {
+        fn name(&self) -> &str {
+            "MutatingNone"
+        }
+
+        fn description(&self) -> &str {
+            "A mutating None-permission test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::None
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn capabilities(
+            &self,
+            _input: &serde_json::Value,
+        ) -> mangocode_tools::runtime::ToolCapabilities {
+            mangocode_tools::runtime::ToolCapabilities::mutating()
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("mutating ok")
+        }
+    }
+
+    struct TestNetworkTool(&'static str);
+
+    #[async_trait]
+    impl Tool for TestNetworkTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "A network permission test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Network
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("network ok")
+        }
+    }
+
     #[test]
     fn shared_agent_filter_preserves_live_dynamic_tools() {
         let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestDynamicReadOnlyTool)]);
@@ -220,6 +792,21 @@ mod tests {
         assert!(filtered.iter().any(|tool| tool.name() == "DynamicReadOnly"));
     }
 
+    #[test]
+    fn read_only_agent_filter_rejects_mutating_none_permission_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestMutatingNoneTool)]);
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-agent", feature = "tool-bash", feature = "tool-read")
+    ))]
     #[test]
     fn read_only_agent_filter_preserves_live_none_permission_tools() {
         let tools = build_tools_with_mcp(None, &[], &[]);
@@ -232,6 +819,75 @@ mod tests {
     }
 
     #[test]
+    fn read_only_agent_filter_allows_only_read_oriented_network_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(TestNetworkTool(
+                mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+            )),
+            Box::new(TestNetworkTool(
+                mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+            )),
+            Box::new(TestNetworkTool("DocSearch")),
+            Box::new(TestNetworkTool("DocRead")),
+            Box::new(TestNetworkTool("DeepRead")),
+            Box::new(TestNetworkTool("RenderedFetch")),
+            Box::new(TestNetworkTool("ListMcpResources")),
+            Box::new(TestNetworkTool("ReadMcpResource")),
+            Box::new(TestNetworkTool("RemoteTrigger")),
+            Box::new(TestNetworkTool("mcp__auth")),
+        ]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let names: std::collections::HashSet<&str> =
+            filtered.iter().map(|tool| tool.name()).collect();
+
+        for tool in [
+            mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+            mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+            "DocSearch",
+            "DocRead",
+            "DeepRead",
+            "RenderedFetch",
+            "ListMcpResources",
+            "ReadMcpResource",
+        ] {
+            assert!(names.contains(tool), "{tool} should remain available");
+        }
+
+        assert!(!names.contains("RemoteTrigger"));
+        assert!(!names.contains("mcp__auth"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-get-goal",
+            feature = "tool-create-goal",
+            feature = "tool-update-goal"
+        )
+    ))]
+    #[test]
+    fn read_only_agent_filter_allows_goal_reads_not_goal_writes() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "get_goal"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "create_goal"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "update_goal"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-grep",
+            feature = "tool-tool-search",
+            feature = "tool-write"
+        )
+    ))]
+    #[test]
     fn search_only_agent_filter_keeps_tool_search() {
         let tools = build_tools_with_mcp(None, &[], &[]);
         let filtered = filter_tools_for_agent(tools, "search-only");
@@ -241,6 +897,16 @@ mod tests {
         assert!(!filtered.iter().any(|tool| tool.name() == "Write"));
     }
 
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-bash",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
     #[test]
     fn agent_filter_visibility_config_matches_filtered_runtime_tools() {
         let tools = build_tools_with_mcp(None, &[], &[]);
@@ -255,6 +921,17 @@ mod tests {
         assert!(config.disallowed_tools.is_empty());
     }
 
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-agent",
+            feature = "tool-bash",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
     #[test]
     fn dynamic_tool_rebuild_preserves_named_agent_filter() {
         let query_config = mangocode_query::QueryConfig {
@@ -275,6 +952,12 @@ mod tests {
         assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
     }
 
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-bash", feature = "tool-tool-search")
+    ))]
     #[test]
     fn interactive_visibility_resync_survives_base_config_overwrite() {
         let query_config = mangocode_query::QueryConfig {
@@ -905,11 +1588,7 @@ async fn main() -> anyhow::Result<()> {
     if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
         let mut registry = mangocode_api::ModelRegistry::new();
         // Load cached models.dev data if available so the list is comprehensive.
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("mangocode")
-            .join("models.json");
-        registry.load_cache(&cache_path);
+        registry.load_standard_cache();
         let mut entries = registry.list_all();
         // Sort by provider then model id for stable output.
         entries.sort_by(|a, b| {
@@ -948,6 +1627,7 @@ async fn main() -> anyhow::Result<()> {
                     cost_tracker: CostTracker::new(),
                     session_metrics: None,
                     messages: vec![],
+                    effort_level: None,
                     working_dir: cwd,
                     session_id: "pre-session".to_string(),
                     session_title: None,
@@ -1011,7 +1691,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref key) = cli.api_key {
         config.api_key = Some(key.clone());
     }
-    config.model = cli.model.clone();
+    apply_cli_model_override(&mut config, cli.model.as_deref())?;
     if let Some(mt) = cli.max_tokens {
         config.max_tokens = Some(mt);
     }
@@ -1075,11 +1755,7 @@ async fn main() -> anyhow::Result<()> {
     // --list-models fast path
     if cli.list_models {
         let mut registry = mangocode_api::ModelRegistry::new();
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("mangocode")
-            .join("models.json");
-        registry.load_cache(&cache_path);
+        registry.load_standard_cache();
         let mut entries = registry.list_all();
         entries.sort_by(|a, b| {
             (*a.info.provider_id)
@@ -1138,18 +1814,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Determine mode early (needed for auth error handling, permission handler
+    // selection, headless-only prompt de-duplication, and prompt dumps).
+    let is_headless = cli.print || cli.prompt.is_some();
+
     // --dump-system-prompt fast path
     if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
+        let system_prompt = build_session_system_prompt(cwd.clone(), &config, is_headless).await;
+        println!("{system_prompt}");
         return Ok(());
     }
-
-    // Determine mode early (needed for auth error handling, permission handler
-    // selection, and headless-only prompt de-duplication).
-    let is_headless = cli.print || cli.prompt.is_some();
 
     let system_prompt = build_session_system_prompt(cwd.clone(), &config, is_headless).await;
 
@@ -1483,30 +2157,17 @@ async fn main() -> anyhow::Result<()> {
     // from the models.dev cache if available.
     let model_registry = {
         let mut reg = mangocode_api::ModelRegistry::new();
-        let cache_path = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("mangocode")
-            .join("models.json");
-        reg.load_cache(&cache_path);
+        reg.load_standard_cache();
         Arc::new(reg)
     };
-
-    // Resolve the effective model and write it back to config so all consumers
-    // (Config tool, TUI status bar, init event) report the same model that's
-    // actually used for API calls.
-    if config.model.is_none() {
-        config.model = Some(mangocode_api::effective_model_for_config(
-            &config,
-            &model_registry,
-        ));
-    }
-    // Update the ToolContext config to match (it was cloned before registry was available)
-    tool_ctx.config.model = config.model.clone();
 
     // Build query config
     let mut query_config =
         mangocode_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
+    query_config.is_non_interactive = is_headless;
+    query_config.has_append_system_prompt = append_system_prompt_configured(&config);
+    cost_tracker.set_model(&query_config.model);
     query_config.max_turns = cli.max_turns;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
@@ -1528,7 +2189,10 @@ async fn main() -> anyhow::Result<()> {
         query_config.max_budget_usd = Some(usd);
     }
     if let Some(ref fb) = cli.fallback_model {
-        query_config.fallback_model = Some(fb.clone());
+        let Some(fallback_model) = mangocode_api::normalize_model_id(fb) else {
+            anyhow::bail!("--fallback-model requires a non-empty model name");
+        };
+        query_config.fallback_model = Some(fallback_model);
     }
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
@@ -1539,9 +2203,11 @@ async fn main() -> anyhow::Result<()> {
         mangocode_query::SkillIndex::default(),
     ));
     let prefetch_root = config.project_dir.clone().unwrap_or_else(|| cwd.clone());
+    let prefetch_skills_config = config.skills.clone();
     let skill_index_bg = skill_index.clone();
     tokio::spawn(async move {
-        mangocode_query::prefetch_skills(&prefetch_root, skill_index_bg).await;
+        mangocode_query::prefetch_skills(&prefetch_root, &prefetch_skills_config, skill_index_bg)
+            .await;
     });
     query_config.skill_index = Some(skill_index);
 
@@ -1682,9 +2348,9 @@ fn build_tools_with_mcp(
 }
 
 /// Filter the tool list based on the agent's access level.
-/// - "full"        → all tools allowed (no filtering)
-/// - "read-only"   → only ReadOnly/None permission tools and AskUserQuestion
-/// - "search-only" → only Grep, Glob, Read, WebSearch, WebFetch tools
+/// - "full"        -> runtime-visible tools allowed (no extra agent filtering)
+/// - "read-only"   -> ReadOnly tools, read-oriented Network tools, non-mutating None tools, and safe interactive helpers
+/// - "search-only" -> only Grep, Glob, Read, WebSearch, WebFetch, and ToolSearch tools
 fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
     access: &str,
@@ -1692,7 +2358,7 @@ fn filter_tools_for_agent(
     match access {
         "read-only" => filter_live_tools_for_agent(tools, tool_allowed_for_read_only_agent),
         "search-only" => filter_live_tools_for_agent(tools, tool_allowed_for_search_only_agent),
-        _ => tools, // "full" — allow all tools unchanged
+        _ => tools, // "full" — keep the runtime-visible tools unchanged
     }
 }
 
@@ -1770,16 +2436,42 @@ fn filter_live_tools_for_agent(
 
 fn tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
     use mangocode_tools::PermissionLevel as PL;
-    matches!(tool.permission_level(), PL::ReadOnly | PL::None) || tool.name() == "AskUserQuestion"
+    match tool.permission_level() {
+        PL::ReadOnly => true,
+        PL::Network => network_tool_allowed_for_read_only_agent(tool),
+        PL::None => {
+            let name = tool.name();
+            name == mangocode_core::constants::TOOL_NAME_ASK_USER
+                || name == mangocode_core::constants::TOOL_NAME_AGENT
+                || !tool.capabilities(&serde_json::Value::Null).mutating
+        }
+        _ => false,
+    }
+}
+
+fn network_tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    const READ_ONLY_NETWORK_TOOLS: &[&str] = &[
+        mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+        mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+        "DocSearch",
+        "DocRead",
+        "DeepRead",
+        "RenderedFetch",
+        "ListMcpResources",
+        "ReadMcpResource",
+    ];
+    READ_ONLY_NETWORK_TOOLS
+        .iter()
+        .any(|allowed| mangocode_tools::tool_name_matches(tool, allowed))
 }
 
 fn tool_allowed_for_search_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
     const SEARCH_TOOLS: &[&str] = &[
-        "Grep",
-        "Glob",
-        "Read",
-        "WebSearch",
-        "WebFetch",
+        mangocode_core::constants::TOOL_NAME_GREP,
+        mangocode_core::constants::TOOL_NAME_GLOB,
+        mangocode_core::constants::TOOL_NAME_FILE_READ,
+        mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+        mangocode_core::constants::TOOL_NAME_WEB_FETCH,
         "ToolSearch",
     ];
     SEARCH_TOOLS
@@ -1828,6 +2520,8 @@ async fn run_headless(
         })
     }
 
+    let mut tool_ctx = tool_ctx;
+    let mut query_config = query_config;
     let start_time = std::time::Instant::now();
 
     // Load prior conversation when --resume is provided; headless mode keeps
@@ -1835,6 +2529,46 @@ async fn run_headless(
     let mut session = if let Some(ref id) = cli.resume {
         match mangocode_core::history::load_session(id).await {
             Ok(mut s) => {
+                if !s.model.is_empty() {
+                    sync_session_model_to_runtime_config(
+                        &mut tool_ctx.config,
+                        &mut query_config,
+                        &cost_tracker,
+                        &s.model,
+                    );
+                }
+                if let Some(saved_dir) = s.working_dir.as_ref() {
+                    let saved_path = PathBuf::from(saved_dir);
+                    if saved_path.exists() {
+                        tool_ctx.working_dir = saved_path;
+                        tool_ctx.config.project_dir = Some(tool_ctx.working_dir.clone());
+                        query_config.working_directory =
+                            Some(tool_ctx.working_dir.display().to_string());
+                        query_config.system_prompt = Some(
+                            build_session_system_prompt(
+                                tool_ctx.working_dir.clone(),
+                                &tool_ctx.config,
+                                true,
+                            )
+                            .await,
+                        );
+                        let skill_index = Arc::new(tokio::sync::RwLock::new(
+                            mangocode_query::SkillIndex::default(),
+                        ));
+                        let skill_index_bg = skill_index.clone();
+                        let prefetch_root = tool_ctx.working_dir.clone();
+                        let prefetch_skills_config = tool_ctx.config.skills.clone();
+                        tokio::spawn(async move {
+                            mangocode_query::prefetch_skills(
+                                &prefetch_root,
+                                &prefetch_skills_config,
+                                skill_index_bg,
+                            )
+                            .await;
+                        });
+                        query_config.skill_index = Some(skill_index);
+                    }
+                }
                 if s.id != tool_ctx.session_id {
                     s.id = tool_ctx.session_id.clone();
                 }
@@ -1842,22 +2576,25 @@ async fn run_headless(
             }
             Err(e) => {
                 eprintln!("Warning: could not load session {}: {}", id, e);
-                let mut fresh =
-                    mangocode_core::history::ConversationSession::new(query_config.model.clone());
+                let mut fresh = mangocode_core::history::ConversationSession::new(
+                    canonical_session_model(&tool_ctx.config, &query_config.model),
+                );
                 fresh.id = tool_ctx.session_id.clone();
                 fresh
             }
         }
     } else {
-        let mut fresh =
-            mangocode_core::history::ConversationSession::new(query_config.model.clone());
+        let mut fresh = mangocode_core::history::ConversationSession::new(canonical_session_model(
+            &tool_ctx.config,
+            &query_config.model,
+        ));
         fresh.id = tool_ctx.session_id.clone();
         fresh
     };
 
     session.working_dir = Some(tool_ctx.working_dir.display().to_string());
-    if session.model.is_empty() {
-        session.model = query_config.model.clone();
+    if session.model.trim().is_empty() {
+        session.model = canonical_session_model(&tool_ctx.config, &query_config.model);
     }
 
     // Build new input messages for this invocation.
@@ -2229,7 +2966,7 @@ async fn run_headless(
     let full_text = event_task.await.unwrap_or_default();
 
     session.messages = messages;
-    session.model = query_config.model.clone();
+    session.model = canonical_session_model(&tool_ctx.config, &query_config.model);
     session.working_dir = Some(tool_ctx.working_dir.display().to_string());
     session.total_cost = cost_tracker.total_cost_usd();
     session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
@@ -2548,8 +3285,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("Warning: could not load session {}: {}", id, e);
+                let effective_model =
+                    mangocode_api::effective_model_for_config(&config, &model_registry);
                 let mut session = mangocode_core::history::ConversationSession::new(
-                    mangocode_api::effective_model_for_config(&config, &model_registry),
+                    canonical_session_model(&config, &effective_model),
                 );
                 session.id = tool_ctx.session_id.clone();
                 session.working_dir = Some(tool_ctx.working_dir.display().to_string());
@@ -2557,8 +3296,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
             }
         }
     } else {
+        let effective_model = mangocode_api::effective_model_for_config(&config, &model_registry);
         let mut session = mangocode_core::history::ConversationSession::new(
-            mangocode_api::effective_model_for_config(&config, &model_registry),
+            canonical_session_model(&config, &effective_model),
         );
         session.id = tool_ctx.session_id.clone();
         session.working_dir = Some(tool_ctx.working_dir.display().to_string());
@@ -2569,28 +3309,40 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     // provider registry after a runtime `/connect` flow (see the
     // `provider_registry_stale` check inside the main loop below).
     let mut base_query_config = query_config;
+    let persisted_ui_settings = load_persisted_ui_settings();
     let mut live_config = config.clone();
-    if !session.model.is_empty() {
-        live_config.model = Some(session.model.clone());
+    if !session.model.trim().is_empty() {
+        apply_session_model_if_present(&mut live_config, &session.model);
     }
+    if persisted_ui_settings.fast_mode.unwrap_or(false) {
+        live_config.model = Some(mangocode_tui::model_picker::FAST_MODE_MODEL.to_string());
+    }
+    live_config.project_dir = Some(tool_ctx.working_dir.clone());
     tool_ctx.config = live_config.clone();
+    base_query_config.model =
+        mangocode_api::effective_model_for_config(&live_config, &model_registry);
     base_query_config.working_directory = Some(tool_ctx.working_dir.display().to_string());
     base_query_config.system_prompt = Some(
         build_session_system_prompt(tool_ctx.working_dir.clone(), &tool_ctx.config, false).await,
     );
+    base_query_config.has_append_system_prompt = append_system_prompt_configured(&live_config);
+    base_query_config.append_system_prompt = None;
 
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.model_name = base_query_config.model.clone();
+    app.cost_tracker.set_model(&base_query_config.model);
+    app.output_style = tui_output_style_for_config(&live_config);
     init_mascot(&mut app);
     // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
     if let Some(level) = base_query_config.effort_level {
-        use mangocode_tui::EffortLevel as TuiEL;
-        app.effort_level = match level {
-            mangocode_core::effort::EffortLevel::Low => TuiEL::Low,
-            mangocode_core::effort::EffortLevel::Medium => TuiEL::Normal,
-            mangocode_core::effort::EffortLevel::High => TuiEL::High,
-            mangocode_core::effort::EffortLevel::Max => TuiEL::Max,
-        };
+        app.effort_level = core_effort_to_tui(level);
     }
+    app.fast_mode = persisted_ui_settings
+        .fast_mode
+        .unwrap_or_else(|| app.model_name.contains("haiku"));
+    app.prompt_input.vim_enabled =
+        matches!(persisted_ui_settings.editor_mode.as_deref(), Some("vim"));
+    app.refresh_prompt_input();
     app.provider_registry = base_query_config.provider_registry.clone();
 
     // Background: refresh the model registry from models.dev.
@@ -2647,14 +3399,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     // Mark whether valid credentials exist so the TUI can show a provider
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
-
-    // If a non-Anthropic provider is active, prefix model_name with "provider/model"
-    // so the status bar can show the provider name.
-    if let Some(ref provider) = live_config.provider {
-        if provider != "anthropic" && !app.model_name.contains('/') {
-            app.model_name = format!("{}/{}", provider, app.model_name);
-        }
-    }
 
     // Set agent mode from the --agent flag (carried on query_config).
     if let Some(ref agent_name) = base_query_config.agent_name {
@@ -2785,6 +3529,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         cost_tracker: cost_tracker.clone(),
         session_metrics: tool_ctx.session_metrics.clone(),
         messages: messages.clone(),
+        effort_level: base_query_config.effort_level,
         working_dir: tool_ctx.working_dir.clone(),
         session_id: session.id.clone(),
         session_title: session.title.clone(),
@@ -2804,7 +3549,8 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
     // Active effort level (None = use model default / High).
     // Tracks the user's /effort selection; flows into qcfg each turn.
-    let mut current_effort: Option<mangocode_core::effort::EffortLevel> = None;
+    let mut current_effort: Option<mangocode_core::effort::EffortLevel> =
+        base_query_config.effort_level;
 
     // Background update check: spawned once at startup; result delivered via channel.
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -2956,6 +3702,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 mangocode_tui::input::parse_slash_command(&input);
                             let cmd_name = cmd_name.to_string();
                             let cmd_args = cmd_args.to_string();
+                            let cmd_key = slash_command_lookup_key(&cmd_name);
 
                             // ── Step 1: TUI-layer intercept (overlays, toggles) ────────
                             // Run first so we know whether a UI overlay opened, which
@@ -2966,26 +3713,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             //   /model claude-haiku  → set model, don't open picker
                             //   /theme dark          → set theme, don't open picker
                             //   /resume <id>         → load session, don't open browser
-                            // Also skip TUI for /vim, /voice, /fast with explicit
-                            // on|off args so the blind-toggle doesn't misfire.
-                            let skip_tui_for_args = !cmd_args.is_empty()
-                                && matches!(
-                                    cmd_name.as_str(),
-                                    "model"
-                                        | "theme"
-                                        | "resume"
-                                        | "session"
-                                        | "rewind"
-                                        | "vim"
-                                        | "vi"
-                                        | "voice"
-                                        | "fast"
-                                        | "speed"
-                                );
+                            // Also skip TUI for state toggles with explicit
+                            // on|off/value args so blind toggles do not misfire.
+                            let skip_tui_for_args =
+                                slash_command_with_args_skips_tui(&cmd_key, &cmd_args);
                             let handled_by_tui = if skip_tui_for_args {
                                 false
                             } else {
-                                app.intercept_slash_command(&cmd_name)
+                                app.intercept_slash_command_with_args(&cmd_key, &cmd_args)
                             };
                             if handled_by_tui {
                                 terminal.render_live(&app)?;
@@ -2993,8 +3728,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
                             // Sync effort level when TUI cycled the visual indicator
                             // (no-args /effort → cycle Low→Med→High→Max→Low).
-                            if handled_by_tui && cmd_name == "effort" && cmd_args.is_empty() {
-                                current_effort = Some(tui_effort_to_core(app.effort_level));
+                            if handled_by_tui && cmd_key == "effort" && cmd_args.is_empty() {
+                                let level = tui_effort_to_core(app.effort_level);
+                                current_effort = Some(level);
+                                base_query_config.effort_level = Some(level);
                             }
 
                             // Honour exit/quit triggered by TUI intercept immediately.
@@ -3007,9 +3744,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
+                            cmd_ctx.effort_level = current_effort;
                             let cli_result = execute_command(&input, &mut cmd_ctx).await;
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
+                            let cli_succeeded = !matches!(
+                                &cli_result,
+                                Some(CommandResult::Error(_)) | Some(CommandResult::Silent) | None
+                            );
 
                             // Whether we need to fall through and submit a user message.
                             let mut submit_user_msg: Option<String> = None;
@@ -3037,6 +3779,112 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     ));
                                     terminal.reset_transcript(&app, &messages)?;
                                 }
+                                Some(CommandResult::ImportSessionState {
+                                    config,
+                                    messages: imported_msgs,
+                                    effort: imported_effort,
+                                    working_dir: imported_dir,
+                                    message: msg,
+                                }) => {
+                                    let mut new_cfg = config;
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
+
+                                    if let Some(ref new_dir) = imported_dir {
+                                        new_cfg.project_dir = Some(new_dir.clone());
+                                    }
+
+                                    messages = imported_msgs.clone();
+                                    app.replace_messages(imported_msgs);
+                                    session.messages = messages.clone();
+
+                                    if let Some(new_dir) = imported_dir {
+                                        tool_ctx.working_dir = new_dir.clone();
+                                        cmd_ctx.working_dir = new_dir.clone();
+                                        base_query_config.working_directory =
+                                            Some(new_dir.display().to_string());
+                                        session.working_dir = Some(new_dir.display().to_string());
+                                        clear_session_shell_state(&tool_ctx.session_id);
+                                        let _ = std::env::set_current_dir(&new_dir);
+                                    } else {
+                                        base_query_config.working_directory =
+                                            Some(tool_ctx.working_dir.display().to_string());
+                                    }
+
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
+                                    if let Some(level) = imported_effort {
+                                        current_effort = Some(level);
+                                        base_query_config.effort_level = Some(level);
+                                        app.effort_level = core_effort_to_tui(level);
+                                    }
+                                    cmd_ctx.config = new_cfg.clone();
+                                    cmd_ctx.effort_level = current_effort;
+                                    tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
+                                    app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
+                                    app.fast_mode = new_cfg
+                                        .model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        mangocode_core::config::PermissionMode::Plan
+                                    );
+                                    session.updated_at = chrono::Utc::now();
+                                    let _ = mangocode_core::history::save_session(&session).await;
+                                    app.status_message = Some(msg.clone());
+                                    terminal.reset_transcript(&app, &messages)?;
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
                                     app.open_rewind_flow();
@@ -3052,10 +3900,33 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     session = resumed_session;
                                     messages = session.messages.clone();
                                     app.replace_messages(messages.clone());
-                                    cmd_ctx.config.model = Some(session.model.clone());
-                                    app.config.model = Some(session.model.clone());
-                                    tool_ctx.config.model = Some(session.model.clone());
-                                    app.model_name = session.model.clone();
+                                    if !session.model.trim().is_empty() {
+                                        apply_session_model_if_present(
+                                            &mut cmd_ctx.config,
+                                            &session.model,
+                                        );
+                                        apply_session_model_if_present(
+                                            &mut app.config,
+                                            &session.model,
+                                        );
+                                        apply_session_model_if_present(
+                                            &mut tool_ctx.config,
+                                            &session.model,
+                                        );
+                                    }
+                                    base_query_config.model =
+                                        mangocode_api::effective_model_for_config(
+                                            &cmd_ctx.config,
+                                            &model_registry,
+                                        );
+                                    app.model_name = base_query_config.model.clone();
+                                    app.cost_tracker.set_model(&base_query_config.model);
+                                    if session.model.trim().is_empty() {
+                                        session.model = canonical_session_model(
+                                            &cmd_ctx.config,
+                                            &base_query_config.model,
+                                        );
+                                    }
                                     tool_ctx.session_id = session.id.clone();
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
                                         mangocode_core::file_history::FileHistory::new(),
@@ -3071,6 +3942,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
+                                    tool_ctx.config.project_dir =
+                                        Some(tool_ctx.working_dir.clone());
+                                    cmd_ctx.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
                                     base_query_config.working_directory =
                                         Some(tool_ctx.working_dir.display().to_string());
                                     base_query_config.system_prompt = Some(
@@ -3081,7 +3956,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         )
                                         .await,
                                     );
-                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&cmd_ctx.config);
+                                    base_query_config.append_system_prompt = None;
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
@@ -3089,8 +3966,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.session_id = Some(session.id.clone());
                                     app.session_title = session.title.clone();
                                     app.remote_session_url = session.remote_session_url.clone();
-                                    app.status_message =
-                                        Some(format!("Resumed session {}.", &session.id[..8]));
+                                    app.status_message = Some(format!(
+                                        "Resumed session {}.",
+                                        truncate_bytes_prefix(&session.id, 8)
+                                    ));
                                     terminal.reset_transcript(&app, &messages)?;
                                 }
                                 Some(CommandResult::SetWorkingDir(new_dir, msg)) => {
@@ -3110,6 +3989,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         )
                                         .await,
                                     );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&cmd_ctx.config);
+                                    base_query_config.append_system_prompt = None;
                                     session.working_dir = Some(new_dir.display().to_string());
                                     session.updated_at = chrono::Utc::now();
                                     clear_session_shell_state(&tool_ctx.session_id);
@@ -3170,6 +4052,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         )
                                         .await,
                                     );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
                                     base_query_config.working_directory =
                                         Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
@@ -3178,6 +4063,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     tool_ctx.permission_handler =
                                         make_permission_handler(false, &new_cfg.permission_mode);
                                     app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
                                     if reconnect_mcp {
                                         app.pending_mcp_reconnect = true;
                                     } else if rebuild_tools {
@@ -3193,10 +4079,17 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         &base_query_config,
                                     );
                                     app.refresh_prompt_slash_commands();
-                                    // Sync model name shown in the TUI header.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
-                                    }
+                                    // Sync the model actually used for dispatch,
+                                    // including provider defaults after model reset.
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
                                     // Sync fast_mode visual indicator.
                                     app.fast_mode = new_cfg
                                         .model
@@ -3227,6 +4120,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         )
                                         .await,
                                     );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
                                     base_query_config.working_directory =
                                         Some(tool_ctx.working_dir.display().to_string());
                                     cmd_ctx.config = new_cfg.clone();
@@ -3234,19 +4130,29 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     tool_ctx.permission_mode = new_cfg.permission_mode.clone();
                                     tool_ctx.permission_handler =
                                         make_permission_handler(false, &new_cfg.permission_mode);
-                                    // Sync model name + fast_mode visual indicator.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
-                                        app.fast_mode = model.contains("haiku");
-                                    } else {
-                                        // model reset to None means fast mode off.
-                                        app.fast_mode = false;
-                                    }
+                                    // Sync the model actually used for dispatch,
+                                    // including provider defaults after model reset.
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
+                                    // Sync fast_mode visual indicator.
+                                    app.fast_mode = new_cfg
+                                        .model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
                                     app.plan_mode = matches!(
                                         new_cfg.permission_mode,
                                         mangocode_core::config::PermissionMode::Plan
                                     );
                                     app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
                                     if reconnect_mcp {
                                         app.pending_mcp_reconnect = true;
                                     } else if rebuild_tools {
@@ -3265,6 +4171,23 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.status_message = Some(msg);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
+                                    if cmd_key == "plan" {
+                                        let mode = if cmd_args.trim().eq_ignore_ascii_case("exit") {
+                                            mangocode_core::config::PermissionMode::Default
+                                        } else {
+                                            mangocode_core::config::PermissionMode::Plan
+                                        };
+                                        app.plan_mode = matches!(
+                                            mode,
+                                            mangocode_core::config::PermissionMode::Plan
+                                        );
+                                        app.config.permission_mode = mode.clone();
+                                        cmd_ctx.config.permission_mode = mode.clone();
+                                        tool_ctx.config.permission_mode = mode.clone();
+                                        tool_ctx.permission_mode = mode.clone();
+                                        tool_ctx.permission_handler =
+                                            make_permission_handler(false, &mode);
+                                    }
                                     // Queue a user-visible turn for the model.
                                     submit_user_msg = Some(msg);
                                 }
@@ -3301,25 +4224,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
 
                             // Sync effort visual + API level when CLI handled
                             // /effort with explicit args (/effort high).
-                            if handled_by_cli && cmd_name == "effort" && !cmd_args.is_empty() {
-                                if let Some(level) =
-                                    mangocode_core::effort::EffortLevel::parse(&cmd_args)
-                                {
+                            if handled_by_cli && cmd_key == "effort" && !cmd_args.is_empty() {
+                                if let Some(level) = parse_effort_level_arg(&cmd_args) {
                                     current_effort = Some(level);
-                                    app.effort_level = match level {
-                                        mangocode_core::effort::EffortLevel::Low => {
-                                            mangocode_tui::EffortLevel::Low
-                                        }
-                                        mangocode_core::effort::EffortLevel::Medium => {
-                                            mangocode_tui::EffortLevel::Normal
-                                        }
-                                        mangocode_core::effort::EffortLevel::High => {
-                                            mangocode_tui::EffortLevel::High
-                                        }
-                                        mangocode_core::effort::EffortLevel::Max => {
-                                            mangocode_tui::EffortLevel::Max
-                                        }
-                                    };
+                                    base_query_config.effort_level = Some(level);
+                                    cmd_ctx.effort_level = Some(level);
+                                    app.effort_level = core_effort_to_tui(level);
                                     app.status_message = Some(format!(
                                         "Effort: {} {}",
                                         app.effort_level.symbol(),
@@ -3328,19 +4238,33 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 }
                             }
 
-                            // Sync vim mode when CLI handled /vim with explicit args.
-                            if handled_by_cli
-                                && matches!(cmd_name.as_str(), "vim" | "vi")
-                                && !cmd_args.is_empty()
+                            // Sync vim mode from the setting the CLI command just wrote.
+                            if cli_succeeded
+                                && handled_by_cli
+                                && matches!(cmd_key.as_str(), "vim" | "vi")
                             {
-                                app.prompt_input.vim_enabled =
-                                    matches!(cmd_args.trim(), "on" | "vim");
+                                let latest_ui_settings = load_persisted_ui_settings();
+                                if let Some(editor_mode) = latest_ui_settings.editor_mode {
+                                    app.prompt_input.vim_enabled = editor_mode == "vim";
+                                    app.refresh_prompt_input();
+                                }
+                            }
+
+                            // Sync voice mode from the setting the CLI command just wrote.
+                            if cli_succeeded && handled_by_cli && cmd_key == "voice" {
+                                let latest_ui_settings = load_persisted_ui_settings();
+                                if let Some(enabled) = latest_ui_settings.voice_enabled {
+                                    app.set_voice_enabled(enabled);
+                                }
                             }
 
                             if handled_by_cli
-                                && (cmd_name == "reload-plugins"
-                                    || (matches!(cmd_name.as_str(), "plugin" | "plugins")
-                                        && cmd_args.trim_start().starts_with("reload")))
+                                && (cmd_key == "reload-plugins"
+                                    || (matches!(cmd_key.as_str(), "plugin" | "plugins")
+                                        && slash_command_first_arg_matches(
+                                            &cmd_args,
+                                            &["reload", "refresh"],
+                                        )))
                             {
                                 app.refresh_prompt_slash_commands();
                             }
@@ -3453,7 +4377,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             let attachment_caps =
                                 mangocode_core::smart_attachments::model_attachment_capabilities(
                                     app.config.provider.as_deref(),
-                                    app.config.effective_model(),
+                                    &app.model_name,
                                 );
                             let mut blocks: Vec<mangocode_core::types::ContentBlock> = Vec::new();
                             for img in &pending_imgs {
@@ -3538,26 +4462,17 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
                         let msgs_arc_clone = msgs_arc.clone();
 
-                        // Share the Arc so the spawned task can access all tools (incl. MCP).
+                        // Share the already-filtered runtime tool set, including visible MCP tools.
                         let tools_arc_clone = tools_arc.clone();
                         let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
-                        qcfg.model = mangocode_api::effective_model_for_config(
+                        sync_query_config_for_runtime(
+                            &mut qcfg,
                             &cmd_ctx.config,
+                            &tool_ctx.working_dir,
                             &model_registry,
                         );
-                        qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
-                        qcfg.output_style = cmd_ctx.config.effective_output_style();
-                        qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
-                        qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
-                        // Propagate active OAuth provider so system-prompt identity
-                        // text reflects the correct product branding (e.g. Claude Max).
-                        qcfg.oauth_provider =
-                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
-                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
-                            );
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
@@ -3598,7 +4513,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         && !app.model_picker.visible
                         && key.code == KeyCode::Enter
                     {
-                        current_effort = Some(tui_effort_to_core(app.effort_level));
+                        let level = tui_effort_to_core(app.effort_level);
+                        current_effort = Some(level);
+                        base_query_config.effort_level = Some(level);
                     }
                     if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
                         terminal.reset_transcript(&app, &messages)?;
@@ -3615,6 +4532,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     tool_ctx.permission_mode = app_config.permission_mode.clone();
                     tool_ctx.permission_handler =
                         make_permission_handler(false, &app_config.permission_mode);
+                    sync_tui_runtime_state_from_config(
+                        &mut app,
+                        &mut base_query_config,
+                        &tool_ctx.working_dir,
+                        &model_registry,
+                    );
                     if reconnect_mcp {
                         app.pending_mcp_reconnect = true;
                     } else if rebuild_tools {
@@ -3630,7 +4553,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         &base_query_config,
                     );
                     if !app.model_name.is_empty() {
-                        session.model = app.model_name.clone();
+                        session.model = canonical_session_model(&app.config, &app.model_name);
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -3928,15 +4851,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         let tools_arc_clone = tools_arc.clone();
                         let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
-                        qcfg.model = mangocode_api::effective_model_for_config(
+                        sync_query_config_for_runtime(
+                            &mut qcfg,
                             &cmd_ctx.config,
+                            &tool_ctx.working_dir,
                             &model_registry,
                         );
-                        qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                        qcfg.oauth_provider =
-                            mangocode_core::system_prompt::OAuthProvider::from_provider_id(
-                                cmd_ctx.config.provider.as_deref().unwrap_or(""),
-                            );
+                        qcfg.system_prompt = base_query_config.system_prompt.clone();
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                        }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -4047,13 +4971,16 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                 let tools_arc_clone = tools_arc.clone();
                 let ctx_clone = tool_ctx.clone();
                 let mut qcfg = base_query_config.clone();
-                qcfg.model =
-                    mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                qcfg.oauth_provider =
-                    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
-                        cmd_ctx.config.provider.as_deref().unwrap_or(""),
-                    );
+                sync_query_config_for_runtime(
+                    &mut qcfg,
+                    &cmd_ctx.config,
+                    &tool_ctx.working_dir,
+                    &model_registry,
+                );
+                qcfg.system_prompt = base_query_config.system_prompt.clone();
+                if let Some(level) = current_effort {
+                    qcfg.effort_level = Some(level);
+                }
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -4319,8 +5246,9 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     messages = synced_messages;
                     session.messages = messages.clone();
                     session.updated_at = chrono::Utc::now();
-                    session.model =
+                    let effective_model =
                         mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                    session.model = canonical_session_model(&cmd_ctx.config, &effective_model);
                     session.working_dir = Some(tool_ctx.working_dir.display().to_string());
                     app.is_streaming = false;
                     // Sync the authoritative message list (with ToolUse / ToolResult

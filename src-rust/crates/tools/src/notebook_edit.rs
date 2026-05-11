@@ -34,6 +34,35 @@ fn default_edit_mode() -> String {
     "replace".to_string()
 }
 
+fn normalize_notebook_cell_type(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "code" => Ok("code"),
+        "markdown" => Ok("markdown"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid cell_type: {value}. Expected one of: code, markdown"
+            ))
+        }
+    }
+}
+
+fn normalize_notebook_edit_mode(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "replace" => Ok("replace"),
+        "insert" => Ok("insert"),
+        "delete" => Ok("delete"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid edit_mode: {value}. Expected one of: replace, insert, delete"
+            ))
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for NotebookEditTool {
     fn name(&self) -> &str {
@@ -88,6 +117,14 @@ impl Tool for NotebookEditTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let edit_mode = match normalize_notebook_edit_mode(&params.edit_mode) {
+            Ok(mode) => mode,
+            Err(e) => return ToolResult::error(e),
+        };
+        let cell_type = match normalize_notebook_cell_type(&params.cell_type) {
+            Ok(cell_type) => cell_type,
+            Err(e) => return ToolResult::error(e),
+        };
 
         let path = ctx.resolve_path(&params.notebook_path);
 
@@ -116,16 +153,16 @@ impl Tool for NotebookEditTool {
             Err(e) => return ToolResult::error(format!("Invalid notebook JSON: {}", e)),
         };
 
-        debug!(path = %path.display(), mode = %params.edit_mode, "Editing notebook");
+        debug!(path = %path.display(), mode = %edit_mode, "Editing notebook");
 
-        let result = match params.edit_mode.as_str() {
+        let result = match edit_mode {
             "replace" => {
                 let cell_id = match &params.cell_id {
                     Some(id) => id.clone(),
                     None => {
                         return ToolResult::error(
                             "cell_id is required for replace mode".to_string(),
-                        )
+                        );
                     }
                 };
                 let new_source = match &params.new_source {
@@ -133,7 +170,7 @@ impl Tool for NotebookEditTool {
                     None => {
                         return ToolResult::error(
                             "new_source is required for replace mode".to_string(),
-                        )
+                        );
                     }
                 };
                 replace_cell(&mut notebook, &cell_id, &new_source)
@@ -144,26 +181,28 @@ impl Tool for NotebookEditTool {
                     None => {
                         return ToolResult::error(
                             "new_source is required for insert mode".to_string(),
-                        )
+                        );
                     }
                 };
                 insert_cell(
                     &mut notebook,
                     params.cell_id.as_deref(),
                     &new_source,
-                    &params.cell_type,
+                    cell_type,
                 )
             }
             "delete" => {
                 let cell_id = match &params.cell_id {
                     Some(id) => id.clone(),
                     None => {
-                        return ToolResult::error("cell_id is required for delete mode".to_string())
+                        return ToolResult::error(
+                            "cell_id is required for delete mode".to_string(),
+                        );
                     }
                 };
                 delete_cell(&mut notebook, &cell_id)
             }
-            other => return ToolResult::error(format!("Unknown edit_mode: {}", other)),
+            _ => unreachable!("edit_mode is validated before editing"),
         };
 
         match result {
@@ -172,7 +211,7 @@ impl Tool for NotebookEditTool {
                 let updated = match serde_json::to_string_pretty(&notebook) {
                     Ok(s) => s,
                     Err(e) => {
-                        return ToolResult::error(format!("Failed to serialize notebook: {}", e))
+                        return ToolResult::error(format!("Failed to serialize notebook: {}", e));
                     }
                 };
                 if let Err(e) = tokio::fs::write(&path, &updated).await {
@@ -327,4 +366,25 @@ fn delete_cell(notebook: &mut Value, cell_id: &str) -> Result<String, String> {
     cells.remove(idx);
 
     Ok(format!("Deleted cell '{}' (was at index {})", cell_id, idx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notebook_modes_are_normalized_or_rejected() {
+        assert_eq!(normalize_notebook_edit_mode(" INSERT "), Ok("insert"));
+        assert_eq!(normalize_notebook_cell_type(" Markdown "), Ok("markdown"));
+
+        let mode_err = normalize_notebook_edit_mode("replace\ndelete")
+            .expect_err("invalid edit mode must be rejected");
+        let cell_err = normalize_notebook_cell_type("code\nmarkdown")
+            .expect_err("invalid cell type must be rejected");
+
+        assert!(mode_err.contains("Invalid edit_mode"));
+        assert!(mode_err.contains("\"replace\\ndelete\""));
+        assert!(cell_err.contains("Invalid cell_type"));
+        assert!(cell_err.contains("\"code\\nmarkdown\""));
+    }
 }

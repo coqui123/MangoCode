@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+#[cfg(feature = "tool-enter-worktree")]
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -37,6 +38,7 @@ static WORKTREE_SESSION: Lazy<Arc<RwLock<Option<WorktreeSession>>>> =
 #[cfg(feature = "tool-enter-worktree")]
 pub struct EnterWorktreeTool;
 
+#[cfg(feature = "tool-enter-worktree")]
 #[derive(Debug, Deserialize)]
 struct EnterWorktreeInput {
     /// Optional branch name. If omitted, a timestamped branch is created.
@@ -275,6 +277,7 @@ impl Tool for EnterWorktreeTool {
 #[cfg(feature = "tool-exit-worktree")]
 pub struct ExitWorktreeTool;
 
+#[cfg(feature = "tool-exit-worktree")]
 #[derive(Debug, Deserialize)]
 struct ExitWorktreeInput {
     /// "keep" = leave the worktree on disk; "remove" = delete it.
@@ -285,8 +288,24 @@ struct ExitWorktreeInput {
     discard_changes: bool,
 }
 
+#[cfg(feature = "tool-exit-worktree")]
 fn default_action() -> String {
     "keep".to_string()
+}
+
+#[cfg(any(feature = "tool-exit-worktree", test))]
+fn normalize_exit_worktree_action(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "keep" => Ok("keep"),
+        "remove" => Ok("remove"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid action: {value}. Expected one of: keep, remove"
+            ))
+        }
+    }
 }
 
 #[cfg(feature = "tool-exit-worktree")]
@@ -325,11 +344,16 @@ impl Tool for ExitWorktreeTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        let params: ExitWorktreeInput = match serde_json::from_value(input) {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let mut params: ExitWorktreeInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let action = match normalize_exit_worktree_action(&params.action) {
+            Ok(action) => action,
+            Err(e) => return ToolResult::error(e),
+        };
+        params.action = action.to_string();
 
         let session_guard = WORKTREE_SESSION.read().await;
         let session = match &*session_guard {
@@ -344,6 +368,14 @@ impl Tool for ExitWorktreeTool {
             }
         };
         drop(session_guard);
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Exit worktree with action {}", params.action),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         let worktree_str = session.worktree_path.to_string_lossy().to_string();
 
@@ -457,5 +489,19 @@ async fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String>
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_worktree_action_is_normalized_or_rejected() {
+        assert_eq!(normalize_exit_worktree_action(" REMOVE "), Ok("remove"));
+        let err = normalize_exit_worktree_action("keep\nremove")
+            .expect_err("invalid action must be rejected");
+        assert!(err.contains("Invalid action"));
+        assert!(err.contains("\"keep\\nremove\""));
     }
 }

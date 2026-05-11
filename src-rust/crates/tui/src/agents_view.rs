@@ -79,7 +79,7 @@ pub struct AgentDefinition {
     pub memory_scope: Option<String>,
     /// Description.
     pub description: String,
-    /// Tool list (empty = all tools).
+    /// Tool list (empty = runtime-visible tools).
     pub tools: Vec<String>,
     /// If another agent overrides this one.
     pub shadowed_by: Option<String>,

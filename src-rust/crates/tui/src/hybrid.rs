@@ -42,8 +42,8 @@ use crate::{
     messages::{render_message, RenderContext},
     prompt_input::{input_height, render_prompt_input, InputMode},
     render::{
-        build_tool_names, flush_sixel_blit_with_cursor, render_app, reset_last_sixel_position,
-        reset_sixel_blit_state,
+        build_tool_names, compact_model_label, flush_sixel_blit_with_cursor, render_app,
+        reset_last_sixel_position, reset_sixel_blit_state,
     },
 };
 
@@ -779,11 +779,7 @@ fn render_composer_to_buffer(app: &App, area: Rect, buffer: &mut Buffer) {
 }
 
 fn composer_status_line(app: &App) -> Line<'static> {
-    let model_short = app
-        .model_name
-        .split_once('/')
-        .map(|(_, model)| model)
-        .unwrap_or(app.model_name.as_str());
+    let model_short = compact_model_label(&app.model_name, app.config.provider.as_deref());
     let agent_mode =
         app.agent_mode
             .as_deref()

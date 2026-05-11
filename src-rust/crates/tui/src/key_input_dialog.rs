@@ -86,6 +86,20 @@ impl KeyInputDialogState {
     }
 }
 
+fn masked_key_input(input: &str) -> String {
+    if input.is_empty() {
+        return "paste your API key here...".to_string();
+    }
+
+    let len = input.chars().count();
+    if len <= 4 {
+        input.to_string()
+    } else {
+        let suffix: String = input.chars().skip(len - 4).collect();
+        format!("{}{}", "\u{2022}".repeat(len - 4), suffix)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -146,16 +160,7 @@ pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, a
     )]));
 
     // Masked key display (show last 4 chars, mask the rest)
-    let masked = if state.input.is_empty() {
-        "paste your API key here...".to_string()
-    } else {
-        let len = state.input.len();
-        if len <= 4 {
-            state.input.clone()
-        } else {
-            format!("{}{}", "\u{2022}".repeat(len - 4), &state.input[len - 4..])
-        }
-    };
+    let masked = masked_key_input(&state.input);
 
     let input_style = if state.input.is_empty() {
         Style::default().fg(dim)
@@ -179,4 +184,14 @@ pub fn render_key_input_dialog(frame: &mut Frame, state: &KeyInputDialogState, a
 
     let para = Paragraph::new(lines).bg(dialog_bg);
     frame.render_widget(para, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn masked_key_input_keeps_last_four_unicode_chars() {
+        assert_eq!(masked_key_input("abcé中def"), "••••中def");
+    }
 }

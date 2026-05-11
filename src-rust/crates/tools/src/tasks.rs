@@ -16,6 +16,7 @@
     allow(dead_code, unused_imports)
 )]
 
+#[cfg(feature = "tool-task-output")]
 use crate::output_reducers::{reduce_command_output, OutputMode};
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -24,7 +25,9 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+#[cfg(feature = "tool-task-create")]
 use tracing::debug;
+#[cfg(feature = "tool-task-create")]
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -56,6 +59,24 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
+#[cfg(any(feature = "tool-task-update", test))]
+fn normalize_task_update_status(value: &str) -> Result<TaskStatus, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok(TaskStatus::Pending),
+        "in_progress" | "in-progress" => Ok(TaskStatus::InProgress),
+        "completed" => Ok(TaskStatus::Completed),
+        "deleted" => Ok(TaskStatus::Deleted),
+        "failed" => Ok(TaskStatus::Failed),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid status: {value}. Expected one of: pending, in_progress, completed, deleted, failed"
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -74,6 +95,7 @@ pub struct Task {
 }
 
 impl Task {
+    #[cfg(feature = "tool-task-create")]
     fn new(subject: impl Into<String>, description: impl Into<String>) -> Self {
         let now = chrono::Utc::now();
         Self {
@@ -91,6 +113,7 @@ impl Task {
         }
     }
 
+    #[cfg(feature = "tool-task-list")]
     fn to_summary_value(&self) -> Value {
         // Compute effective blocked_by (exclude completed tasks)
         let blocked_by = self.blocked_by.clone();
@@ -103,6 +126,7 @@ impl Task {
         })
     }
 
+    #[cfg(any(feature = "tool-task-get", feature = "tool-task-output"))]
     fn to_full_value(&self) -> Value {
         json!({
             "id": self.id,
@@ -131,6 +155,7 @@ pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> = Lazy::new(|| Arc::new(
 #[cfg(feature = "tool-task-create")]
 pub struct TaskCreateTool;
 
+#[cfg(feature = "tool-task-create")]
 #[derive(Debug, Deserialize)]
 struct TaskCreateInput {
     subject: String,
@@ -194,6 +219,7 @@ impl Tool for TaskCreateTool {
 #[cfg(feature = "tool-task-get")]
 pub struct TaskGetTool;
 
+#[cfg(feature = "tool-task-get")]
 #[derive(Debug, Deserialize)]
 struct TaskGetInput {
     #[serde(alias = "taskId")]
@@ -247,6 +273,7 @@ impl Tool for TaskGetTool {
 #[cfg(feature = "tool-task-update")]
 pub struct TaskUpdateTool;
 
+#[cfg(feature = "tool-task-update")]
 #[derive(Debug, Deserialize)]
 struct TaskUpdateInput {
     #[serde(alias = "taskId")]
@@ -308,6 +335,13 @@ impl Tool for TaskUpdateTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+        let status_update = match params.status.as_deref() {
+            Some(status) => match normalize_task_update_status(status) {
+                Ok(status) => Some(status),
+                Err(e) => return ToolResult::error(e),
+            },
+            None => None,
+        };
 
         let mut task = match TASK_STORE.get_mut(&params.task_id) {
             Some(t) => t,
@@ -324,16 +358,8 @@ impl Tool for TaskUpdateTool {
             task.description = desc.clone();
             updated_fields.push("description");
         }
-        if let Some(status_str) = &params.status {
-            task.status = match status_str.as_str() {
-                "pending" => TaskStatus::Pending,
-                "in_progress" | "in-progress" => TaskStatus::InProgress,
-                "completed" => TaskStatus::Completed,
-                "deleted" => TaskStatus::Deleted,
-                "running" => TaskStatus::Running,
-                "failed" => TaskStatus::Failed,
-                other => return ToolResult::error(format!("Unknown status: {}", other)),
-            };
+        if let Some(status) = status_update {
+            task.status = status;
             updated_fields.push("status");
         }
         if let Some(owner) = &params.owner {
@@ -449,6 +475,7 @@ impl Tool for TaskListTool {
 #[cfg(feature = "tool-task-stop")]
 pub struct TaskStopTool;
 
+#[cfg(feature = "tool-task-stop")]
 #[derive(Debug, Deserialize)]
 struct TaskStopInput {
     #[serde(alias = "shell_id")]
@@ -478,11 +505,17 @@ impl Tool for TaskStopTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: TaskStopInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Stop task {}", params.task_id), false)
+        {
+            return ToolResult::error(e.to_string());
+        }
 
         match TASK_STORE.get_mut(&params.task_id) {
             Some(mut task) => {
@@ -514,6 +547,7 @@ impl Tool for TaskStopTool {
 #[cfg(feature = "tool-task-output")]
 pub struct TaskOutputTool;
 
+#[cfg(feature = "tool-task-output")]
 #[derive(Debug, Deserialize)]
 struct TaskOutputInput {
     task_id: String,
@@ -523,6 +557,7 @@ struct TaskOutputInput {
     output_mode: Option<OutputMode>,
 }
 
+#[cfg(feature = "tool-task-output")]
 fn default_block() -> bool {
     true
 }
@@ -604,5 +639,31 @@ impl Tool for TaskOutputTool {
             }
             None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_update_status_is_normalized_or_rejected() {
+        assert_eq!(
+            normalize_task_update_status(" in-progress "),
+            Ok(TaskStatus::InProgress)
+        );
+        assert_eq!(
+            normalize_task_update_status(" FAILED "),
+            Ok(TaskStatus::Failed)
+        );
+
+        let injected = normalize_task_update_status("pending\nfailed")
+            .expect_err("invalid status must be rejected");
+        let running = normalize_task_update_status("running")
+            .expect_err("model-updatable status must match schema");
+
+        assert!(injected.contains("Invalid status"));
+        assert!(injected.contains("\"pending\\nfailed\""));
+        assert!(running.contains("Invalid status"));
     }
 }

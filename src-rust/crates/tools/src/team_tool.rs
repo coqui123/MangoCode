@@ -25,13 +25,17 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+#[cfg(feature = "tool-team-create")]
 use futures::future::join_all;
 use once_cell::sync::OnceCell;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+#[cfg(feature = "tool-team-create")]
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "tool-team-create")]
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -43,7 +47,7 @@ use uuid::Uuid;
 /// Arguments:
 ///   description — short label for logging
 ///   prompt      — full task prompt
-///   tools       — optional allowlist of tool names; None means all tools
+///   tools       — optional allowlist of tool names; None means parent-visible tools
 ///   system      — optional system prompt override
 ///   max_turns   — max agent turns (default 10 when None)
 ///   ctx         — parent tool context (cloned in for the sub-agent)
@@ -78,6 +82,7 @@ pub fn register_agent_runner(f: AgentRunFn) {
 ///
 /// Falls back to a stub result when no runner has been registered (e.g., in
 /// unit tests that don't initialise cc-query).
+#[cfg(feature = "tool-team-create")]
 async fn run_agent(
     description: String,
     prompt: String,
@@ -131,6 +136,7 @@ fn sanitize_name(name: &str) -> String {
         .collect()
 }
 
+#[cfg(feature = "tool-team-create")]
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -142,6 +148,7 @@ fn now_millis() -> u64 {
 // On-disk schema
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "tool-team-create")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TeamMember {
     agent_id: String,
@@ -152,6 +159,7 @@ struct TeamMember {
     tools: Option<Vec<String>>,
 }
 
+#[cfg(feature = "tool-team-create")]
 #[derive(Debug, Serialize, Deserialize)]
 struct TeamConfig {
     name: String,
@@ -173,6 +181,7 @@ struct TeamConfig {
 pub struct TeamCreateTool;
 
 /// Per-agent specification provided in the input.
+#[cfg(feature = "tool-team-create")]
 #[derive(Debug, Deserialize)]
 struct AgentSpec {
     name: String,
@@ -186,6 +195,7 @@ struct AgentSpec {
     task: Option<String>,
 }
 
+#[cfg(feature = "tool-team-create")]
 #[derive(Debug, Deserialize)]
 struct TeamCreateInput {
     team_name: String,
@@ -204,6 +214,7 @@ struct TeamCreateInput {
     description: Option<String>,
 }
 
+#[cfg(feature = "tool-team-create")]
 fn default_parallel() -> bool {
     true
 }
@@ -249,7 +260,7 @@ impl Tool for TeamCreateTool {
                             "tools": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Allowed tool names.  Omit to use all tools."
+                                "description": "Allowed tool names. Omit to use the parent-visible runtime tools."
                             },
                             "task": {
                                 "type": "string",
@@ -283,6 +294,14 @@ impl Tool for TeamCreateTool {
         }
         if params.task.trim().is_empty() {
             return ToolResult::error("task is required for TeamCreate".to_string());
+        }
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Create team {}", params.team_name.trim()),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
         }
 
         let safe_name = sanitize_name(&params.team_name);
@@ -487,6 +506,7 @@ impl Tool for TeamCreateTool {
 #[cfg(feature = "tool-team-delete")]
 pub struct TeamDeleteTool;
 
+#[cfg(feature = "tool-team-delete")]
 #[derive(Debug, Deserialize)]
 struct TeamDeleteInput {
     team_name: String,
@@ -522,7 +542,7 @@ impl Tool for TeamDeleteTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: TeamDeleteInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -530,6 +550,14 @@ impl Tool for TeamDeleteTool {
 
         if params.team_name.trim().is_empty() {
             return ToolResult::error("team_name is required for TeamDelete".to_string());
+        }
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Delete team {}", params.team_name.trim()),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
         }
 
         let safe_name = sanitize_name(&params.team_name);

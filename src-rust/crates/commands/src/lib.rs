@@ -9,6 +9,7 @@ use mangocode_core::analytics::SessionMetrics;
 use mangocode_core::config::{Config, Settings, Theme};
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
 use mangocode_core::cost::CostTracker;
+use mangocode_core::effort::EffortLevel;
 use mangocode_core::feature_flags::FeatureFlags;
 use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
 use mangocode_core::types::Message;
@@ -28,6 +29,7 @@ pub struct CommandContext {
     pub cost_tracker: Arc<CostTracker>,
     pub session_metrics: Option<Arc<SessionMetrics>>,
     pub messages: Vec<Message>,
+    pub effort_level: Option<EffortLevel>,
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
     pub session_title: Option<String>,
@@ -55,6 +57,14 @@ pub enum CommandResult {
     ClearConversation,
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
+    /// Replace imported live session state in one runner-owned transaction.
+    ImportSessionState {
+        config: Config,
+        messages: Vec<Message>,
+        effort: Option<EffortLevel>,
+        working_dir: Option<std::path::PathBuf>,
+        message: String,
+    },
     /// Load a previously saved session into the live REPL.
     ResumeSession(mangocode_core::history::ConversationSession),
     /// Switch the active project/workspace directory for the live session.
@@ -80,6 +90,94 @@ pub enum CommandResult {
     /// Open the hooks configuration browser overlay in the TUI.
     /// Falls back to a text listing in non-TUI contexts.
     OpenHooksOverlay,
+}
+
+fn effective_model_for_command_config(
+    config: &Config,
+    registry: Option<&mangocode_api::ModelRegistry>,
+) -> String {
+    if let Some(registry) = registry {
+        return mangocode_api::effective_model_for_config(config, registry);
+    }
+
+    let mut fallback = mangocode_api::ModelRegistry::new();
+    fallback.load_standard_cache();
+    mangocode_api::effective_model_for_config(config, &fallback)
+}
+
+fn normalize_model_id(model: &str) -> Option<String> {
+    mangocode_api::normalize_model_id(model)
+}
+
+fn apply_model_override(
+    config: &mut Config,
+    model: String,
+    registry: Option<&mangocode_api::ModelRegistry>,
+) -> bool {
+    mangocode_api::apply_model_selection_to_config(config, &model, registry)
+}
+
+fn resolve_provider_and_model_for_display(
+    model: &str,
+    configured_provider: Option<&str>,
+    model_is_explicit: bool,
+    registry: &mangocode_api::ModelRegistry,
+) -> (String, String) {
+    if model_is_explicit {
+        if let Some((provider, model_id)) =
+            mangocode_core::ProviderId::split_known_model_prefix(model)
+        {
+            return (provider.to_string(), model_id.to_string());
+        }
+    }
+
+    if let Some(provider) = configured_provider {
+        let provider_prefix = format!("{}/", provider);
+        let model_id = model.strip_prefix(&provider_prefix).unwrap_or(model);
+        return (provider.to_string(), model_id.to_string());
+    }
+
+    if let Some((provider, model_id)) = mangocode_core::ProviderId::split_known_model_prefix(model)
+    {
+        return (provider.to_string(), model_id.to_string());
+    }
+
+    let provider = registry
+        .find_provider_for_model(model)
+        .map(|provider| provider.to_string())
+        .unwrap_or_else(|| "anthropic".to_string());
+    (provider, model.to_string())
+}
+
+fn model_matches_provider_default_for_display(
+    model: &str,
+    configured_provider: Option<&str>,
+    registry: &mangocode_api::ModelRegistry,
+) -> bool {
+    let Some(provider) = configured_provider else {
+        return false;
+    };
+
+    let provider_prefix = format!("{}/", provider);
+    let provider_model = model.strip_prefix(&provider_prefix).unwrap_or(model);
+
+    let matches_model_or_provider_model =
+        |candidate: &str| candidate == model || candidate == provider_model;
+
+    if registry
+        .best_model_for_provider(provider)
+        .as_deref()
+        .is_some_and(matches_model_or_provider_model)
+    {
+        return true;
+    }
+
+    let default_config = Config {
+        provider: Some(provider.to_string()),
+        model: None,
+        ..Default::default()
+    };
+    matches_model_or_provider_model(default_config.effective_model())
 }
 
 /// Every slash command implements this trait.
@@ -433,14 +531,39 @@ fn pipedream_vault_secret(key: &str) -> Option<String> {
 }
 
 fn current_output_style_name(config: &Config) -> &str {
-    config.output_style.as_deref().unwrap_or("default")
+    config
+        .output_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .unwrap_or("default")
 }
 
-fn available_output_style_names() -> Vec<String> {
-    mangocode_core::output_styles::all_styles(&Settings::config_dir())
+fn available_output_style_names(config: &Config, working_dir: &std::path::Path) -> Vec<String> {
+    available_output_styles(config, working_dir)
         .into_iter()
         .map(|style| style.name)
         .collect()
+}
+
+fn available_output_styles(
+    config: &Config,
+    working_dir: &std::path::Path,
+) -> Vec<mangocode_core::output_styles::OutputStyleDef> {
+    let project_dir = config.project_dir.as_deref().or(Some(working_dir));
+    mangocode_core::output_styles::all_styles_with_runtime_for_project(
+        &Settings::config_dir(),
+        project_dir,
+    )
+}
+
+fn resolve_output_style_name(
+    config: &Config,
+    working_dir: &std::path::Path,
+    value: &str,
+) -> Option<String> {
+    let styles = available_output_styles(config, working_dir);
+    mangocode_core::output_styles::find_style(&styles, value).map(|style| style.name.clone())
 }
 
 fn split_command_args(args: &str) -> Vec<String> {
@@ -937,9 +1060,14 @@ impl SlashCommand for ModelCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
-            CommandResult::Message(format!("Current model: {}", ctx.config.effective_model()))
+            CommandResult::Message(format!(
+                "Current model: {}",
+                effective_model_for_command_config(&ctx.config, ctx.model_registry.as_deref())
+            ))
         } else {
-            let model_str = args.to_string();
+            let Some(model_str) = normalize_model_id(args) else {
+                return CommandResult::Error("Model must not be empty.".to_string());
+            };
 
             // Validate against the model registry if available.
             if let Some(ref registry) = ctx.model_registry {
@@ -967,7 +1095,9 @@ impl SlashCommand for ModelCommand {
                 format!("Switched to {}", model_str)
             };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(model_str);
+            if !apply_model_override(&mut new_config, model_str, ctx.model_registry.as_deref()) {
+                return CommandResult::Error("Model must not be empty.".to_string());
+            }
             CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
@@ -992,7 +1122,7 @@ impl SlashCommand for ConfigCommand {
         if args.is_empty() || matches!(args, "show" | "get") {
             let json = serde_json::to_string_pretty(&ctx.config).unwrap_or_default();
             return CommandResult::Message(format!(
-                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <default|concise|explanatory|learning|formal|casual>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config unset <model|output-style>",
+                "Current configuration:\n{}\n\nUsage:\n  /config\n  /config set theme <default|dark|light>\n  /config set output-style <style-name>\n  /config set model <model>\n  /config set permission-mode <default|accept-edits|bypass-permissions|plan>\n  /config unset <model|output-style>\n\nUse /output-style to list available built-in, user, and plugin styles.",
                 json
             ));
         }
@@ -1004,9 +1134,10 @@ impl SlashCommand for ConfigCommand {
                     "output-style = {}",
                     current_output_style_name(&ctx.config)
                 )),
-                "model" => {
-                    CommandResult::Message(format!("model = {}", ctx.config.effective_model()))
-                }
+                "model" => CommandResult::Message(format!(
+                    "model = {}",
+                    effective_model_for_command_config(&ctx.config, ctx.model_registry.as_deref())
+                )),
                 "permission-mode" | "permission_mode" => CommandResult::Message(format!(
                     "permission-mode = {:?}",
                     ctx.config.permission_mode
@@ -1081,21 +1212,24 @@ impl SlashCommand for ConfigCommand {
                 )
             }
             "output-style" | "output_style" => {
-                let normalized = value.trim().to_lowercase();
-                let valid = available_output_style_names();
-                if !valid.iter().any(|name| name == &normalized) {
+                let canonical_style =
+                    resolve_output_style_name(&ctx.config, &ctx.working_dir, value);
+                let valid = available_output_style_names(&ctx.config, &ctx.working_dir);
+                let Some(canonical_style) = canonical_style else {
                     return CommandResult::Error(format!(
                         "Unsupported output style '{}'. Use one of: {}",
                         value,
                         valid.join(", ")
                     ));
-                }
+                };
 
                 let mut new_config = ctx.config.clone();
-                new_config.output_style = (normalized != "default").then(|| normalized.clone());
+                new_config.output_style = (!canonical_style.eq_ignore_ascii_case("default"))
+                    .then(|| canonical_style.clone());
                 if let Err(err) = save_settings_mutation(|settings| {
-                    settings.config.output_style =
-                        (normalized != "default").then(|| normalized.clone());
+                    settings.config.output_style = (!canonical_style
+                        .eq_ignore_ascii_case("default"))
+                    .then(|| canonical_style.clone());
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
@@ -1103,19 +1237,35 @@ impl SlashCommand for ConfigCommand {
                     new_config,
                     format!(
                         "Output style set to {}. Changes take effect on the next request.",
-                        normalized
+                        canonical_style
                     ),
                 )
             }
             "model" => {
+                let Some(model_value) = normalize_model_id(value) else {
+                    return CommandResult::Error("Model must not be empty.".to_string());
+                };
                 let mut new_config = ctx.config.clone();
-                new_config.model = Some(value.to_string());
+                apply_model_override(
+                    &mut new_config,
+                    model_value.clone(),
+                    ctx.model_registry.as_deref(),
+                );
+                let provider = new_config.provider.clone();
+                let model = new_config.model.clone();
                 if let Err(err) = save_settings_mutation(|settings| {
-                    settings.config.model = Some(value.to_string());
+                    settings.config.model = model.clone();
+                    if let Some(provider) = provider.clone() {
+                        settings.provider = Some(provider.clone());
+                        settings.config.provider = Some(provider);
+                    }
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
-                CommandResult::ConfigChangeMessage(new_config, format!("Model set to {}.", value))
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!("Model set to {}.", model_value),
+                )
             }
             "permission-mode" | "permission_mode" => {
                 let mode = match value.trim().to_lowercase().as_str() {
@@ -1180,7 +1330,9 @@ impl SlashCommand for FlagsCommand {
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
-            let mut out = String::from("Runtime feature flags\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n");
+            let mut out = String::from(
+                "Runtime feature flags\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
+            );
             for (name, enabled) in FeatureFlags::list_all() {
                 out.push_str(&format!(
                     "{}: {}\n",
@@ -1331,40 +1483,45 @@ impl SlashCommand for OutputStyleCommand {
         "Usage: /output-style [style-name]\n\n\
          With no argument: list available styles and show the current one.\n\
          With a style name: switch to that style (persisted to settings).\n\n\
-         Built-in styles: default, verbose, concise\n\
-         Plugin-defined styles are listed automatically.\n\n\
+         Available built-in, user, and plugin-defined styles are listed automatically.\n\n\
          Changes take effect on the next request."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let arg = args.trim();
-        let valid_styles = available_output_style_names();
+        let valid_styles = available_output_style_names(&ctx.config, &ctx.working_dir);
         let current = current_output_style_name(&ctx.config);
 
         if arg.is_empty() {
             // List available styles
             let mut lines = format!("Current output style: {}\n\nAvailable styles:\n", current);
             for style in &valid_styles {
-                let marker = if style == current { " *" } else { "" };
+                let marker = if style == current || style.eq_ignore_ascii_case(current) {
+                    " *"
+                } else {
+                    ""
+                };
                 lines.push_str(&format!("  {}{}\n", style, marker));
             }
             lines.push_str("\nUse /output-style <name> to switch.");
             return CommandResult::Message(lines);
         }
 
-        let normalized = arg.to_lowercase();
-        if !valid_styles.iter().any(|name| name == &normalized) {
+        let Some(canonical_style) = resolve_output_style_name(&ctx.config, &ctx.working_dir, arg)
+        else {
             return CommandResult::Error(format!(
                 "Unknown output style '{}'. Available styles: {}",
                 arg,
                 valid_styles.join(", ")
             ));
-        }
+        };
 
         let mut new_config = ctx.config.clone();
-        new_config.output_style = (normalized != "default").then(|| normalized.clone());
+        new_config.output_style =
+            (!canonical_style.eq_ignore_ascii_case("default")).then(|| canonical_style.clone());
         if let Err(err) = save_settings_mutation(|settings| {
-            settings.config.output_style = (normalized != "default").then(|| normalized.clone());
+            settings.config.output_style =
+                (!canonical_style.eq_ignore_ascii_case("default")).then(|| canonical_style.clone());
         }) {
             return CommandResult::Error(format!("Failed to save configuration: {}", err));
         }
@@ -1373,7 +1530,7 @@ impl SlashCommand for OutputStyleCommand {
             new_config,
             format!(
                 "Output style set to '{}'. Changes take effect on the next request.",
-                normalized
+                canonical_style
             ),
         )
     }
@@ -1410,7 +1567,7 @@ impl SlashCommand for KeybindingsCommand {
                     return CommandResult::Error(format!(
                         "Failed to generate keybindings template: {}",
                         err
-                    ))
+                    ));
                 }
             };
 
@@ -1515,7 +1672,7 @@ impl SlashCommand for ResumeCommand {
             let mut output = String::from("Recent sessions:\n\n");
             for (i, session) in sessions.iter().take(10).enumerate() {
                 let title = session.title.as_deref().unwrap_or("(untitled)");
-                let id_short = &session.id[..session.id.len().min(8)];
+                let id_short = truncate_bytes_prefix(&session.id, 8);
                 output.push_str(&format!(
                     "  {}. {} - {} ({} messages)\n",
                     i + 1,
@@ -1682,28 +1839,26 @@ impl SlashCommand for StatusCommand {
             .unwrap_or_else(|_| "n/a".to_string());
 
         // Token usage details for current conversation context.
-        let model = ctx.config.effective_model();
+        let model = effective_model_for_command_config(&ctx.config, ctx.model_registry.as_deref());
         let tokens_used = estimate_message_tokens(&ctx.messages);
-        let registry = mangocode_api::ModelRegistry::new();
-        let (provider_id, model_id) = if let Some((provider, model_name)) = model.split_once('/') {
-            (provider.to_string(), model_name.to_string())
-        } else {
-            let provider = ctx
-                .config
-                .provider
-                .clone()
-                .or_else(|| {
-                    registry
-                        .find_provider_for_model(model)
-                        .map(|p| p.to_string())
-                })
-                .unwrap_or_else(|| "anthropic".to_string());
-            (provider, model.to_string())
-        };
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let model_is_explicit = ctx.config.model.is_some()
+            && !model_matches_provider_default_for_display(
+                &model,
+                ctx.config.provider.as_deref(),
+                &registry,
+            );
+        let (provider_id, model_id) = resolve_provider_and_model_for_display(
+            &model,
+            ctx.config.provider.as_deref(),
+            model_is_explicit,
+            &registry,
+        );
         let max_tokens = registry
             .get(&provider_id, &model_id)
             .map(|e| u64::from(e.info.context_window))
-            .unwrap_or_else(|| mangocode_core::message_utils::context_window_for_model(model));
+            .unwrap_or_else(|| mangocode_core::message_utils::context_window_for_model(&model));
         let pct_used = if max_tokens > 0 {
             (tokens_used as f64 / max_tokens as f64) * 100.0
         } else {
@@ -1746,7 +1901,7 @@ impl SlashCommand for StatusCommand {
             perm = ctx.config.permission_mode,
             fast = if fast_mode { "on" } else { "off" },
             editor = editor_mode,
-            sid = &ctx.session_id[..ctx.session_id.len().min(12)],
+            sid = truncate_bytes_prefix(&ctx.session_id, 12),
             title = ctx.session_title.as_deref().unwrap_or("(untitled)"),
             msgs = ctx.messages.len(),
             wd = ctx.working_dir.display(),
@@ -1902,7 +2057,7 @@ impl SlashCommand for MemoryCommand {
                         "Failed to open layered memory DB at {}: {}",
                         db_path.display(),
                         e
-                    ))
+                    ));
                 }
             };
             let records = match store.review(limit) {
@@ -1941,7 +2096,7 @@ impl SlashCommand for MemoryCommand {
                         "Failed to open layered memory DB at {}: {}",
                         db_path.display(),
                         e
-                    ))
+                    ));
                 }
             };
             let reviewed = store.review(1000).unwrap_or_default();
@@ -2065,7 +2220,9 @@ impl SlashCommand for MemoryCommand {
         }
 
         // ---- /memory (show all) -----------------------------------------------
-        let mut output = String::from("AGENTS.md Memory Files\nâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n");
+        let mut output = String::from(
+            "AGENTS.md Memory Files\nâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•\n",
+        );
         let mut found_any = false;
 
         for (label, path) in &locations {
@@ -2132,7 +2289,7 @@ impl SlashCommand for BugCommand {
         "feedback"
     }
     fn aliases(&self) -> Vec<&str> {
-        vec!["bug"]
+        vec!["bug", "survey"]
     }
     fn description(&self) -> &str {
         "Submit feedback about MangoCode"
@@ -2642,7 +2799,7 @@ impl SlashCommand for DoctorCommand {
         lines.push("  ok native document Markdown extraction: built in".to_string());
 
         lines.push(
-            "  info Rendered browser fallback: native persistent Chromium backend when built with tools/browser; HTTP/script extraction otherwise"
+            "  info Rendered browser fallback: native persistent Chromium backend when built with tool-browser or tool-rendered-fetch; HTTP/script extraction otherwise"
                 .to_string(),
         );
 
@@ -2866,26 +3023,15 @@ impl SlashCommand for DoctorCommand {
         lines.push(String::new());
 
         // â”€â”€ Tool permissions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        lines.push("Tool Permissions".to_string());
-        let all_tool_names: Vec<String> = mangocode_tools::all_tools()
-            .iter()
-            .map(|t| t.name().to_string())
-            .collect();
-        let total_tools = all_tool_names.len();
+        lines.push("Tool Visibility and Permissions".to_string());
+        let total_tools = mangocode_tools::all_tools().len();
+        let connected_mcp_tools = ctx
+            .mcp_manager
+            .as_ref()
+            .map(|manager| manager.all_tool_definitions().len())
+            .unwrap_or(0);
         let allowed_count = ctx.config.allowed_tools.len();
         let denied_count = ctx.config.disallowed_tools.len();
-        // Tools not in allowed or denied lists require user confirmation
-        let explicit_tools: std::collections::HashSet<&str> = ctx
-            .config
-            .allowed_tools
-            .iter()
-            .chain(ctx.config.disallowed_tools.iter())
-            .map(|s| s.as_str())
-            .collect();
-        let confirm_count = all_tool_names
-            .iter()
-            .filter(|n| !explicit_tools.contains(n.as_str()))
-            .count();
         let mode_label = match ctx.config.permission_mode {
             mangocode_core::PermissionMode::BypassPermissions => {
                 "bypass-permissions (no confirmation required)"
@@ -2897,26 +3043,30 @@ impl SlashCommand for DoctorCommand {
             mangocode_core::PermissionMode::Default => "default (confirm destructive actions)",
         };
         lines.push(format!("  â€¢ Mode: {mode_label}"));
-        lines.push(format!("  â€¢ Total built-in tools: {total_tools}"));
+        lines.push(format!("  - Compiled built-in tools: {total_tools}"));
+        if connected_mcp_tools > 0 {
+            lines.push(format!("  - Connected MCP tools: {connected_mcp_tools}"));
+        }
         if allowed_count > 0 {
             lines.push(format!(
-                "  âœ“ Always allowed: {} tool(s) â€” {}",
+                "  - Visible allowlist: {} tool(s) - {}",
                 allowed_count,
                 ctx.config.allowed_tools.join(", ")
             ));
+        } else {
+            lines.push(
+                "  - Visible allowlist: none (base visibility does not restrict the built runtime tool set unless hidden; agent/session filters may further restrict runtime visibility; execution still follows permission mode)"
+                    .to_string(),
+            );
         }
         if denied_count > 0 {
             lines.push(format!(
-                "  âœ— Always denied: {} tool(s) â€” {}",
+                "  - Hidden/denied tools: {} - {}",
                 denied_count,
                 ctx.config.disallowed_tools.join(", ")
             ));
-        }
-        if ctx.config.permission_mode == mangocode_core::PermissionMode::Default {
-            lines.push(format!(
-                "  âš  Require confirmation: {} tool(s)",
-                confirm_count
-            ));
+        } else {
+            lines.push("  - Hidden/denied tools: none".to_string());
         }
         lines.push(String::new());
 
@@ -3092,13 +3242,13 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match prompt_secure_input("Enter vault passphrase: ") {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 let confirm = match prompt_secure_input("Confirm passphrase: ") {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 if passphrase != confirm {
@@ -3121,7 +3271,7 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match prompt_secure_input("Vault passphrase: ") {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 if let Err(e) = vault.load(&passphrase) {
@@ -3144,7 +3294,7 @@ impl SlashCommand for VaultCommand {
                 let provider = match parts.next() {
                     Some(p) => p,
                     None => {
-                        return CommandResult::Error("Usage: /vault set <provider>".to_string())
+                        return CommandResult::Error("Usage: /vault set <provider>".to_string());
                     }
                 };
                 if !vault.exists() {
@@ -3155,14 +3305,14 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 let secret = match prompt_secure_input(&format!("Enter API key for {}: ", provider))
                 {
                     Ok(s) => s,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read API key: {}", e))
+                        return CommandResult::Error(format!("Failed to read API key: {}", e));
                     }
                 };
                 let label = parts.next().map(|s| s.to_string());
@@ -3179,7 +3329,7 @@ impl SlashCommand for VaultCommand {
                 let provider = match parts.next() {
                     Some(p) => p,
                     None => {
-                        return CommandResult::Error("Usage: /vault get <provider>".to_string())
+                        return CommandResult::Error("Usage: /vault get <provider>".to_string());
                     }
                 };
                 if !vault.exists() {
@@ -3188,7 +3338,7 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 match vault.get_secret(provider, &passphrase) {
@@ -3210,7 +3360,7 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 match vault.list_providers(&passphrase) {
@@ -3245,7 +3395,7 @@ impl SlashCommand for VaultCommand {
                 let provider = match parts.next() {
                     Some(p) => p,
                     None => {
-                        return CommandResult::Error("Usage: /vault remove <provider>".to_string())
+                        return CommandResult::Error("Usage: /vault remove <provider>".to_string());
                     }
                 };
                 if !vault.exists() {
@@ -3254,7 +3404,7 @@ impl SlashCommand for VaultCommand {
                 let passphrase = match get_or_prompt_passphrase() {
                     Ok(p) => p,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to read passphrase: {}", e))
+                        return CommandResult::Error(format!("Failed to read passphrase: {}", e));
                     }
                 };
                 if let Err(e) = vault.remove_secret(provider, &passphrase) {
@@ -3302,7 +3452,7 @@ impl SlashCommand for GatewayCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: /gateway setup <url> <token>".to_string(),
-                        )
+                        );
                     }
                 };
                 let token = match parts.next() {
@@ -3310,7 +3460,7 @@ impl SlashCommand for GatewayCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: /gateway setup <url> <token>".to_string(),
-                        )
+                        );
                     }
                 };
                 // Prefer storing the gateway token inside the vault (encrypted at rest).
@@ -3827,7 +3977,10 @@ fn parse_review_args(args: &str) -> Result<ReviewOptions, String> {
                 let value = tokens
                     .get(i)
                     .ok_or_else(|| "--model requires a model name.".to_string())?;
-                opts.model_override = Some(value.clone());
+                opts.model_override = Some(
+                    normalize_model_id(value)
+                        .ok_or_else(|| "--model requires a non-empty model name.".to_string())?,
+                );
             }
             "--provider" => {
                 i += 1;
@@ -3863,7 +4016,10 @@ fn parse_review_args(args: &str) -> Result<ReviewOptions, String> {
                 } else if let Some(value) = token.strip_prefix("--focus=") {
                     merge_review_focus(&mut opts.focus, value);
                 } else if let Some(value) = token.strip_prefix("--model=") {
-                    opts.model_override = Some(value.to_string());
+                    opts.model_override =
+                        Some(normalize_model_id(value).ok_or_else(|| {
+                            "--model requires a non-empty model name.".to_string()
+                        })?);
                 } else if let Some(value) = token.strip_prefix("--provider=") {
                     opts.provider_override = Some(canonical_review_provider_id(value));
                 } else if let Some(value) = token.strip_prefix("--max-diff-chars=") {
@@ -4598,13 +4754,13 @@ impl SlashCommand for ReviewCommand {
             )
         };
 
-        // Truncate diff to a sensible size for the LLM (â‰ˆ 100 k chars).
-        const MAX_DIFF_CHARS: usize = 100_000;
-        let diff_for_llm = if diff.len() > MAX_DIFF_CHARS {
+        // Truncate diff to a sensible size for the LLM.
+        const MAX_DIFF_BYTES: usize = 100_000;
+        let diff_for_llm = if diff.len() > MAX_DIFF_BYTES {
+            let prefix = truncate_bytes_prefix(&diff, MAX_DIFF_BYTES);
             format!(
-                "{}\n\n[... diff truncated at {} chars ...]",
-                &diff[..MAX_DIFF_CHARS],
-                MAX_DIFF_CHARS
+                "{}\n\n[... diff truncated at {} bytes ...]",
+                prefix, MAX_DIFF_BYTES
             )
         } else {
             diff.clone()
@@ -5249,7 +5405,7 @@ impl McpCommand {
                     "MCP manager is not active. No tool information available.\n\
                  Restart MangoCode to connect to MCP servers."
                         .to_string(),
-                )
+                );
             }
         };
 
@@ -5573,7 +5729,7 @@ impl McpCommand {
                     None => {
                         return Some(CommandResult::Error(
                             "Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string(),
-                        ))
+                        ));
                     }
                 };
                 let prompt_name = match parts.get(2) {
@@ -5581,7 +5737,7 @@ impl McpCommand {
                     None => {
                         return Some(CommandResult::Error(
                             "Usage: /mcp get-prompt <server> <prompt> [key=value ...]".to_string(),
-                        ))
+                        ));
                     }
                 };
                 let mut args: std::collections::HashMap<String, String> =
@@ -5624,6 +5780,43 @@ impl McpCommand {
 
 // ---- /permissions --------------------------------------------------------
 
+fn permission_tool_catalog(ctx: &CommandContext) -> Vec<Box<dyn mangocode_tools::Tool>> {
+    #[allow(unused_mut)]
+    let mut tools = mangocode_tools::all_tools();
+    #[cfg(any(
+        feature = "tool-agent",
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools"
+    ))]
+    tools.push(Box::new(mangocode_query::AgentTool));
+    if let Some(manager) = ctx.mcp_manager.clone() {
+        mangocode_tools::extend_with_mcp_tools(&mut tools, manager);
+    }
+    tools
+}
+
+fn normalize_permission_tool_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace(['-', '.'], "_")
+}
+
+fn permission_tool_names_match(
+    tools: &[Box<dyn mangocode_tools::Tool>],
+    existing: &str,
+    requested: &str,
+) -> bool {
+    if normalize_permission_tool_name(existing) == normalize_permission_tool_name(requested) {
+        return true;
+    }
+
+    mangocode_tools::resolve_tool(tools, existing)
+        .map(|tool| mangocode_tools::tool_name_matches(tool, requested))
+        .unwrap_or(false)
+        || mangocode_tools::resolve_tool(tools, requested)
+            .map(|tool| mangocode_tools::tool_name_matches(tool, existing))
+            .unwrap_or(false)
+}
+
 #[async_trait]
 impl SlashCommand for PermissionsCommand {
     fn name(&self) -> &str {
@@ -5638,8 +5831,8 @@ impl SlashCommand for PermissionsCommand {
          Examples:\n\
            /permissions                    â€” show current permissions\n\
            /permissions set accept-edits   â€” auto-accept file edits\n\
-           /permissions allow Bash         â€” allow a specific tool\n\
-           /permissions deny Write         â€” deny a specific tool\n\
+           /permissions allow Bash         â€” add a tool to the visible allowlist\n\
+           /permissions deny Write         â€” hide/deny a specific tool\n\
            /permissions reset              â€” clear overrides"
     }
 
@@ -5648,7 +5841,7 @@ impl SlashCommand for PermissionsCommand {
 
         if args.is_empty() {
             let allowed_display = if ctx.config.allowed_tools.is_empty() {
-                "(all tools allowed)".to_string()
+                "(none; base visibility does not restrict the built runtime tool set unless hidden; agent/session filters may further restrict runtime visibility; execution still follows permission mode)".to_string()
             } else {
                 ctx.config.allowed_tools.join(", ")
             };
@@ -5658,13 +5851,13 @@ impl SlashCommand for PermissionsCommand {
                 ctx.config.disallowed_tools.join(", ")
             };
             return CommandResult::Message(format!(
-                "Permission Settings\n\
+                "Tool Visibility and Permission Settings\n\
                  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                  Mode:          {:?}\n\
-                 Allowed tools: {}\n\
-                 Denied tools:  {}\n\n\
+                 Tool allowlist: {}\n\
+                 Hidden/denied:  {}\n\n\
                  Use /permissions set <mode> to change the permission mode.\n\
-                 Use /permissions allow|deny <tool> to override individual tools.\n\
+                 Use /permissions allow|deny <tool> to change tool visibility.\n\
                  Use /permissions reset to clear all overrides.",
                 ctx.config.permission_mode, allowed_display, denied_display,
             ));
@@ -5689,7 +5882,7 @@ impl SlashCommand for PermissionsCommand {
                         return CommandResult::Error(
                             "Mode must be: default, accept-edits, bypass-permissions, or plan"
                                 .to_string(),
-                        )
+                        );
                     }
                 };
                 let mut new_config = ctx.config.clone();
@@ -5708,40 +5901,74 @@ impl SlashCommand for PermissionsCommand {
                     return CommandResult::Error("Usage: /permissions allow <tool>".to_string());
                 }
                 let tool = arg.to_string();
+                let runtime_tools = permission_tool_catalog(ctx);
                 let mut new_config = ctx.config.clone();
-                if !new_config.allowed_tools.contains(&tool) {
+                if !new_config
+                    .allowed_tools
+                    .iter()
+                    .any(|t| permission_tool_names_match(&runtime_tools, t, &tool))
+                {
                     new_config.allowed_tools.push(tool.clone());
                 }
-                new_config.disallowed_tools.retain(|t| t != &tool);
+                new_config
+                    .disallowed_tools
+                    .retain(|t| !permission_tool_names_match(&runtime_tools, t, &tool));
                 if let Err(e) = save_settings_mutation(|s| {
-                    if !s.config.allowed_tools.contains(&tool) {
+                    if !s
+                        .config
+                        .allowed_tools
+                        .iter()
+                        .any(|t| permission_tool_names_match(&runtime_tools, t, &tool))
+                    {
                         s.config.allowed_tools.push(tool.clone());
                     }
-                    s.config.disallowed_tools.retain(|t| t != &tool);
+                    s.config
+                        .disallowed_tools
+                        .retain(|t| !permission_tool_names_match(&runtime_tools, t, &tool));
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
-                CommandResult::ConfigChangeMessage(new_config, format!("Allowed tool: {}", tool))
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!("Added tool to visible allowlist: {}", tool),
+                )
             }
             "deny" => {
                 if arg.is_empty() {
                     return CommandResult::Error("Usage: /permissions deny <tool>".to_string());
                 }
                 let tool = arg.to_string();
+                let runtime_tools = permission_tool_catalog(ctx);
                 let mut new_config = ctx.config.clone();
-                if !new_config.disallowed_tools.contains(&tool) {
+                if !new_config
+                    .disallowed_tools
+                    .iter()
+                    .any(|t| permission_tool_names_match(&runtime_tools, t, &tool))
+                {
                     new_config.disallowed_tools.push(tool.clone());
                 }
-                new_config.allowed_tools.retain(|t| t != &tool);
+                new_config
+                    .allowed_tools
+                    .retain(|t| !permission_tool_names_match(&runtime_tools, t, &tool));
                 if let Err(e) = save_settings_mutation(|s| {
-                    if !s.config.disallowed_tools.contains(&tool) {
+                    if !s
+                        .config
+                        .disallowed_tools
+                        .iter()
+                        .any(|t| permission_tool_names_match(&runtime_tools, t, &tool))
+                    {
                         s.config.disallowed_tools.push(tool.clone());
                     }
-                    s.config.allowed_tools.retain(|t| t != &tool);
+                    s.config
+                        .allowed_tools
+                        .retain(|t| !permission_tool_names_match(&runtime_tools, t, &tool));
                 }) {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
-                CommandResult::ConfigChangeMessage(new_config, format!("Denied tool: {}", tool))
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!("Hidden/denied tool: {}", tool),
+                )
             }
             "reset" => {
                 let mut new_config = ctx.config.clone();
@@ -5842,8 +6069,9 @@ impl SlashCommand for CriticCommand {
                 if evals.is_empty() {
                     return CommandResult::Message("No evaluations yet.".to_string());
                 }
-                let mut out =
-                    String::from("Recent Critic Evaluations\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n");
+                let mut out = String::from(
+                    "Recent Critic Evaluations\nâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n",
+                );
                 for (i, eval) in evals.iter().enumerate() {
                     out.push_str(&format!(
                         "\n{}. [{}] {} â€” {}\n   {} | {}{}\n",
@@ -6009,7 +6237,7 @@ fn execute_goal_command_with_store(
                         _ => {
                             return CommandResult::Error(
                                 "Goal budget must be a positive integer, or 'clear'.".to_string(),
-                            )
+                            );
                         }
                     }
                 };
@@ -6029,7 +6257,7 @@ fn execute_goal_command_with_store(
             let existing = match store.get_thread_goal(session_id) {
                 Ok(goal) => goal,
                 Err(e) => {
-                    return CommandResult::Error(format!("Failed to read current goal: {}", e))
+                    return CommandResult::Error(format!("Failed to read current goal: {}", e));
                 }
             };
             let result = if existing
@@ -6141,7 +6369,7 @@ impl SlashCommand for SessionCommand {
                     let mut output = String::from("Recent sessions:\n\n");
                     for sess in sessions.iter().take(10) {
                         let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
-                        let id_short = &sess.id[..sess.id.len().min(8)];
+                        let id_short = truncate_bytes_prefix(&sess.id, 8);
                         output.push_str(&format!(
                             "  {} | {} | {} messages | {}\n",
                             id_short,
@@ -6192,7 +6420,7 @@ impl SlashCommand for SessionCommand {
                         output.push_str("\nRecent sessions:\n\n");
                         for sess in sessions.iter().take(5) {
                             let updated = sess.updated_at.format("%Y-%m-%d %H:%M").to_string();
-                            let id_short = &sess.id[..sess.id.len().min(8)];
+                            let id_short = truncate_bytes_prefix(&sess.id, 8);
                             let marker = if sess.id == ctx.session_id {
                                 " â—€ current"
                             } else {
@@ -6677,105 +6905,72 @@ impl SlashCommand for SkillsCommand {
         vec!["skill"]
     }
     fn description(&self) -> &str {
-        "List available skills in .mangocode/commands/"
+        "List available skills from project, user, configured, and plugin sources"
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let mut found: Vec<String> = Vec::new();
-        let dirs = [
-            ctx.working_dir.join(".mangocode").join("commands"),
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".mangocode")
-                .join("commands"),
-        ];
+        // Include discovered skills from .mangocode/skills/, configured paths/URLs,
+        // and enabled plugin skill paths.
+        let skills_config = mangocode_plugins::skills_config_with_plugin_paths(&ctx.config.skills);
+        let discovered = mangocode_core::discover_skills(&ctx.working_dir, &skills_config);
 
-        for dir in &dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().is_some_and(|e| e == "md") {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            let name = stem.to_string();
-                            if !found.contains(&name) {
-                                found.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include skills contributed by installed plugins.
-        if let Some(registry) = mangocode_plugins::global_plugin_registry() {
-            for skill_dir in registry.all_skill_paths() {
-                if let Ok(entries) = std::fs::read_dir(&skill_dir) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        // Skills can be individual .md files or subdirs with SKILL.md.
-                        if p.is_dir() {
-                            if p.join("SKILL.md").exists() || p.join("skill.md").exists() {
-                                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                    let skill_name = name.to_string();
-                                    if !found.contains(&skill_name) {
-                                        found.push(skill_name);
-                                    }
-                                }
-                            }
-                        } else if p.extension().is_some_and(|e| e == "md") {
-                            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                                let name = stem.to_string();
-                                if !found.contains(&name) {
-                                    found.push(name);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include discovered skills from .mangocode/skills/ and configured paths/URLs.
-        let discovered = mangocode_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
-
-        let mut output = if found.is_empty() && discovered.is_empty() {
+        if discovered.is_empty() {
             return CommandResult::Message(
-                "No skills found.\nCreate .md files in .mangocode/commands/ to define skills.\n\
-                 Example: .mangocode/commands/review.md"
+                "No skills found.\nCreate skills in .mangocode/skills/ or .mangocode/commands/, \
+                 configure skills.paths or skills.urls, or enable a plugin that provides skills."
                     .to_string(),
             );
-        } else if found.is_empty() {
-            String::new()
-        } else {
-            found.sort();
-            format!(
-                "Available skills ({}):\n{}",
-                found.len(),
-                found
-                    .iter()
-                    .map(|s| format!("  /{}", s))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
+        }
 
-        if !discovered.is_empty() {
-            let mut disc_list: Vec<(&String, &mangocode_core::DiscoveredSkill)> =
-                discovered.iter().collect();
-            disc_list.sort_by_key(|(name, _)| name.as_str());
+        let reserved_names = slash_command_reserved_lookup_keys();
+        let mut disc_list: Vec<_> = discovered
+            .values()
+            .filter_map(|skill| {
+                let name = normalized_skill_command_name(&skill.name)?;
+                let normalized_name = name.to_string();
+                let lookup_key = normalized_name.to_lowercase();
+                if reserved_names.contains(&lookup_key) {
+                    return None;
+                }
 
-            if !output.is_empty() {
-                output.push('\n');
+                Some((
+                    lookup_key,
+                    skill.name.trim().starts_with('/'),
+                    normalized_name,
+                    skill,
+                ))
+            })
+            .collect();
+        disc_list.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.source_path.cmp(&b.3.source_path))
+        });
+
+        let mut seen = std::collections::HashSet::new();
+        let mut visible_skills = Vec::new();
+        for (lookup_key, _, name, skill) in disc_list {
+            if seen.insert(lookup_key) {
+                visible_skills.push((name, skill));
             }
-            output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
-            for (name, skill) in disc_list {
-                output.push_str(&format!(
-                    "  /{} â€” {} ({})\n",
-                    name,
-                    skill.description,
-                    skill.source_path.display()
-                ));
-            }
+        }
+
+        if visible_skills.is_empty() {
+            return CommandResult::Message(
+                "No runnable skill commands found. Discovered skills are reserved, duplicated, or blank."
+                    .to_string(),
+            );
+        }
+
+        let mut output = format!("Available skills ({}):\n", visible_skills.len());
+        for (name, skill) in visible_skills {
+            output.push_str(&format!(
+                "  /{} - {} ({})\n",
+                name,
+                skill.description,
+                skill.source_path.display()
+            ));
         }
 
         CommandResult::Message(output.trim_end().to_string())
@@ -7071,7 +7266,7 @@ impl SlashCommand for RenameCommand {
                     role: "user".to_string(),
                     content: serde_json::Value::String(format!(
                         "Conversation to name:\n\n{}",
-                        &excerpt[..excerpt.len().min(2000)]
+                        truncate_bytes_prefix(&excerpt, 2000)
                     )),
                 })
                 .build();
@@ -7121,43 +7316,53 @@ impl SlashCommand for RenameCommand {
 
 // ---- /effort -------------------------------------------------------------
 
+fn parse_effort_level_alias(value: &str) -> Option<EffortLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(EffortLevel::Medium),
+        other => EffortLevel::parse(other),
+    }
+}
+
 #[async_trait]
 impl SlashCommand for EffortCommand {
     fn name(&self) -> &str {
         "effort"
     }
     fn description(&self) -> &str {
-        "Set the model's thinking effort (low | normal | high)"
+        "Set the model's thinking effort (low | medium/normal | high | max)"
     }
     fn help(&self) -> &str {
-        "Usage: /effort [low|normal|high]\n\
+        "Usage: /effort [low|medium|normal|high|max]\n\
          Sets how much computation the model uses for reasoning.\n\
-         'high' enables extended thinking with a larger budget."
+         'high' and 'max' enable extended thinking with larger budgets."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        match args.trim() {
-            "" => CommandResult::Message(
-                "Current effort: normal\nUse /effort [low|normal|high] to change.".to_string(),
-            ),
-            "low" => {
-                // Low effort: smaller max_tokens
-                ctx.config.max_tokens = Some(4096);
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            "normal" => {
-                ctx.config.max_tokens = None; // use default
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            "high" => {
-                ctx.config.max_tokens = Some(32768);
-                CommandResult::ConfigChange(ctx.config.clone())
-            }
-            other => CommandResult::Error(format!(
-                "Unknown effort level '{}'. Use: low | normal | high",
-                other
-            )),
+        let trimmed = args.trim();
+        if trimmed.is_empty() {
+            let current = ctx
+                .effort_level
+                .map(|level| level.as_str())
+                .unwrap_or("medium");
+            return CommandResult::Message(format!(
+                "Current effort: {current}\nUse /effort [low|medium|normal|high|max] to change."
+            ));
         }
+
+        let Some(level) = parse_effort_level_alias(trimmed) else {
+            return CommandResult::Error(format!(
+                "Unknown effort level '{}'. Use: low | medium | normal | high | max",
+                trimmed
+            ));
+        };
+
+        ctx.effort_level = Some(level);
+        ctx.config.max_tokens = match level {
+            EffortLevel::Low => Some(4096),
+            EffortLevel::Medium => None,
+            EffortLevel::High | EffortLevel::Max => Some(32768),
+        };
+        CommandResult::ConfigChange(ctx.config.clone())
     }
 }
 
@@ -7352,7 +7557,7 @@ impl SlashCommand for RemoteControlCommand {
 
                 // Device fingerprint (first 12 chars are enough for display)
                 let fingerprint = mangocode_bridge::device_fingerprint();
-                let fp_short = &fingerprint[..fingerprint.len().min(12)];
+                let fp_short = truncate_bytes_prefix(&fingerprint, 12);
 
                 CommandResult::Message(format!(
                     "Remote Control (Bridge)\n\
@@ -7476,7 +7681,7 @@ impl SlashCommand for RemoteEnvCommand {
                     || key.to_uppercase().contains("SECRET")
                     || key.to_uppercase().contains("PASSWORD")
                 {
-                    format!("{}***", &val[..val.len().min(4)])
+                    format!("{}***", truncate_bytes_prefix(val, 4))
                 } else {
                     val.clone()
                 };
@@ -7602,6 +7807,77 @@ impl SlashCommand for ContextCommand {
 
 // ---- /copy ---------------------------------------------------------------
 
+fn copy_text_to_clipboard(text: &str) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("clip")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        for cmd in [
+            ["wl-copy"].as_slice(),
+            ["xclip", "-selection", "clipboard"].as_slice(),
+            ["xsel", "--clipboard", "--input"].as_slice(),
+        ] {
+            if let Some((program, args)) = cmd.split_first() {
+                if let Ok(mut child) = std::process::Command::new(*program)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        let _ = stdin.write_all(text.as_bytes());
+                    }
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 #[async_trait]
 impl SlashCommand for CopyCommand {
     fn name(&self) -> &str {
@@ -7633,7 +7909,7 @@ impl SlashCommand for CopyCommand {
             None => {
                 return CommandResult::Message(
                     "No assistant messages found in conversation.".to_string(),
-                )
+                );
             }
         };
 
@@ -7642,25 +7918,15 @@ impl SlashCommand for CopyCommand {
             return CommandResult::Message("Last assistant message is empty.".to_string());
         }
 
-        // Try system clipboard via arboard
-        #[cfg(not(target_os = "linux"))]
-        {
-            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
-                Ok(()) => {
-                    let preview: String = text.chars().take(80).collect();
-                    let ellipsis = if text.len() > 80 { "â€¦" } else { "" };
-                    return CommandResult::Message(format!(
-                        "Copied {} chars to clipboard.\nPreview: {}{}",
-                        text.len(),
-                        preview,
-                        ellipsis
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!("Clipboard write failed: {}", e);
-                    // Fall through to file fallback
-                }
-            }
+        if copy_text_to_clipboard(&text) {
+            let preview: String = text.chars().take(80).collect();
+            let ellipsis = if text.chars().count() > 80 { "..." } else { "" };
+            return CommandResult::Message(format!(
+                "Copied {} chars to clipboard.\nPreview: {}{}",
+                text.len(),
+                preview,
+                ellipsis
+            ));
         }
 
         // Fallback: write to a temp file and inform the user
@@ -7668,7 +7934,7 @@ impl SlashCommand for CopyCommand {
         match std::fs::write(&tmp_path, &text) {
             Ok(()) => {
                 let preview: String = text.chars().take(80).collect();
-                let ellipsis = if text.len() > 80 { "â€¦" } else { "" };
+                let ellipsis = if text.chars().count() > 80 { "..." } else { "" };
                 CommandResult::Message(format!(
                     "Clipboard not available; saved {} chars to {}\nPreview: {}{}",
                     text.len(),
@@ -8222,7 +8488,7 @@ impl SlashCommand for VimCommand {
                 return CommandResult::Error(format!(
                     "Unknown argument '{}'. Use: /vim [on|off]",
                     other
-                ))
+                ));
             }
         };
 
@@ -8232,10 +8498,10 @@ impl SlashCommand for VimCommand {
                 new_mode,
                 if new_mode == "vim" {
                     "Use Esc to switch between INSERT and NORMAL modes.\n\
-                     Restart the REPL for the change to take effect."
+                     Interactive TUI sessions update immediately."
                 } else {
                     "Using standard (readline-style) keyboard bindings.\n\
-                     Restart the REPL for the change to take effect."
+                     Interactive TUI sessions update immediately."
                 }
             )),
             Err(e) => CommandResult::Error(format!("Failed to save setting: {}", e)),
@@ -8272,7 +8538,7 @@ impl SlashCommand for VoiceCommand {
                 return CommandResult::Error(format!(
                     "Unknown argument '{}'. Use: /voice [on|off]",
                     other
-                ))
+                ));
             }
         };
 
@@ -8331,7 +8597,7 @@ impl SlashCommand for UpgradeCommand {
                     "Current version: {current}\n\
                      Could not check for updates (HTTP client error: {e})\n\
                      Visit https://github.com/kuberwastaken/mangocode/releases for updates."
-                ))
+                ));
             }
         };
 
@@ -8429,7 +8695,7 @@ impl SlashCommand for ReleaseNotesCommand {
                 return CommandResult::Message(format!(
                     "MangoCode {tag} release notes:\n\
                      Visit https://github.com/kuberwastaken/mangocode/releases/tag/{tag}"
-                ))
+                ));
             }
         };
 
@@ -8595,7 +8861,7 @@ impl SlashCommand for StatuslineCommand {
             _ => {
                 return CommandResult::Error(
                     "Usage: /statusline [show|hide] [cost|tokens|model|time|all]".to_string(),
-                )
+                );
             }
         };
 
@@ -8610,7 +8876,7 @@ impl SlashCommand for StatuslineCommand {
                     return CommandResult::Message(format!(
                         "Status line: all items {}.",
                         if show { "shown" } else { "hidden" }
-                    ))
+                    ));
                 }
                 Err(e) => return CommandResult::Error(format!("Failed to save: {}", e)),
             }
@@ -8625,7 +8891,7 @@ impl SlashCommand for StatuslineCommand {
                 return CommandResult::Error(format!(
                     "Unknown item '{}'. Use: cost, tokens, model, time, or all.",
                     other
-                ))
+                ));
             }
         };
 
@@ -9037,7 +9303,7 @@ impl SlashCommand for FastCommand {
                 return CommandResult::Error(format!(
                     "Unknown argument '{}'. Use: /fast [on|off]",
                     other
-                ))
+                ));
             }
         };
 
@@ -9339,6 +9605,9 @@ impl SlashCommand for SearchCommand {
     fn name(&self) -> &str {
         "search"
     }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["find"]
+    }
     fn description(&self) -> &str {
         "Search across all sessions"
     }
@@ -9353,9 +9622,10 @@ impl SlashCommand for SearchCommand {
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let query = args.trim();
         if query.is_empty() {
-            return CommandResult::Error(
+            return CommandResult::Message(
                 "Usage: /search <query>\n\
-                 Provide a search term to look up across all sessions."
+                 Provide a search term to look up across all sessions.\n\
+                 In the TUI, /search opens the session search dialog."
                     .to_string(),
             );
         }
@@ -9369,7 +9639,7 @@ impl SlashCommand for SearchCommand {
                     "Failed to open session database: {}\n\
                      The database is created automatically once sessions are stored.",
                     e
-                ))
+                ));
             }
         };
 
@@ -9391,11 +9661,11 @@ impl SlashCommand for SearchCommand {
             let title = s.title.as_deref().unwrap_or("(untitled)");
             out.push_str(&format!(
                 "  [{}] {} â€” {} ({} messages, updated {})\n",
-                &s.id[..s.id.len().min(12)],
+                truncate_bytes_prefix(&s.id, 12),
                 title,
                 s.model,
                 s.message_count,
-                &s.updated_at[..s.updated_at.len().min(10)],
+                truncate_bytes_prefix(&s.updated_at, 10),
             ));
         }
         out.push_str("\nTip: use /resume <session-id> to continue a session.");
@@ -9437,7 +9707,10 @@ impl SlashCommand for ShareCommand {
         let messages_json = match serde_json::to_value(&ctx.messages) {
             Ok(v) => v,
             Err(e) => {
-                return CommandResult::Error(format!("Failed to serialize session messages: {}", e))
+                return CommandResult::Error(format!(
+                    "Failed to serialize session messages: {}",
+                    e
+                ));
             }
         };
 
@@ -9479,7 +9752,7 @@ impl SlashCommand for ShareCommand {
                         return CommandResult::Error(format!(
                             "Failed to parse share API response: {}",
                             e
-                        ))
+                        ));
                     }
                 };
                 let share_url = json
@@ -9530,23 +9803,33 @@ mod teleport_bundle {
     pub struct TeleportBundle {
         /// Always `"1"`.
         pub version: String,
+        #[serde(default)]
         pub session_id: String,
         pub messages: Vec<Message>,
         pub working_dir: String,
         pub permissions: TeleportPermissions,
+        #[serde(default)]
         pub model: Option<String>,
+        #[serde(default)]
         pub effort: Option<String>,
         /// Recently accessed file paths extracted from tool-use blocks.
+        #[serde(default)]
         pub files: Vec<String>,
-        /// Environment variables â€” ANTHROPIC_API_KEY is excluded for security.
+        /// Environment variables are intentionally omitted from new bundles;
+        /// the field is retained for backwards-compatible bundle parsing.
+        #[serde(default)]
         pub env: std::collections::HashMap<String, String>,
+        #[serde(default)]
         pub exported_at: String,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct TeleportPermissions {
+        #[serde(default)]
         pub allowed: Vec<String>,
+        #[serde(default)]
         pub denied: Vec<String>,
+        #[serde(default)]
         pub rules: Vec<SerializedPermissionRule>,
     }
 
@@ -9555,10 +9838,15 @@ mod teleport_bundle {
             let mut allowed = Vec::new();
             let mut denied = Vec::new();
             for r in rules {
-                let name = r.tool_name.clone().unwrap_or_else(|| "*".to_string());
-                match r.action {
-                    PermissionAction::Allow => allowed.push(name),
-                    PermissionAction::Deny => denied.push(name),
+                if let Some(name) = r.tool_name.clone() {
+                    match r.action {
+                        PermissionAction::Allow => {
+                            if r.path_pattern.is_none() {
+                                allowed.push(name);
+                            }
+                        }
+                        PermissionAction::Deny => denied.push(name),
+                    }
                 }
             }
             TeleportPermissions {
@@ -9585,8 +9873,8 @@ impl SlashCommand for TeleportCommand {
          \x20 Serialize the current session to a .teleport JSON bundle.\n\
          \x20 Defaults to ~/.mangocode/teleport_<session_id>.json\n\
          \n\
-         /teleport import <file>\n\
-         \x20 Load a .teleport bundle and restore messages, working dir, and\n\
+         /teleport import <file|teleport://link>\n\
+         \x20 Load a .teleport bundle or deep link and restore messages, working dir, and\n\
          \x20 tool permissions into the current session.\n\
          \n\
          /teleport link\n\
@@ -9608,17 +9896,44 @@ impl SlashCommand for TeleportCommand {
             "export" => {
                 // ---- determine output path --------------------------------
                 let output_path: std::path::PathBuf = {
-                    // Parse --output <file>
-                    let explicit = if let Some(stripped) = rest.strip_prefix("--output") {
-                        let path_str = stripped.trim();
-                        if !path_str.is_empty() {
+                    let export_arg = rest.trim();
+                    let explicit = if export_arg.is_empty() {
+                        None
+                    } else if let Some(path_str) = export_arg.strip_prefix("--output=") {
+                        let path_str = strip_matching_quotes(path_str);
+                        if path_str.is_empty() {
+                            return CommandResult::Error(
+                                "Usage: /teleport export [--output <file>]".to_string(),
+                            );
+                        }
+                        Some(std::path::PathBuf::from(path_str))
+                    } else if export_arg == "--output" {
+                        return CommandResult::Error(
+                            "Usage: /teleport export [--output <file>]".to_string(),
+                        );
+                    } else if let Some(path_str) = export_arg.strip_prefix("--output") {
+                        if path_str.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+                            let path_str = strip_matching_quotes(path_str);
+                            if path_str.is_empty() {
+                                return CommandResult::Error(
+                                    "Usage: /teleport export [--output <file>]".to_string(),
+                                );
+                            }
                             Some(std::path::PathBuf::from(path_str))
                         } else {
-                            None
+                            return CommandResult::Error(format!(
+                                "Unknown /teleport export option '{}'. Use --output <file>.",
+                                export_arg
+                            ));
                         }
+                    } else if export_arg.starts_with('-') {
+                        return CommandResult::Error(format!(
+                            "Unknown /teleport export option '{}'. Use --output <file>.",
+                            export_arg
+                        ));
                     } else if !rest.is_empty() {
                         // Bare path without --output flag is also accepted.
-                        Some(std::path::PathBuf::from(rest))
+                        Some(std::path::PathBuf::from(strip_matching_quotes(export_arg)))
                     } else {
                         None
                     };
@@ -9674,15 +9989,10 @@ impl SlashCommand for TeleportCommand {
                     seen.into_iter().take(50).collect()
                 };
 
-                // ---- collect env vars (exclude ANTHROPIC_API_KEY) ----------
-                let env: std::collections::HashMap<String, String> = std::env::vars()
-                    .filter(|(k, _)| k != "ANTHROPIC_API_KEY")
-                    .collect();
-
                 // ---- build permissions snapshot from config ----------------
-                // The config holds allowed_tools / disallowed_tools as plain
-                // tool-name strings; we also pull any serialized permission rules
-                // from the settings if accessible.
+                // CommandContext carries the active allow/deny tool lists; path
+                // scoped permission rules live in Settings and are not part of
+                // the live command context.
                 let permissions = {
                     let allowed: Vec<String> = ctx.config.allowed_tools.clone();
                     let denied: Vec<String> = ctx.config.disallowed_tools.clone();
@@ -9714,9 +10024,9 @@ impl SlashCommand for TeleportCommand {
                     working_dir: ctx.working_dir.to_string_lossy().into_owned(),
                     permissions,
                     model: ctx.config.model.clone(),
-                    effort: None, // EffortLevel not stored in CommandContext directly
+                    effort: ctx.effort_level.map(|level| level.as_str().to_string()),
                     files,
-                    env,
+                    env: std::collections::HashMap::new(),
                     exported_at: chrono::Utc::now().to_rfc3339(),
                 };
 
@@ -9724,7 +10034,7 @@ impl SlashCommand for TeleportCommand {
                 let json = match serde_json::to_string_pretty(&bundle) {
                     Ok(j) => j,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e))
+                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e));
                     }
                 };
 
@@ -9743,6 +10053,7 @@ impl SlashCommand for TeleportCommand {
                      Messages: {}\n\
                      Files:    {}\n\
                      Model:    {}\n\
+                     Env:      omitted for security\n\
                      Time:     {}",
                     output_path.display(),
                     bundle.session_id,
@@ -9755,19 +10066,45 @@ impl SlashCommand for TeleportCommand {
 
             "import" => {
                 if rest.is_empty() {
-                    return CommandResult::Error("Usage: /teleport import <file>".to_string());
+                    return CommandResult::Error(
+                        "Usage: /teleport import <file|teleport://link>".to_string(),
+                    );
                 }
 
-                let path = std::path::PathBuf::from(rest);
-
-                let data = match std::fs::read_to_string(&path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        return CommandResult::Error(format!(
-                            "Cannot read teleport bundle '{}': {}",
-                            path.display(),
-                            e
-                        ))
+                let import_target = strip_matching_quotes(rest);
+                let data = if let Some(encoded) = import_target.strip_prefix("teleport://") {
+                    use base64::Engine as _;
+                    let decoded = match base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(encoded.trim())
+                    {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            return CommandResult::Error(format!(
+                                "Failed to decode teleport link: {}",
+                                e
+                            ));
+                        }
+                    };
+                    match String::from_utf8(decoded) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return CommandResult::Error(format!(
+                                "Teleport link payload is not valid UTF-8: {}",
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    let path = std::path::PathBuf::from(import_target);
+                    match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return CommandResult::Error(format!(
+                                "Cannot read teleport bundle '{}': {}",
+                                path.display(),
+                                e
+                            ));
+                        }
                     }
                 };
 
@@ -9777,7 +10114,7 @@ impl SlashCommand for TeleportCommand {
                         return CommandResult::Error(format!(
                             "Failed to parse teleport bundle: {}",
                             e
-                        ))
+                        ));
                     }
                 };
 
@@ -9789,58 +10126,77 @@ impl SlashCommand for TeleportCommand {
                     ));
                 }
 
-                // ---- restore working directory ---------------------------
+                // ---- prepare working directory restore --------------------
                 let restored_dir = std::path::PathBuf::from(&bundle.working_dir);
-                if restored_dir.exists() {
-                    ctx.working_dir = restored_dir.clone();
-                    let _ = std::env::set_current_dir(&restored_dir);
-                }
+                let restored_working_dir = restored_dir.exists().then_some(restored_dir);
 
-                // ---- restore tool permissions ----------------------------
+                // ---- prepare tool permissions restore ---------------------
+                let permissions = if bundle.permissions.allowed.is_empty()
+                    && bundle.permissions.denied.is_empty()
+                    && !bundle.permissions.rules.is_empty()
+                {
+                    TeleportPermissions::from_rules(&bundle.permissions.rules)
+                } else {
+                    bundle.permissions.clone()
+                };
                 let mut new_config = ctx.config.clone();
-                new_config.allowed_tools = bundle.permissions.allowed.clone();
-                new_config.disallowed_tools = bundle.permissions.denied.clone();
+                new_config.allowed_tools = permissions.allowed.clone();
+                new_config.disallowed_tools = permissions.denied.clone();
                 if let Some(ref model) = bundle.model {
-                    new_config.model = Some(model.clone());
+                    apply_model_override(
+                        &mut new_config,
+                        model.clone(),
+                        ctx.model_registry.as_deref(),
+                    );
                 }
-                ctx.config = new_config.clone();
+                let effort = bundle.effort.as_deref().and_then(parse_effort_level_alias);
 
-                // ---- restore messages ------------------------------------
+                // ---- prepare messages restore -----------------------------
                 // Capture summary fields before moving bundle.messages.
                 let msg_count = bundle.messages.len();
                 let files_count = bundle.files.len();
                 let working_dir_display = bundle.working_dir.clone();
-                let session_id = bundle.session_id.clone();
-                let exported_at = bundle.exported_at.clone();
-                let allowed_count = bundle.permissions.allowed.len();
-                let denied_count = bundle.permissions.denied.len();
-                let dir_restored = restored_dir.exists();
+                let session_id = if bundle.session_id.trim().is_empty() {
+                    "(unknown)".to_string()
+                } else {
+                    bundle.session_id.clone()
+                };
+                let exported_at = if bundle.exported_at.trim().is_empty() {
+                    "(unknown)".to_string()
+                } else {
+                    bundle.exported_at.clone()
+                };
+                let allowed_count = permissions.allowed.len();
+                let denied_count = permissions.denied.len();
+                let dir_restored = restored_working_dir.is_some();
 
-                // Directly replace messages in the live context; the caller's
-                // REPL will see the updated ctx.messages on the next turn.
-                ctx.messages = bundle.messages;
-
-                CommandResult::Message(format!(
-                    "Teleport bundle imported.\n\
-                     Source session: {}\n\
-                     Exported at:    {}\n\
-                     Messages:       {} restored\n\
-                     Working dir:    {}{}\n\
-                     Permissions:    {} allowed, {} denied\n\
-                     Files tracked:  {}",
-                    session_id,
-                    exported_at,
-                    msg_count,
-                    working_dir_display,
-                    if dir_restored {
-                        " (restored)"
-                    } else {
-                        " (path not found, skipped)"
-                    },
-                    allowed_count,
-                    denied_count,
-                    files_count,
-                ))
+                CommandResult::ImportSessionState {
+                    config: new_config,
+                    messages: bundle.messages,
+                    effort,
+                    working_dir: restored_working_dir,
+                    message: format!(
+                        "Teleport bundle imported.\n\
+                         Source session: {}\n\
+                         Exported at:    {}\n\
+                         Messages:       {} restored\n\
+                         Working dir:    {}{}\n\
+                         Permissions:    {} allowed, {} denied\n\
+                         Files tracked:  {}",
+                        session_id,
+                        exported_at,
+                        msg_count,
+                        working_dir_display,
+                        if dir_restored {
+                            " (restored)"
+                        } else {
+                            " (path not found, skipped)"
+                        },
+                        allowed_count,
+                        denied_count,
+                        files_count,
+                    ),
+                }
             }
 
             "link" => {
@@ -9877,7 +10233,7 @@ impl SlashCommand for TeleportCommand {
                     working_dir: ctx.working_dir.to_string_lossy().into_owned(),
                     permissions,
                     model: ctx.config.model.clone(),
-                    effort: None,
+                    effort: ctx.effort_level.map(|level| level.as_str().to_string()),
                     files: Vec::new(),                     // keep link compact
                     env: std::collections::HashMap::new(), // omit env for security
                     exported_at: chrono::Utc::now().to_rfc3339(),
@@ -9886,7 +10242,7 @@ impl SlashCommand for TeleportCommand {
                 let json = match serde_json::to_string(&bundle) {
                     Ok(j) => j,
                     Err(e) => {
-                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e))
+                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e));
                     }
                 };
 
@@ -9916,7 +10272,7 @@ impl SlashCommand for TeleportCommand {
                 CommandResult::Message(
                     "Usage:\n\
                      \x20 /teleport export [--output <file>]   export session to .teleport bundle\n\
-                     \x20 /teleport import <file>              restore a .teleport bundle\n\
+                     \x20 /teleport import <file|link>         restore a .teleport bundle or link\n\
                      \x20 /teleport link                       generate a teleport:// deep link\n\
                      \nSee /help teleport for details."
                         .to_string(),
@@ -10193,7 +10549,7 @@ impl SlashCommand for SandboxToggleCommand {
                 return CommandResult::Error(format!(
                     "Unknown argument '{}'. Use: /sandbox-toggle [on|off|status|exclude <pattern>]",
                     other
-                ))
+                ));
             }
         };
 
@@ -10616,7 +10972,8 @@ impl SlashCommand for ProvidersCommand {
     }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let registry = mangocode_api::ModelRegistry::new();
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
         let all = registry.list_all();
 
         if all.is_empty() {
@@ -10956,10 +11313,39 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
 
 /// Find a command by name or alias.
 pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
-    let name = name.trim_start_matches('/');
+    let name = name.trim().trim_start_matches('/').trim().to_lowercase();
+    all_commands().into_iter().find(|c| {
+        c.name().eq_ignore_ascii_case(&name)
+            || c.aliases()
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&name))
+    })
+}
+
+fn builtin_command_lookup_keys() -> std::collections::HashSet<String> {
     all_commands()
-        .into_iter()
-        .find(|c| c.name() == name || c.aliases().contains(&name))
+        .iter()
+        .flat_map(|cmd| {
+            std::iter::once(cmd.name().to_string())
+                .chain(cmd.aliases().into_iter().map(str::to_string))
+        })
+        .map(|name| name.to_lowercase())
+        .collect()
+}
+
+fn slash_command_reserved_lookup_keys() -> std::collections::HashSet<String> {
+    let mut keys = builtin_command_lookup_keys();
+    keys.extend(
+        mangocode_tui::slash_commands::TUI_SLASH_COMMAND_RESERVED_KEYS
+            .iter()
+            .map(|key| key.to_lowercase()),
+    );
+    keys
+}
+
+fn slash_command_key_is_reserved(name: &str) -> bool {
+    let key = name.trim().trim_start_matches('/').trim().to_lowercase();
+    !key.is_empty() && slash_command_reserved_lookup_keys().contains(&key)
 }
 
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
@@ -11015,16 +11401,83 @@ impl SlashCommand for TemplateCommand {
 /// Build slash commands from user-defined command templates stored in
 /// `settings.commands`.
 pub fn commands_from_settings(settings: &mangocode_core::Settings) -> Vec<Box<dyn SlashCommand>> {
-    settings
-        .commands
-        .iter()
-        .map(|(name, template)| {
-            Box::new(TemplateCommand {
-                name: name.clone(),
+    let reserved_names = slash_command_reserved_lookup_keys();
+    let mut seen_template_names = std::collections::HashSet::new();
+    sorted_template_command_entries(&settings.commands)
+        .into_iter()
+        .filter_map(|(name, template)| {
+            let lookup_key = name.to_lowercase();
+            if reserved_names.contains(&lookup_key) || !seen_template_names.insert(lookup_key) {
+                return None;
+            }
+
+            Some(Box::new(TemplateCommand {
+                name: name.to_string(),
                 template: template.clone(),
-            }) as Box<dyn SlashCommand>
+            }) as Box<dyn SlashCommand>)
         })
         .collect()
+}
+
+fn normalized_template_command_name(name: &str) -> Option<&str> {
+    let name = name.trim().trim_start_matches('/').trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalized_skill_command_name(name: &str) -> Option<&str> {
+    let name = normalized_template_command_name(name)?;
+    let name = strip_markdown_suffix(name).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn strip_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
+}
+
+fn sorted_template_command_entries(
+    commands: &std::collections::HashMap<String, mangocode_core::CommandTemplate>,
+) -> Vec<(&str, &mangocode_core::CommandTemplate)> {
+    let mut entries: Vec<(&str, &str, &mangocode_core::CommandTemplate)> = commands
+        .iter()
+        .filter_map(|(raw_key, template)| {
+            let key = normalized_template_command_name(raw_key)?;
+            Some((key, raw_key.as_str(), template))
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then(
+                a.1.trim()
+                    .starts_with('/')
+                    .cmp(&b.1.trim().starts_with('/')),
+            )
+            .then(a.0.cmp(b.0))
+            .then(a.1.cmp(b.1))
+    });
+    entries
+        .into_iter()
+        .map(|(key, _, template)| (key, template))
+        .collect()
+}
+
+fn find_template_command_for_command<'a>(
+    name: &str,
+    commands: &'a std::collections::HashMap<String, mangocode_core::CommandTemplate>,
+) -> Option<(&'a str, &'a mangocode_core::CommandTemplate)> {
+    let lookup = normalized_template_command_name(name)?.to_lowercase();
+    if slash_command_key_is_reserved(&lookup) {
+        return None;
+    }
+
+    sorted_template_command_entries(commands)
+        .into_iter()
+        .find(|(key, _)| key.to_lowercase() == lookup)
 }
 
 // ---------------------------------------------------------------------------
@@ -11034,8 +11487,8 @@ pub fn commands_from_settings(settings: &mangocode_core::Settings) -> Vec<Box<dy
 /// A slash command backed by a discovered skill markdown file.
 struct SkillCommand {
     name: String,
-    description: String,
-    template: String,
+    skill: mangocode_core::DiscoveredSkill,
+    skill_index: Arc<std::collections::HashMap<String, mangocode_core::DiscoveredSkill>>,
 }
 
 #[async_trait]
@@ -11044,18 +11497,12 @@ impl SlashCommand for SkillCommand {
         &self.name
     }
     fn description(&self) -> &str {
-        &self.description
+        &self.skill.description
     }
 
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let mut words = args.split_whitespace();
-        let arg1 = words.next().unwrap_or("");
-        let arg2 = words.next().unwrap_or("");
-        let prompt = self
-            .template
-            .replace("$ARGUMENTS", args)
-            .replace("$1", arg1)
-            .replace("$2", arg2);
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let prompt =
+            expand_discovered_skill_for_command(&self.skill, self.skill_index.as_ref(), args, ctx);
         CommandResult::UserMessage(prompt)
     }
 }
@@ -11070,23 +11517,169 @@ pub fn commands_from_discovered_skills(
     cwd: &std::path::Path,
     skills_config: &mangocode_core::SkillsConfig,
 ) -> Vec<Box<dyn SlashCommand>> {
-    let discovered = mangocode_core::discover_skills(cwd, skills_config);
-    // Build a set of built-in command names so we can skip collisions.
-    let all_cmds = all_commands();
-    let builtin_names: std::collections::HashSet<&str> =
-        all_cmds.iter().map(|c| c.name()).collect();
+    let skills_config = mangocode_plugins::skills_config_with_plugin_paths(skills_config);
+    let discovered = mangocode_core::discover_skills(cwd, &skills_config);
+    // Build a set of built-in command names and aliases so we can skip
+    // collisions that execute_command would route to built-ins.
+    let reserved_names = slash_command_reserved_lookup_keys();
 
-    discovered
-        .into_values()
-        .filter(|skill| !builtin_names.contains(skill.name.as_str()))
-        .map(|skill| {
-            Box::new(SkillCommand {
-                name: skill.name,
-                description: skill.description,
-                template: skill.template,
-            }) as Box<dyn SlashCommand>
+    let mut skills: Vec<_> = discovered
+        .values()
+        .filter_map(|skill| {
+            let name = normalized_skill_command_name(&skill.name)?;
+            let normalized_name = name.to_string();
+            let lookup_key = normalized_name.to_lowercase();
+            if reserved_names.contains(&lookup_key) {
+                return None;
+            }
+
+            Some((
+                lookup_key,
+                skill.name.trim().starts_with('/'),
+                normalized_name,
+                skill.clone(),
+            ))
+        })
+        .collect();
+    skills.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.source_path.cmp(&b.3.source_path))
+    });
+    let skill_index = Arc::new(discovered);
+    let mut seen_skill_names = std::collections::HashSet::new();
+
+    skills
+        .into_iter()
+        .filter_map(|(lookup_key, _, name, skill)| {
+            if !seen_skill_names.insert(lookup_key) {
+                return None;
+            }
+
+            Some(Box::new(SkillCommand {
+                name,
+                skill,
+                skill_index: skill_index.clone(),
+            }) as Box<dyn SlashCommand>)
         })
         .collect()
+}
+
+fn find_discovered_skill_for_command<'a>(
+    name: &str,
+    discovered: &'a std::collections::HashMap<String, mangocode_core::DiscoveredSkill>,
+) -> Option<&'a mangocode_core::DiscoveredSkill> {
+    let key = normalized_skill_command_name(name)?.to_lowercase();
+    if slash_command_key_is_reserved(&key) {
+        return None;
+    }
+
+    discovered.get(key.as_str()).or_else(|| {
+        discovered
+            .values()
+            .filter(|skill| {
+                normalized_skill_command_name(&skill.name)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&key))
+            })
+            .min_by(|a, b| {
+                a.name
+                    .trim()
+                    .starts_with('/')
+                    .cmp(&b.name.trim().starts_with('/'))
+                    .then(a.name.cmp(&b.name))
+                    .then(a.source_path.cmp(&b.source_path))
+            })
+    })
+}
+
+fn find_plugin_command_def_for_command<'a>(
+    name: &str,
+    defs: &'a [mangocode_plugins::PluginCommandDef],
+) -> Option<&'a mangocode_plugins::PluginCommandDef> {
+    let lookup = normalized_template_command_name(name)?.to_lowercase();
+    if slash_command_key_is_reserved(&lookup) {
+        return None;
+    }
+
+    defs.iter()
+        .filter(|cmd_def| {
+            normalized_template_command_name(&cmd_def.name)
+                .is_some_and(|name| name.eq_ignore_ascii_case(&lookup))
+        })
+        .min_by(|a, b| {
+            a.name
+                .trim()
+                .starts_with('/')
+                .cmp(&b.name.trim().starts_with('/'))
+                .then(a.plugin_source_id.cmp(&b.plugin_source_id))
+                .then(a.plugin_name.cmp(&b.plugin_name))
+                .then(a.name.cmp(&b.name))
+        })
+}
+
+fn expand_discovered_skill_for_command(
+    skill: &mangocode_core::DiscoveredSkill,
+    skill_index: &std::collections::HashMap<String, mangocode_core::DiscoveredSkill>,
+    args: &str,
+    ctx: &mut CommandContext,
+) -> String {
+    use mangocode_core::skill_discovery::{
+        format_qa_block, install_skill_scripts, load_skill_with_dependencies,
+    };
+
+    let mut loaded = std::collections::HashSet::new();
+    let mut skill_context = Vec::new();
+    load_skill_with_dependencies(&skill.name, skill_index, &mut loaded, &mut skill_context);
+    if skill_context.is_empty() {
+        skill_context.push(skill.clone());
+    }
+
+    let session_scripts_root = ctx.working_dir.join(".mangocode").join("skill-scripts");
+    for skill in &skill_context {
+        install_skill_scripts(skill, &session_scripts_root);
+    }
+
+    let target_skill_key = normalized_skill_command_name(&skill.name).map(str::to_lowercase);
+    let mut parts: Vec<String> = skill_context
+        .iter()
+        .map(|loaded_skill| {
+            let skill_args = if normalized_skill_command_name(&loaded_skill.name)
+                .map(str::to_lowercase)
+                == target_skill_key
+            {
+                args
+            } else {
+                ""
+            };
+            expand_skill_command_template(&loaded_skill.template, skill_args)
+        })
+        .filter(|prompt| !prompt.trim().is_empty())
+        .collect();
+
+    let qa_blocks: Vec<String> = skill_context
+        .iter()
+        .filter_map(format_qa_block)
+        .map(|block| block.trim().to_string())
+        .filter(|block| !block.is_empty())
+        .collect();
+    if !qa_blocks.is_empty() {
+        parts.push(qa_blocks.join("\n\n"));
+    }
+
+    parts.join("\n\n")
+}
+
+fn expand_skill_command_template(template: &str, args: &str) -> String {
+    let mut words = args.split_whitespace();
+    let arg1 = words.next().unwrap_or("");
+    let arg2 = words.next().unwrap_or("");
+    template
+        .replace("$ARGUMENTS", args)
+        .replace("$1", arg1)
+        .replace("$2", arg2)
+        .trim()
+        .to_string()
 }
 
 /// Execute a slash command string (with leading /).
@@ -11103,22 +11696,29 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
 
     // Check user-defined command templates from settings.
     let cmd_name = name.trim_start_matches('/');
-    if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
+    if let Some((template_name, tmpl)) =
+        find_template_command_for_command(cmd_name, &ctx.config.commands)
+    {
         let tc = TemplateCommand {
-            name: cmd_name.to_string(),
-            template: tmpl,
+            name: template_name.to_string(),
+            template: tmpl.clone(),
         };
         return Some(tc.execute(args, ctx).await);
     }
 
     // Check discovered skill commands (from .mangocode/skills/, git URLs, etc.).
     {
-        let discovered = mangocode_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
-        if let Some(skill) = discovered.get(cmd_name) {
+        let skills_config = mangocode_plugins::skills_config_with_plugin_paths(&ctx.config.skills);
+        let discovered = mangocode_core::discover_skills(&ctx.working_dir, &skills_config);
+        let skill = find_discovered_skill_for_command(cmd_name, &discovered).cloned();
+        if let Some(skill) = skill {
+            let name = normalized_skill_command_name(&skill.name)
+                .unwrap_or(skill.name.as_str())
+                .to_string();
             let sc = SkillCommand {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                template: skill.template.clone(),
+                name,
+                skill,
+                skill_index: Arc::new(discovered),
             };
             return Some(sc.execute(args, ctx).await);
         }
@@ -11132,11 +11732,10 @@ pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<Co
         let project_dir = ctx.working_dir.clone();
         mangocode_plugins::load_plugins(&project_dir, &[]).await
     };
-    for cmd_def in registry.all_command_defs() {
-        if cmd_def.name == cmd_name {
-            let adapter = PluginSlashCommandAdapter { def: cmd_def };
-            return Some(adapter.execute(args, ctx).await);
-        }
+    let cmd_defs = registry.all_command_defs();
+    if let Some(cmd_def) = find_plugin_command_def_for_command(cmd_name, &cmd_defs).cloned() {
+        let adapter = PluginSlashCommandAdapter { def: cmd_def };
+        return Some(adapter.execute(args, ctx).await);
     }
 
     None
@@ -11162,6 +11761,7 @@ mod tests {
             cost_tracker: CostTracker::new(),
             session_metrics: None,
             messages: vec![],
+            effort_level: None,
             working_dir: std::path::PathBuf::from("."),
             session_id: "test-session".to_string(),
             session_title: None,
@@ -11202,6 +11802,543 @@ mod tests {
         }
     }
 
+    fn discovered_skill(
+        name: &str,
+        template: &str,
+        dependencies: Vec<&str>,
+        qa_steps: Vec<&str>,
+    ) -> mangocode_core::DiscoveredSkill {
+        mangocode_core::DiscoveredSkill {
+            name: name.to_string(),
+            description: String::new(),
+            template: template.to_string(),
+            source_path: std::path::PathBuf::from(format!("{name}.md")),
+            triggers: Vec::new(),
+            dependencies: dependencies.into_iter().map(String::from).collect(),
+            sub_files: Default::default(),
+            scripts: Vec::new(),
+            qa_required: !qa_steps.is_empty(),
+            qa_steps: qa_steps.into_iter().map(String::from).collect(),
+        }
+    }
+
+    fn plugin_command_def(name: &str) -> mangocode_plugins::PluginCommandDef {
+        mangocode_plugins::PluginCommandDef {
+            name: name.to_string(),
+            description: "Plugin command".to_string(),
+            plugin_name: "toolbox".to_string(),
+            plugin_source_id: "toolbox@project".to_string(),
+            run_action: mangocode_plugins::CommandRunAction::StaticResponse("ok".to_string()),
+            plugin_capabilities: None,
+        }
+    }
+
+    fn command_template(template: &str) -> mangocode_core::CommandTemplate {
+        mangocode_core::CommandTemplate {
+            template: template.to_string(),
+            description: Some("Custom command".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn discovered_skill_command_expands_dependencies_and_qa() {
+        let mut ctx = make_ctx();
+        let base = discovered_skill("base", "Base $ARGUMENTS", vec![], vec![]);
+        let review = discovered_skill(
+            "review",
+            "Review $1 $2 $ARGUMENTS",
+            vec!["base"],
+            vec!["Run the focused tests"],
+        );
+        let mut index = std::collections::HashMap::new();
+        index.insert(base.name.clone(), base);
+        index.insert(review.name.clone(), review.clone());
+
+        let prompt = expand_discovered_skill_for_command(&review, &index, "foo bar", &mut ctx);
+
+        assert!(prompt.starts_with("Base"));
+        assert!(prompt.contains("Review foo bar foo bar"));
+        assert!(prompt.contains("Required QA"));
+        assert!(prompt.contains("Run the focused tests"));
+    }
+
+    #[test]
+    fn discovered_skill_command_lookup_is_case_insensitive() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "review-code".to_string(),
+            discovered_skill("Review-Code", "Review", vec![], vec![]),
+        );
+
+        let skill = find_discovered_skill_for_command("review-code", &index).unwrap();
+
+        assert_eq!(skill.name, "Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_command_lookup_normalizes_names() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "/review-code".to_string(),
+            discovered_skill("/Review-Code", "Review", vec![], vec![]),
+        );
+
+        let skill = find_discovered_skill_for_command("/review-code", &index).unwrap();
+
+        assert_eq!(skill.name, "/Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_command_lookup_normalizes_markdown_suffix() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "review-code".to_string(),
+            discovered_skill("Review-Code", "Review", vec![], vec![]),
+        );
+
+        let skill = find_discovered_skill_for_command("/review-code.MD", &index).unwrap();
+
+        assert_eq!(skill.name, "Review-Code");
+    }
+
+    #[test]
+    fn discovered_skill_command_lookup_prefers_unslashed_duplicate() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "/projectreview".to_string(),
+            discovered_skill("/ProjectReview", "Slash review", vec![], vec![]),
+        );
+        index.insert(
+            "projectreview".to_string(),
+            discovered_skill("ProjectReview", "Plain review", vec![], vec![]),
+        );
+
+        let skill = find_discovered_skill_for_command("/projectreview", &index).unwrap();
+
+        assert_eq!(skill.name, "ProjectReview");
+    }
+
+    #[test]
+    fn discovered_skill_command_lookup_skips_reserved_tui_commands() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "changes".to_string(),
+            discovered_skill("changes", "Shadow changes", vec![], vec![]),
+        );
+        index.insert(
+            "review-code".to_string(),
+            discovered_skill("Review-Code", "Review", vec![], vec![]),
+        );
+
+        assert!(find_discovered_skill_for_command("changes", &index).is_none());
+        assert!(find_discovered_skill_for_command("review-code", &index).is_some());
+    }
+
+    #[test]
+    fn discovered_skill_commands_expose_normalized_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("review.md"),
+            "---\nname: /ProjectReview.MD\ndescription: Project review\n---\nReview.",
+        )
+        .unwrap();
+
+        let commands =
+            commands_from_discovered_skills(tmp.path(), &mangocode_core::SkillsConfig::default());
+
+        assert!(commands
+            .iter()
+            .any(|command| command.name() == "ProjectReview"));
+        assert!(!commands
+            .iter()
+            .any(|command| command.name() == "/ProjectReview"));
+        assert!(!commands
+            .iter()
+            .any(|command| command.name() == "ProjectReview.MD"));
+    }
+
+    #[test]
+    fn discovered_skill_commands_dedupe_normalized_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("plain.md"),
+            "---\nname: ProjectReview\ndescription: Plain project review\n---\nReview.",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("slash.md"),
+            "---\nname: /ProjectReview\ndescription: Slash project review\n---\nReview.",
+        )
+        .unwrap();
+
+        let commands =
+            commands_from_discovered_skills(tmp.path(), &mangocode_core::SkillsConfig::default());
+
+        let matches = commands
+            .iter()
+            .filter(|command| command.name() == "ProjectReview")
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].description(), "Plain project review");
+    }
+
+    #[test]
+    fn plugin_command_lookup_is_case_insensitive() {
+        let defs = vec![plugin_command_def("Toolbox:Build")];
+
+        let def = find_plugin_command_def_for_command("toolbox:build", &defs).unwrap();
+
+        assert_eq!(def.name, "Toolbox:Build");
+    }
+
+    #[test]
+    fn plugin_command_lookup_normalizes_names() {
+        let defs = vec![plugin_command_def(" /Toolbox:Build ")];
+
+        let def = find_plugin_command_def_for_command("/toolbox:build", &defs).unwrap();
+
+        assert_eq!(def.name, " /Toolbox:Build ");
+    }
+
+    #[test]
+    fn plugin_command_lookup_preserves_markdown_suffix() {
+        let defs = vec![
+            plugin_command_def("Toolbox:Build"),
+            plugin_command_def("Toolbox:Build.md"),
+        ];
+
+        let def = find_plugin_command_def_for_command("toolbox:build.md", &defs).unwrap();
+
+        assert_eq!(def.name, "Toolbox:Build.md");
+    }
+
+    #[test]
+    fn plugin_command_lookup_accepts_nested_colon_names() {
+        let defs = vec![plugin_command_def("Toolbox:Build:Deploy")];
+
+        let def = find_plugin_command_def_for_command("/toolbox:build:deploy", &defs).unwrap();
+
+        assert_eq!(def.name, "Toolbox:Build:Deploy");
+    }
+
+    #[tokio::test]
+    async fn plugin_command_adapter_runs_nested_markdown_prompt_with_args() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command_file = tmp.path().join("deploy.md");
+        std::fs::write(&command_file, "Deploy the current build.").unwrap();
+        let def = mangocode_plugins::PluginCommandDef {
+            name: "toolbox:build:deploy".to_string(),
+            description: "Deploy nested build command".to_string(),
+            plugin_name: "toolbox".to_string(),
+            plugin_source_id: "toolbox@project".to_string(),
+            run_action: mangocode_plugins::CommandRunAction::MarkdownPrompt {
+                file_path: command_file.to_string_lossy().into_owned(),
+                plugin_root: tmp.path().to_string_lossy().into_owned(),
+            },
+            plugin_capabilities: Some(vec!["read_files".to_string()]),
+        };
+        let adapter = PluginSlashCommandAdapter { def };
+        let mut ctx = make_ctx();
+
+        let result = adapter.execute("prod us-east", &mut ctx).await;
+
+        match result {
+            CommandResult::UserMessage(message) => {
+                assert!(message.contains("Deploy the current build."));
+                assert!(message.contains("Arguments: prod us-east"));
+            }
+            other => panic!("expected plugin markdown prompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_command_lookup_prefers_unslashed_duplicate() {
+        let defs = vec![
+            plugin_command_def(" /Toolbox:Build "),
+            plugin_command_def("Toolbox:Build"),
+        ];
+
+        let def = find_plugin_command_def_for_command("/toolbox:build", &defs).unwrap();
+
+        assert_eq!(def.name, "Toolbox:Build");
+    }
+
+    #[test]
+    fn plugin_command_lookup_skips_reserved_tui_commands() {
+        let defs = vec![
+            plugin_command_def("changes"),
+            plugin_command_def("Toolbox:Build"),
+        ];
+
+        assert!(find_plugin_command_def_for_command("changes", &defs).is_none());
+        assert!(find_plugin_command_def_for_command("toolbox:build", &defs).is_some());
+    }
+
+    #[test]
+    fn template_command_lookup_is_case_insensitive_and_trims_slash() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert("/Build".to_string(), command_template("Build $ARGUMENTS"));
+
+        let (name, template) = find_template_command_for_command("build", &commands).unwrap();
+
+        assert_eq!(name, "Build");
+        assert_eq!(template.template, "Build $ARGUMENTS");
+    }
+
+    #[test]
+    fn template_command_lookup_preserves_markdown_suffix() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert("Build".to_string(), command_template("plain"));
+        commands.insert("Build.md".to_string(), command_template("markdown"));
+
+        let (name, template) = find_template_command_for_command("build.md", &commands).unwrap();
+
+        assert_eq!(name, "Build.md");
+        assert_eq!(template.template, "markdown");
+    }
+
+    #[test]
+    fn template_command_lookup_skips_reserved_tui_commands() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert("changes".to_string(), command_template("Shadow changes"));
+        commands.insert("Build".to_string(), command_template("Build $ARGUMENTS"));
+
+        assert!(find_template_command_for_command("changes", &commands).is_none());
+        assert!(find_template_command_for_command("build", &commands).is_some());
+    }
+
+    #[test]
+    fn template_command_lookup_deduplicates_case_variants_deterministically() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert("build".to_string(), command_template("lower"));
+        commands.insert("Build".to_string(), command_template("upper"));
+
+        let (name, template) = find_template_command_for_command("build", &commands).unwrap();
+        let (upper_name, upper_template) =
+            find_template_command_for_command("BUILD", &commands).unwrap();
+
+        assert_eq!(name, "Build");
+        assert_eq!(template.template, "upper");
+        assert_eq!(upper_name, "Build");
+        assert_eq!(upper_template.template, "upper");
+    }
+
+    #[test]
+    fn template_command_lookup_prefers_unslashed_duplicate_keys() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert("/Build".to_string(), command_template("slash"));
+        commands.insert("Build".to_string(), command_template("plain"));
+
+        let (name, template) = find_template_command_for_command("build", &commands).unwrap();
+
+        assert_eq!(name, "Build");
+        assert_eq!(template.template, "plain");
+    }
+
+    #[test]
+    fn template_command_lookup_prefers_unslashed_duplicate_with_spacing_and_case() {
+        let mut commands = std::collections::HashMap::new();
+        commands.insert(" /Build ".to_string(), command_template("slash"));
+        commands.insert("build".to_string(), command_template("plain"));
+
+        let (name, template) = find_template_command_for_command("build", &commands).unwrap();
+
+        assert_eq!(name, "build");
+        assert_eq!(template.template, "plain");
+    }
+
+    #[test]
+    fn commands_from_settings_skips_builtin_aliases_and_case_duplicates() {
+        let mut settings = mangocode_core::Settings::default();
+        settings
+            .commands
+            .insert("h".to_string(), command_template("shadow help alias"));
+        settings.commands.insert(
+            "changes".to_string(),
+            command_template("shadow TUI changes"),
+        );
+        settings
+            .commands
+            .insert("ship".to_string(), command_template("lower"));
+        settings
+            .commands
+            .insert("Ship".to_string(), command_template("upper"));
+
+        let commands = commands_from_settings(&settings);
+        let names = commands
+            .iter()
+            .map(|command| command.name().to_string())
+            .collect::<Vec<_>>();
+        let ship_names = names
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case("ship"))
+            .collect::<Vec<_>>();
+
+        assert!(!names.iter().any(|name| name == "h"));
+        assert!(!names.iter().any(|name| name == "changes"));
+        assert_eq!(ship_names.len(), 1);
+        assert_eq!(ship_names[0].as_str(), "Ship");
+    }
+
+    #[tokio::test]
+    async fn execute_command_runs_template_commands_case_insensitively() {
+        let mut ctx = make_ctx();
+        ctx.config.commands.insert(
+            "Build".to_string(),
+            command_template("Build $1 $2 $ARGUMENTS"),
+        );
+
+        let result = execute_command("/build foo bar", &mut ctx).await.unwrap();
+
+        let CommandResult::UserMessage(prompt) = result else {
+            panic!("expected user message");
+        };
+        assert_eq!(prompt, "Build foo bar foo bar");
+    }
+
+    #[tokio::test]
+    async fn execute_command_does_not_run_reserved_tui_template_commands() {
+        let mut ctx = make_ctx();
+        ctx.config
+            .commands
+            .insert("changes".to_string(), command_template("Shadow changes"));
+
+        let result = execute_command("/changes", &mut ctx).await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_command_does_not_run_reserved_tui_skill_commands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("changes.md"),
+            "---\nname: changes\ndescription: Shadow changes\n---\nShadow.",
+        )
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.working_dir = tmp.path().to_path_buf();
+
+        let result = execute_command("/changes", &mut ctx).await;
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn discovered_skill_commands_skip_builtin_alias_collisions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("h.md"),
+            "---\nname: h\ndescription: Shadow help alias\n---\nShadow.",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("changes.md"),
+            "---\nname: changes\ndescription: Shadow TUI changes\n---\nShadow.",
+        )
+        .unwrap();
+
+        let commands =
+            commands_from_discovered_skills(tmp.path(), &mangocode_core::SkillsConfig::default());
+
+        assert!(!commands.iter().any(|command| command.name() == "h"));
+        assert!(!commands.iter().any(|command| command.name() == "changes"));
+    }
+
+    #[tokio::test]
+    async fn skills_command_lists_canonical_skill_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("review.md"),
+            "---\nname: /ReviewSkill.MD\ndescription: Project review\n---\nReview.",
+        )
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.working_dir = tmp.path().to_path_buf();
+
+        let result = SkillsCommand.execute("", &mut ctx).await;
+
+        let CommandResult::Message(output) = result else {
+            panic!("expected message");
+        };
+        assert!(output.contains("/ReviewSkill - Project review"));
+        assert!(!output.contains("//ReviewSkill - Project review"));
+        assert!(!output.contains("/ReviewSkill.MD - Project review"));
+    }
+
+    #[tokio::test]
+    async fn skills_command_omits_reserved_and_dedupes_normalized_names() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skills_dir = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("plain.md"),
+            "---\nname: ProjectReview\ndescription: Plain project review\n---\nReview.",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("slash.md"),
+            "---\nname: /ProjectReview\ndescription: Slash project review\n---\nReview.",
+        )
+        .unwrap();
+        std::fs::write(
+            skills_dir.join("changes.md"),
+            "---\nname: changes\ndescription: Reserved changes\n---\nReview.",
+        )
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.working_dir = tmp.path().to_path_buf();
+
+        let result = SkillsCommand.execute("", &mut ctx).await;
+
+        let CommandResult::Message(output) = result else {
+            panic!("expected message");
+        };
+        assert_eq!(output.matches("/ProjectReview -").count(), 1);
+        assert!(output.contains("/ProjectReview - Plain project review"));
+        assert!(!output.contains("/changes - Reserved changes"));
+    }
+
+    #[test]
+    fn output_style_helpers_trim_and_include_project_styles() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("ProjectLocal.md"),
+            "# Project Local\nProject style.\n\nUse project local style.",
+        )
+        .unwrap();
+        let nested_dir = project_dir.path().join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let config = Config {
+            project_dir: Some(nested_dir.clone()),
+            output_style: Some(" concise ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(current_output_style_name(&config), "concise");
+        assert!(available_output_style_names(&config, &nested_dir)
+            .iter()
+            .any(|name| name == "ProjectLocal"));
+        assert_eq!(
+            resolve_output_style_name(&config, &nested_dir, " projectlocal ").as_deref(),
+            Some("ProjectLocal")
+        );
+    }
+
     // ---- Command registry tests ---------------------------------------------
 
     #[test]
@@ -11222,6 +12359,103 @@ mod tests {
     }
 
     #[test]
+    fn test_all_command_lookup_keys_are_unique() {
+        let mut keys = std::collections::HashMap::new();
+        for cmd in all_commands() {
+            for key in std::iter::once(cmd.name()).chain(cmd.aliases().into_iter()) {
+                let key = key.trim().trim_start_matches('/').trim().to_lowercase();
+                let owner = cmd.name().to_string();
+                if key.is_empty() {
+                    continue;
+                }
+                if let Some(previous_owner) = keys.insert(key.clone(), owner.clone()) {
+                    panic!(
+                        "Duplicate slash-command lookup key '{key}' for '{previous_owner}' and '{owner}'"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_command_lookup_keys_are_declared_normalized() {
+        for cmd in all_commands() {
+            for key in std::iter::once(cmd.name()).chain(cmd.aliases().into_iter()) {
+                assert!(
+                    !key.trim().is_empty(),
+                    "Empty lookup key for {}",
+                    cmd.name()
+                );
+                assert_eq!(
+                    key,
+                    key.trim(),
+                    "Lookup key '{key}' for '{}' has surrounding whitespace",
+                    cmd.name()
+                );
+                assert!(
+                    !key.starts_with('/'),
+                    "Lookup key '{key}' for '{}' should not include a leading slash",
+                    cmd.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tui_runtime_reserved_keys_cover_builtin_command_lookup_keys() {
+        let reserved = mangocode_tui::slash_commands::RUNTIME_SLASH_COMMAND_RESERVED_KEYS
+            .iter()
+            .map(|key| key.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut missing = builtin_command_lookup_keys()
+            .into_iter()
+            .filter(|key| !reserved.contains(key))
+            .collect::<Vec<_>>();
+        missing.sort();
+
+        assert!(
+            missing.is_empty(),
+            "TUI slash-command reserved list is missing runtime keys: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn tui_runtime_reserved_keys_are_real_builtin_command_lookup_keys() {
+        let runtime_keys = builtin_command_lookup_keys();
+        let mut extras = mangocode_tui::slash_commands::RUNTIME_SLASH_COMMAND_RESERVED_KEYS
+            .iter()
+            .map(|key| key.to_lowercase())
+            .filter(|key| !runtime_keys.contains(key))
+            .collect::<Vec<_>>();
+        extras.sort();
+
+        assert!(
+            extras.is_empty(),
+            "TUI runtime reserved list contains unknown runtime keys: {extras:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_slash_commands_are_runtime_or_tui_reserved() {
+        let runtime_keys = builtin_command_lookup_keys();
+        let tui_keys = mangocode_tui::slash_commands::TUI_SLASH_COMMAND_RESERVED_KEYS
+            .iter()
+            .map(|key| key.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let mut missing = mangocode_tui::slash_commands::PROMPT_SLASH_COMMANDS
+            .iter()
+            .map(|cmd| cmd.name.to_lowercase())
+            .filter(|name| !runtime_keys.contains(name) && !tui_keys.contains(name))
+            .collect::<Vec<_>>();
+        missing.sort();
+
+        assert!(
+            missing.is_empty(),
+            "TUI prompt slash commands have no runtime or TUI handler: {missing:?}"
+        );
+    }
+
+    #[test]
     fn test_find_command_by_name() {
         assert!(find_command("help").is_some());
         assert!(find_command("clear").is_some());
@@ -11231,10 +12465,22 @@ mod tests {
     }
 
     #[test]
+    fn test_find_command_case_insensitive() {
+        assert!(find_command("HELP").is_some());
+        assert!(find_command("/H").is_some());
+    }
+
+    #[test]
     fn test_find_command_with_slash_prefix() {
         // find_command should strip the leading / before lookup
         assert!(find_command("/help").is_some());
         assert!(find_command("/clear").is_some());
+    }
+
+    #[test]
+    fn test_find_command_trims_lookup_key() {
+        assert!(find_command(" /HELP ").is_some());
+        assert!(find_command(" /H ").is_some());
     }
 
     #[test]
@@ -11247,9 +12493,11 @@ mod tests {
         assert!(find_command("settings").is_some());
         assert!(find_command("continue").is_some());
         assert!(find_command("bug").is_some());
+        assert!(find_command("survey").is_some());
         assert!(find_command("bashes").is_some());
         assert!(find_command("remote").is_some());
         assert!(find_command("remote-setup").is_some());
+        assert!(find_command("find").is_some());
     }
 
     #[test]
@@ -11457,6 +12705,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_model_command_provider_prefix_updates_provider() {
+        let mut ctx = make_ctx();
+        ctx.config.provider = Some("openrouter".to_string());
+        let cmd = find_command("model").unwrap();
+
+        let result = cmd.execute(" openai/gpt-4o ", &mut ctx).await;
+
+        let CommandResult::ConfigChangeMessage(config, _) = result else {
+            panic!("expected ConfigChangeMessage");
+        };
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn test_apply_model_override_trims_and_ignores_blank_model() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!apply_model_override(&mut config, "   ".to_string(), None));
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+
+        assert!(apply_model_override(
+            &mut config,
+            " openai/gpt-4o ".to_string(),
+            None
+        ));
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn test_model_command_bare_known_model_updates_provider() {
+        let mut ctx = make_ctx();
+        ctx.config.provider = Some("openai".to_string());
+        let cmd = find_command("model").unwrap();
+
+        let result = cmd.execute("claude-haiku-4-5", &mut ctx).await;
+
+        let CommandResult::ConfigChangeMessage(config, _) = result else {
+            panic!("expected ConfigChangeMessage");
+        };
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[tokio::test]
+    async fn test_model_command_anthropic_prefix_stores_bare_model() {
+        let mut ctx = make_ctx();
+        ctx.config.provider = Some("openrouter".to_string());
+        let cmd = find_command("model").unwrap();
+
+        let result = cmd.execute("anthropic/claude-haiku-4-5", &mut ctx).await;
+
+        let CommandResult::ConfigChangeMessage(config, _) = result else {
+            panic!("expected ConfigChangeMessage");
+        };
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn test_display_provider_preserves_configured_gateway_namespaces() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved = resolve_provider_and_model_for_display(
+            "meta-llama/Llama-3.3-70B-Instruct",
+            Some("openrouter"),
+            true,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "meta-llama/Llama-3.3-70B-Instruct".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_display_provider_uses_known_prefix_without_configured_provider() {
+        let registry = mangocode_api::ModelRegistry::new();
+
+        let resolved =
+            resolve_provider_and_model_for_display("openai/gpt-4o", None, true, &registry);
+
+        assert_eq!(resolved, ("openai".to_string(), "gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_display_provider_treats_stored_gateway_default_as_default() {
+        let registry = mangocode_api::ModelRegistry::new();
+        assert!(model_matches_provider_default_for_display(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        ));
+
+        let model_is_explicit = !model_matches_provider_default_for_display(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        );
+        let resolved = resolve_provider_and_model_for_display(
+            "anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            model_is_explicit,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-sonnet-4".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_display_provider_treats_prefixed_gateway_default_as_default() {
+        let registry = mangocode_api::ModelRegistry::new();
+        assert!(model_matches_provider_default_for_display(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        ));
+
+        let model_is_explicit = !model_matches_provider_default_for_display(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            &registry,
+        );
+        let resolved = resolve_provider_and_model_for_display(
+            "openrouter/anthropic/claude-sonnet-4",
+            Some("openrouter"),
+            model_is_explicit,
+            &registry,
+        );
+
+        assert_eq!(
+            resolved,
+            (
+                "openrouter".to_string(),
+                "anthropic/claude-sonnet-4".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn test_login_command_starts_oauth_flow() {
         let mut ctx = make_ctx();
         let cmd = find_command("login").unwrap();
@@ -11483,6 +12887,367 @@ mod tests {
             matches!(result, CommandResult::Message(_) | CommandResult::Silent),
             "help should return Message or Silent"
         );
+    }
+
+    #[tokio::test]
+    async fn permissions_command_describes_tool_visibility() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("permissions").unwrap();
+        let result = cmd.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(msg.contains("Tool Visibility and Permission Settings"));
+                assert!(msg.contains("Tool allowlist:"));
+                assert!(
+                    msg.contains("agent/session filters may further restrict runtime visibility")
+                );
+                assert!(msg.contains("built runtime tool set"));
+                assert!(msg.contains("execution still follows permission mode"));
+                assert!(!msg.contains("all tools allowed"));
+            }
+            other => panic!("expected permissions text output, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn effort_command_accepts_current_effort_aliases() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("effort").unwrap();
+
+        for (arg, expected) in [
+            ("low", EffortLevel::Low),
+            ("normal", EffortLevel::Medium),
+            ("medium", EffortLevel::Medium),
+            ("high", EffortLevel::High),
+            ("max", EffortLevel::Max),
+        ] {
+            let result = cmd.execute(arg, &mut ctx).await;
+            match result {
+                CommandResult::ConfigChange(_) => assert_eq!(ctx.effort_level, Some(expected)),
+                other => panic!("expected ConfigChange for {arg}, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_import_returns_session_state_change_without_direct_context_mutation() {
+        let mut ctx = make_ctx();
+        ctx.config.allowed_tools = vec!["OldTool".to_string()];
+        ctx.messages = vec![mangocode_core::types::Message::user("existing".to_string())];
+
+        let temp = tempfile::tempdir().unwrap();
+        let restored_dir = temp.path().join("workspace");
+        std::fs::create_dir(&restored_dir).unwrap();
+        let bundle_path = temp.path().join("bundle with spaces.teleport");
+        let bundle = teleport_bundle::TeleportBundle {
+            version: teleport_bundle::BUNDLE_VERSION.to_string(),
+            session_id: "source-session".to_string(),
+            messages: vec![mangocode_core::types::Message::user("imported".to_string())],
+            working_dir: restored_dir.display().to_string(),
+            permissions: teleport_bundle::TeleportPermissions {
+                allowed: vec!["Bash".to_string()],
+                denied: vec!["Read".to_string()],
+                rules: vec![],
+            },
+            model: Some("import-model".to_string()),
+            effort: None,
+            files: vec!["src/main.rs".to_string()],
+            env: Default::default(),
+            exported_at: "2026-05-08T00:00:00Z".to_string(),
+        };
+        std::fs::write(&bundle_path, serde_json::to_string(&bundle).unwrap()).unwrap();
+
+        let cmd = find_command("teleport").unwrap();
+        let result = cmd
+            .execute(&format!("import \"{}\"", bundle_path.display()), &mut ctx)
+            .await;
+
+        match result {
+            CommandResult::ImportSessionState {
+                config,
+                messages,
+                effort,
+                working_dir,
+                message,
+            } => {
+                assert_eq!(config.allowed_tools, vec!["Bash"]);
+                assert_eq!(config.disallowed_tools, vec!["Read"]);
+                assert_eq!(config.model.as_deref(), Some("import-model"));
+                assert!(effort.is_none());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(working_dir.as_deref(), Some(restored_dir.as_path()));
+                assert!(message.contains("Teleport bundle imported."));
+                assert!(message.contains("Permissions:    1 allowed, 1 denied"));
+            }
+            other => panic!("expected ImportSessionState, got {:?}", other),
+        }
+
+        assert_eq!(ctx.config.allowed_tools, vec!["OldTool"]);
+        assert_eq!(ctx.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn teleport_import_provider_prefixed_model_updates_provider() {
+        let mut ctx = make_ctx();
+        ctx.config.provider = Some("openrouter".to_string());
+
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_path = temp.path().join("provider-model.teleport");
+        let bundle = teleport_bundle::TeleportBundle {
+            version: teleport_bundle::BUNDLE_VERSION.to_string(),
+            session_id: "source-session".to_string(),
+            messages: vec![mangocode_core::types::Message::user("imported".to_string())],
+            working_dir: temp.path().display().to_string(),
+            permissions: teleport_bundle::TeleportPermissions::default(),
+            model: Some("openai/gpt-4o".to_string()),
+            effort: None,
+            files: vec![],
+            env: Default::default(),
+            exported_at: "2026-05-08T00:00:00Z".to_string(),
+        };
+        std::fs::write(&bundle_path, serde_json::to_string(&bundle).unwrap()).unwrap();
+
+        let cmd = find_command("teleport").unwrap();
+        let result = cmd
+            .execute(&format!("import {}", bundle_path.display()), &mut ctx)
+            .await;
+
+        match result {
+            CommandResult::ImportSessionState { config, .. } => {
+                assert_eq!(config.provider.as_deref(), Some("openai"));
+                assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+            }
+            other => panic!("expected ImportSessionState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_export_accepts_quoted_output_paths() {
+        let mut ctx = make_ctx();
+        ctx.messages = vec![mangocode_core::types::Message::user(
+            "export me".to_string(),
+        )];
+        ctx.effort_level = Some(EffortLevel::High);
+
+        let temp = tempfile::tempdir().unwrap();
+        let output_path = temp.path().join("quoted bundle.teleport");
+        let equals_output_path = temp.path().join("quoted equals bundle.teleport");
+
+        let cmd = find_command("teleport").unwrap();
+        for (args, path) in [
+            (
+                format!("export --output \"{}\"", output_path.display()),
+                output_path,
+            ),
+            (
+                format!("export --output=\"{}\"", equals_output_path.display()),
+                equals_output_path,
+            ),
+        ] {
+            let result = cmd.execute(&args, &mut ctx).await;
+
+            match result {
+                CommandResult::Message(msg) => {
+                    assert!(msg.contains("Teleport bundle exported."));
+                    assert!(path.exists());
+                    let data = std::fs::read_to_string(path).unwrap();
+                    let bundle: teleport_bundle::TeleportBundle =
+                        serde_json::from_str(&data).unwrap();
+                    assert_eq!(bundle.messages.len(), 1);
+                    assert_eq!(bundle.effort.as_deref(), Some("high"));
+                    assert!(bundle.env.is_empty());
+                }
+                other => panic!("expected Message, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_export_rejects_missing_or_malformed_output_flags() {
+        let mut ctx = make_ctx();
+        let cmd = find_command("teleport").unwrap();
+
+        for args in ["export --output", "export --outputfoo", "export --bogus"] {
+            let result = cmd.execute(args, &mut ctx).await;
+            match result {
+                CommandResult::Error(msg) => {
+                    assert!(
+                        msg.contains("--output") || msg.contains("Usage: /teleport export"),
+                        "unexpected error message for {args}: {msg}"
+                    );
+                }
+                other => panic!("expected Error for {args}, got {:?}", other),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_import_accepts_generated_deep_links() {
+        use base64::Engine as _;
+
+        let mut ctx = make_ctx();
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = teleport_bundle::TeleportBundle {
+            version: teleport_bundle::BUNDLE_VERSION.to_string(),
+            session_id: "linked-session".to_string(),
+            messages: vec![mangocode_core::types::Message::user(
+                "from link".to_string(),
+            )],
+            working_dir: temp.path().display().to_string(),
+            permissions: teleport_bundle::TeleportPermissions {
+                allowed: vec!["ToolSearch".to_string()],
+                denied: vec![],
+                rules: vec![],
+            },
+            model: None,
+            effort: None,
+            files: Vec::new(),
+            env: Default::default(),
+            exported_at: "2026-05-08T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&bundle).unwrap();
+        let link = format!(
+            "teleport://{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes())
+        );
+
+        let cmd = find_command("teleport").unwrap();
+        let result = cmd.execute(&format!("import \"{}\"", link), &mut ctx).await;
+
+        match result {
+            CommandResult::ImportSessionState {
+                config,
+                messages,
+                effort,
+                working_dir,
+                message,
+            } => {
+                assert_eq!(config.allowed_tools, vec!["ToolSearch"]);
+                assert!(effort.is_none());
+                assert_eq!(messages.len(), 1);
+                assert_eq!(working_dir.as_deref(), Some(temp.path()));
+                assert!(message.contains("Source session: linked-session"));
+            }
+            other => panic!("expected ImportSessionState, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn teleport_import_accepts_minimal_bundle_without_optional_metadata() {
+        let mut ctx = make_ctx();
+        let temp = tempfile::tempdir().unwrap();
+        let bundle_path = temp.path().join("minimal.teleport");
+        let data = serde_json::json!({
+            "version": teleport_bundle::BUNDLE_VERSION,
+            "messages": [mangocode_core::types::Message::user("minimal".to_string())],
+            "working_dir": temp.path().display().to_string(),
+            "permissions": {
+                "rules": [
+                    {
+                        "tool_name": "ToolSearch",
+                        "action": "Allow"
+                    },
+                    {
+                        "tool_name": "Read",
+                        "action": "Deny"
+                    },
+                    {
+                        "tool_name": "Bash",
+                        "path_pattern": "src/**",
+                        "action": "Allow"
+                    },
+                    {
+                        "tool_name": "Write",
+                        "path_pattern": "secrets/**",
+                        "action": "Deny"
+                    },
+                    {
+                        "path_pattern": "docs/**",
+                        "action": "Allow"
+                    }
+                ]
+            },
+            "model": null,
+            "effort": "normal"
+        });
+        std::fs::write(&bundle_path, serde_json::to_string(&data).unwrap()).unwrap();
+
+        let cmd = find_command("teleport").unwrap();
+        let result = cmd
+            .execute(&format!("import {}", bundle_path.display()), &mut ctx)
+            .await;
+
+        match result {
+            CommandResult::ImportSessionState {
+                config,
+                messages,
+                effort,
+                working_dir,
+                message,
+            } => {
+                assert_eq!(config.allowed_tools, vec!["ToolSearch"]);
+                assert_eq!(config.disallowed_tools, vec!["Read", "Write"]);
+                assert_eq!(effort, Some(EffortLevel::Medium));
+                assert!(!config.allowed_tools.iter().any(|name| name == "Bash"));
+                assert!(!config.allowed_tools.iter().any(|name| name == "*"));
+                assert_eq!(messages.len(), 1);
+                assert_eq!(working_dir.as_deref(), Some(temp.path()));
+                assert!(message.contains("Source session: (unknown)"));
+                assert!(message.contains("Exported at:    (unknown)"));
+                assert!(message.contains("Permissions:    1 allowed, 2 denied"));
+                assert!(message.contains("Files tracked:  0"));
+            }
+            other => panic!("expected ImportSessionState, got {:?}", other),
+        }
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        feature = "tool-bash"
+    ))]
+    #[test]
+    fn permissions_alias_matching_removes_opposite_entries() {
+        let ctx = make_ctx();
+        let runtime_tools = permission_tool_catalog(&ctx);
+
+        assert!(permission_tool_names_match(
+            &runtime_tools,
+            "shell_command",
+            "Bash"
+        ));
+        assert!(permission_tool_names_match(
+            &runtime_tools,
+            "container.exec",
+            "Bash"
+        ));
+
+        let mut denied = vec!["shell_command".to_string(), "Write".to_string()];
+        denied.retain(|name| !permission_tool_names_match(&runtime_tools, name, "Bash"));
+        assert_eq!(denied, vec!["Write"]);
+
+        let mut allowed = vec!["Bash".to_string(), "Read".to_string()];
+        allowed.retain(|name| !permission_tool_names_match(&runtime_tools, name, "shell_command"));
+        assert_eq!(allowed, vec!["Read"]);
+
+        let mut allowed = vec!["shell_command".to_string()];
+        if !allowed
+            .iter()
+            .any(|name| permission_tool_names_match(&runtime_tools, name, "Bash"))
+        {
+            allowed.push("Bash".to_string());
+        }
+        assert_eq!(allowed, vec!["shell_command"]);
+
+        let mut denied = vec!["Bash".to_string()];
+        if !denied
+            .iter()
+            .any(|name| permission_tool_names_match(&runtime_tools, name, "container.exec"))
+        {
+            denied.push("container.exec".to_string());
+        }
+        assert_eq!(denied, vec!["Bash"]);
     }
 
     #[tokio::test]
@@ -11619,7 +13384,7 @@ mod tests {
     #[test]
     fn test_parse_review_args_supports_modes_and_overrides() {
         let opts = parse_review_args(
-            "main --mode deep --focus bugs,tests --model openai/gpt-5 --no-post --max-diff-chars 200000",
+            "main --mode deep --focus bugs,tests --model \" openai/gpt-5 \" --no-post --max-diff-chars 200000",
         )
         .unwrap();
         assert_eq!(opts.base_ref.as_deref(), Some("main"));
@@ -11628,6 +13393,15 @@ mod tests {
         assert_eq!(opts.model_override.as_deref(), Some("openai/gpt-5"));
         assert!(!opts.post_to_github);
         assert_eq!(opts.max_diff_chars, 200_000);
+    }
+
+    #[test]
+    fn test_parse_review_args_rejects_blank_model_override() {
+        let err = parse_review_args("--model \"   \"").unwrap_err();
+        assert!(err.contains("non-empty model"));
+
+        let err = parse_review_args("--model=").unwrap_err();
+        assert!(err.contains("non-empty model"));
     }
 
     #[test]

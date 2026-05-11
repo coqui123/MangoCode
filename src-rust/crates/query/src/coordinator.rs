@@ -46,26 +46,26 @@ pub fn coordinator_system_prompt() -> &'static str {
 You are operating as an orchestrator for parallel worker agents.
 
 ### Your Role
-- Orchestrate workers using the Agent tool to spawn parallel subagents
-- Use SendMessage to continue communication with running workers
-- Use TaskStop to cancel workers that are no longer needed
+- Orchestrate workers using available agent and coordination tools
+- Continue communication with running workers when a messaging tool is available
+- Cancel workers that are no longer needed when a stop/cancel tool is available
 - Synthesize findings across workers before presenting to the user
 - Answer directly when the question doesn't need delegation
 
 ### Task Workflow
-1. **Research Phase**: Spawn workers to gather information in parallel
+1. **Research Phase**: Gather information directly or with workers in parallel when available
 2. **Synthesis Phase**: Collect and merge worker findings
-3. **Implementation Phase**: Delegate implementation tasks to specialized workers
-4. **Verification Phase**: Spawn verification workers to validate results
+3. **Implementation Phase**: Delegate implementation tasks to specialized workers when available
+4. **Verification Phase**: Validate results directly or with verification workers when available
 
 ### Worker Guidelines
 - Worker prompts must be fully self-contained (workers cannot see your conversation)
 - Always synthesize findings before spawning follow-up workers
-- Workers have access to all standard tools + MCP + skills
-- Use TaskCreate/TaskUpdate to track parallel work
+- Workers have access only to tools exposed by the current build, session config, permission mode, and MCP connections
+- Use task-tracking tools to track parallel work when they are available
 
 ### Internal Tools (do not delegate to workers)
-- Agent, SendMessage, TaskStop (coordination only)
+- Coordination-only tools exposed in the current runtime tool list
 "#
 }
 
@@ -148,8 +148,8 @@ impl Default for ScratchpadGate {
 
 /// Filter a tool list so only tools appropriate for `mode` are included.
 ///
-/// - `AgentMode::Coordinator`: all tools are available (coordinator has the
-///   full set including Agent/SendMessage/TaskStop).
+/// - `AgentMode::Coordinator`: retains all tools from the already-built
+///   runtime-visible tool list.
 /// - `AgentMode::Worker`: COORDINATOR_ONLY_TOOLS are removed.
 /// - `AgentMode::Normal`: no filtering.
 ///   Tools that WorktreeWorker is additionally allowed to use on top of Worker tools.
@@ -244,8 +244,8 @@ pub fn match_session_mode_from_agent_mode(session_mode: AgentMode) -> Option<Str
 /// Resolve which skills should be auto-loaded for a given user message by
 /// matching against each skill's declared trigger phrases.
 ///
-/// Returns an ordered list of skill **names** matched for this turn (most relevant
-/// first). Load templates and expand dependencies with
+/// Returns an ordered list of normalized skill **names** matched for this turn
+/// (most relevant first). Load templates and expand dependencies with
 /// `skill_discovery::load_skill_with_dependencies`, then build
 /// `SystemPromptOptions::injected_skills` / `skill_qa_blocks` **before** the
 /// model API call. Dependencies are resolved and deduplicated by the caller.
@@ -274,8 +274,22 @@ pub fn resolve_skills_for_turn(
     use mangocode_core::skill_discovery::resolve_skills_for_message;
     resolve_skills_for_message(user_message, skill_index)
         .into_iter()
-        .map(|s| s.name.clone())
+        .filter_map(|s| normalized_skill_name_for_turn(&s.name))
         .collect()
+}
+
+fn normalized_skill_name_for_turn(name: &str) -> Option<String> {
+    let name = strip_markdown_suffix(name.trim().trim_start_matches('/').trim()).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn strip_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +387,30 @@ mod tests {
         assert!(prompt.contains("orchestrator"));
         assert!(prompt.contains("Research Phase"));
         assert!(prompt.contains("Synthesis Phase"));
+    }
+
+    #[test]
+    fn test_resolve_skills_for_turn_normalizes_skill_names() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "projectreview".to_string(),
+            mangocode_core::skill_discovery::DiscoveredSkill {
+                name: " /ProjectReview.MD ".to_string(),
+                description: "Project review".to_string(),
+                template: "Review instructions.".to_string(),
+                source_path: std::path::PathBuf::from("review.md"),
+                triggers: vec!["review project".to_string()],
+                dependencies: Vec::new(),
+                sub_files: Default::default(),
+                scripts: Vec::new(),
+                qa_required: false,
+                qa_steps: Vec::new(),
+            },
+        );
+
+        let names = resolve_skills_for_turn("please review project", &index);
+
+        assert_eq!(names, vec!["ProjectReview".to_string()]);
     }
 
     #[test]

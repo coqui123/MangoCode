@@ -10,7 +10,7 @@ use crate::overlays::{
 };
 use mangocode_core::config::{Config, Settings};
 use mangocode_core::keybindings::default_bindings;
-use mangocode_core::output_styles::builtin_styles;
+use mangocode_core::output_styles::{all_styles_with_runtime_for_project, OutputStyleDef};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -87,6 +87,47 @@ pub struct SettingsScreen {
     pub selected_field: usize,
 }
 
+fn apply_model_setting(config: &mut Config, value: &str) {
+    if mangocode_api::normalize_model_id(value).is_none() {
+        config.model = None;
+        return;
+    }
+
+    mangocode_api::apply_model_selection_to_config(config, value, None);
+}
+
+fn apply_output_style_setting(config: &mut Config, value: &str) {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("default") {
+        config.output_style = None;
+        return;
+    }
+
+    let styles = available_output_styles(config);
+    let canonical = mangocode_core::output_styles::find_style(&styles, value)
+        .map(|style| style.name.clone())
+        .unwrap_or_else(|| value.to_string());
+    config.output_style = Some(canonical);
+}
+
+fn configured_output_style_name(config: &Config) -> &str {
+    config
+        .output_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .unwrap_or("default")
+}
+
+fn available_output_styles(config: &Config) -> Vec<OutputStyleDef> {
+    all_styles_with_runtime_for_project(&Settings::config_dir(), config.project_dir.as_deref())
+}
+
+fn sync_settings_snapshot_from_config(settings: &mut Settings, config: &Config) {
+    settings.config = config.clone();
+    settings.provider = config.provider.clone();
+}
+
 impl SettingsScreen {
     pub fn new() -> Self {
         let settings_snapshot = Settings::load_sync().unwrap_or_default();
@@ -117,8 +158,9 @@ impl SettingsScreen {
         }
     }
 
-    pub fn open(&mut self) {
+    pub fn open(&mut self, live_config: &Config) {
         self.settings_snapshot = Settings::load_sync().unwrap_or_default();
+        self.settings_snapshot.config = live_config.clone();
         self.pending_changes.clear();
         self.edit_field = None;
         self.edit_value.clear();
@@ -230,11 +272,7 @@ impl SettingsScreen {
         for (field, value) in &self.pending_changes {
             match field.as_str() {
                 "model" => {
-                    config.model = if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.clone())
-                    };
+                    apply_model_setting(config, value);
                 }
                 "max_tokens" => {
                     if let Ok(n) = value.parse::<u32>() {
@@ -242,17 +280,13 @@ impl SettingsScreen {
                     }
                 }
                 "output_style" => {
-                    config.output_style = if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.clone())
-                    };
+                    apply_output_style_setting(config, value);
                 }
                 _ => {}
             }
         }
         // Update snapshot and persist
-        self.settings_snapshot.config = config.clone();
+        sync_settings_snapshot_from_config(&mut self.settings_snapshot, config);
         let _ = self.settings_snapshot.save_sync();
         self.pending_changes.clear();
     }
@@ -570,15 +604,15 @@ fn build_general_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     // Output style
-    let style_names: Vec<String> = builtin_styles().into_iter().map(|s| s.name).collect();
-    let output_style_val = cfg
-        .output_style
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
+    let style_names: Vec<String> = available_output_styles(cfg)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    let output_style_val = configured_output_style_name(cfg);
     lines.extend(field_lines(
         "output_style",
         "Output Style",
-        &output_style_val,
+        output_style_val,
         "Controls the verbosity and format of responses.",
         screen,
     ));
@@ -712,9 +746,9 @@ fn build_display_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     // Output styles section
     lines.push(section_header("Available Output Styles"));
     lines.push(Line::from(""));
-    for style in builtin_styles() {
-        let active = cfg.output_style.as_deref() == Some(&style.name)
-            || (cfg.output_style.is_none() && style.name == "default");
+    let current_style = configured_output_style_name(cfg);
+    for style in available_output_styles(cfg) {
+        let active = current_style == style.name || current_style.eq_ignore_ascii_case(&style.name);
         let marker = if active { " *" } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(
@@ -1381,7 +1415,7 @@ pub fn handle_settings_key(
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     // Helper: create a temporary settings.json with a given JSON body.
     fn write_temp_settings(json: &str) -> NamedTempFile {
@@ -1465,6 +1499,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn settings_screen_open_uses_live_config_snapshot() {
+        let project_dir = TempDir::new().unwrap();
+        let mut screen = SettingsScreen::new();
+        let config = Config {
+            project_dir: Some(project_dir.path().to_path_buf()),
+            output_style: Some("ProjectUI".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        screen.open(&config);
+
+        assert_eq!(
+            screen.settings_snapshot.config.project_dir.as_deref(),
+            Some(project_dir.path())
+        );
+        assert_eq!(
+            screen.settings_snapshot.config.output_style.as_deref(),
+            Some("ProjectUI")
+        );
+        assert_eq!(
+            screen.settings_snapshot.config.model.as_deref(),
+            Some("openai/gpt-4o")
+        );
+    }
+
+    #[test]
+    fn model_setting_trims_and_updates_provider() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        apply_model_setting(&mut config, " openai/gpt-4o ");
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn model_setting_clears_blank_model() {
+        let mut config = Config {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        apply_model_setting(&mut config, "   ");
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model, None);
+    }
+
+    #[test]
+    fn settings_snapshot_sync_mirrors_top_level_provider() {
+        let mut settings = Settings {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+        let config = Config {
+            provider: Some("openai".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        sync_settings_snapshot_from_config(&mut settings, &config);
+
+        assert_eq!(settings.provider.as_deref(), Some("openai"));
+        assert_eq!(settings.config.provider.as_deref(), Some("openai"));
+        assert_eq!(settings.config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn output_style_setting_trims_and_clears_default() {
+        let mut config = Config::default();
+
+        apply_output_style_setting(&mut config, " concise ");
+        assert_eq!(config.output_style.as_deref(), Some("concise"));
+
+        apply_output_style_setting(&mut config, " default ");
+        assert_eq!(config.output_style, None);
+
+        apply_output_style_setting(&mut config, "   ");
+        assert_eq!(config.output_style, None);
+    }
+
+    #[test]
+    fn output_style_setting_canonicalizes_project_style_case() {
+        let project_dir = TempDir::new().unwrap();
+        let styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("ProjectUI.md"),
+            "# Project UI\nProject display style.\n\nUse project UI style.",
+        )
+        .unwrap();
+        let mut config = Config {
+            project_dir: Some(project_dir.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        apply_output_style_setting(&mut config, " projectui ");
+
+        assert_eq!(config.output_style.as_deref(), Some("ProjectUI"));
+    }
+
     // ---------------------------------------------------------------------------
     // toggle_current_field tests
     // ---------------------------------------------------------------------------
@@ -1545,7 +1686,7 @@ mod tests {
         assert!(
             text.contains("Auto-compact"),
             "General tab should render an Auto-compact row; got: {}",
-            &text[..text.len().min(300)]
+            mangocode_core::truncate::truncate_bytes_prefix(&text, 300)
         );
         assert!(
             text.contains("95%"),
@@ -1585,6 +1726,30 @@ mod tests {
             text.contains("Terminal progress bar"),
             "Display tab should have Terminal progress bar row"
         );
+    }
+
+    #[test]
+    fn output_style_lists_include_project_styles() {
+        let project_dir = TempDir::new().unwrap();
+        let styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("project-ui.md"),
+            "# Project UI\nProject display style.\n\nUse project UI style.",
+        )
+        .unwrap();
+
+        let mut screen = SettingsScreen::new();
+        screen.settings_snapshot.config.project_dir = Some(project_dir.path().to_path_buf());
+
+        let lines = build_display_lines(&screen);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+
+        assert!(text.contains("project-ui"));
     }
 
     // ---------------------------------------------------------------------------

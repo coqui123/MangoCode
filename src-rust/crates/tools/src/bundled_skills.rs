@@ -25,7 +25,9 @@ pub struct BundledSkill {
     /// `$ARGUMENTS_SUFFIX` expands to `": <args>"` when args are non-empty,
     /// or `""` otherwise.
     pub prompt_template: &'static str,
-    /// If `Some`, only these tool names are available during the skill run.
+    /// Suggested tool subset for a future skill-runner sandbox. `SkillTool`
+    /// currently expands prompt text; the active runtime tool list remains the
+    /// source of truth for what the model can call.
     pub allowed_tools: Option<&'static [&'static str]>,
     /// Whether a human user can invoke this skill via `/skill <name>`.
     pub user_invocable: bool,
@@ -54,8 +56,9 @@ mentioned or edited earlier in this conversation.
 
 ## Phase 2: Launch Three Review Agents in Parallel
 
-Use the Agent tool to launch all three agents concurrently in a single message.
-Pass each agent the full diff so it has complete context.
+If an agent/delegation tool is available, launch all three reviews concurrently
+in a single message and pass each agent the full diff so it has complete
+context. If not, perform the three reviews yourself in sequence.
 
 ### Agent 1: Code Reuse Review
 
@@ -94,7 +97,6 @@ $ARGUMENTS_SUFFIX"#,
         allowed_tools: None,
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // remember
     // -----------------------------------------------------------------------
@@ -102,7 +104,9 @@ $ARGUMENTS_SUFFIX"#,
         name: "remember",
         description: "Review auto-memory entries and propose promotions to AGENTS.md, AGENTS.local.md, or shared memory.",
         aliases: &["mem", "save"],
-        when_to_use: Some("When the user wants to review, organise, or promote their auto-memory entries."),
+        when_to_use: Some(
+            "When the user wants to review, organise, or promote their auto-memory entries.",
+        ),
         argument_hint: Some("[additional context]"),
         prompt_template: r#"# Memory Review
 
@@ -140,7 +144,6 @@ $ARGUMENTS_SUFFIX"#,
         allowed_tools: Some(&["Read", "Write", "Edit", "Glob"]),
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // debug
     // -----------------------------------------------------------------------
@@ -178,7 +181,6 @@ Read the relevant files before making any changes."#,
         allowed_tools: Some(&["Read", "Grep", "Glob"]),
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // stuck
     // -----------------------------------------------------------------------
@@ -200,7 +202,6 @@ Be direct and actionable. Focus on unblocking, not on explaining concepts."#,
         allowed_tools: None,
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // batch
     // -----------------------------------------------------------------------
@@ -208,7 +209,9 @@ Be direct and actionable. Focus on unblocking, not on explaining concepts."#,
         name: "batch",
         description: "Research and plan a large-scale change, then execute it in parallel across isolated worktree agents that each open a PR.",
         aliases: &[],
-        when_to_use: Some("When the user wants to make a sweeping, mechanical change across many files that can be decomposed into independent parallel units."),
+        when_to_use: Some(
+            "When the user wants to make a sweeping, mechanical change across many files that can be decomposed into independent parallel units.",
+        ),
         argument_hint: Some("<instruction>"),
         prompt_template: r#"# Batch: Parallel Work Orchestration
 
@@ -222,8 +225,10 @@ $ARGUMENTS
 
 Enter plan mode, then:
 
-1. **Understand the scope.** Launch subagents to deeply research what this instruction
-   touches. Find all files, patterns, and call sites that need to change.
+1. **Understand the scope.** If an agent/delegation tool is available, launch
+   subagents to deeply research what this instruction touches. Otherwise,
+   inspect the codebase yourself. Find all files, patterns, and call sites that
+   need to change.
 
 2. **Decompose into independent units.** Break the work into 5–30 self-contained units.
    Each unit must be independently implementable in an isolated git worktree and
@@ -237,16 +242,17 @@ Enter plan mode, then:
 
 ## Phase 2: Spawn Workers (After Plan Approval)
 
-Spawn one background agent per work unit using the Agent tool with
-`isolation: "worktree"` and `run_in_background: true`. Launch them all in a single
-message block so they run in parallel. Each agent prompt must be fully self-contained.
+If an agent/delegation tool and worktree isolation are available, spawn one
+background agent per work unit with worktree isolation enabled. Launch them all
+in a single message block so they run in parallel. Each agent prompt must be
+fully self-contained. If those tools are not available, explain the limitation
+and provide the plan plus the next executable unit of work.
 
 After each agent finishes, parse the `PR: <url>` line from its result and render
 a status table. When all agents have reported, print a final summary."#,
         allowed_tools: None,
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // verify
     // -----------------------------------------------------------------------
@@ -269,7 +275,6 @@ a status table. When all agents have reported, print a final summary."#,
         allowed_tools: None,
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // update-config
     // -----------------------------------------------------------------------
@@ -277,7 +282,9 @@ a status table. When all agents have reported, print a final summary."#,
         name: "update-config",
         description: "Configure MangoCode settings (hooks, permissions, env vars, behaviours) via settings.json.",
         aliases: &["config-update", "settings"],
-        when_to_use: Some("When the user wants to configure automated behaviours, permissions, or settings."),
+        when_to_use: Some(
+            "When the user wants to configure automated behaviours, permissions, or settings.",
+        ),
         argument_hint: Some("<what to configure>"),
         prompt_template: r#"# Update Config Skill
 
@@ -308,7 +315,6 @@ $ARGUMENTS"#,
         allowed_tools: Some(&["Read", "Write", "Edit", "Bash"]),
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // claude-api
     // -----------------------------------------------------------------------
@@ -316,7 +322,9 @@ $ARGUMENTS"#,
         name: "claude-api",
         description: "Build apps with the Claude API or Anthropic SDK.",
         aliases: &["api", "anthropic-sdk"],
-        when_to_use: Some("When the user wants to use the Claude API, Anthropic SDK, or build Claude-powered apps."),
+        when_to_use: Some(
+            "When the user wants to use the Claude API, Anthropic SDK, or build Claude-powered apps.",
+        ),
         argument_hint: Some("[what to build]"),
         prompt_template: r#"# Build a Claude API Integration
 
@@ -360,7 +368,6 @@ Use async/await patterns. Follow SDK best practices."#,
         allowed_tools: Some(&["Read", "Grep", "Glob", "WebFetch"]),
         user_invocable: true,
     },
-
     // -----------------------------------------------------------------------
     // loop
     // -----------------------------------------------------------------------
@@ -372,7 +379,10 @@ Use async/await patterns. Follow SDK best practices."#,
         argument_hint: Some("[interval] <command>"),
         prompt_template: r#"# /loop — schedule a recurring prompt
 
-Parse the input below into `[interval] <prompt…>` and schedule it with CronCreate.
+Parse the input below into `[interval] <prompt...>` and schedule it with
+CronCreate when that tool is available. If CronCreate is not in the current
+runtime tool list, explain that recurring scheduling is unavailable in this
+build/session and stop.
 
 ## Parsing (in priority order)
 
@@ -395,7 +405,7 @@ If the resulting prompt is empty, show usage `/loop [interval] <prompt>` and sto
 
 ## Action
 
-1. Call CronCreate with the parsed cron expression and prompt.
+1. If CronCreate is available, call CronCreate with the parsed cron expression and prompt.
 2. Confirm what was scheduled, including the cron expression and human-readable cadence.
 3. **Immediately execute the parsed prompt now** — don't wait for the first cron fire.
 

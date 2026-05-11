@@ -46,7 +46,7 @@ impl Tool for ListMcpResourcesTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
+        PermissionLevel::Network
     }
 
     fn input_schema(&self) -> Value {
@@ -75,6 +75,14 @@ impl Tool for ListMcpResourcesTool {
                 );
             }
         };
+
+        let description = match params.server.as_deref() {
+            Some(server) => format!("List MCP resources from {}", server),
+            None => "List MCP resources from connected servers".to_string(),
+        };
+        if let Err(e) = ctx.check_permission(self.name(), &description, false) {
+            return ToolResult::error(e.to_string());
+        }
 
         let resources = manager.list_all_resources(params.server.as_deref()).await;
 
@@ -117,7 +125,7 @@ impl Tool for ReadMcpResourceTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::ReadOnly
+        PermissionLevel::Network
     }
 
     fn input_schema(&self) -> Value {
@@ -154,6 +162,14 @@ impl Tool for ReadMcpResourceTool {
 
         debug!(server = %params.server, uri = %params.uri, "Reading MCP resource");
 
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Read MCP resource {} from {}", params.uri, params.server),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
+
         match manager.read_resource(&params.server, &params.uri).await {
             Ok(contents) => {
                 let json_out = serde_json::to_string_pretty(&contents).unwrap_or_default();
@@ -164,5 +180,62 @@ impl Tool for ReadMcpResourceTool {
                 params.uri, params.server, e
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mangocode_core::config::{Config, PermissionMode};
+    use mangocode_core::permissions::AutoPermissionHandler;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    fn default_denying_context() -> ToolContext {
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/workspace"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "mcp-resources-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: Some(Arc::new(mangocode_mcp::McpManager::new())),
+            config: Config::default(),
+        }
+    }
+
+    #[cfg(feature = "tool-list-mcp-resources")]
+    #[tokio::test]
+    async fn list_mcp_resources_requires_network_permission_before_call() {
+        let result = ListMcpResourcesTool
+            .execute(json!({ "server": "remote" }), &default_denying_context())
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
+    }
+
+    #[cfg(feature = "tool-read-mcp-resource")]
+    #[tokio::test]
+    async fn read_mcp_resource_requires_network_permission_before_call() {
+        let result = ReadMcpResourceTool
+            .execute(
+                json!({
+                    "server": "remote",
+                    "uri": "resource://item",
+                }),
+                &default_denying_context(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
     }
 }

@@ -5,6 +5,7 @@
 //! of the registered names — before the normal REPL starts.
 //!
 use crate::{CommandContext, CommandResult};
+use mangocode_core::truncate::truncate_bytes_prefix;
 use rpassword::prompt_password;
 // `open` crate: used by StickersCommand to launch the browser.
 
@@ -95,7 +96,7 @@ impl NamedCommand for AgentsCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: mangocode agents edit <name>".to_string(),
-                        )
+                        );
                     }
                 };
                 CommandResult::Message(format!(
@@ -108,7 +109,7 @@ impl NamedCommand for AgentsCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: mangocode agents delete <name>".to_string(),
-                        )
+                        );
                     }
                 };
                 CommandResult::Message(format!(
@@ -163,7 +164,7 @@ impl NamedCommand for AddDirCommand {
             Err(e) => {
                 return CommandResult::Error(format!(
                     "Failed to load settings before updating workspace paths: {e}"
-                ))
+                ));
             }
         };
 
@@ -351,7 +352,7 @@ impl NamedCommand for VaultNamedCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: mangocode vault set <provider-id>".to_string(),
-                        )
+                        );
                     }
                 };
                 if !vault.exists() {
@@ -388,7 +389,7 @@ impl NamedCommand for VaultNamedCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: mangocode vault get <provider-id>".to_string(),
-                        )
+                        );
                     }
                 };
                 if !vault.exists() {
@@ -447,7 +448,7 @@ impl NamedCommand for VaultNamedCommand {
                     None => {
                         return CommandResult::Error(
                             "Usage: mangocode vault remove <provider-id>".to_string(),
-                        )
+                        );
                     }
                 };
                 if !vault.exists() {
@@ -529,9 +530,7 @@ impl NamedCommand for BranchCommand {
                             "Created branch: \"{title}\"\nNew session ID: {}\n\
                              To resume original: mangocode --resume {}\n\
                              To switch to branch: /branch switch {}",
-                            new_session.id,
-                            ctx.session_id,
-                            new_session.id,
+                            new_session.id, ctx.session_id, new_session.id,
                         ))
                     }
                     Err(e) => CommandResult::Error(format!("Failed to branch session: {e}")),
@@ -551,17 +550,15 @@ impl NamedCommand for BranchCommand {
                     .collect();
 
                 if branches.is_empty() {
-                    CommandResult::Message(
-                        "No branches found for the current session.".to_string(),
-                    )
+                    CommandResult::Message("No branches found for the current session.".to_string())
                 } else {
                     let mut out = format!(
                         "Branches of session {}:\n\n",
-                        &parent_id[..parent_id.len().min(8)]
+                        truncate_bytes_prefix(&parent_id, 8)
                     );
                     for b in &branches {
                         let updated = b.updated_at.format("%Y-%m-%d %H:%M").to_string();
-                        let id_short = &b.id[..b.id.len().min(8)];
+                        let id_short = truncate_bytes_prefix(&b.id, 8);
                         out.push_str(&format!(
                             "  {} | {} | {} messages | {}\n",
                             id_short,
@@ -580,7 +577,7 @@ impl NamedCommand for BranchCommand {
                     _ => {
                         return CommandResult::Error(
                             "Usage: mangocode branch switch <session-id>".to_string(),
-                        )
+                        );
                     }
                 };
 
@@ -594,7 +591,9 @@ impl NamedCommand for BranchCommand {
                     Err(e) => CommandResult::Error(format!("Could not load session '{id}': {e}")),
                 }
             }
-            sub => CommandResult::Error(format!("Unknown branch subcommand: '{sub}'\nUsage: mangocode branch [create|list|switch] [name|id]")),
+            sub => CommandResult::Error(format!(
+                "Unknown branch subcommand: '{sub}'\nUsage: mangocode branch [create|list|switch] [name|id]"
+            )),
         }
     }
 }
@@ -649,9 +648,7 @@ impl NamedCommand for TagCommand {
             "add" => {
                 let tag = match args.get(1).copied() {
                     Some(t) if !t.is_empty() => t.to_string(),
-                    _ => {
-                        return CommandResult::Error("Usage: mangocode tag add <tag>".to_string())
-                    }
+                    _ => return CommandResult::Error("Usage: mangocode tag add <tag>".to_string()),
                 };
 
                 let result = tokio::task::block_in_place(|| {
@@ -672,7 +669,7 @@ impl NamedCommand for TagCommand {
                     _ => {
                         return CommandResult::Error(
                             "Usage: mangocode tag remove <tag>".to_string(),
-                        )
+                        );
                     }
                 };
 
@@ -692,7 +689,7 @@ impl NamedCommand for TagCommand {
                     _ => {
                         return CommandResult::Error(
                             "Usage: mangocode tag toggle <tag>".to_string(),
-                        )
+                        );
                     }
                 };
 
@@ -907,7 +904,7 @@ impl NamedCommand for PrCommentsCommand {
             Err(_) => {
                 return CommandResult::Error(
                     "GitHub CLI (gh) not found. Install from https://cli.github.com".to_string(),
-                )
+                );
             }
             Ok(out) if !out.status.success() => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1485,6 +1482,7 @@ mod tests {
             cost_tracker: CostTracker::new(),
             session_metrics: None,
             messages: vec![],
+            effort_level: None,
             working_dir: std::path::PathBuf::from("."),
             session_id: "named-test-session".to_string(),
             session_title: None,

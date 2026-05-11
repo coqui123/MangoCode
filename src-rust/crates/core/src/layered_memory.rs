@@ -508,6 +508,9 @@ fn decode_dense_embedding(value: &str) -> Vec<f32> {
 }
 
 fn local_embedding_for_text(text: &str, purpose: EmbeddingPurpose) -> anyhow::Result<Vec<f32>> {
+    #[cfg(not(feature = "fastembed"))]
+    let _ = purpose;
+
     if embeddings_provider() == "fastembed" {
         #[cfg(feature = "fastembed")]
         if let Ok(embedding) = fastembed_embedding_for_text(text, purpose) {
@@ -672,17 +675,14 @@ fn extract_explicit_memory_candidates(text: &str) -> Vec<(MemoryClass, String)> 
     for raw_line in text.lines() {
         let line = raw_line.trim();
         let lower = line.to_ascii_lowercase();
-        let candidate = if let Some(rest) = lower.strip_prefix("remember:") {
-            Some((MemoryClass::ProjectFact, &line[line.len() - rest.len()..]))
-        } else if let Some(rest) = lower.strip_prefix("remember ") {
-            Some((MemoryClass::ProjectFact, &line[line.len() - rest.len()..]))
-        } else if let Some(rest) = lower.strip_prefix("decision:") {
-            Some((MemoryClass::Decision, &line[line.len() - rest.len()..]))
-        } else if let Some(rest) = lower.strip_prefix("preference:") {
-            Some((
-                MemoryClass::UserPreference,
-                &line[line.len() - rest.len()..],
-            ))
+        let candidate = if lower.starts_with("remember:") {
+            Some((MemoryClass::ProjectFact, &line["remember:".len()..]))
+        } else if lower.starts_with("remember ") {
+            Some((MemoryClass::ProjectFact, &line["remember ".len()..]))
+        } else if lower.starts_with("decision:") {
+            Some((MemoryClass::Decision, &line["decision:".len()..]))
+        } else if lower.starts_with("preference:") {
+            Some((MemoryClass::UserPreference, &line["preference:".len()..]))
         } else if lower.starts_with("i prefer ") || lower.starts_with("we prefer ") {
             Some((MemoryClass::UserPreference, line))
         } else if line.contains("://") {
@@ -751,6 +751,24 @@ mod tests {
         );
         assert_eq!(ids.len(), 2);
         assert_eq!(store.review(10).expect("review").len(), 2);
+    }
+
+    #[test]
+    fn explicit_memory_candidates_preserve_unicode_after_prefix() {
+        let candidates = extract_explicit_memory_candidates(
+            "remember: İ-aware Café\ndecision: keep naïve façade support",
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                (MemoryClass::ProjectFact, "İ-aware Café".to_string()),
+                (
+                    MemoryClass::Decision,
+                    "keep naïve façade support".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]

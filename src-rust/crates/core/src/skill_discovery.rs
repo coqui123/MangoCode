@@ -241,7 +241,11 @@ fn parse_skill_file_with_dir(
     let name = name.unwrap_or_else(|| {
         // For folder-based skills the path points to SKILL.md; use the parent
         // directory name as the skill name.
-        if path.file_name().and_then(|s| s.to_str()) == Some("SKILL.md") {
+        if path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_skill_index_file_name)
+        {
             path.parent()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
@@ -330,23 +334,26 @@ fn scan_skill_dir_extras(
         return (sub_files, scripts);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+
+    for path in paths {
         if path.is_dir() {
             // Check for a `scripts/` subdirectory
             if path.file_name().and_then(|s| s.to_str()) == Some("scripts") {
                 if let Ok(script_entries) = std::fs::read_dir(&path) {
-                    for se in script_entries.flatten() {
-                        scripts.push(se.path());
-                    }
+                    let mut script_paths: Vec<PathBuf> =
+                        script_entries.flatten().map(|entry| entry.path()).collect();
+                    script_paths.sort();
+                    scripts.extend(script_paths);
                 }
             }
             continue;
         }
         // Collect non-SKILL.md markdown files as sub-files
-        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        if has_markdown_extension(&path) {
             let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if filename != "SKILL.md" {
+            if !is_skill_index_file_name(filename) {
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -380,13 +387,13 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
         }
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
 
+    for path in paths {
         if path.is_dir() {
             // Folder-based skill: look for SKILL.md inside
-            let skill_md = path.join("SKILL.md");
-            if skill_md.is_file() {
+            if let Some(skill_md) = skill_index_file(&path) {
                 match std::fs::read_to_string(&skill_md) {
                     Ok(content) => {
                         if let Some(skill) =
@@ -404,7 +411,7 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
                     }
                 }
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        } else if has_markdown_extension(&path) {
             match std::fs::read_to_string(&path) {
                 Ok(content) => {
                     if let Some(skill) = parse_skill_file(&content, &path) {
@@ -419,6 +426,40 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
     }
 
     skills
+}
+
+fn skill_index_file(dir: &Path) -> Option<PathBuf> {
+    for filename in ["SKILL.md", "skill.md"] {
+        let candidate = dir.join(filename);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(is_skill_index_file_name)
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+fn is_skill_index_file_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("skill.md")
+}
+
+fn has_markdown_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
 // ---------------------------------------------------------------------------
@@ -438,9 +479,31 @@ pub fn discover_skills(
     let mut scanned_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     // Inline closure: insert a batch, warning on duplicates.
-    let mut add = |skills: Vec<DiscoveredSkill>| {
+    let mut add = |mut skills: Vec<DiscoveredSkill>| {
+        skills.sort_by(|a, b| {
+            let a_key = normalized_skill_lookup_key(&a.name).unwrap_or_default();
+            let b_key = normalized_skill_lookup_key(&b.name).unwrap_or_default();
+            a_key
+                .cmp(&b_key)
+                .then_with(|| {
+                    a.name
+                        .trim()
+                        .starts_with('/')
+                        .cmp(&b.name.trim().starts_with('/'))
+                })
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.source_path.cmp(&b.source_path))
+        });
+
         for skill in skills {
-            if let Some(existing) = all.get(&skill.name) {
+            let Some(key) = normalized_skill_lookup_key(&skill.name) else {
+                tracing::warn!(
+                    path = %skill.source_path.display(),
+                    "Ignoring skill with blank normalized name"
+                );
+                continue;
+            };
+            if let Some(existing) = all.get(&key) {
                 warn_duplicates.push(format!(
                     "Duplicate skill '{}' found at {} (keeping {})",
                     skill.name,
@@ -448,7 +511,7 @@ pub fn discover_skills(
                     existing.source_path.display()
                 ));
             } else {
-                all.insert(skill.name.clone(), skill);
+                all.insert(key, skill);
             }
         }
     };
@@ -522,15 +585,30 @@ pub fn load_skill_with_dependencies(
     loaded: &mut HashSet<String>,
     context: &mut Vec<DiscoveredSkill>,
 ) {
-    let key = skill_name.to_lowercase();
+    let Some(key) = normalized_skill_lookup_key(skill_name) else {
+        tracing::warn!(
+            skill = skill_name,
+            "skill_discovery: blank dependency name, skipping"
+        );
+        return;
+    };
     if loaded.contains(&key) {
         return;
     }
     loaded.insert(key.clone());
 
     let skill = match index.get(&key).or_else(|| {
-        // Fallback: case-insensitive linear scan
-        index.values().find(|s| s.name.to_lowercase() == key)
+        index
+            .values()
+            .filter(|s| normalized_skill_lookup_key(&s.name).as_deref() == Some(key.as_str()))
+            .min_by(|a, b| {
+                a.name
+                    .trim()
+                    .starts_with('/')
+                    .cmp(&b.name.trim().starts_with('/'))
+                    .then(a.name.cmp(&b.name))
+                    .then(a.source_path.cmp(&b.source_path))
+            })
     }) {
         Some(s) => s.clone(),
         None => {
@@ -551,6 +629,24 @@ pub fn load_skill_with_dependencies(
     context.push(skill);
 }
 
+fn normalized_skill_name(name: &str) -> Option<&str> {
+    let name = strip_markdown_suffix(name.trim().trim_start_matches('/').trim()).trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn normalized_skill_lookup_key(name: &str) -> Option<String> {
+    normalized_skill_name(name).map(str::to_lowercase)
+}
+
+fn strip_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
+}
+
 // ---------------------------------------------------------------------------
 // QA enforcement helpers
 // ---------------------------------------------------------------------------
@@ -564,11 +660,12 @@ pub fn format_qa_block(skill: &DiscoveredSkill) -> Option<String> {
     if !skill.qa_required || skill.qa_steps.is_empty() {
         return None;
     }
+    let skill_name = normalized_skill_name(&skill.name).unwrap_or(&skill.name);
     let mut block = format!(
         "## Required QA for this task (skill: {})\n\
          You MUST complete ALL steps below before delivering output. \
          Skipping any step is a failure.\n\n",
-        skill.name
+        skill_name
     );
     for (i, step) in skill.qa_steps.iter().enumerate() {
         block.push_str(&format!("{}. {}\n", i + 1, step));
@@ -591,7 +688,7 @@ pub fn install_skill_scripts(skill: &DiscoveredSkill, session_workspace: &Path) 
 
     let dest = session_workspace
         .join("skills")
-        .join(&skill.name)
+        .join(skill_script_dir_name(&skill.name))
         .join("scripts");
 
     if let Err(err) = std::fs::create_dir_all(&dest) {
@@ -623,6 +720,26 @@ pub fn install_skill_scripts(skill: &DiscoveredSkill, session_workspace: &Path) 
     }
 }
 
+fn skill_script_dir_name(name: &str) -> String {
+    let Some(name) = normalized_skill_name(name) else {
+        return "unnamed".to_string();
+    };
+    let safe: String = name
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect();
+    let safe = safe.trim_matches(|ch| ch == ' ' || ch == '.');
+    if safe.is_empty() {
+        "unnamed".to_string()
+    } else {
+        safe.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Intent-based trigger matching
 // ---------------------------------------------------------------------------
@@ -630,7 +747,8 @@ pub fn install_skill_scripts(skill: &DiscoveredSkill, session_workspace: &Path) 
 /// Match a user message against all skill triggers in `index`.
 ///
 /// Returns the matching skills in descending order of match confidence
-/// (number of trigger phrases matched). Ties are broken alphabetically.
+/// (number of trigger phrases matched). Ties are broken by normalized skill
+/// name, preferring the unslashed spelling when duplicates normalize together.
 ///
 /// This is the core of Phase 1 auto-loading: call this before the model API
 /// request and inject returned skills into the system prompt dynamic section.
@@ -639,7 +757,7 @@ pub fn resolve_skills_for_message<'a>(
     index: &'a HashMap<String, DiscoveredSkill>,
 ) -> Vec<&'a DiscoveredSkill> {
     let msg = message.to_lowercase();
-    let mut matched: Vec<(&'a DiscoveredSkill, usize)> = index
+    let mut matched: Vec<(String, bool, &'a DiscoveredSkill, usize)> = index
         .values()
         .filter_map(|skill| {
             let hits = skill
@@ -648,15 +766,27 @@ pub fn resolve_skills_for_message<'a>(
                 .filter(|t| msg.contains(t.to_lowercase().as_str()))
                 .count();
             if hits > 0 {
-                Some((skill, hits))
+                let key = normalized_skill_lookup_key(&skill.name)?;
+                Some((key, skill.name.trim().starts_with('/'), skill, hits))
             } else {
                 None
             }
         })
         .collect();
 
-    matched.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.name.cmp(&b.0.name)));
-    matched.into_iter().map(|(s, _)| s).collect()
+    matched.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+            .then(a.2.name.cmp(&b.2.name))
+            .then(a.2.source_path.cmp(&b.2.source_path))
+    });
+
+    let mut seen = HashSet::new();
+    matched
+        .into_iter()
+        .filter_map(|(key, _, skill, _)| seen.insert(key).then_some(skill))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +990,64 @@ mod tests {
     }
 
     #[test]
+    fn test_dependency_lookup_normalizes_skill_names() {
+        let mut index: HashMap<String, DiscoveredSkill> = HashMap::new();
+
+        let make = |name: &str, deps: Vec<&str>| DiscoveredSkill {
+            name: name.to_string(),
+            description: String::new(),
+            template: format!("template-{}", name),
+            source_path: PathBuf::from(format!("{}.md", name.trim_start_matches('/'))),
+            triggers: vec![],
+            dependencies: deps.iter().map(|s| s.to_string()).collect(),
+            sub_files: HashMap::new(),
+            scripts: vec![],
+            qa_required: false,
+            qa_steps: vec![],
+        };
+
+        index.insert("/base".to_string(), make("/Base", vec![]));
+        index.insert("/top".to_string(), make("/Top", vec!["base"]));
+
+        let mut loaded = HashSet::new();
+        let mut context: Vec<DiscoveredSkill> = Vec::new();
+        load_skill_with_dependencies("top", &index, &mut loaded, &mut context);
+
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].name, "/Base");
+        assert_eq!(context[1].name, "/Top");
+    }
+
+    #[test]
+    fn test_dependency_lookup_normalizes_markdown_suffix() {
+        let mut index: HashMap<String, DiscoveredSkill> = HashMap::new();
+
+        let make = |name: &str, deps: Vec<&str>| DiscoveredSkill {
+            name: name.to_string(),
+            description: String::new(),
+            template: format!("template-{}", name),
+            source_path: PathBuf::from(format!("{}.md", name.trim_start_matches('/'))),
+            triggers: vec![],
+            dependencies: deps.iter().map(|s| s.to_string()).collect(),
+            sub_files: HashMap::new(),
+            scripts: vec![],
+            qa_required: false,
+            qa_steps: vec![],
+        };
+
+        index.insert("base".to_string(), make("Base", vec![]));
+        index.insert("top".to_string(), make("Top", vec!["/base.MD"]));
+
+        let mut loaded = HashSet::new();
+        let mut context: Vec<DiscoveredSkill> = Vec::new();
+        load_skill_with_dependencies("top.md", &index, &mut loaded, &mut context);
+
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[0].name, "Base");
+        assert_eq!(context[1].name, "Top");
+    }
+
+    #[test]
     fn test_dependency_cycle_safe() {
         let mut index: HashMap<String, DiscoveredSkill> = HashMap::new();
         let make = |name: &str, deps: Vec<&str>| DiscoveredSkill {
@@ -917,6 +1105,26 @@ mod tests {
     }
 
     #[test]
+    fn test_format_qa_block_normalizes_skill_name() {
+        let skill = DiscoveredSkill {
+            name: "/ProjectReview".to_string(),
+            description: String::new(),
+            template: String::new(),
+            source_path: PathBuf::from("review.md"),
+            triggers: vec![],
+            dependencies: vec![],
+            sub_files: HashMap::new(),
+            scripts: vec![],
+            qa_required: true,
+            qa_steps: vec!["Run check".to_string()],
+        };
+        let block = format_qa_block(&skill).unwrap();
+
+        assert!(block.contains("skill: ProjectReview"));
+        assert!(!block.contains("skill: /ProjectReview"));
+    }
+
+    #[test]
     fn test_format_qa_block_none_when_not_required() {
         let skill = DiscoveredSkill {
             name: "foo".to_string(),
@@ -931,6 +1139,37 @@ mod tests {
             qa_steps: vec![],
         };
         assert!(format_qa_block(&skill).is_none());
+    }
+
+    #[test]
+    fn test_install_skill_scripts_uses_safe_skill_directory_name() {
+        let tmp = make_temp_dir();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let script_path = source_dir.join("run.ps1");
+        std::fs::write(&script_path, "Write-Output ok").unwrap();
+        let skill = DiscoveredSkill {
+            name: "/Review:Skill".to_string(),
+            description: String::new(),
+            template: String::new(),
+            source_path: PathBuf::from("skill.md"),
+            triggers: vec![],
+            dependencies: vec![],
+            sub_files: HashMap::new(),
+            scripts: vec![script_path],
+            qa_required: false,
+            qa_steps: vec![],
+        };
+
+        install_skill_scripts(&skill, tmp.path());
+
+        assert!(tmp
+            .path()
+            .join("skills")
+            .join("Review_Skill")
+            .join("scripts")
+            .join("run.ps1")
+            .is_file());
     }
 
     // ---- trigger resolution -------------------------------------------------
@@ -971,6 +1210,36 @@ mod tests {
         assert!(matched3.is_empty());
     }
 
+    #[test]
+    fn test_resolve_skills_for_message_dedupes_normalized_names() {
+        let mut index: HashMap<String, DiscoveredSkill> = HashMap::new();
+        let make = |name: &str, description: &str| DiscoveredSkill {
+            name: name.to_string(),
+            description: description.to_string(),
+            template: String::new(),
+            source_path: PathBuf::from(format!("{}.md", name.trim_start_matches('/'))),
+            triggers: vec!["review".to_string()],
+            dependencies: vec![],
+            sub_files: HashMap::new(),
+            scripts: vec![],
+            qa_required: false,
+            qa_steps: vec![],
+        };
+        index.insert(
+            "/projectreview".to_string(),
+            make("/ProjectReview", "Slash review"),
+        );
+        index.insert(
+            "projectreview".to_string(),
+            make("ProjectReview", "Plain review"),
+        );
+
+        let matched = resolve_skills_for_message("please review", &index);
+
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "ProjectReview");
+    }
+
     // ---- scan_dir -----------------------------------------------------------
 
     #[test]
@@ -981,7 +1250,7 @@ mod tests {
             "review.md",
             "---\nname: review\n---\nReview $ARGUMENTS",
         );
-        write_file(tmp.path(), "debug.md", "Debug help.");
+        write_file(tmp.path(), "debug.MD", "Debug help.");
         write_file(tmp.path(), "not-md.txt", "ignored");
 
         let skills = scan_dir(tmp.path());
@@ -1010,6 +1279,57 @@ mod tests {
         assert!(skills[0].sub_files.contains_key("security"));
         assert!(skills[0].sub_files.contains_key("performance"));
         assert!(skills[0].triggers.contains(&"review rust".to_string()));
+    }
+
+    #[test]
+    fn test_scan_dir_finds_lowercase_folder_skill_marker() {
+        let tmp = make_temp_dir();
+        let skill_dir = tmp.path().join("rust-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        write_file(&skill_dir, "skill.md", "# Rust Review\nReview carefully.");
+
+        let skills = scan_dir(tmp.path());
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "rust-review");
+    }
+
+    #[test]
+    fn test_scan_dir_finds_mixed_case_folder_skill_marker() {
+        let tmp = make_temp_dir();
+        let skill_dir = tmp.path().join("rust-review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        write_file(&skill_dir, "Skill.MD", "# Rust Review\nReview carefully.");
+
+        let skills = scan_dir(tmp.path());
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "rust-review");
+    }
+
+    #[test]
+    fn test_scan_skill_dir_extras_sorts_scripts_and_handles_markdown_case() {
+        let tmp = make_temp_dir();
+        let scripts_dir = tmp.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(scripts_dir.join("z.ps1"), "z").unwrap();
+        std::fs::write(scripts_dir.join("a.ps1"), "a").unwrap();
+        write_file(tmp.path(), "Skill.MD", "# Main");
+        write_file(tmp.path(), "Security.MD", "# Security");
+
+        let (sub_files, scripts) = scan_skill_dir_extras(tmp.path(), "review");
+        let script_names: Vec<String> = scripts
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert_eq!(script_names, vec!["a.ps1".to_string(), "z.ps1".to_string()]);
+        assert!(sub_files.contains_key("Security"));
+        assert!(!sub_files.contains_key("Skill"));
     }
 
     #[test]
@@ -1097,5 +1417,83 @@ mod tests {
         let discovered = discover_skills(tmp.path(), &config);
         // Project-level wins over extra path.
         assert_eq!(discovered["dup"].description, "project");
+    }
+
+    #[test]
+    fn test_discover_deduplicates_case_insensitively() {
+        let tmp = make_temp_dir();
+        let proj_skills = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&proj_skills).unwrap();
+        write_file(
+            &proj_skills,
+            "review.md",
+            "---\nname: Review\ndescription: project\n---\nProject.",
+        );
+
+        let extra = make_temp_dir();
+        write_file(
+            extra.path(),
+            "review.md",
+            "---\nname: review\ndescription: extra\n---\nExtra.",
+        );
+
+        let config = crate::config::SkillsConfig {
+            paths: vec![extra.path().to_str().unwrap().to_string()],
+            urls: vec![],
+        };
+        let discovered = discover_skills(tmp.path(), &config);
+
+        assert!(discovered.contains_key("review"));
+        assert_eq!(discovered["review"].name, "Review");
+        assert_eq!(discovered["review"].description, "project");
+    }
+
+    #[test]
+    fn test_discover_normalizes_slash_prefixed_skill_key() {
+        let tmp = make_temp_dir();
+        let proj_skills = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&proj_skills).unwrap();
+        write_file(
+            &proj_skills,
+            "review.md",
+            "---\nname: /Review\ndescription: slash\n---\nProject.",
+        );
+
+        let config = crate::config::SkillsConfig::default();
+        let discovered = discover_skills(tmp.path(), &config);
+
+        assert!(discovered.contains_key("review"));
+        assert!(!discovered.contains_key("/review"));
+        assert_eq!(discovered["review"].name, "/Review");
+    }
+
+    #[test]
+    fn test_discover_deduplicates_slash_and_plain_names_prefer_plain() {
+        let tmp = make_temp_dir();
+        let proj_skills = tmp.path().join(".mangocode").join("skills");
+        std::fs::create_dir_all(&proj_skills).unwrap();
+        write_file(
+            &proj_skills,
+            "a-slash.md",
+            "---\nname: /Review\ndescription: slash\n---\nSlash.",
+        );
+        write_file(
+            &proj_skills,
+            "z-plain.md",
+            "---\nname: Review\ndescription: plain\n---\nPlain.",
+        );
+
+        let config = crate::config::SkillsConfig::default();
+        let discovered = discover_skills(tmp.path(), &config);
+
+        assert_eq!(
+            discovered
+                .keys()
+                .filter(|key| key.as_str() == "review" || key.as_str() == "/review")
+                .count(),
+            1
+        );
+        assert_eq!(discovered["review"].name, "Review");
+        assert_eq!(discovered["review"].description, "plain");
     }
 }

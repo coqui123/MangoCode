@@ -13,7 +13,7 @@
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,25 @@ impl OutputStyleDef {
                 .to_string(),
         }
     }
+
+    pub fn builtin_formal() -> Self {
+        Self {
+            name: "formal".to_string(),
+            label: "Formal".to_string(),
+            description: "Precise, professional responses with a formal tone.".to_string(),
+            prompt: "Maintain a formal, professional tone. Use precise technical language."
+                .to_string(),
+        }
+    }
+
+    pub fn builtin_casual() -> Self {
+        Self {
+            name: "casual".to_string(),
+            label: "Casual".to_string(),
+            description: "Conversational responses with a relaxed tone.".to_string(),
+            prompt: "Use a casual, conversational tone.".to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +112,8 @@ pub fn builtin_styles() -> Vec<OutputStyleDef> {
         OutputStyleDef::builtin_concise(),
         OutputStyleDef::builtin_explanatory(),
         OutputStyleDef::builtin_learning(),
+        OutputStyleDef::builtin_formal(),
+        OutputStyleDef::builtin_casual(),
     ]
 }
 
@@ -121,8 +142,8 @@ pub fn load_output_styles_dir(styles_dir: &Path) -> Vec<OutputStyleDef> {
     for entry in entries.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext == "md" || ext == "json" {
-            if let Some(style) = load_style_file(&path) {
+        if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("json") {
+            if let Some(style) = load_output_style_file(&path) {
                 styles.push(style);
             }
         }
@@ -133,15 +154,25 @@ pub fn load_output_styles_dir(styles_dir: &Path) -> Vec<OutputStyleDef> {
     styles
 }
 
-fn load_style_file(path: &Path) -> Option<OutputStyleDef> {
+pub fn load_output_style_file(path: &Path) -> Option<OutputStyleDef> {
     let content = std::fs::read_to_string(path).ok()?;
     let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+    if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    if ext.eq_ignore_ascii_case("json") {
         // Try deserialising directly; fall back to inserting the stem as name.
         let mut def: OutputStyleDef = serde_json::from_str(&content).ok()?;
+        def.name = if def.name.trim().is_empty() {
+            stem.trim().to_string()
+        } else {
+            def.name.trim().to_string()
+        };
         if def.name.is_empty() {
-            def.name = stem;
+            return None;
         }
         return Some(def);
     }
@@ -169,8 +200,13 @@ fn load_style_file(path: &Path) -> Option<OutputStyleDef> {
     let prompt_lines: Vec<&str> = lines.collect();
     let prompt = prompt_lines.join("\n").trim().to_string();
 
+    let name = stem.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
     Some(OutputStyleDef {
-        name: stem,
+        name,
         label,
         description,
         prompt,
@@ -188,13 +224,76 @@ fn load_style_file(path: &Path) -> Option<OutputStyleDef> {
 pub fn all_styles(config_dir: &Path) -> Vec<OutputStyleDef> {
     let mut styles = builtin_styles();
     let user_dir = config_dir.join("output-styles");
-    styles.extend(load_output_styles_dir(&user_dir));
+    append_unique_styles(&mut styles, load_output_styles_dir(&user_dir));
     styles
+}
+
+/// Return all styles available from global config plus the nearest project
+/// `.mangocode/output-styles/` directory, if one exists.
+pub fn all_styles_for_project(
+    config_dir: &Path,
+    project_dir: Option<&Path>,
+) -> Vec<OutputStyleDef> {
+    let mut styles = all_styles(config_dir);
+    if let Some(project_dir) = project_dir.and_then(find_project_output_styles_dir) {
+        append_project_styles(&mut styles, load_output_styles_dir(&project_dir));
+    }
+    styles
+}
+
+fn find_project_output_styles_dir(project_dir: &Path) -> Option<PathBuf> {
+    for dir in project_dir.ancestors() {
+        let candidate = dir.join(".mangocode").join("output-styles");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn append_unique_styles(styles: &mut Vec<OutputStyleDef>, new_styles: Vec<OutputStyleDef>) {
+    for style in new_styles {
+        if !styles
+            .iter()
+            .any(|existing| same_style_name(&existing.name, &style.name))
+        {
+            styles.push(style);
+        }
+    }
+}
+
+fn append_project_styles(styles: &mut Vec<OutputStyleDef>, project_styles: Vec<OutputStyleDef>) {
+    for style in project_styles {
+        if let Some(index) = styles
+            .iter()
+            .position(|existing| same_style_name(&existing.name, &style.name))
+        {
+            if !is_builtin_style_name(&style.name) {
+                styles[index] = style;
+            }
+        } else {
+            styles.push(style);
+        }
+    }
+}
+
+fn is_builtin_style_name(name: &str) -> bool {
+    builtin_styles()
+        .iter()
+        .any(|style| same_style_name(&style.name, name))
+}
+
+fn same_style_name(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
 }
 
 /// Find a style by its `name` field.
 pub fn find_style<'a>(styles: &'a [OutputStyleDef], name: &str) -> Option<&'a OutputStyleDef> {
-    styles.iter().find(|s| s.name == name)
+    let name = name.trim();
+    styles
+        .iter()
+        .find(|s| s.name == name)
+        .or_else(|| styles.iter().find(|s| same_style_name(&s.name, name)))
 }
 
 // ---------------------------------------------------------------------------
@@ -208,12 +307,35 @@ static RUNTIME_STYLES: Lazy<Mutex<Vec<OutputStyleDef>>> = Lazy::new(|| Mutex::ne
 /// Styles registered here are included in `all_styles_with_runtime` and
 /// `find_style_runtime`.  Duplicate names are silently ignored so that
 /// hot-reloading a plugin does not double-register styles.
-pub fn register_runtime_style(style: OutputStyleDef) {
+pub fn register_runtime_style(mut style: OutputStyleDef) {
+    style.name = style.name.trim().to_string();
     if let Ok(mut list) = RUNTIME_STYLES.lock() {
-        if !list.iter().any(|s| s.name == style.name) {
+        if !style.name.trim().is_empty()
+            && !list.iter().any(|s| same_style_name(&s.name, &style.name))
+        {
             list.push(style);
         }
     }
+}
+
+/// Replace all runtime-registered styles with a fresh list.
+pub fn set_runtime_styles(styles: impl IntoIterator<Item = OutputStyleDef>) {
+    if let Ok(mut list) = RUNTIME_STYLES.lock() {
+        list.clear();
+        for mut style in styles {
+            style.name = style.name.trim().to_string();
+            if !style.name.trim().is_empty()
+                && !list.iter().any(|s| same_style_name(&s.name, &style.name))
+            {
+                list.push(style);
+            }
+        }
+    }
+}
+
+/// Clear runtime-registered styles.
+pub fn clear_runtime_styles() {
+    set_runtime_styles(std::iter::empty());
 }
 
 /// Return all runtime-registered styles.
@@ -225,11 +347,18 @@ pub fn runtime_styles() -> Vec<OutputStyleDef> {
 pub fn all_styles_with_runtime(config_dir: &Path) -> Vec<OutputStyleDef> {
     let mut styles = all_styles(config_dir);
     let rt = runtime_styles();
-    for s in rt {
-        if !styles.iter().any(|existing| existing.name == s.name) {
-            styles.push(s);
-        }
-    }
+    append_unique_styles(&mut styles, rt);
+    styles
+}
+
+/// Like `all_styles_for_project`, but also includes runtime-registered plugin
+/// styles.
+pub fn all_styles_with_runtime_for_project(
+    config_dir: &Path,
+    project_dir: Option<&Path>,
+) -> Vec<OutputStyleDef> {
+    let mut styles = all_styles_for_project(config_dir, project_dir);
+    append_unique_styles(&mut styles, runtime_styles());
     styles
 }
 
@@ -243,7 +372,12 @@ pub fn find_style_runtime<'a>(
     }
     // Fall back to runtime registry.
     if let Ok(rt) = RUNTIME_STYLES.lock() {
-        if let Some(s) = rt.iter().find(|s| s.name == name) {
+        let name = name.trim();
+        if let Some(s) = rt
+            .iter()
+            .find(|s| s.name == name)
+            .or_else(|| rt.iter().find(|s| same_style_name(&s.name, name)))
+        {
             return Some(std::borrow::Cow::Owned(s.clone()));
         }
     }
@@ -277,6 +411,25 @@ mod tests {
     }
 
     #[test]
+    fn builtin_styles_include_prompt_enum_styles() {
+        let styles = builtin_styles();
+        for name in [
+            "default",
+            "concise",
+            "explanatory",
+            "learning",
+            "formal",
+            "casual",
+        ] {
+            assert!(
+                styles.iter().any(|style| style.name == name),
+                "missing built-in style: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
     fn builtin_default_has_empty_prompt() {
         let def = OutputStyleDef::builtin_default();
         assert!(def.prompt.is_empty());
@@ -303,6 +456,21 @@ mod tests {
         let found = find_style(&styles, "concise");
         assert!(found.is_some());
         assert_eq!(found.unwrap().name, "concise");
+    }
+
+    #[test]
+    fn find_style_trims_and_matches_case_insensitively() {
+        let styles = vec![OutputStyleDef {
+            name: " ProjectReview ".to_string(),
+            label: "Project Review".to_string(),
+            description: "Review style.".to_string(),
+            prompt: "Review carefully.".to_string(),
+        }];
+
+        assert_eq!(
+            find_style(&styles, " projectreview ").map(|style| style.name.as_str()),
+            Some(" ProjectReview ")
+        );
     }
 
     #[test]
@@ -341,8 +509,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_file(
             &dir,
-            "formal.json",
-            r#"{"name":"formal","label":"Formal","description":"Formal tone.","prompt":"Use formal language."}"#,
+            " formal.json",
+            r#"{"name":" formal ","label":"Formal","description":"Formal tone.","prompt":"Use formal language."}"#,
         );
         let styles = load_output_styles_dir(dir.path());
         assert_eq!(styles.len(), 1);
@@ -358,6 +526,7 @@ mod tests {
         write_file(&dir, "ignore.txt", "should be skipped");
         let styles = load_output_styles_dir(dir.path());
         assert!(styles.is_empty());
+        assert!(load_output_style_file(&dir.path().join("ignore.txt")).is_none());
     }
 
     #[test]
@@ -375,6 +544,36 @@ mod tests {
         let styles = load_output_styles_dir(dir.path());
         assert_eq!(styles[0].name, "apple");
         assert_eq!(styles[1].name, "zebra");
+    }
+
+    #[test]
+    fn runtime_style_names_are_trimmed_and_deduped_case_insensitively() {
+        clear_runtime_styles();
+
+        register_runtime_style(OutputStyleDef {
+            name: " ProjectReview ".to_string(),
+            label: "Project Review".to_string(),
+            description: "Review style.".to_string(),
+            prompt: "Review carefully.".to_string(),
+        });
+        register_runtime_style(OutputStyleDef {
+            name: "projectreview".to_string(),
+            label: "Duplicate".to_string(),
+            description: "Duplicate style.".to_string(),
+            prompt: "Should not replace the first style.".to_string(),
+        });
+
+        let styles = runtime_styles();
+        assert_eq!(styles.len(), 1);
+        assert_eq!(styles[0].name, "ProjectReview");
+        assert_eq!(
+            find_style_runtime(&[], " projectreview ")
+                .map(|style| style.name.clone())
+                .as_deref(),
+            Some("ProjectReview")
+        );
+
+        clear_runtime_styles();
     }
 
     // ---- all_styles --------------------------------------------------------
@@ -403,5 +602,57 @@ mod tests {
         assert!(styles.iter().any(|s| s.name == "pirate"));
         // Built-ins still present.
         assert!(styles.iter().any(|s| s.name == "default"));
+    }
+
+    #[test]
+    fn all_styles_for_project_loads_nearest_project_styles() {
+        let config_dir = TempDir::new().unwrap();
+        let global_styles_dir = config_dir.path().join("output-styles");
+        std::fs::create_dir_all(&global_styles_dir).unwrap();
+        std::fs::write(
+            global_styles_dir.join("shared.md"),
+            "# Shared\nGlobal style.\n\nUse the global style.",
+        )
+        .unwrap();
+        let project_dir = TempDir::new().unwrap();
+        let output_styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&output_styles_dir).unwrap();
+        std::fs::write(
+            output_styles_dir.join("project-style.md"),
+            "# Project Style\nProject-local style.\n\nUse project-specific phrasing.",
+        )
+        .unwrap();
+        std::fs::write(
+            output_styles_dir.join("shared.md"),
+            "# Shared\nProject style.\n\nUse the project style.",
+        )
+        .unwrap();
+        std::fs::write(
+            output_styles_dir.join("Concise.md"),
+            "# Concise\nShould not replace built-in.\n\nDo not use this prompt.",
+        )
+        .unwrap();
+        let nested_dir = project_dir.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let styles = all_styles_for_project(config_dir.path(), Some(&nested_dir));
+
+        assert!(styles.iter().any(|s| s.name == "project-style"));
+        assert!(styles.iter().any(|s| s.name == "default"));
+        assert_eq!(
+            styles
+                .iter()
+                .filter(|style| style.name.eq_ignore_ascii_case("concise"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            find_style(&styles, "concise").map(|style| style.name.as_str()),
+            Some("concise")
+        );
+        assert_eq!(
+            find_style(&styles, "shared").map(|style| style.prompt.as_str()),
+            Some("Use the project style.")
+        );
     }
 }

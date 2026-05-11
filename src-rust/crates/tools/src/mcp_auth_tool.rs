@@ -37,7 +37,7 @@ impl Tool for McpAuthTool {
     }
 
     fn permission_level(&self) -> PermissionLevel {
-        PermissionLevel::None
+        PermissionLevel::Network
     }
 
     fn input_schema(&self) -> Value {
@@ -64,7 +64,7 @@ impl Tool for McpAuthTool {
             None => {
                 return ToolResult::error(
                     "No MCP manager configured. Cannot authenticate MCP servers.".to_string(),
-                )
+                );
             }
         };
 
@@ -96,6 +96,14 @@ impl Tool for McpAuthTool {
             McpServerStatus::Disconnected { .. } => {
                 // Fall through to attempt auth.
             }
+        }
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Initiate MCP OAuth for {}", params.server_name),
+            false,
+        ) {
+            return ToolResult::error(e.to_string());
         }
 
         // 2. Use McpManager::initiate_auth() to build the PKCE auth URL.
@@ -130,5 +138,58 @@ impl Tool for McpAuthTool {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mangocode_core::config::{Config, McpServerConfig, PermissionMode};
+    use mangocode_core::permissions::AutoPermissionHandler;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    async fn context_with_disconnected_mcp_server() -> ToolContext {
+        let manager = mangocode_mcp::McpManager::connect_all(&[McpServerConfig {
+            name: "needs-auth".to_string(),
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some("https://example.com/mcp".to_string()),
+            headers: HashMap::new(),
+            pipedream: None,
+            server_type: "unsupported-test-transport".to_string(),
+        }])
+        .await;
+
+        ToolContext {
+            working_dir: std::path::PathBuf::from("/workspace"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "mcp-auth-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: Some(Arc::new(manager)),
+            config: Config::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_requires_network_permission_before_initiating_auth() {
+        let ctx = context_with_disconnected_mcp_server().await;
+        let result = McpAuthTool
+            .execute(json!({ "server_name": "needs-auth" }), &ctx)
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Permission denied"));
     }
 }

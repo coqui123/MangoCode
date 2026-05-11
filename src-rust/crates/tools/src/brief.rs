@@ -30,6 +30,20 @@ fn default_status() -> String {
     "normal".to_string()
 }
 
+fn normalize_brief_status(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Ok("normal"),
+        "proactive" => Ok("proactive"),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid status: {value}. Expected one of: normal, proactive"
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct AttachmentMeta {
     path: String,
@@ -78,7 +92,7 @@ impl Tool for BriefTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let params: BriefInput = match serde_json::from_value(input) {
+        let mut params: BriefInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
@@ -86,6 +100,11 @@ impl Tool for BriefTool {
         if params.message.trim().is_empty() {
             return ToolResult::error("Message cannot be empty.".to_string());
         }
+        let status = match normalize_brief_status(&params.status) {
+            Ok(status) => status,
+            Err(e) => return ToolResult::error(e),
+        };
+        params.status = status.to_string();
 
         // Resolve and validate attachments
         let mut resolved: Vec<AttachmentMeta> = Vec::new();
@@ -157,4 +176,18 @@ async fn resolve_attachment(path: &Path) -> Result<AttachmentMeta, String> {
         size,
         is_image,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brief_status_is_normalized_or_rejected() {
+        assert_eq!(normalize_brief_status(" proactive "), Ok("proactive"));
+        let err = normalize_brief_status("normal\nproactive")
+            .expect_err("invalid status must be rejected");
+        assert!(err.contains("Invalid status"));
+        assert!(err.contains("\"normal\\nproactive\""));
+    }
 }

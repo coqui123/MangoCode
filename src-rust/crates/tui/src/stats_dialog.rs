@@ -819,6 +819,15 @@ fn heatmap_color(intensity: f64) -> Color {
 // Models tab
 // ---------------------------------------------------------------------------
 
+fn truncate_model_id_for_display(model_id: &str) -> String {
+    let model_len = model_id.chars().count();
+    if model_len > 42 {
+        format!("{}...", model_id.chars().take(39).collect::<String>())
+    } else {
+        model_id.to_string()
+    }
+}
+
 fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
     if state.model_breakdown.is_empty() {
         Paragraph::new("No model usage data yet.")
@@ -855,11 +864,7 @@ fn render_models(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
         total_cost += entry.cost_usd;
 
         // Truncate long model IDs
-        let model_display = if entry.model_id.len() > 42 {
-            format!("{}...", &entry.model_id[..39])
-        } else {
-            entry.model_id.clone()
-        };
+        let model_display = truncate_model_id_for_display(&entry.model_id);
 
         lines.push(Line::from(vec![
             Span::styled(
@@ -956,6 +961,16 @@ mod tests {
             agg.daily_tokens.push((date.to_string(), 100));
         }
         agg
+    }
+
+    #[test]
+    fn truncate_model_id_handles_unicode_boundaries() {
+        let model_id = format!("{}é中{}", "a".repeat(38), "b".repeat(8));
+        let truncated = truncate_model_id_for_display(&model_id);
+
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.starts_with(&"a".repeat(38)));
+        assert!(truncated.contains('é'));
     }
 
     // ---- model breakdown: add_model_usage ----------------------------------

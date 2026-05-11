@@ -81,7 +81,10 @@ pub use providers::MinimaxProvider;
 pub use providers::OpenAiProvider;
 
 // Phase 3 re-exports — model registry.
-pub use model_registry::{effective_model_for_config, ModelEntry, ModelRegistry};
+pub use model_registry::{
+    apply_model_selection_to_config, effective_model_for_config, normalize_model_id, ModelEntry,
+    ModelRegistry,
+};
 
 // Phase 6 re-exports — provider-aware error handling.
 pub use error_handling::{is_context_overflow, parse_error_response, RetryConfig};

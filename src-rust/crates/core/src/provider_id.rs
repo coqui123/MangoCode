@@ -73,6 +73,76 @@ impl ProviderId {
     pub const ANTHROPIC_MAX: &'static str = "anthropic-max";
     /// OpenAI Codex (ChatGPT plan) via OAuth — distinct from API-key `openai`.
     pub const OPENAI_CODEX: &'static str = "openai-codex";
+
+    /// Provider IDs that may be used as the first segment in a canonical
+    /// `"provider/model"` model string.
+    pub const KNOWN_MODEL_PREFIXES: &'static [&'static str] = &[
+        Self::ANTHROPIC,
+        Self::ANTHROPIC_MAX,
+        Self::OPENAI,
+        Self::OPENAI_CODEX,
+        "codex",
+        Self::GOOGLE,
+        Self::GOOGLE_VERTEX,
+        Self::GROQ,
+        Self::MISTRAL,
+        Self::DEEPSEEK,
+        Self::XAI,
+        Self::COHERE,
+        Self::PERPLEXITY,
+        Self::CEREBRAS,
+        Self::OPENROUTER,
+        "togetherai",
+        Self::TOGETHER_AI,
+        Self::DEEPINFRA,
+        Self::VENICE,
+        Self::GITHUB_COPILOT,
+        Self::OLLAMA,
+        "lmstudio",
+        Self::LM_STUDIO,
+        "llamacpp",
+        Self::LLAMA_CPP,
+        Self::AZURE,
+        Self::AMAZON_BEDROCK,
+        Self::HUGGINGFACE,
+        Self::NVIDIA,
+        Self::FIREWORKS,
+        Self::SAMBANOVA,
+        Self::MINIMAX,
+        Self::SILICONFLOW,
+        Self::MOONSHOT,
+        "moonshot",
+        Self::ZHIPU,
+        "zhipu",
+        "qwen",
+        Self::NEBIUS,
+        Self::NOVITA,
+        Self::OVHCLOUD,
+        Self::SCALEWAY,
+        Self::VULTR,
+        Self::BASETEN,
+        Self::FRIENDLI,
+        Self::UPSTAGE,
+        Self::STEPFUN,
+    ];
+
+    /// Return true when `provider` is a known MangoCode provider identifier
+    /// suitable for canonical `"provider/model"` strings.
+    pub fn is_known_model_prefix(provider: &str) -> bool {
+        Self::KNOWN_MODEL_PREFIXES.contains(&provider)
+    }
+
+    /// Split a canonical `"provider/model"` string only when the first segment
+    /// is a known provider. Unknown first segments are model namespaces, such as
+    /// `"meta-llama/Llama-3"` routed through OpenRouter or another gateway.
+    pub fn split_known_model_prefix(model: &str) -> Option<(&str, &str)> {
+        let (provider, model_id) = model.split_once('/')?;
+        if !model_id.is_empty() && Self::is_known_model_prefix(provider) {
+            Some((provider, model_id))
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for ProviderId {
@@ -166,5 +236,26 @@ impl PartialEq<str> for ModelId {
 impl PartialEq<&str> for ModelId {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderId;
+
+    #[test]
+    fn split_known_model_prefix_accepts_provider_ids() {
+        assert_eq!(
+            ProviderId::split_known_model_prefix("openrouter/openai/gpt-4o"),
+            Some(("openrouter", "openai/gpt-4o"))
+        );
+    }
+
+    #[test]
+    fn split_known_model_prefix_rejects_model_namespaces() {
+        assert_eq!(
+            ProviderId::split_known_model_prefix("meta-llama/Llama-3.3-70B"),
+            None
+        );
     }
 }

@@ -5,7 +5,7 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::overlays::centered_rect;
 
@@ -181,11 +181,14 @@ fn truncate_display(s: &str, max_width: usize) -> String {
         return "…".to_string();
     }
     let mut out = String::new();
+    let mut width = 0usize;
     for ch in s.chars() {
-        if out.width() + ch.len_utf8() + 1 > max_width {
+        let ch_width = ch.width().unwrap_or(0);
+        if width + ch_width + 1 > max_width {
             break;
         }
         out.push(ch);
+        width += ch_width;
     }
     format!("{}…", out)
 }
@@ -637,6 +640,14 @@ mod tests {
             result.width() <= 6,
             "truncated string should fit within budget"
         );
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_display_uses_display_width_for_unicode() {
+        let result = truncate_display("ab中def", 5);
+
+        assert!(result.width() <= 5);
         assert!(result.ends_with('…'));
     }
 }

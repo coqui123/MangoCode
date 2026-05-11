@@ -6,7 +6,7 @@
 // The AgentTool creates a nested query loop with its own context, enabling
 // the model to delegate complex work to specialized sub-agents. Each sub-agent:
 //   - Runs its own agentic loop
-//   - Has access to all tools (except AgentTool itself, preventing infinite recursion)
+//   - Has access to parent-visible tools (except AgentTool itself, preventing infinite recursion)
 //   - Returns its final output as the tool result
 //
 // New capabilities (TS parity):
@@ -64,6 +64,13 @@ pub fn poll_background_agent(agent_id: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn normalize_model_override(model: Option<String>) -> Option<String> {
+    model.and_then(|model| {
+        let model = model.trim();
+        (!model.is_empty()).then(|| model.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -282,10 +289,7 @@ fn build_provider_and_model_registries(
     );
 
     let mut model_registry = mangocode_api::ModelRegistry::new();
-    if let Some(cache_dir) = dirs::cache_dir() {
-        let cache_path = cache_dir.join("mangocode").join("models_dev.json");
-        model_registry.load_cache(&cache_path);
-    }
+    model_registry.load_standard_cache();
 
     (provider_registry, std::sync::Arc::new(model_registry))
 }
@@ -353,7 +357,13 @@ fn build_subagent_tools(
         mangocode_tools::extend_with_mcp_tools(&mut tools, manager);
     }
 
-    tools
+    let parent_visible_tools = mangocode_tools::filter_tools_by_name_config(
+        tools,
+        &parent_ctx.config.allowed_tools,
+        &parent_ctx.config.disallowed_tools,
+    );
+
+    parent_visible_tools
         .into_iter()
         .filter(|tool| tool.name() != mangocode_core::constants::TOOL_NAME_AGENT)
         .filter(|tool| {
@@ -413,7 +423,7 @@ impl Tool for AgentTool {
                 "tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "List of tool names to make available. Defaults to all tools."
+                    "description": "List of parent-visible tool names to make available. Defaults to all parent-visible tools."
                 },
                 "system_prompt": {
                     "type": "string",
@@ -488,10 +498,9 @@ impl Tool for AgentTool {
         let agent_tools = build_subagent_tools(ctx, params.tools.as_deref());
 
         // Resolve model: explicit override > default.
-        let model = params
-            .model
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| ctx.config.effective_model().to_string());
+        let model = normalize_model_override(params.model).unwrap_or_else(|| {
+            mangocode_api::effective_model_for_config(&ctx.config, model_registry.as_ref())
+        });
 
         // Resolve effective mode (same logic as execute_with_runtime).
         let allow_teammate_fallback = params.allow_teammate_fallback.unwrap_or(false);
@@ -524,22 +533,13 @@ impl Tool for AgentTool {
 
             if let Some(registry) = mangocode_plugins::global_plugin_registry() {
                 let mut agent_defs = String::new();
-                for agent_dir in registry.all_agent_paths() {
-                    if let Ok(entries) = std::fs::read_dir(&agent_dir) {
-                        for entry in entries.flatten() {
-                            let p = entry.path();
-                            if p.extension().is_some_and(|e| e == "md") {
-                                if let Ok(content) = std::fs::read_to_string(&p) {
-                                    let name =
-                                        p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent");
-                                    agent_defs.push_str(&format!(
-                                        "\n\n## Agent: {}\n{}",
-                                        name,
-                                        content.trim()
-                                    ));
-                                }
-                            }
-                        }
+                for agent_file in registry.all_agent_files() {
+                    if let Ok(content) = std::fs::read_to_string(&agent_file) {
+                        let name = agent_file
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("agent");
+                        agent_defs.push_str(&format!("\n\n## Agent: {}\n{}", name, content.trim()));
                     }
                 }
                 if !agent_defs.is_empty() {
@@ -598,11 +598,16 @@ impl Tool for AgentTool {
             .project_dir
             .clone()
             .unwrap_or_else(|| agent_ctx.working_dir.clone());
+        let prefetch_skills_config = agent_ctx.config.skills.clone();
         let skill_index_bg = skill_index.clone();
         tokio::spawn(async move {
-            crate::prefetch_skills(&prefetch_root, skill_index_bg).await;
+            crate::prefetch_skills(&prefetch_root, &prefetch_skills_config, skill_index_bg).await;
         });
 
+        let oauth_provider = crate::oauth_provider_for_config_and_model(&agent_ctx.config, &model);
+        let has_append_system_prompt = append_system_prompt
+            .as_deref()
+            .is_some_and(|append| !append.trim().is_empty());
         let query_config = QueryConfig {
             model,
             max_tokens: mangocode_core::constants::DEFAULT_MAX_TOKENS,
@@ -625,9 +630,9 @@ impl Tool for AgentTool {
             agent_name: None,
             agent_definition: None,
             model_registry: Some(model_registry),
-            oauth_provider: mangocode_core::system_prompt::OAuthProvider::from_provider_id(
-                agent_ctx.config.provider.as_deref().unwrap_or(""),
-            ),
+            oauth_provider,
+            is_non_interactive: agent_ctx.non_interactive,
+            has_append_system_prompt,
             skills: agent_ctx.config.skills.clone(),
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
@@ -904,10 +909,8 @@ pub async fn execute_with_runtime(
     let model = params
         .model
         .clone()
-        .filter(|m| !m.is_empty())
-        .or_else(|| {
-            (!parent_query_config.model.is_empty()).then(|| parent_query_config.model.clone())
-        })
+        .and_then(|m| normalize_model_override(Some(m)))
+        .or_else(|| normalize_model_override(Some(parent_query_config.model.clone())))
         .unwrap_or_else(|| mangocode_core::constants::DEFAULT_MODEL.to_string());
 
     // -----------------------------------------------------------------------
@@ -975,24 +978,17 @@ pub async fn execute_with_runtime(
 
                 if let Some(registry) = mangocode_plugins::global_plugin_registry() {
                     let mut agent_defs = String::new();
-                    for agent_dir in registry.all_agent_paths() {
-                        if let Ok(entries) = std::fs::read_dir(&agent_dir) {
-                            for entry in entries.flatten() {
-                                let p = entry.path();
-                                if p.extension().is_some_and(|e| e == "md") {
-                                    if let Ok(content) = std::fs::read_to_string(&p) {
-                                        let name = p
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .unwrap_or("agent");
-                                        agent_defs.push_str(&format!(
-                                            "\n\n## Agent: {}\n{}",
-                                            name,
-                                            content.trim()
-                                        ));
-                                    }
-                                }
-                            }
+                    for agent_file in registry.all_agent_files() {
+                        if let Ok(content) = std::fs::read_to_string(&agent_file) {
+                            let name = agent_file
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("agent");
+                            agent_defs.push_str(&format!(
+                                "\n\n## Agent: {}\n{}",
+                                name,
+                                content.trim()
+                            ));
                         }
                     }
                     if !agent_defs.is_empty() {
@@ -1063,6 +1059,14 @@ pub async fn execute_with_runtime(
     query_config.command_queue = None;
     query_config.agent_name = None;
     query_config.agent_definition = None;
+    query_config.oauth_provider =
+        crate::oauth_provider_for_config_and_model(&agent_ctx.config, &query_config.model);
+    query_config.is_non_interactive = agent_ctx.non_interactive;
+    query_config.has_append_system_prompt = query_config.has_append_system_prompt
+        || query_config
+            .append_system_prompt
+            .as_deref()
+            .is_some_and(|append| !append.trim().is_empty());
 
     // -----------------------------------------------------------------------
     // Background mode: launch a detached sub-agent while preserving the active
@@ -1384,7 +1388,7 @@ pub fn init_team_swarm_runner() {
                             return format!(
                                 "[Agent '{}' failed to create client: {}]",
                                 description, e
-                            )
+                            );
                         }
                     };
 
@@ -1398,7 +1402,10 @@ pub fn init_team_swarm_runner() {
                     ctx.working_dir.clone(),
                 ));
 
-                let model = agent_ctx.config.effective_model().to_string();
+                let model = mangocode_api::effective_model_for_config(
+                    &agent_ctx.config,
+                    model_registry.as_ref(),
+                );
 
                 let system_prompt = system.unwrap_or_else(|| {
                     "You are a specialized AI agent helping with a specific sub-task. \
@@ -1406,6 +1413,8 @@ pub fn init_team_swarm_runner() {
                         .to_string()
                 });
 
+                let oauth_provider =
+                    crate::oauth_provider_for_config_and_model(&agent_ctx.config, &model);
                 let query_config = crate::QueryConfig {
                     model,
                     max_tokens: mangocode_core::constants::DEFAULT_MAX_TOKENS,
@@ -1416,6 +1425,11 @@ pub fn init_team_swarm_runner() {
                     output_style_prompt: agent_ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(provider_registry),
                     model_registry: Some(model_registry),
+                    qwen_preserve_thinking: agent_ctx.config.preserve_thinking,
+                    oauth_provider,
+                    is_non_interactive: agent_ctx.non_interactive,
+                    has_append_system_prompt: false,
+                    skills: agent_ctx.config.skills.clone(),
                     ..Default::default()
                 };
 
@@ -1460,32 +1474,74 @@ mod tests {
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob"),
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
-    use super::{build_subagent_context, build_subagent_tools};
+    use super::build_subagent_context;
     #[cfg(any(
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob"),
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash"),
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob"),
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
+    use super::build_subagent_tools;
+    use super::normalize_model_override;
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash"),
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob"),
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
     use mangocode_tools::ToolContext;
+
+    #[test]
+    fn model_override_is_trimmed_and_blank_is_ignored() {
+        assert_eq!(
+            normalize_model_override(Some(" openai/gpt-4o ".to_string())).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        assert!(normalize_model_override(Some("   ".to_string())).is_none());
+        assert!(normalize_model_override(None).is_none());
+    }
     #[cfg(any(
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob"),
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash"),
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob"),
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
     use std::path::PathBuf;
     #[cfg(any(
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob"),
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash"),
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob"),
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
     use std::sync::Arc;
 
@@ -1493,8 +1549,13 @@ mod tests {
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob"),
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash"),
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob"),
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
     fn test_context() -> ToolContext {
         ToolContext {
@@ -1520,7 +1581,7 @@ mod tests {
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-glob")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-glob")
     ))]
     #[test]
     fn subagent_tool_allowlist_accepts_runtime_aliases() {
@@ -1536,7 +1597,46 @@ mod tests {
         feature = "default-tools",
         feature = "default-tools-no-web-research",
         feature = "full-tools",
-        all(feature = "tool-read", feature = "tool-tool-search")
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash")
+    ))]
+    #[test]
+    fn subagent_tools_inherit_parent_visibility_config() {
+        let mut parent_ctx = test_context();
+        parent_ctx.config.allowed_tools = vec!["Read".to_string()];
+
+        let tools = build_subagent_tools(&parent_ctx, None);
+
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-agent", feature = "tool-read", feature = "tool-bash")
+    ))]
+    #[test]
+    fn subagent_requested_tools_cannot_reenable_parent_disallowed_tool() {
+        let mut parent_ctx = test_context();
+        parent_ctx.config.disallowed_tools = vec!["shell_command".to_string()];
+        let requested = vec!["Read".to_string(), "Bash".to_string()];
+
+        let tools = build_subagent_tools(&parent_ctx, Some(&requested));
+
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
     ))]
     #[test]
     fn subagent_context_matches_runtime_tools_and_working_directory() {

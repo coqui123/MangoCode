@@ -24,6 +24,9 @@ full-tools = [
     "mangocode-query/full-tools",
     "mangocode-tools/full-tools",
     "mangocode-tui/full-tools",
+    "tool-browser",
+    "tool-computer-use",
+    "tool-rendered-fetch",
 ]
 tool-agent = ["mangocode-query/tool-agent", "mangocode-tools/tool-agent", "mangocode-tui/tool-agent"]
 tool-apply-patch = ["mangocode-query/tool-apply-patch", "mangocode-tools/tool-apply-patch", "mangocode-tui/tool-apply-patch"]
@@ -58,7 +61,11 @@ tool-pr-watch = ["mangocode-query/tool-pr-watch", "mangocode-tools/tool-pr-watch
 tool-read = ["mangocode-query/tool-read", "mangocode-tools/tool-read", "mangocode-tui/tool-read"]
 tool-read-mcp-resource = ["mangocode-query/tool-read-mcp-resource", "mangocode-tools/tool-read-mcp-resource", "mangocode-tui/tool-read-mcp-resource"]
 tool-remote-trigger = ["mangocode-query/tool-remote-trigger", "mangocode-tools/tool-remote-trigger", "mangocode-tui/tool-remote-trigger"]
-tool-rendered-fetch = ["mangocode-query/tool-rendered-fetch", "mangocode-tools/tool-rendered-fetch", "mangocode-tui/tool-rendered-fetch"]
+tool-rendered-fetch = [
+    "mangocode-query/tool-rendered-fetch",
+    "mangocode-tools/tool-rendered-fetch",
+    "mangocode-tui/tool-rendered-fetch",
+]
 tool-repl = ["mangocode-query/tool-repl", "mangocode-tools/tool-repl", "mangocode-tui/tool-repl"]
 tool-send-message = ["mangocode-query/tool-send-message", "mangocode-tools/tool-send-message", "mangocode-tui/tool-send-message"]
 tool-skill = ["mangocode-query/tool-skill", "mangocode-tools/tool-skill", "mangocode-tui/tool-skill"]
@@ -108,7 +115,7 @@ qrcode = { workspace = true }
 mangocode-bridge = { workspace = true }
 hostname = "0.4"
 rpassword = "7"
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }

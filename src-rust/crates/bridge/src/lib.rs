@@ -1032,7 +1032,11 @@ pub async fn start_bridge_session(
                 if body_text.is_empty() {
                     String::new()
                 } else {
-                    format!("Response: {}", &body_text[..body_text.len().min(200)])
+                    let mut end = body_text.len().min(200);
+                    while end > 0 && !body_text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("Response: {}", &body_text[..end])
                 }
             );
         }

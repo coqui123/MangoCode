@@ -8,7 +8,9 @@
 
 use crate::oauth::OAuthTokens;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "voice")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "voice")]
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},

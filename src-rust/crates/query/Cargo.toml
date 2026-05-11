@@ -21,6 +21,9 @@ default-tools-no-web-research = [
 full-tools = [
     "mangocode-tools/full-tools",
     "tool-agent",
+    "tool-browser",
+    "tool-computer-use",
+    "tool-rendered-fetch",
     "tool-team-create",
     "tool-team-delete",
 ]

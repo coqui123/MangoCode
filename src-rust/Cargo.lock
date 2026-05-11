@@ -3600,6 +3600,7 @@ dependencies = [
  "mangocode-api",
  "mangocode-core",
  "mangocode-mcp",
+ "mangocode-plugins",
  "mangocode-tool-runtime",
  "nix 0.29.0",
  "once_cell",

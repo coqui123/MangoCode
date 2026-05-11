@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::bypass_permissions_dialog::render_bypass_permissions_dialog;
+use crate::casefold::case_insensitive_non_overlapping_matches;
 use crate::context_viz::render_context_viz;
 use crate::desktop_upsell_startup::render_desktop_upsell_startup;
 use crate::device_auth_dialog::render_device_auth_dialog;
@@ -65,6 +66,68 @@ const SPINNER: &[char] = &[
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 176, 32); // #FFB020 golden mango
 const MIN_WELCOME_BOX_HEIGHT: u16 = 10;
 const MAX_WELCOME_BOX_HEIGHT: u16 = 20;
+
+fn configured_provider(config: &mangocode_core::config::Config) -> Option<&str> {
+    config
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+}
+
+fn model_display_label(model_name: &str, configured_provider: Option<&str>) -> String {
+    if let Some(provider) = configured_provider {
+        let provider_prefix = format!("{}/", provider);
+        if let Some(model) = model_name.strip_prefix(&provider_prefix) {
+            return if provider == "anthropic" {
+                model.to_string()
+            } else {
+                format!("{} [{}]", model, provider)
+            };
+        }
+
+        if model_name.contains('/') {
+            return format!("{} [{}]", model_name, provider);
+        }
+
+        return if provider == "anthropic" {
+            model_name.to_string()
+        } else {
+            format!("{} [{}]", model_name, provider)
+        };
+    }
+
+    if let Some((provider, model)) =
+        mangocode_core::ProviderId::split_known_model_prefix(model_name)
+    {
+        if provider == "anthropic" {
+            model.to_string()
+        } else {
+            format!("{} [{}]", model, provider)
+        }
+    } else {
+        model_name.to_string()
+    }
+}
+
+pub(crate) fn compact_model_label<'a>(
+    model_name: &'a str,
+    configured_provider: Option<&str>,
+) -> &'a str {
+    let configured_provider = configured_provider.filter(|provider| !provider.is_empty());
+    if let Some(provider) = configured_provider {
+        let provider_prefix = format!("{}/", provider);
+        if let Some(model) = model_name.strip_prefix(&provider_prefix) {
+            return model;
+        }
+        if model_name.contains('/') {
+            return model_name;
+        }
+    }
+
+    mangocode_core::ProviderId::split_known_model_prefix(model_name)
+        .map(|(_, model)| model)
+        .unwrap_or(model_name)
+}
 
 // ---------------------------------------------------------------------------
 // Inline image post-draw blit
@@ -399,6 +462,13 @@ fn flatten_line_text(line: &Line<'_>) -> String {
         .map(|span| span.content.to_string())
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn case_insensitive_match_ranges(text: &str, query: &str) -> Vec<(usize, usize)> {
+    case_insensitive_non_overlapping_matches(text, query)
+        .into_iter()
+        .map(|m| (m.original_start, m.original_end))
+        .collect()
 }
 
 fn hash_expanded_tool_outputs(set: &std::collections::HashSet<String>) -> u64 {
@@ -974,6 +1044,26 @@ mod tests {
     }
 
     #[test]
+    fn truncate_end_handles_unicode_display_width() {
+        let truncated = truncate_end("ab中def", 5);
+
+        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 5);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn case_insensitive_match_ranges_handles_expanding_unicode_casefold() {
+        let text = "prefix İ suffix";
+        let ranges = case_insensitive_match_ranges(text, "i");
+
+        assert!(ranges.contains(&(7, 9)));
+        for (start, end) in ranges {
+            assert!(text.is_char_boundary(start));
+            assert!(text.is_char_boundary(end));
+        }
+    }
+
+    #[test]
     fn spinner_color_turns_red_after_stall_timeout() {
         let mut app = App::new(
             mangocode_core::config::Config::default(),
@@ -982,6 +1072,43 @@ mod tests {
         app.stall_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
 
         assert_eq!(spinner_color(&app), Color::Red);
+    }
+
+    #[test]
+    fn model_display_preserves_gateway_namespaces() {
+        assert_eq!(
+            model_display_label("anthropic/claude-sonnet-4", Some("openrouter")),
+            "anthropic/claude-sonnet-4 [openrouter]"
+        );
+        assert_eq!(
+            compact_model_label("anthropic/claude-sonnet-4", Some("openrouter")),
+            "anthropic/claude-sonnet-4"
+        );
+    }
+
+    #[test]
+    fn model_display_strips_matching_known_provider_prefixes() {
+        assert_eq!(
+            model_display_label("anthropic/claude-haiku-4-5", Some("anthropic")),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            model_display_label("openai/gpt-4o", Some("openai")),
+            "gpt-4o [openai]"
+        );
+        assert_eq!(
+            compact_model_label("openai/gpt-4o", Some("openai")),
+            "gpt-4o"
+        );
+    }
+
+    #[test]
+    fn model_display_labels_bare_non_anthropic_provider_models() {
+        assert_eq!(
+            model_display_label("gpt-4o", Some("openai")),
+            "gpt-4o [openai]"
+        );
+        assert_eq!(compact_model_label("gpt-4o", Some("openai")), "gpt-4o");
     }
 }
 
@@ -1091,7 +1218,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     // Highlight transcript search matches (all + current match)
     let lines = if !app.transcript_search.query.is_empty() {
-        let query_lc = app.transcript_search.query.to_lowercase();
+        let query = app.transcript_search.query.as_str();
+        let query_lc = query.to_lowercase();
         let current_match = app.transcript_search.current_match;
         let mut match_cursor = 0usize;
         lines
@@ -1105,16 +1233,15 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
                         .into_iter()
                         .flat_map(|span| {
                             let original_style = span.style;
-                            let span_lc = span.content.to_lowercase();
-                            if !span_lc.contains(query_lc.as_str()) {
+                            let text = span.content.to_string();
+                            let ranges = case_insensitive_match_ranges(&text, query);
+                            if ranges.is_empty() {
                                 return vec![span];
                             }
 
-                            let text = span.content.to_string();
                             let mut result: Vec<Span<'static>> = Vec::new();
                             let mut cursor = 0usize;
-                            while let Some(rel) = span_lc[cursor..].find(query_lc.as_str()) {
-                                let abs = cursor + rel;
+                            for (abs, end) in ranges {
                                 if abs > cursor {
                                     result.push(Span::styled(
                                         text[cursor..abs].to_string(),
@@ -1132,7 +1259,6 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
                                 } else {
                                     original_style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow)
                                 };
-                                let end = abs + query_lc.len();
                                 result.push(Span::styled(text[abs..end].to_string(), style));
                                 match_cursor += 1;
                                 cursor = end;
@@ -1611,15 +1737,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     }
     // Only show model line if credentials are configured
     if show_model_line {
-        let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
-            if provider == "anthropic" {
-                model.to_string()
-            } else {
-                format!("{} [{}]", model, provider)
-            }
-        } else {
-            app.model_name.clone()
-        };
+        let model_display = model_display_label(&app.model_name, configured_provider(&app.config));
         left_lines.push(Line::from(Span::styled(
             format!("{} \u{00b7} API Usage", model_display),
             Style::default().fg(Color::DarkGray),
@@ -2004,11 +2122,8 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
 
         let status_line = if app.has_credentials {
             // Show model (strip provider prefix for compact display).
-            let model_short = if let Some((_, model)) = app.model_name.split_once('/') {
-                model
-            } else {
-                &app.model_name
-            };
+            let model_short =
+                compact_model_label(&app.model_name, configured_provider(&app.config));
             Line::from(vec![
                 Span::styled(
                     format!(" {} ", model_short),
@@ -2359,11 +2474,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         if app.is_streaming {
             let provider_id = app.config.provider.as_deref().unwrap_or("anthropic");
             let provider_name = provider_status_name(provider_id);
-            let model_short = app
-                .model_name
-                .rsplit('/')
-                .next()
-                .unwrap_or(app.model_name.as_str());
+            let model_short =
+                compact_model_label(&app.model_name, configured_provider(&app.config));
             let auth_source = if app.auth_store.get(provider_id).is_some() {
                 "stored"
             } else {
@@ -2850,13 +2962,7 @@ fn render_legacy_history_search(
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let truncated = if UnicodeWidthStr::width(entry) > (dialog_width as usize - 6) {
-                let mut s = entry.to_string();
-                s.truncate(dialog_width as usize - 9);
-                format!("{}\u{2026}", s)
-            } else {
-                entry.to_string()
-            };
+            let truncated = truncate_end(entry, dialog_width as usize - 6);
 
             let (prefix, style) = if is_selected {
                 (
@@ -3001,7 +3107,7 @@ pub fn render_full_status_line(
 
     // Session ID
     if let Some(sid) = &data.session_id {
-        let short = &sid[..sid.len().min(8)];
+        let short = mangocode_core::truncate::truncate_bytes_prefix(sid, 8);
         spans.push(Span::styled(
             format!("[session:{}]", short),
             Style::default().fg(Color::DarkGray),

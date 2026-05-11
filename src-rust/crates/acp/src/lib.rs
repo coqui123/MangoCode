@@ -6,6 +6,7 @@
 use mangocode_core::config::{Config, PermissionMode, Settings};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::file_history::FileHistory;
+use mangocode_core::history::{apply_session_model_to_config, canonical_session_model};
 use mangocode_core::types::{ContentBlock, Message, MessageContent, Role};
 use mangocode_core::{PermissionDecision, PermissionHandler, PermissionRequest};
 use mangocode_tools::ToolContext;
@@ -285,12 +286,7 @@ async fn create_session(
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let model_override = params
-        .get("model")
-        .or_else(|| params.get("modelId"))
-        .or_else(|| params.get("model_id"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let model_override = params_model_id(&params);
     let model = model_override
         .clone()
         .unwrap_or_else(|| mangocode_core::constants::DEFAULT_MODEL.to_string());
@@ -338,7 +334,8 @@ async fn load_session(
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let acp_session = AcpSession {
-        model_override: Some(session.model.clone()),
+        model_override: (!session.model.trim().is_empty())
+            .then(|| session.model.trim().to_string()),
         session,
         cwd,
         permission_mode: None,
@@ -448,7 +445,8 @@ async fn prompt_session(
         )
         .await;
 
-        session_guard.session.model = runtime.query_config.model.clone();
+        session_guard.session.model =
+            canonical_session_model(&runtime.tool_ctx.config, &runtime.query_config.model);
         session_guard.session.working_dir = Some(session_guard.cwd.display().to_string());
         session_guard.session.total_cost = runtime.cost_tracker.total_cost_usd();
         session_guard.session.total_tokens =
@@ -539,13 +537,8 @@ async fn set_session_model(
     let params = params.unwrap_or(Value::Null);
     let session_id = params_session_id(&params)
         .ok_or_else(|| anyhow::anyhow!("session/set_model requires sessionId"))?;
-    let model = params
-        .get("modelId")
-        .or_else(|| params.get("model_id"))
-        .or_else(|| params.get("model"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("session/set_model requires modelId"))?
-        .to_string();
+    let model = params_model_id(&params)
+        .ok_or_else(|| anyhow::anyhow!("session/set_model requires non-empty modelId"))?;
 
     let session_arc = {
         let sessions = state.sessions.lock().unwrap();
@@ -619,15 +612,10 @@ async fn build_runtime(
     out_tx: OutboundTx,
     state: Arc<AcpServerState>,
 ) -> anyhow::Result<QueryRuntime> {
-    let mut config = acp_effective_config(cwd, model_override, mode_override, true).await;
+    let config = acp_effective_config(cwd, model_override, mode_override, true).await;
 
-    let model_registry = mangocode_api::ModelRegistry::new();
-    if config.model.is_none() {
-        config.model = Some(mangocode_api::effective_model_for_config(
-            &config,
-            &model_registry,
-        ));
-    }
+    let mut model_registry = mangocode_api::ModelRegistry::new();
+    model_registry.load_standard_cache();
 
     let (api_key, use_bearer_auth) = match config.resolve_auth_async().await {
         Some(auth) => auth,
@@ -683,6 +671,7 @@ async fn build_runtime(
 
     let mut query_config =
         mangocode_query::QueryConfig::from_config_with_registry(&config, &model_registry);
+    cost_tracker.set_model(&query_config.model);
     query_config.provider_registry = Some(provider_registry);
     query_config.model_registry = Some(Arc::new(model_registry));
     query_config.working_directory = Some(cwd.display().to_string());
@@ -706,7 +695,7 @@ async fn acp_effective_config(
     let mut config = settings.effective_config();
     config.project_dir = Some(cwd.to_path_buf());
     if let Some(model) = model_override.filter(|model| !model.trim().is_empty()) {
-        config.model = Some(model);
+        apply_session_model_to_config(&mut config, &model);
     }
     if let Some(mode) = mode_override {
         config.permission_mode = mode;
@@ -1065,6 +1054,17 @@ fn params_session_id(params: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn params_model_id(params: &Value) -> Option<String> {
+    params
+        .get("model")
+        .or_else(|| params.get("modelId"))
+        .or_else(|| params.get("model_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn parse_permission_mode(mode: &str) -> Option<PermissionMode> {
     match mode {
         "default" | "ask" => Some(PermissionMode::Default),
@@ -1224,12 +1224,7 @@ async fn tool_list_json(
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            params
-                .get("model")
-                .or_else(|| params.get("modelId"))
-                .or_else(|| params.get("model_id"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+            params_model_id(&params),
             params
                 .get("modeId")
                 .or_else(|| params.get("mode_id"))
@@ -1252,7 +1247,8 @@ fn tool_list_value_from_tools(tools: &[Box<dyn mangocode_tools::Tool>]) -> Value
 }
 
 fn model_list_json() -> Value {
-    let registry = mangocode_api::ModelRegistry::new();
+    let mut registry = mangocode_api::ModelRegistry::new();
+    registry.load_standard_cache();
     let mut entries = registry.list_all();
     entries.sort_by(|a, b| {
         (*a.info.provider_id)
@@ -1370,6 +1366,44 @@ mod tests {
     }
 
     #[test]
+    fn params_model_id_trims_and_rejects_blank_values() {
+        assert_eq!(
+            params_model_id(&json!({ "modelId": " openai/gpt-4o " })).as_deref(),
+            Some("openai/gpt-4o")
+        );
+        assert!(params_model_id(&json!({ "model": "   " })).is_none());
+    }
+
+    #[tokio::test]
+    async fn effective_config_restores_provider_from_session_model() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = acp_effective_config(
+            &cwd,
+            Some(" openrouter/anthropic/claude-sonnet-4 ".to_string()),
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_config_ignores_blank_session_model() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = acp_effective_config(&cwd, Some("   ".to_string()), None, false).await;
+
+        assert!(config
+            .model
+            .as_deref()
+            .is_none_or(|model| !model.trim().is_empty()));
+    }
+
+    #[test]
     fn maps_permission_result() {
         let decision = permission_decision_from_result(Some(json!({
             "selectedOptionId": "allow-once"
@@ -1382,9 +1416,15 @@ mod tests {
         assert_eq!(decision, PermissionDecision::AllowPermanently);
     }
 
-    #[cfg(all(feature = "tool-bash", feature = "tool-tool-search"))]
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-bash", feature = "tool-tool-search")
+    ))]
     #[test]
     fn acp_tool_filter_respects_config_aliases() {
+        #[allow(unused_mut)]
         let mut tools = mangocode_tools::all_tools();
         #[cfg(feature = "tool-agent")]
         tools.push(Box::new(mangocode_query::AgentTool));
@@ -1428,15 +1468,11 @@ mod tests {
             feature = "default-tools-no-web-research",
             feature = "full-tools"
         ));
-        let tool_search_enabled =
-            default_tool_set_enabled || cfg!(feature = "tool-tool-search");
-        let view_image_enabled =
-            default_tool_set_enabled || cfg!(feature = "tool-view-image");
+        let tool_search_enabled = default_tool_set_enabled || cfg!(feature = "tool-tool-search");
+        let view_image_enabled = default_tool_set_enabled || cfg!(feature = "tool-view-image");
         let get_goal_enabled = default_tool_set_enabled || cfg!(feature = "tool-get-goal");
-        let create_goal_enabled =
-            default_tool_set_enabled || cfg!(feature = "tool-create-goal");
-        let update_goal_enabled =
-            default_tool_set_enabled || cfg!(feature = "tool-update-goal");
+        let create_goal_enabled = default_tool_set_enabled || cfg!(feature = "tool-create-goal");
+        let update_goal_enabled = default_tool_set_enabled || cfg!(feature = "tool-update-goal");
         let agent_enabled = default_tool_set_enabled || cfg!(feature = "tool-agent");
 
         for (name, should_exist) in [

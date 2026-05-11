@@ -30,6 +30,10 @@ use super::openai_compat_providers::{
 };
 use super::request_options::merge_openai_compatible_options;
 
+fn truncate_wire_debug_text(text: &str, max_bytes: usize) -> &str {
+    mangocode_core::truncate::truncate_bytes_prefix(text, max_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // ProviderQuirks
 // ---------------------------------------------------------------------------
@@ -705,11 +709,7 @@ impl OpenAiCompatProvider {
 
         if dump_http {
             const MAX: usize = 8192;
-            let truncated = if body_str.len() > MAX {
-                &body_str[..MAX]
-            } else {
-                &body_str
-            };
+            let truncated = truncate_wire_debug_text(&body_str, MAX);
             // Use stderr directly to avoid any logger filtering/compilation issues.
             eprintln!("[openai_compat wire] request_json={}", truncated);
             trace!(target: "mangocode_api::providers::openai_compat::wire", request_json = %truncated);
@@ -750,11 +750,7 @@ impl OpenAiCompatProvider {
 
         if dump_http {
             const MAX: usize = 16384;
-            let truncated = if text.len() > MAX {
-                &text[..MAX]
-            } else {
-                &text
-            };
+            let truncated = truncate_wire_debug_text(&text, MAX);
             // Use stderr directly to avoid any logger filtering/compilation issues.
             eprintln!(
                 "[openai_compat wire] status={} response_json={}",
@@ -1066,12 +1062,12 @@ impl LlmProvider for OpenAiCompatProvider {
                         // Log raw provider frames to stderr (truncated) for debugging tool-call wire formats.
                         // This is intentionally opt-in because it can include sensitive content.
                         const MAX: usize = 8192;
-                        let truncated = if data.len() > MAX { &data[..MAX] } else { data };
+                        let truncated = truncate_wire_debug_text(data, MAX);
                         trace!(target: "mangocode_api::providers::openai_compat::wire", sse_data = %truncated);
                     }
                     if debug_ollama {
                         const MAX: usize = 4096;
-                        let truncated = if data.len() > MAX { &data[..MAX] } else { data };
+                        let truncated = truncate_wire_debug_text(data, MAX);
                         eprintln!("[ollama stream] raw_chunk={}", truncated);
                     }
 
@@ -1435,6 +1431,14 @@ impl LlmProvider for OpenAiCompatProvider {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn wire_debug_truncation_handles_multibyte_boundaries() {
+        let text = "abcédef";
+        let truncated = truncate_wire_debug_text(text, 4);
+
+        assert_eq!(truncated, "abc");
+    }
 
     #[test]
     fn mistral_tool_ids_match_opencode_style() {

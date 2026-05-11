@@ -35,6 +35,7 @@ pub mod app;
 pub mod bridge_state;
 /// Startup confirmation dialog for --dangerously-skip-permissions mode.
 pub mod bypass_permissions_dialog;
+mod casefold;
 /// Context window and rate-limit visualization overlay (/context).
 pub mod context_viz;
 /// Desktop app upsell startup dialog (shown at startup on macOS/Windows x64).

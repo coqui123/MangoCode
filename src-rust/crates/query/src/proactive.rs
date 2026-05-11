@@ -26,15 +26,22 @@ use tracing::{debug, info, warn};
 // Allowed tool names for the proactive agent (observe-only)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Bash", "LSP", "Brief"];
+const ALLOWED_TOOLS: &[&str] = &[
+    mangocode_core::constants::TOOL_NAME_FILE_READ,
+    mangocode_core::constants::TOOL_NAME_GREP,
+    mangocode_core::constants::TOOL_NAME_GLOB,
+    mangocode_core::constants::TOOL_NAME_BASH,
+    "LSP",
+    "Brief",
+];
 
 const DENIED_TOOLS: &[&str] = &[
-    "Write",
-    "Edit",
-    "NotebookEdit",
-    "Agent",
+    mangocode_core::constants::TOOL_NAME_FILE_WRITE,
+    mangocode_core::constants::TOOL_NAME_FILE_EDIT,
+    mangocode_core::constants::TOOL_NAME_NOTEBOOK_EDIT,
+    mangocode_core::constants::TOOL_NAME_AGENT,
     "SendMessage",
-    "TodoWrite",
+    mangocode_core::constants::TOOL_NAME_TODO_WRITE,
     "CronCreate",
     "CronDelete",
 ];
@@ -297,8 +304,10 @@ impl ProactiveAgent {
         let _watcher = start_file_watcher(&self.working_dir, self.file_changes.clone());
 
         // Build a fresh read-only tool set from the built-in registry,
-        // with Bash wrapped to enforce read-only execution.
-        let allowed_tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(build_proactive_tools());
+        // with Bash wrapped to enforce read-only execution, then apply the
+        // session's tool visibility config.
+        let allowed_tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(build_proactive_tools_for_config(&tool_ctx.config));
 
         loop {
             // Sleep for the configured interval.
@@ -657,13 +666,23 @@ pub fn build_proactive_tools() -> Vec<Box<dyn Tool>> {
                 return None;
             }
 
-            if name == "Bash" {
+            if name == mangocode_core::constants::TOOL_NAME_BASH {
                 return Some(Box::new(ReadOnlyBashTool { inner: t }) as Box<dyn Tool>);
             }
 
             Some(t)
         })
         .collect()
+}
+
+pub fn build_proactive_tools_for_config(
+    config: &mangocode_core::config::Config,
+) -> Vec<Box<dyn Tool>> {
+    mangocode_tools::filter_tools_by_name_config(
+        build_proactive_tools(),
+        &config.allowed_tools,
+        &config.disallowed_tools,
+    )
 }
 
 struct ReadOnlyBashTool {
@@ -817,5 +836,37 @@ mod tests {
         assert!(!ReadOnlyBashTool::is_read_only("ls; rm -rf /tmp/x"));
         assert!(!ReadOnlyBashTool::is_read_only("ls & rm -rf /tmp/x"));
         assert!(!ReadOnlyBashTool::is_read_only("cat a.txt > b.txt"));
+    }
+
+    #[cfg(feature = "tool-read")]
+    #[test]
+    fn proactive_tools_respect_allowed_tools_config() {
+        let config = mangocode_core::config::Config {
+            allowed_tools: vec!["Read".to_string()],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = super::build_proactive_tools_for_config(&config)
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["Read"]);
+    }
+
+    #[cfg(feature = "tool-bash")]
+    #[test]
+    fn proactive_tools_respect_disallowed_tools_config() {
+        let config = mangocode_core::config::Config {
+            disallowed_tools: vec!["shell_command".to_string()],
+            ..Default::default()
+        };
+
+        let names: Vec<String> = super::build_proactive_tools_for_config(&config)
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+
+        assert!(!names.iter().any(|name| name == "Bash"));
     }
 }

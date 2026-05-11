@@ -8,6 +8,10 @@
 //! - Paste handling (large pastes → placeholder)
 //! - Character count + token estimate
 
+use crate::casefold::{
+    case_insensitive_first_match, case_insensitive_first_match_from, case_insensitive_last_match,
+    case_insensitive_last_match_before,
+};
 use crate::slash_commands::SlashCommandSpec;
 use ratatui::{
     buffer::Buffer,
@@ -2891,16 +2895,13 @@ impl PromptInputState {
         } else {
             self.cursor
         };
-        // Search from `start` forward, then wrap around
-        let text_lc = self.text.to_lowercase();
-        let pat_lc = pattern.to_lowercase();
-        if let Some(pos) = text_lc[start..].find(&pat_lc) {
-            self.cursor = start + pos;
+        // Search from `start` forward, then wrap around.
+        if let Some(m) = case_insensitive_first_match_from(&self.text, pattern, start) {
+            self.cursor = m.original_start;
             return;
         }
-        // Wrap: search from beginning
-        if let Some(pos) = text_lc.find(&pat_lc) {
-            self.cursor = pos;
+        if let Some(m) = case_insensitive_first_match(&self.text, pattern) {
+            self.cursor = m.original_start;
         }
     }
 
@@ -2909,17 +2910,13 @@ impl PromptInputState {
         if pattern.is_empty() {
             return;
         }
-        let text_lc = self.text.to_lowercase();
-        let pat_lc = pattern.to_lowercase();
-        // Find all occurrences, pick the last one before cursor
-        let before = &text_lc[..self.cursor];
-        if let Some(pos) = before.rfind(&pat_lc) {
-            self.cursor = pos;
+        // Find all occurrences, pick the last one before cursor.
+        if let Some(m) = case_insensitive_last_match_before(&self.text, pattern, self.cursor) {
+            self.cursor = m.original_start;
             return;
         }
-        // Wrap: find last occurrence in whole text
-        if let Some(pos) = text_lc.rfind(&pat_lc) {
-            self.cursor = pos;
+        if let Some(m) = case_insensitive_last_match(&self.text, pattern) {
+            self.cursor = m.original_start;
         }
     }
 
@@ -3833,6 +3830,19 @@ mod tests {
         let suggestions = compute_typeahead("/H", &cmds);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].text, "/Help");
+    }
+
+    #[test]
+    fn typeahead_matches_nested_colon_plugin_commands() {
+        let cmds = [SlashCommandSpec {
+            name: "toolbox:build:deploy".to_string(),
+            description: "Deploy from plugin".to_string(),
+            group: "Plugins".to_string(),
+        }];
+        let suggestions = compute_typeahead("/toolbox:b", &cmds);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].text, "/toolbox:build:deploy");
+        assert_eq!(suggestions[0].description, "Deploy from plugin");
     }
 
     // ---- suggestion navigation -----------------------------------------
@@ -4859,6 +4869,24 @@ mod tests {
         s.vim_search_last = Some("aa".to_string());
         s.vim_command("N");
         assert_eq!(s.cursor, 0); // wraps to first 'aa'
+    }
+
+    #[test]
+    fn search_handles_expanding_lowercase_offsets() {
+        let mut s = PromptInputState::new();
+        s.vim_mode = VimMode::Normal;
+        s.text = "x\u{0130}y x\u{0130}y".to_string();
+        s.cursor = 0;
+
+        s.vim_search_forward("i\u{0307}", 0);
+        assert_eq!(s.cursor, 1);
+
+        s.vim_search_forward("i\u{0307}", 1);
+        assert_eq!(s.cursor, 6);
+
+        s.vim_search_backward("i\u{0307}");
+        assert_eq!(s.cursor, 1);
+        assert!(s.text.is_char_boundary(s.cursor));
     }
 
     #[test]
