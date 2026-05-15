@@ -523,11 +523,7 @@ impl Tool for CronListTool {
                     cron_to_human(&t.cron),
                     t.recurring,
                     t.durable,
-                    if t.prompt.len() > 60 {
-                        truncate_bytes_with_ellipsis(&t.prompt, 60)
-                    } else {
-                        t.prompt.clone()
-                    }
+                    truncate_bytes_with_ellipsis(&t.prompt, 60)
                 )
             })
             .collect();

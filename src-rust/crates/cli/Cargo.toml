@@ -29,7 +29,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 tokio-util = { workspace = true }
 chrono = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 rpassword = "7"
 url = { workspace = true }
 crossterm = { workspace = true }

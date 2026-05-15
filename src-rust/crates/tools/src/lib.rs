@@ -36,6 +36,7 @@ pub mod bundled_skills;
 pub mod computer_use;
 #[cfg(feature = "tool-config")]
 pub mod config_tool;
+pub mod coordination;
 pub mod cron;
 #[cfg(feature = "tool-enter-plan-mode")]
 pub mod enter_plan_mode;
@@ -127,6 +128,10 @@ pub use browser_tool::BrowserTool;
 pub use computer_use::ComputerUseTool;
 #[cfg(feature = "tool-config")]
 pub use config_tool::ConfigTool;
+#[cfg(feature = "tool-coordination")]
+pub use coordination::{
+    ClaimWorkTool, CoordinationMessageTool, CoordinationStatusTool, ReleaseWorkTool,
+};
 #[cfg(feature = "tool-cron-create")]
 pub use cron::CronCreateTool;
 #[cfg(feature = "tool-cron-delete")]
@@ -637,6 +642,14 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(BriefTool),
         #[cfg(feature = "tool-config")]
         Box::new(ConfigTool),
+        #[cfg(feature = "tool-coordination")]
+        Box::new(CoordinationStatusTool),
+        #[cfg(feature = "tool-coordination")]
+        Box::new(ClaimWorkTool),
+        #[cfg(feature = "tool-coordination")]
+        Box::new(ReleaseWorkTool),
+        #[cfg(feature = "tool-coordination")]
+        Box::new(CoordinationMessageTool),
         #[cfg(feature = "tool-send-message")]
         Box::new(SendMessageTool),
         #[cfg(feature = "tool-skill")]

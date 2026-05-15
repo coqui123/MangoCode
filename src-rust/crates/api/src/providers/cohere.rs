@@ -673,6 +673,8 @@ impl LlmProvider for CohereProvider {
                 name: "Command R+".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("command-r"),
@@ -680,6 +682,8 @@ impl LlmProvider for CohereProvider {
                 name: "Command R".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
         ])
     }

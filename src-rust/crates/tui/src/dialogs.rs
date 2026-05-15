@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 use ratatui::Frame;
+use std::borrow::Cow;
 
 // ---------------------------------------------------------------------------
 // Permission dialog kinds
@@ -1199,16 +1200,16 @@ pub fn handle_mcp_approval_key(
 // ---------------------------------------------------------------------------
 
 /// Truncate a string to at most `max_chars` characters, appending `…` if cut.
-fn truncate_str(s: &str, max_chars: usize) -> String {
+fn truncate_str(s: &str, max_chars: usize) -> Cow<'_, str> {
     if max_chars == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars {
-        s.to_string()
+        Cow::Borrowed(s)
     } else {
         let cut: String = chars[..max_chars.saturating_sub(1)].iter().collect();
-        format!("{}\u{2026}", cut)
+        Cow::Owned(format!("{}\u{2026}", cut))
     }
 }
 

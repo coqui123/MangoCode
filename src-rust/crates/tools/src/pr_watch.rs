@@ -6,6 +6,7 @@ use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -456,12 +457,12 @@ fn extract_run_id(link: &str) -> Option<u64> {
     cap.get(1)?.as_str().parse::<u64>().ok()
 }
 
-fn tail_lines(input: &str, max_lines: usize) -> String {
+fn tail_lines(input: &str, max_lines: usize) -> Cow<'_, str> {
     let lines = input.lines().collect::<Vec<_>>();
     if lines.len() <= max_lines {
-        return input.to_string();
+        return Cow::Borrowed(input);
     }
-    lines[lines.len() - max_lines..].join("\n")
+    Cow::Owned(lines[lines.len() - max_lines..].join("\n"))
 }
 
 async fn analyze_failed_checks(

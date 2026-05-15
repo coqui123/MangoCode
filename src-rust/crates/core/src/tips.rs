@@ -73,7 +73,7 @@ static ALL_TIPS: Lazy<Vec<Tip>> = Lazy::new(|| {
         },
         Tip {
             id: "prompt-queue",
-            content: "Hit Enter to queue up additional messages while MangoCode is working.",
+            content: "Hit Tab to queue up additional messages while MangoCode is working.",
             cooldown_sessions: 5,
         },
         Tip {

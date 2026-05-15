@@ -24,6 +24,8 @@ struct NotebookEditInput {
     cell_type: String,
     #[serde(default = "default_edit_mode")]
     edit_mode: String,
+    #[serde(default)]
+    confirm_conflicts: bool,
 }
 
 fn default_cell_type() -> String {
@@ -106,6 +108,10 @@ impl Tool for NotebookEditTool {
                     "type": "string",
                     "enum": ["replace", "insert", "delete"],
                     "description": "Edit mode: replace, insert, or delete (default: replace)"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for this notebook."
                 }
             },
             "required": ["notebook_path"]
@@ -141,6 +147,16 @@ impl Tool for NotebookEditTool {
         ) {
             return ToolResult::error(e.to_string());
         }
+
+        let coordination_conflicts = match crate::coordination::preflight_write_conflicts(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(result) => return result,
+        };
 
         // Read notebook
         let content = match tokio::fs::read_to_string(&path).await {
@@ -223,7 +239,16 @@ impl Tool for NotebookEditTool {
                     updated.as_bytes(),
                     self.name(),
                 );
-                ToolResult::success(msg)
+                let msg = crate::coordination::append_confirmed_conflict_note(
+                    msg,
+                    coordination_conflicts.as_deref(),
+                );
+                ToolResult::success(msg).with_metadata(json!({
+                    "notebook_path": path.display().to_string(),
+                    "edit_mode": edit_mode,
+                    "cell_type": cell_type,
+                    "coordination_conflicts": coordination_conflicts,
+                }))
             }
             Err(e) => ToolResult::error(e),
         }

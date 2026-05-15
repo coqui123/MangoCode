@@ -9,6 +9,7 @@ members = [
     "crates/tools",
     "crates/query",
     "crates/tui",
+    "crates/sleep-inhibitor",
     "crates/commands",
     "crates/mcp",
     "crates/bridge",
@@ -26,15 +27,14 @@ license = "GPL-3.0"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.44", features = ["full"] }
+tokio = { version = "1.44", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"
 async-stream = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "stream", "native-tls", "multipart"], default-features = false }
-reqwest-eventsource = "0.6"
+reqwest = { version = "0.12", features = ["native-tls"], default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -80,12 +80,12 @@ url = "2"
 mime = "0.3"
 urlencoding = "2"
 open = "5"
-qrcode = "0.14"
+qrcode = { version = "0.14", default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }
 icy_sixel = "0.5"
-image = { version = "0.25", features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 resvg = "0.44"
-fastembed = "5"
+fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
 
 # Text processing
 similar = "2"
@@ -110,6 +110,7 @@ mangocode-core = { path = "crates/core" }
 mangocode-tool-runtime = { path = "crates/tool-runtime" }
 mangocode-file-search = { path = "crates/file-search" }
 mangocode-turn-diff = { path = "crates/turn-diff" }
+mangocode-sleep-inhibitor = { path = "crates/sleep-inhibitor" }
 mangocode-acp = { path = "crates/acp", default-features = false }
 mangocode-api = { path = "crates/api" }
 mangocode-tools = { path = "crates/tools", default-features = false }

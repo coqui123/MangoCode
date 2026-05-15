@@ -12,7 +12,9 @@ use mangocode_core::codex_oauth::{
 use mangocode_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use mangocode_core::provider_id::{ModelId, ProviderId};
 use mangocode_core::types::ContentBlock;
+use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -32,6 +34,31 @@ const DISK_CHECK_INTERVAL_MS: i64 = 60_000;
 const CODEX_DEBUG_ENV: &str = "MANGOCODE_CODEX_DEBUG";
 const CODEX_OPENAI_BETA_VALUE: &str = "responses=experimental";
 const CODEX_ORIGINATOR_VALUE: &str = "codex_cli_rs";
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelInfo {
+    slug: String,
+    display_name: String,
+    description: Option<String>,
+    visibility: Option<String>,
+    supported_in_api: Option<bool>,
+    priority: Option<i32>,
+    context_window: Option<u32>,
+    max_context_window: Option<u32>,
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
 
 /// OpenAI Codex using a ChatGPT-plan OAuth access token against the Codex
 /// HTTP API (`chatgpt.com/backend-api/codex/...`).
@@ -86,17 +113,189 @@ impl OpenAiCodexProvider {
     }
 
     fn truncate_debug_payload(value: &Value) -> String {
-        Self::truncate_payload_with_ellipsis(&value.to_string(), 800)
+        Self::truncate_payload_with_ellipsis(&value.to_string(), 800).into_owned()
     }
 
-    fn truncate_payload_with_ellipsis(text: &str, max_bytes: usize) -> String {
+    fn truncate_payload_with_ellipsis(text: &str, max_bytes: usize) -> Cow<'_, str> {
         if text.len() <= max_bytes {
-            return text.to_string();
+            return Cow::Borrowed(text);
         }
-        format!(
+        Cow::Owned(format!(
             "{}...",
             mangocode_core::truncate::truncate_bytes_prefix(text, max_bytes)
-        )
+        ))
+    }
+
+    fn models_endpoint(&self) -> String {
+        if self.endpoint.ends_with("/responses") {
+            format!("{}/models", self.endpoint.trim_end_matches("/responses"))
+        } else {
+            format!("{}/models", self.endpoint.trim_end_matches('/'))
+        }
+    }
+
+    fn static_models(&self) -> Vec<ModelInfo> {
+        let pid = self.id.clone();
+        mangocode_core::codex_oauth::CODEX_MODELS
+            .iter()
+            .map(|(id, name)| ModelInfo {
+                id: ModelId::new(*id),
+                provider_id: pid.clone(),
+                name: (*name).to_string(),
+                context_window: 256_000,
+                max_output_tokens: 32_000,
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: static_codex_reasoning_levels(id),
+            })
+            .collect()
+    }
+
+    fn model_info_from_codex(&self, model: CodexModelInfo) -> Option<(i32, ModelInfo)> {
+        if model.slug.trim().is_empty() {
+            return None;
+        }
+
+        if model.supported_in_api == Some(false) {
+            return None;
+        }
+
+        if model
+            .visibility
+            .as_deref()
+            .is_some_and(|visibility| !visibility.eq_ignore_ascii_case("list"))
+        {
+            return None;
+        }
+
+        let priority = model
+            .priority
+            .or_else(|| response_priority_hint(&model.slug))
+            .unwrap_or(i32::MAX);
+
+        Some((
+            priority,
+            ModelInfo {
+                id: ModelId::new(model.slug),
+                provider_id: self.id.clone(),
+                name: match model.description {
+                    Some(description) if !description.trim().is_empty() => {
+                        format!("{} - {}", model.display_name, description)
+                    }
+                    _ => model.display_name,
+                },
+                context_window: model
+                    .context_window
+                    .or(model.max_context_window)
+                    .unwrap_or(256_000),
+                max_output_tokens: 32_000,
+                default_reasoning_level: model.default_reasoning_level,
+                supported_reasoning_levels: model
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| level.effort)
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn fetch_live_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        self.ensure_fresh().await;
+        let token = self.bearer.lock().await.clone();
+        if token.is_empty() {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "OpenAI Codex OAuth is not connected. Run /connect and choose OpenAI Codex (OAuth)."
+                    .to_string(),
+            });
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
+                ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Codex auth header build failed: {}", e),
+                    status: None,
+                    body: None,
+                }
+            })?,
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_OPENAI_BETA_VALUE),
+        );
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR_VALUE),
+        );
+
+        let account_id = extract_chatgpt_account_id(&token);
+        if let Some(ref id) = account_id {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(id) {
+                headers.insert("chatgpt-account-id", v);
+            }
+        }
+
+        let client_version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.0");
+        let resp = self
+            .http
+            .get(self.models_endpoint())
+            .query(&[("client_version", client_version)])
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex models request failed: {}", e),
+                status: None,
+                body: None,
+            })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: e.to_string(),
+            status: None,
+            body: None,
+        })?;
+
+        if !status.is_success() {
+            return Err(ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex models request failed ({}): {}",
+                    status,
+                    Self::truncate_payload_with_ellipsis(text.trim(), 600)
+                ),
+                status: Some(status.as_u16()),
+                body: Some(text),
+            });
+        }
+
+        let response: CodexModelsResponse =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex models response parse error: {}: {}",
+                    e,
+                    Self::truncate_payload_with_ellipsis(text.trim(), 600)
+                ),
+                status: None,
+                body: Some(text),
+            })?;
+
+        let mut models: Vec<(i32, ModelInfo)> = response
+            .models
+            .into_iter()
+            .filter_map(|model| self.model_info_from_codex(model))
+            .collect();
+        models.sort_by_key(|(priority, _)| *priority);
+        Ok(models.into_iter().map(|(_, model)| model).collect())
     }
 
     /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
@@ -631,17 +830,10 @@ impl LlmProvider for OpenAiCodexProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let pid = self.id.clone();
-        Ok(mangocode_core::codex_oauth::CODEX_MODELS
-            .iter()
-            .map(|(id, name)| ModelInfo {
-                id: ModelId::new(*id),
-                provider_id: pid.clone(),
-                name: (*name).to_string(),
-                context_window: 256_000,
-                max_output_tokens: 32_000,
-            })
-            .collect())
+        match self.fetch_live_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) | Err(_) => Ok(self.static_models()),
+        }
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -670,6 +862,26 @@ impl LlmProvider for OpenAiCodexProvider {
             system_prompt_style: SystemPromptStyle::TopLevel,
         }
     }
+}
+
+fn response_priority_hint(model_id: &str) -> Option<i32> {
+    mangocode_core::codex_oauth::CODEX_MODELS
+        .iter()
+        .position(|(id, _)| *id == model_id)
+        .map(|idx| idx as i32)
+}
+
+fn static_codex_reasoning_levels(model_id: &str) -> Vec<String> {
+    let mut levels = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+    if model_id.starts_with("gpt-5.5")
+        || model_id.starts_with("gpt-5.4")
+        || model_id.starts_with("gpt-5.3")
+        || model_id.starts_with("gpt-5.2")
+        || model_id.starts_with("gpt-5.1-codex-max")
+    {
+        levels.push("xhigh".to_string());
+    }
+    levels
 }
 
 #[cfg(test)]

@@ -22,6 +22,12 @@ pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
 pub mod goals;
 pub use goals::{ThreadGoal, ThreadGoalStatus};
 
+// Local multi-process session coordination.
+pub mod coordination;
+pub use coordination::{
+    ConflictWarning, CoordinationMessage, CoordinationStore, SessionPresence, WorkClaim,
+};
+
 // Durable local harness events/checkpoints/traces.
 pub mod harness;
 pub mod layered_memory;
@@ -95,9 +101,9 @@ pub use update_check::{check_for_updates, UpdateInfo};
 
 // Re-export commonly used types at the crate root
 pub use config::{
-    default_agents, strip_jsonc_comments, substitute_env_vars, AgentDefinition, CommandTemplate,
-    Config, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig,
-    Settings, SkillsConfig, Theme,
+    default_agents, strip_jsonc_comments, substitute_env_vars, AgentDefinition, ApprovalsReviewer,
+    CommandTemplate, Config, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode,
+    ProviderConfig, Settings, SkillsConfig, Theme,
 };
 pub use error::{ClaudeError, Result};
 pub use types::{
@@ -754,6 +760,9 @@ pub mod config {
         pub model: Option<String>,
         pub max_tokens: Option<u32>,
         pub permission_mode: PermissionMode,
+        /// Reviewer used for approval decisions.
+        #[serde(default, alias = "approvals-reviewer")]
+        pub approvals_reviewer: ApprovalsReviewer,
         pub theme: Theme,
         #[serde(default)]
         pub output_style: Option<String>,
@@ -824,6 +833,9 @@ pub mod config {
         /// Layered durable memory behavior.
         #[serde(default)]
         pub memory: MemoryConfig,
+        /// Prevent system idle sleep while MangoCode is running an active turn.
+        #[serde(default)]
+        pub prevent_idle_sleep: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -930,6 +942,28 @@ pub mod config {
         Plan,
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ApprovalsReviewer {
+        #[default]
+        User,
+        #[serde(alias = "guardian_subagent")]
+        AutoReview,
+    }
+
+    impl ApprovalsReviewer {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::User => "user",
+                Self::AutoReview => "auto_review",
+            }
+        }
+
+        pub fn is_auto_review(self) -> bool {
+            matches!(self, Self::AutoReview)
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     #[serde(rename_all = "camelCase")]
     pub enum Theme {
@@ -1018,6 +1052,8 @@ pub mod config {
     pub struct Settings {
         #[serde(default)]
         pub config: Config,
+        #[serde(skip)]
+        pub explicit_config_keys: std::collections::HashSet<String>,
         pub version: Option<u32>,
         #[serde(default)]
         pub projects: HashMap<String, ProjectSettings>,
@@ -1310,6 +1346,22 @@ pub mod config {
     }
 
     impl Settings {
+        pub(crate) fn from_json_str(content: &str) -> anyhow::Result<Self> {
+            let explicit_config_keys = serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("config")
+                        .and_then(|config| config.as_object())
+                        .cloned()
+                })
+                .map(|config| config.keys().cloned().collect())
+                .unwrap_or_default();
+            let mut settings = serde_json::from_str::<Self>(content)?;
+            settings.explicit_config_keys = explicit_config_keys;
+            Ok(settings)
+        }
+
         /// The per-user configuration directory (`~/.mangocode`).
         pub fn config_dir() -> PathBuf {
             dirs::home_dir()
@@ -1327,7 +1379,7 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                Ok(Self::from_json_str(&content).unwrap_or_default())
             } else {
                 Ok(Self::default())
             }
@@ -1349,7 +1401,7 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                Ok(Self::from_json_str(&content).unwrap_or_default())
             } else {
                 Ok(Self::default())
             }
@@ -1440,8 +1492,8 @@ pub mod config {
                     if candidate.exists() && candidate != global_path {
                         if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
                             let stripped = strip_jsonc_comments(&content);
-                            if let Ok(s) = serde_json::from_str::<Self>(&stripped) {
-                                return Some(s);
+                            if let Ok(settings) = Self::from_json_str(&stripped) {
+                                return Some(settings);
                             }
                         }
                         // Found a file but couldn't parse — stop here, don't go up.
@@ -1459,7 +1511,7 @@ pub mod config {
         /// Merge two settings with `override_settings` taking priority.
         /// Simple strategy: override wins for all scalar fields; Vecs are
         /// concatenated (deduped); HashMaps are merged (override wins on collision).
-        fn merge(base: Self, over: Self) -> Self {
+        pub(crate) fn merge(base: Self, over: Self) -> Self {
             // Helper to merge two HashMaps (over wins on key collision).
             fn merge_map<K: std::hash::Hash + Eq + Clone, V: Clone>(
                 mut base: HashMap<K, V>,
@@ -1476,6 +1528,14 @@ pub mod config {
                 model: over.config.model.or(base.config.model),
                 max_tokens: over.config.max_tokens.or(base.config.max_tokens),
                 permission_mode: over.config.permission_mode,
+                approvals_reviewer: if over.explicit_config_keys.contains("approvals_reviewer")
+                    || over.explicit_config_keys.contains("approvals-reviewer")
+                    || over.config.approvals_reviewer != ApprovalsReviewer::User
+                {
+                    over.config.approvals_reviewer
+                } else {
+                    base.config.approvals_reviewer
+                },
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
                 auto_compact: over.config.auto_compact || base.config.auto_compact,
@@ -1564,9 +1624,16 @@ pub mod config {
                 attachments: over.config.attachments,
                 tool_output: over.config.tool_output,
                 memory: over.config.memory,
+                prevent_idle_sleep: over.config.prevent_idle_sleep
+                    || base.config.prevent_idle_sleep,
             };
             Self {
                 config: merged_config,
+                explicit_config_keys: {
+                    let mut s = base.explicit_config_keys;
+                    s.extend(over.explicit_config_keys);
+                    s
+                },
                 version: over.version.or(base.version),
                 projects: merge_map(base.projects, over.projects),
                 remote_control_at_startup: over.remote_control_at_startup
@@ -4324,6 +4391,80 @@ mod tests {
     fn test_hooks_config_default() {
         let cfg = crate::config::Config::default();
         assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn approvals_reviewer_defaults_to_user() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::User
+        );
+        assert_eq!(cfg.approvals_reviewer.label(), "user");
+    }
+
+    #[test]
+    fn approvals_reviewer_accepts_codex_values_and_serializes_auto_review() {
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals_reviewer": "auto_review"}))
+                .unwrap();
+        assert!(cfg.approvals_reviewer.is_auto_review());
+
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals_reviewer": "guardian_subagent"}))
+                .unwrap();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals-reviewer": "auto_review"}))
+                .unwrap();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+
+        let encoded = serde_json::to_value(crate::config::Config {
+            approvals_reviewer: crate::config::ApprovalsReviewer::AutoReview,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["approvals_reviewer"], "auto_review");
+    }
+
+    #[test]
+    fn settings_merge_allows_project_to_opt_out_of_global_auto_review() {
+        let global = crate::config::Settings::from_json_str(
+            r#"{"config":{"approvals_reviewer":"auto_review"}}"#,
+        )
+        .unwrap();
+        let inherited = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        let explicit_user =
+            crate::config::Settings::from_json_str(r#"{"config":{"approvals_reviewer":"user"}}"#)
+                .unwrap();
+
+        assert_eq!(
+            crate::config::Settings::merge(global.clone(), inherited)
+                .config
+                .approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+        assert_eq!(
+            crate::config::Settings::merge(global, explicit_user)
+                .config
+                .approvals_reviewer,
+            crate::config::ApprovalsReviewer::User
+        );
+    }
+
+    #[test]
+    fn settings_from_json_str_rejects_invalid_approvals_reviewer() {
+        let err = crate::config::Settings::from_json_str(
+            r#"{"config":{"approvals_reviewer":"definitely_not_valid"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("definitely_not_valid"));
     }
 
     #[test]

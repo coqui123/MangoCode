@@ -72,6 +72,8 @@ impl LlmProvider for MinimaxProvider {
             name: "MiniMax M2.7".to_string(),
             context_window: 128_000,
             max_output_tokens: 8_192,
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
         }])
     }
 

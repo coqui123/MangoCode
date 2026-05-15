@@ -8,7 +8,7 @@ mangocode-core = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

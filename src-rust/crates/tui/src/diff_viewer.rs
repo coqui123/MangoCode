@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use similar::{ChangeTag, TextDiff};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -631,15 +632,15 @@ fn short_patch_id(id: &str) -> String {
     format!("#{}", suffix.chars().take(8).collect::<String>())
 }
 
-fn truncate_path_tail(path: &str, max_chars: usize) -> String {
+fn truncate_path_tail(path: &str, max_chars: usize) -> Cow<'_, str> {
     if path.chars().count() <= max_chars {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
     if max_chars == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if max_chars == 1 {
-        return "…".to_string();
+        return Cow::Borrowed("…");
     }
 
     let tail = path
@@ -650,7 +651,7 @@ fn truncate_path_tail(path: &str, max_chars: usize) -> String {
         .into_iter()
         .rev()
         .collect::<String>();
-    format!("…{tail}")
+    Cow::Owned(format!("…{tail}"))
 }
 
 fn render_file_list(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {

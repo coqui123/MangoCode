@@ -73,11 +73,7 @@ impl ScratchpadState {
     /// Update the current plan explicitly (called when model declares a plan).
     pub fn set_plan(&mut self, plan: impl Into<String>) {
         let p = plan.into();
-        if p.len() > MAX_PLAN_CHARS {
-            self.current_plan = Some(truncate_bytes_with_ellipsis(&p, MAX_PLAN_CHARS));
-        } else {
-            self.current_plan = Some(p);
-        }
+        self.current_plan = Some(truncate_bytes_with_ellipsis(&p, MAX_PLAN_CHARS).into_owned());
     }
 
     /// Returns `true` if there is any scratchpad content worth injecting.
@@ -168,11 +164,8 @@ fn extract_last_tool_result_summary(messages: &[Message]) -> Option<String> {
                 };
                 // One-line: strip newlines, truncate.
                 let one_line = text.lines().next().unwrap_or("").trim().to_string();
-                let summary = if one_line.len() > RESULT_SUMMARY_CHARS {
-                    truncate_bytes_with_ellipsis(&one_line, RESULT_SUMMARY_CHARS)
-                } else {
-                    one_line
-                };
+                let summary =
+                    truncate_bytes_with_ellipsis(&one_line, RESULT_SUMMARY_CHARS).into_owned();
                 result_texts.push(format!("{}: {}", name, summary));
             }
         }
@@ -222,11 +215,7 @@ fn extract_next_action_hint(messages: &[Message]) -> Option<String> {
             .map(|l| l.trim().to_string());
 
         if let Some(line) = last_line {
-            let hint = if line.len() > 150 {
-                truncate_bytes_with_ellipsis(&line, 150)
-            } else {
-                line
-            };
+            let hint = truncate_bytes_with_ellipsis(&line, 150).into_owned();
             return Some(hint);
         }
         break; // only look at the most recent assistant turn

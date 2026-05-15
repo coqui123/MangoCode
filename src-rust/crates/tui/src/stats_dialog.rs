@@ -11,6 +11,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -819,12 +820,15 @@ fn heatmap_color(intensity: f64) -> Color {
 // Models tab
 // ---------------------------------------------------------------------------
 
-fn truncate_model_id_for_display(model_id: &str) -> String {
+fn truncate_model_id_for_display(model_id: &str) -> Cow<'_, str> {
     let model_len = model_id.chars().count();
     if model_len > 42 {
-        format!("{}...", model_id.chars().take(39).collect::<String>())
+        Cow::Owned(format!(
+            "{}...",
+            model_id.chars().take(39).collect::<String>()
+        ))
     } else {
-        model_id.to_string()
+        Cow::Borrowed(model_id)
     }
 }
 

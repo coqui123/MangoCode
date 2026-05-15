@@ -7,6 +7,7 @@
 use crate::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent};
 use crate::{FeatureFlags, FLAG_LLM_COMPACTION};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -500,36 +501,36 @@ fn truncate_message_middle(msg: &mut Message) -> bool {
     match &mut msg.content {
         MessageContent::Text(text) => {
             let truncated = truncate_text_middle(text);
-            if truncated == *text {
+            if matches!(truncated, Cow::Borrowed(_)) {
                 false
             } else {
-                *text = truncated;
+                *text = truncated.into_owned();
                 true
             }
         }
         MessageContent::Blocks(_) => {
             let as_text = message_to_text(msg);
             let truncated = truncate_text_middle(&as_text);
-            if truncated == as_text {
+            if matches!(truncated, Cow::Borrowed(_)) {
                 false
             } else {
-                msg.content = MessageContent::Text(truncated);
+                msg.content = MessageContent::Text(truncated.into_owned());
                 true
             }
         }
     }
 }
 
-fn truncate_text_middle(text: &str) -> String {
+fn truncate_text_middle(text: &str) -> Cow<'_, str> {
     let total_chars = text.chars().count();
     if total_chars < 60 {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
 
     let keep = ((total_chars as f64) * 0.2).ceil() as usize;
     let keep_each = keep.max(1);
     if keep_each * 2 >= total_chars {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
 
     let head = first_n_chars(text, keep_each);
@@ -539,7 +540,10 @@ fn truncate_text_middle(text: &str) -> String {
     let kept_tokens = estimate_tokens(&head) + estimate_tokens(&tail);
     let snipped = total_tokens.saturating_sub(kept_tokens).max(1);
 
-    format!("{}\n[...{} tokens snipped...]\n{}", head, snipped, tail)
+    Cow::Owned(format!(
+        "{}\n[...{} tokens snipped...]\n{}",
+        head, snipped, tail
+    ))
 }
 
 fn first_n_chars(text: &str, n: usize) -> String {

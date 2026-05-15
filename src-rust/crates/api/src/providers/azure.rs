@@ -456,6 +456,8 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4o (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-4o-mini"),
@@ -463,6 +465,8 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4o Mini (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-4-turbo"),
@@ -470,6 +474,8 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-4 Turbo (Azure)".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 4_096,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-35-turbo"),
@@ -477,6 +483,8 @@ impl LlmProvider for AzureProvider {
                 name: "GPT-3.5 Turbo (Azure)".to_string(),
                 context_window: 16_385,
                 max_output_tokens: 4_096,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
         ])
     }

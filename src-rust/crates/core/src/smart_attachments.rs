@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1346,15 +1347,18 @@ fn follows_pdf_text_operator(chars: &[char], i: usize) -> bool {
     op.starts_with("Tj") || op.starts_with("TJ") || op.starts_with("'") || op.starts_with("\"")
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
+fn truncate_chars(text: &str, max: usize) -> Cow<'_, str> {
+    let mut chars = text.chars();
     let mut out = String::new();
-    for ch in text.chars().take(max) {
+    for ch in chars.by_ref().take(max) {
         out.push(ch);
     }
-    if text.chars().count() > max {
+    if chars.next().is_some() {
         out.push_str("\n\n... (truncated)");
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
     }
-    out
 }
 
 fn file_mtime_unix(meta: &std::fs::Metadata) -> Option<u64> {

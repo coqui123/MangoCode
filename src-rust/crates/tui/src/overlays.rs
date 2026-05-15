@@ -14,6 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::borrow::Cow;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const MANGOCODE_ACCENT: Color = Color::Rgb(255, 176, 32); // #FFB020 golden mango
@@ -22,15 +23,15 @@ pub const MANGOCODE_PANEL_BORDER: Color = Color::Rgb(90, 78, 65); // warm medium
 pub const MANGOCODE_TEXT: Color = Color::Rgb(253, 246, 227); // #FDF6E3 cream
 pub const MANGOCODE_MUTED: Color = Color::Rgb(138, 125, 115); // #8A7D73 warm muted
 
-fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
+fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> Cow<'_, str> {
     if max_width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if max_width <= 1 {
-        return "\u{2026}".to_string();
+        return Cow::Borrowed("\u{2026}");
     }
 
     let mut out = String::new();
@@ -44,7 +45,7 @@ fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
         width += ch_width;
     }
     out.push('\u{2026}');
-    out
+    Cow::Owned(out)
 }
 pub const MANGOCODE_OVERLAY_BG: Color = Color::Rgb(18, 14, 10); // #120E0A deep warm brown
 
@@ -1821,7 +1822,7 @@ mod tests {
         let truncated = truncate_to_width_with_ellipsis("preview Café 中 message", 13);
 
         assert!(truncated.ends_with('…'));
-        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 13);
+        assert!(UnicodeWidthStr::width(truncated.as_ref()) <= 13);
     }
 
     // --- HelpOverlay ---------------------------------------------------

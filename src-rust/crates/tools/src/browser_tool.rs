@@ -4,6 +4,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 
 #[cfg(feature = "tool-browser")]
 #[derive(Debug, Clone, Deserialize)]
@@ -610,15 +611,15 @@ impl BrowserSession {
 }
 
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
-fn truncate_browser_text(text: &str, max: usize) -> String {
+fn truncate_browser_text(text: &str, max: usize) -> Cow<'_, str> {
     if text.len() <= max {
-        text.to_string()
+        Cow::Borrowed(text)
     } else {
-        format!(
+        Cow::Owned(format!(
             "{}\n\n... (truncated, {} total characters)",
             mangocode_core::truncate::truncate_bytes_prefix(text, max),
             text.len()
-        )
+        ))
     }
 }
 

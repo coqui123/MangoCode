@@ -1,5 +1,7 @@
 // plugin_views.rs — Plugin hint/recommendation UI elements and plugin list widget.
 
+use std::borrow::Cow;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -39,15 +41,15 @@ impl PluginHintBanner {
     }
 }
 
-fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
+fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> Cow<'_, str> {
     if max_width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if max_width <= 1 {
-        return "\u{2026}".to_string();
+        return Cow::Borrowed("\u{2026}");
     }
 
     let mut out = String::new();
@@ -61,7 +63,7 @@ fn truncate_to_width_with_ellipsis(text: &str, max_width: usize) -> String {
         width += ch_width;
     }
     out.push('\u{2026}');
-    out
+    Cow::Owned(out)
 }
 
 /// Render the first undismissed plugin hint banner into `area`.
@@ -403,7 +405,7 @@ mod tests {
         let truncated = truncate_to_width_with_ellipsis("plugin Café 中 message", 12);
 
         assert!(truncated.ends_with('…'));
-        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 12);
+        assert!(UnicodeWidthStr::width(truncated.as_ref()) <= 12);
     }
 
     fn make_items(n: usize) -> Vec<PluginListItem> {

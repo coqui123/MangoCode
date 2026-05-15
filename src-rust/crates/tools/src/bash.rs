@@ -335,13 +335,18 @@ impl Tool for BashTool {
         let output_mode = params
             .output_mode
             .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+        let coordination_notice = crate::coordination::execution_claim_notice(ctx, &params.command);
 
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms).await;
+            let result = run_in_background(params.command, cwd, timeout_ms).await;
+            return crate::coordination::append_execution_notice(
+                result,
+                coordination_notice.as_deref(),
+            );
         }
 
         // ── Foreground path ──────────────────────────────────────────────────
@@ -351,7 +356,7 @@ impl Tool for BashTool {
 
         // On Windows fall back to a simpler cmd invocation without state wrapping.
         if cfg!(windows) {
-            return self
+            let result = self
                 .execute_windows(
                     &params.command,
                     ctx,
@@ -361,6 +366,10 @@ impl Tool for BashTool {
                     output_mode,
                 )
                 .await;
+            return crate::coordination::append_execution_notice(
+                result,
+                coordination_notice.as_deref(),
+            );
         }
 
         // Build a wrapper script that restores and then captures shell state.
@@ -466,13 +475,17 @@ impl Tool for BashTool {
 
                 const MAX_OUTPUT_LEN: usize = 100_000;
                 if output.len() > MAX_OUTPUT_LEN {
-                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN);
+                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN)
+                        .into_owned();
                 }
 
                 let reduced =
                     reduce_command_output(&params.command, &output, exit_code, output_mode);
 
-                reduced.into_tool_result(exit_code, "Command exited with code")
+                crate::coordination::append_execution_notice(
+                    reduced.into_tool_result(exit_code, "Command exited with code"),
+                    coordination_notice.as_deref(),
+                )
             }
             Err(_) => {
                 let _ = child.kill().await;
@@ -556,7 +569,8 @@ impl BashTool {
                 }
                 const MAX_OUTPUT_LEN: usize = 100_000;
                 if output.len() > MAX_OUTPUT_LEN {
-                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN);
+                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN)
+                        .into_owned();
                 }
                 let reduced = reduce_command_output(command, &output, exit_code, output_mode);
                 reduced.into_tool_result(exit_code, "Command exited with code")

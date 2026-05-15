@@ -4,6 +4,7 @@
 //! `render_message()` dispatcher routes to the correct renderer based
 //! on message content.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::kitty_image::render_image;
@@ -135,27 +136,27 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
     fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
         input.get(key).and_then(|v| v.as_str()).unwrap_or("")
     }
-    fn truncate(s: &str, n: usize) -> String {
+    fn truncate(s: &str, n: usize) -> Cow<'_, str> {
         let s = s.trim();
         let chars: Vec<char> = s.chars().collect();
         if chars.len() > n {
-            format!("{}\u{2026}", chars[..n].iter().collect::<String>())
+            Cow::Owned(format!("{}\u{2026}", chars[..n].iter().collect::<String>()))
         } else {
-            s.to_string()
+            Cow::Borrowed(s)
         }
     }
     match tool_name {
         "Bash" | "PowerShell" => {
             let cmd = str_field(input, "command");
-            truncate(cmd.lines().next().unwrap_or(""), 60)
+            truncate(cmd.lines().next().unwrap_or(""), 60).into_owned()
         }
-        "Read" => truncate(str_field(input, "file_path"), 60),
-        "Edit" => truncate(str_field(input, "file_path"), 60),
-        "Write" => truncate(str_field(input, "file_path"), 60),
-        "Glob" => truncate(str_field(input, "pattern"), 60),
-        "Grep" => truncate(str_field(input, "pattern"), 60),
-        "WebFetch" => truncate(str_field(input, "url"), 60),
-        "WebSearch" => truncate(str_field(input, "query"), 60),
+        "Read" => truncate(str_field(input, "file_path"), 60).into_owned(),
+        "Edit" => truncate(str_field(input, "file_path"), 60).into_owned(),
+        "Write" => truncate(str_field(input, "file_path"), 60).into_owned(),
+        "Glob" => truncate(str_field(input, "pattern"), 60).into_owned(),
+        "Grep" => truncate(str_field(input, "pattern"), 60).into_owned(),
+        "WebFetch" => truncate(str_field(input, "url"), 60).into_owned(),
+        "WebSearch" => truncate(str_field(input, "query"), 60).into_owned(),
         "Agent" => {
             let task = str_field(input, "task");
             let task = if task.is_empty() {
@@ -163,14 +164,14 @@ pub fn extract_tool_summary(tool_name: &str, input: &serde_json::Value) -> Strin
             } else {
                 task
             };
-            truncate(task.lines().next().unwrap_or(""), 60)
+            truncate(task.lines().next().unwrap_or(""), 60).into_owned()
         }
         _ => {
             // First string value from the input object
             if let Some(obj) = input.as_object() {
                 for v in obj.values() {
                     if let Some(s) = v.as_str() {
-                        return truncate(s, 60);
+                        return truncate(s, 60).into_owned();
                     }
                 }
             }
@@ -660,10 +661,10 @@ pub fn render_hook_progress(command: &str, last_line: Option<&str>) -> Vec<Line<
     lines
 }
 
-fn truncate_user_prompt_text(text: &str) -> String {
+fn truncate_user_prompt_text(text: &str) -> Cow<'_, str> {
     let char_count = text.chars().count();
     if char_count <= MAX_USER_PROMPT_DISPLAY_CHARS {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
 
     let head_chars = TRUNCATE_USER_PROMPT_HEAD_CHARS.min(char_count);
@@ -678,7 +679,7 @@ fn truncate_user_prompt_text(text: &str) -> String {
         .filter(|c| *c == '\n')
         .count();
 
-    format!("{head}\n… +{hidden_lines} lines …\n{tail}")
+    Cow::Owned(format!("{head}\n… +{hidden_lines} lines …\n{tail}"))
 }
 
 fn prefix_message_lines(

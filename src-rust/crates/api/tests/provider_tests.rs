@@ -416,6 +416,81 @@ async fn openai_codex_oauth_is_stateless_and_does_not_use_api_key_format() {
 }
 
 #[tokio::test]
+async fn openai_codex_list_models_fetches_dynamic_codex_catalog() {
+    let response = json!({
+        "models": [
+            {
+                "slug": "gpt-live-hidden",
+                "display_name": "Hidden",
+                "visibility": "hide",
+                "supported_in_api": true,
+                "priority": 0,
+                "context_window": 1_000
+            },
+            {
+                "slug": "gpt-live",
+                "display_name": "GPT Live",
+                "description": "dynamic model",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "context_window": 123_000,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [
+                    { "effort": "low", "description": "Low" },
+                    { "effort": "high", "description": "High" },
+                    { "effort": "xhigh", "description": "Extra high" }
+                ]
+            }
+        ]
+    });
+
+    let (base, req_rx) = spawn_json_server(response).await;
+    let provider = OpenAiCodexProvider::new("test-oauth-token".to_string())
+        .with_endpoint(format!("{base}/responses"))
+        .with_skip_disk(true);
+
+    let models = provider
+        .list_models()
+        .await
+        .expect("dynamic codex models should parse");
+
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id.to_string(), "gpt-live");
+    assert_eq!(models[0].name, "GPT Live - dynamic model");
+    assert_eq!(models[0].context_window, 123_000);
+    assert_eq!(models[0].default_reasoning_level.as_deref(), Some("high"));
+    assert_eq!(
+        models[0].supported_reasoning_levels,
+        vec!["low".to_string(), "high".to_string(), "xhigh".to_string()]
+    );
+
+    let raw = req_rx.await.expect("captured request");
+    let lower = raw.to_ascii_lowercase();
+    assert!(lower.starts_with("get /models?client_version="));
+    assert!(lower.contains("authorization: bearer test-oauth-token"));
+    assert!(lower.contains("openai-beta: responses=experimental"));
+    assert!(lower.contains("originator: codex_cli_rs"));
+}
+
+#[tokio::test]
+async fn openai_codex_list_models_falls_back_to_static_catalog_when_dynamic_is_empty() {
+    let (base, _req_rx) = spawn_json_server(json!({ "models": [] })).await;
+    let provider = OpenAiCodexProvider::new("test-oauth-token".to_string())
+        .with_endpoint(format!("{base}/responses"))
+        .with_skip_disk(true);
+
+    let models = provider
+        .list_models()
+        .await
+        .expect("static codex fallback should be available");
+
+    assert!(models
+        .iter()
+        .any(|model| &*model.id == mangocode_core::codex_oauth::DEFAULT_CODEX_MODEL));
+}
+
+#[tokio::test]
 async fn openai_codex_includes_conversation_and_session_headers_with_prompt_cache_key() {
     let response = json!({
         "output": [{

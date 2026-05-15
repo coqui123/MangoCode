@@ -9,6 +9,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 const MAX_RAW_OUTPUT_CHARS: usize = 100_000;
@@ -440,9 +441,9 @@ fn take_head_tail(output: &str, head: usize, tail: usize) -> String {
     selected.join("\n")
 }
 
-pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> Cow<'_, str> {
     if output.len() <= max_bytes {
-        return output.to_string();
+        return Cow::Borrowed(output);
     }
 
     let half = max_bytes / 2;
@@ -452,16 +453,16 @@ pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> String {
         suffix_start += 1;
     }
     let suffix = &output[suffix_start..];
-    format!(
+    Cow::Owned(format!(
         "{}\n\n... ({} bytes omitted) ...\n\n{}",
         prefix,
         output.len().saturating_sub(prefix.len() + suffix.len()),
         suffix
-    )
+    ))
 }
 
 fn truncate_raw(output: &str) -> String {
-    truncate_middle_bytes(output, MAX_RAW_OUTPUT_CHARS)
+    truncate_middle_bytes(output, MAX_RAW_OUTPUT_CHARS).into_owned()
 }
 
 fn save_raw_log(command: &str, output: &str) -> anyhow::Result<PathBuf> {

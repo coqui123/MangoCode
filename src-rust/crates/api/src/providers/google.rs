@@ -1498,6 +1498,8 @@ impl LlmProvider for GoogleProvider {
                     name: display,
                     context_window: input_limit,
                     max_output_tokens: output_limit,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
                 })
             })
             .collect();

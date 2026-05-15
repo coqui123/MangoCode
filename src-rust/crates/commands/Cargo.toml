@@ -107,7 +107,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 regex = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 arboard = { version = "3", default-features = false }
 urlencoding = { workspace = true }
 open = { workspace = true }

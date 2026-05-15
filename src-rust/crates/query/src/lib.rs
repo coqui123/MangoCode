@@ -4039,10 +4039,15 @@ async fn check_critic(
     config: &mangocode_core::config::Config,
 ) -> Option<mangocode_tools::ToolResult> {
     let critic = mangocode_core::global_critic();
-    if !critic.is_enabled() {
+    let auto_review = config.approvals_reviewer.is_auto_review();
+    if !critic.is_enabled() && !auto_review {
         return None;
     }
-    let critic_cfg = critic.get_config();
+    let mut critic_cfg = critic.get_config();
+    if auto_review && !critic_cfg.enabled {
+        critic_cfg.enabled = true;
+        critic.update_config(critic_cfg.clone());
+    }
 
     // Only evaluate tools above read-only.
     let level = mangocode_core::PermissionLevel::for_tool(tool_name);
@@ -4073,6 +4078,14 @@ async fn check_critic(
             );
             warn!(tool = %tool_name, message = %warning, "Permission critic unavailable");
             end_permission_span(permission_span);
+            if auto_review && critic_cfg.fallback_to_classifier {
+                return static_classifier_fallback(tool_name, tool_input).map(|reason| {
+                    mangocode_tools::ToolResult::error(format!(
+                        "Blocked by approvals_reviewer auto_review fallback: {} (critic unavailable: no API key configured)",
+                        reason
+                    ))
+                });
+            }
             return None;
         }
     };

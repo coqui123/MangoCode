@@ -237,6 +237,7 @@ impl Tool for PowerShellTool {
         let output_mode = params
             .output_mode
             .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+        let coordination_notice = crate::coordination::execution_claim_notice(ctx, &params.command);
 
         // ── Step 1: classify the command ─────────────────────────────────────
         let risk = classify_ps_command(&params.command);
@@ -406,13 +407,17 @@ impl Tool for PowerShellTool {
 
                 const MAX_OUTPUT_LEN: usize = 100_000;
                 if output.len() > MAX_OUTPUT_LEN {
-                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN);
+                    output = crate::output_reducers::truncate_middle_bytes(&output, MAX_OUTPUT_LEN)
+                        .into_owned();
                 }
 
                 let reduced =
                     reduce_command_output(&params.command, &output, exit_code, output_mode);
 
-                reduced.into_tool_result(exit_code, "PowerShell exited with code")
+                crate::coordination::append_execution_notice(
+                    reduced.into_tool_result(exit_code, "PowerShell exited with code"),
+                    coordination_notice.as_deref(),
+                )
             }
             Err(_) => {
                 let _ = child.kill().await;

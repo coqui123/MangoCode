@@ -12,6 +12,8 @@ pub struct FileWriteTool;
 struct FileWriteInput {
     file_path: String,
     content: String,
+    #[serde(default)]
+    confirm_conflicts: bool,
 }
 
 #[async_trait]
@@ -41,6 +43,10 @@ impl Tool for FileWriteTool {
                 "content": {
                     "type": "string",
                     "description": "The content to write to the file"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for this path."
                 }
             },
             "required": ["file_path", "content"]
@@ -62,6 +68,16 @@ impl Tool for FileWriteTool {
         {
             return ToolResult::error(e.to_string());
         }
+
+        let coordination_conflicts = match crate::coordination::preflight_write_conflicts(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(result) => return result,
+        };
 
         // Ensure parent directories exist
         if let Some(parent) = path.parent() {
@@ -118,18 +134,22 @@ impl Tool for FileWriteTool {
         let byte_count = final_content.len();
 
         let action = if is_new { "Created" } else { "Wrote" };
-        ToolResult::success(format!(
-            "{} {} ({} lines, {} bytes)",
-            action,
-            path.display(),
-            line_count,
-            byte_count
-        ))
-        .with_metadata(json!({
+        let content = crate::coordination::append_confirmed_conflict_note(
+            format!(
+                "{} {} ({} lines, {} bytes)",
+                action,
+                path.display(),
+                line_count,
+                byte_count
+            ),
+            coordination_conflicts.as_deref(),
+        );
+        ToolResult::success(content).with_metadata(json!({
             "file_path": path.display().to_string(),
             "is_new": is_new,
             "lines": line_count,
             "bytes": byte_count,
+            "coordination_conflicts": coordination_conflicts,
         }))
     }
 }

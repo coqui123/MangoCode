@@ -103,7 +103,7 @@ hex = { workspace = true }
 getrandom = { workspace = true }
 url = { workspace = true }
 schemars = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 urlencoding = { workspace = true }
 glob = { workspace = true }
 aes-gcm = "0.10"

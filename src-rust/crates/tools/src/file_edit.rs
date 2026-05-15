@@ -16,6 +16,8 @@ struct FileEditInput {
     new_string: String,
     #[serde(default)]
     replace_all: bool,
+    #[serde(default)]
+    confirm_conflicts: bool,
 }
 
 #[async_trait]
@@ -54,6 +56,10 @@ impl Tool for FileEditTool {
                 "replace_all": {
                     "type": "boolean",
                     "description": "Replace all occurrences of old_string (default false)"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for this path."
                 }
             },
             "required": ["file_path", "old_string", "new_string"]
@@ -80,6 +86,16 @@ impl Tool for FileEditTool {
         {
             return ToolResult::error(e.to_string());
         }
+
+        let coordination_conflicts = match crate::coordination::preflight_write_conflicts(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(result) => return result,
+        };
 
         // Read current content
         let content = match tokio::fs::read_to_string(&path).await {
@@ -147,9 +163,14 @@ impl Tool for FileEditTool {
             if replacements != 1 { "s" } else { "" }
         );
 
+        let msg = crate::coordination::append_confirmed_conflict_note(
+            msg,
+            coordination_conflicts.as_deref(),
+        );
         ToolResult::success(msg).with_metadata(json!({
             "file_path": path.display().to_string(),
             "replacements": replacements,
+            "coordination_conflicts": coordination_conflicts,
         }))
     }
 }

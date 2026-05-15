@@ -32,7 +32,7 @@ parking_lot = { workspace = true }
 dashmap = { workspace = true }
 which = { workspace = true }
 dirs = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -64,6 +64,7 @@ default-tools = [
     "tool-batch-edit",
     "tool-brief",
     "tool-config",
+    "tool-coordination",
     "tool-cron-create",
     "tool-cron-delete",
     "tool-cron-list",
@@ -118,6 +119,7 @@ default-tools-no-web-research = [
     "tool-batch-edit",
     "tool-brief",
     "tool-config",
+    "tool-coordination",
     "tool-cron-create",
     "tool-cron-delete",
     "tool-cron-list",
@@ -176,6 +178,7 @@ tool-brief = []
 tool-browser = ["dep:chromiumoxide"]
 tool-computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
 tool-config = []
+tool-coordination = []
 tool-cron-create = []
 tool-cron-delete = []
 tool-cron-list = []

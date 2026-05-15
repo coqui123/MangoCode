@@ -386,6 +386,8 @@ impl LlmProvider for AnthropicProvider {
                 name: "Claude Opus 4.6".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 32_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("claude-sonnet-4-6"),
@@ -393,6 +395,8 @@ impl LlmProvider for AnthropicProvider {
                 name: "Claude Sonnet 4.6".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 16_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("claude-haiku-4-5-20251001"),
@@ -400,6 +404,8 @@ impl LlmProvider for AnthropicProvider {
                 name: "Claude Haiku 4.5".to_string(),
                 context_window: 200_000,
                 max_output_tokens: 8_096,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
         ])
     }

@@ -119,6 +119,104 @@ pub fn model_supports_max_effort(id: &str) -> bool {
         || lower.starts_with("gpt-5.1-codex-max")
 }
 
+fn model_entry_supports_effort(entry: &ModelEntry) -> bool {
+    !available_efforts_for_entry(entry).is_empty()
+}
+
+fn default_efforts_for_model(id: &str) -> Vec<EffortLevel> {
+    if !model_supports_effort(id) {
+        return Vec::new();
+    }
+
+    let mut efforts = vec![EffortLevel::Low, EffortLevel::Normal, EffortLevel::High];
+    if model_supports_max_effort(id) {
+        efforts.push(EffortLevel::Max);
+    }
+    efforts
+}
+
+fn available_efforts_for_entry(entry: &ModelEntry) -> Vec<EffortLevel> {
+    if entry.supported_efforts.is_empty() {
+        return default_efforts_for_model(&entry.id);
+    }
+
+    let mut efforts = Vec::new();
+    for effort in entry.supported_efforts.iter().copied() {
+        if !efforts.contains(&effort) {
+            efforts.push(effort);
+        }
+    }
+    efforts
+}
+
+fn effort_rank(effort: EffortLevel) -> i32 {
+    match effort {
+        EffortLevel::Low => 2,
+        EffortLevel::Normal => 3,
+        EffortLevel::High => 4,
+        EffortLevel::Max => 5,
+    }
+}
+
+fn nearest_effort(target: EffortLevel, supported: &[EffortLevel]) -> Option<EffortLevel> {
+    supported
+        .iter()
+        .copied()
+        .min_by_key(|candidate| (effort_rank(*candidate) - effort_rank(target)).abs())
+}
+
+fn effective_effort_for_entry(entry: &ModelEntry, current: EffortLevel) -> Option<EffortLevel> {
+    let efforts = available_efforts_for_entry(entry);
+    if efforts.is_empty() {
+        return None;
+    }
+
+    if efforts.contains(&current) {
+        return Some(current);
+    }
+
+    if let Some(default) = entry
+        .default_effort
+        .filter(|default| efforts.contains(default))
+    {
+        return Some(default);
+    }
+
+    nearest_effort(current, &efforts)
+}
+
+fn cycle_effort_for_entry(entry: &ModelEntry, current: EffortLevel, direction: i32) -> EffortLevel {
+    let efforts = available_efforts_for_entry(entry);
+    if efforts.is_empty() {
+        return current;
+    }
+
+    let current = effective_effort_for_entry(entry, current).unwrap_or(efforts[0]);
+    let current_idx = efforts
+        .iter()
+        .position(|effort| *effort == current)
+        .unwrap_or(0);
+    let len = efforts.len();
+    let next_idx = if direction >= 0 {
+        (current_idx + 1) % len
+    } else if current_idx == 0 {
+        len - 1
+    } else {
+        current_idx - 1
+    };
+    efforts[next_idx]
+}
+
+pub fn effort_from_reasoning_level(level: &str) -> Option<EffortLevel> {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(EffortLevel::Low),
+        "medium" | "normal" => Some(EffortLevel::Normal),
+        "high" => Some(EffortLevel::High),
+        "xhigh" | "extra_high" | "max" => Some(EffortLevel::Max),
+        _ => None,
+    }
+}
+
 fn effort_control_name(id: &str) -> &'static str {
     if id.to_ascii_lowercase().starts_with("gpt-5") {
         "intelligence"
@@ -256,6 +354,8 @@ pub struct ModelEntry {
     pub id: String,
     pub display_name: String,
     pub description: String,
+    pub default_effort: Option<EffortLevel>,
+    pub supported_efforts: Vec<EffortLevel>,
     /// Whether this is the currently active model.
     pub is_current: bool,
 }
@@ -270,6 +370,8 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
         id: id.to_string(),
         display_name: name.to_string(),
         description: desc.to_string(),
+        default_effort: None,
+        supported_efforts: Vec::new(),
         is_current: false,
     }
 }
@@ -307,6 +409,8 @@ pub fn ollama_installed_to_entry(m: &mangocode_api::OllamaInstalledModel) -> Mod
         id: format!("ollama/{}", m.name),
         display_name: m.name.clone(),
         description: desc_parts.join(" • "),
+        default_effort: None,
+        supported_efforts: Vec::new(),
         is_current: false,
     }
 }
@@ -324,6 +428,8 @@ pub fn ollama_entries_from_installed(
             display_name: "No models installed".to_string(),
             description: "Run `ollama pull <model>` to install one (e.g. `ollama pull llama3.2`)"
                 .to_string(),
+            default_effort: None,
+            supported_efforts: Vec::new(),
             is_current: false,
         }];
     }
@@ -340,6 +446,8 @@ pub fn ollama_offline_entries() -> Vec<ModelEntry> {
         description:
             "Start `ollama serve` (or set OLLAMA_HOST) to discover installed models — showing static suggestions below"
                 .to_string(),
+        default_effort: None,
+        supported_efforts: Vec::new(),
         is_current: false,
     }];
     entries.extend(models_for_provider("ollama"));
@@ -370,6 +478,8 @@ pub fn models_for_provider_from_registry(
                     id: e.info.id.to_string(),
                     display_name: e.info.name.clone(),
                     description: cost_str,
+                    default_effort: None,
+                    supported_efforts: Vec::new(),
                     is_current: false,
                 }
             })
@@ -767,38 +877,26 @@ impl ModelPickerState {
     /// Cycle effort level forward (→ key).
     pub fn effort_next(&mut self) {
         let filtered = self.filtered_models();
-        let id = filtered
-            .get(self.selected_idx)
-            .map(|m| m.id.as_str())
-            .unwrap_or("");
-        let supports_max = model_supports_max_effort(id);
-        self.effort_level = self.effort_level.next(supports_max);
+        if let Some(entry) = filtered.get(self.selected_idx) {
+            self.effort_level = cycle_effort_for_entry(entry, self.effort_level, 1);
+        }
     }
 
     /// Cycle effort level backward (← key).
     pub fn effort_prev(&mut self) {
         let filtered = self.filtered_models();
-        let id = filtered
-            .get(self.selected_idx)
-            .map(|m| m.id.as_str())
-            .unwrap_or("");
-        let supports_max = model_supports_max_effort(id);
-        self.effort_level = self.effort_level.prev(supports_max);
+        if let Some(entry) = filtered.get(self.selected_idx) {
+            self.effort_level = cycle_effort_for_entry(entry, self.effort_level, -1);
+        }
     }
 
     /// Returns the effective effort for the currently highlighted model:
     /// `None` if the model does not support extended thinking.
     pub fn effective_effort(&self) -> Option<EffortLevel> {
         let filtered = self.filtered_models();
-        let id = filtered
+        filtered
             .get(self.selected_idx)
-            .map(|m| m.id.as_str())
-            .unwrap_or("");
-        if model_supports_effort(id) {
-            Some(self.effort_level)
-        } else {
-            None
-        }
+            .and_then(|entry| effective_effort_for_entry(entry, self.effort_level))
     }
 
     /// Confirm the current selection.
@@ -812,11 +910,7 @@ impl ModelPickerState {
         let filtered = self.filtered_models();
         let entry = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
-        let effort = if model_supports_effort(&id) {
-            Some(self.effort_level)
-        } else {
-            None
-        };
+        let effort = effective_effort_for_entry(entry, self.effort_level);
         // If user chose a model other than the fast-mode model while fast mode is
         self.close();
         Some((id, effort))
@@ -890,6 +984,8 @@ impl ModelPickerState {
                                 id: m.id,
                                 display_name: display,
                                 description,
+                                default_effort: None,
+                                supported_efforts: Vec::new(),
                                 is_current: false,
                             },
                         )
@@ -912,54 +1008,72 @@ impl ModelPickerState {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "Most capable model — best for complex reasoning and analysis"
                     .to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "Balanced performance and speed — great for coding tasks".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-haiku-4-5-20251001".to_string(),
                 display_name: "Claude Haiku 4.5 (2025-10-01)".to_string(),
                 description: "Fast and efficient — ideal for quick completions".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-opus-4-5".to_string(),
                 display_name: "Claude Opus 4.5".to_string(),
                 description: "Previous Opus generation — powerful multimodal reasoning".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-sonnet-4-5".to_string(),
                 display_name: "Claude Sonnet 4.5".to_string(),
                 description: "Previous Sonnet generation — solid coding and writing".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "Previous Haiku generation — lightweight and responsive".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-3-7-sonnet-20250219".to_string(),
                 display_name: "Claude 3.7 Sonnet (2025-02-19)".to_string(),
                 description: "Sonnet 3.7 with enhanced instruction following".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-3-5-sonnet-20241022".to_string(),
                 display_name: "Claude 3.5 Sonnet (2024-10-22)".to_string(),
                 description: "Highly capable 3.5 Sonnet — reliable and well-tested".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
             ModelEntry {
                 id: "claude-3-5-haiku-20241022".to_string(),
                 display_name: "Claude 3.5 Haiku (2024-10-22)".to_string(),
                 description: "Fast 3.5 Haiku — great for high-throughput pipelines".to_string(),
+                default_effort: None,
+                supported_efforts: Vec::new(),
                 is_current: false,
             },
         ]
@@ -1094,7 +1208,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     } else {
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
-            let supports_effort = model_supports_effort(&model.id);
+            let supports_effort = model_entry_supports_effort(model);
 
             if is_selected {
                 selected_line_idx = (lines.len() as u16).saturating_sub(current_line_start);
@@ -1128,8 +1242,14 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
                 spans.push(Span::styled(
                     format!(
                         "  {} {}",
-                        state.effort_level.symbol(),
-                        state.effort_level.label()
+                        state
+                            .effective_effort()
+                            .unwrap_or(state.effort_level)
+                            .symbol(),
+                        state
+                            .effective_effort()
+                            .unwrap_or(state.effort_level)
+                            .label()
                     ),
                     Style::default().fg(Color::Rgb(200, 255, 200)).bg(bg),
                 ));
@@ -1165,7 +1285,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     }
 
     if let Some(selected) = filtered.get(state.selected_idx) {
-        if model_supports_effort(&selected.id) {
+        if model_entry_supports_effort(selected) {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 format!(
@@ -1360,6 +1480,67 @@ mod tests {
         assert!(model_supports_max_effort("gpt-5.5"));
         assert!(model_supports_max_effort("gpt-5.1-codex-max"));
         assert!(!model_supports_max_effort("gpt-5.1-codex"));
+    }
+
+    #[test]
+    fn dynamic_codex_reasoning_metadata_controls_confirmed_effort() {
+        let mut p = ModelPickerState::new();
+        p.set_models(vec![ModelEntry {
+            id: "gpt-live".to_string(),
+            display_name: "GPT Live".to_string(),
+            description: "dynamic".to_string(),
+            default_effort: Some(EffortLevel::Max),
+            supported_efforts: vec![EffortLevel::Low, EffortLevel::High, EffortLevel::Max],
+            is_current: false,
+        }]);
+        p.open_with_state("gpt-live", EffortLevel::Low, false);
+
+        p.effort_next();
+        assert_eq!(
+            p.confirm(),
+            Some(("gpt-live".to_string(), Some(EffortLevel::High)))
+        );
+    }
+
+    #[test]
+    fn dynamic_codex_reasoning_metadata_skips_unsupported_efforts() {
+        let mut p = ModelPickerState::new();
+        p.set_models(vec![ModelEntry {
+            id: "gpt-live".to_string(),
+            display_name: "GPT Live".to_string(),
+            description: "dynamic".to_string(),
+            default_effort: Some(EffortLevel::High),
+            supported_efforts: vec![EffortLevel::Low, EffortLevel::High, EffortLevel::Max],
+            is_current: false,
+        }]);
+        p.open_with_state("gpt-live", EffortLevel::Normal, false);
+
+        assert_eq!(p.effective_effort(), Some(EffortLevel::High));
+        p.effort_next();
+        assert_eq!(p.effective_effort(), Some(EffortLevel::Max));
+        p.effort_next();
+        assert_eq!(p.effective_effort(), Some(EffortLevel::Low));
+        p.effort_prev();
+        assert_eq!(p.effective_effort(), Some(EffortLevel::Max));
+    }
+
+    #[test]
+    fn dynamic_codex_reasoning_metadata_clamps_to_nearest_when_no_default() {
+        let mut p = ModelPickerState::new();
+        p.set_models(vec![ModelEntry {
+            id: "gpt-live".to_string(),
+            display_name: "GPT Live".to_string(),
+            description: "dynamic".to_string(),
+            default_effort: None,
+            supported_efforts: vec![EffortLevel::Low, EffortLevel::Max],
+            is_current: false,
+        }]);
+        p.open_with_state("gpt-live", EffortLevel::High, false);
+
+        assert_eq!(
+            p.confirm(),
+            Some(("gpt-live".to_string(), Some(EffortLevel::Max)))
+        );
     }
 
     #[test]

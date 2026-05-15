@@ -735,13 +735,18 @@ impl Tool for PtyBashTool {
         let output_mode = params
             .output_mode
             .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+        let coordination_notice = crate::coordination::execution_claim_notice(ctx, &params.command);
 
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms).await;
+            let result = run_in_background(params.command, cwd, timeout_ms).await;
+            return crate::coordination::append_execution_notice(
+                result,
+                coordination_notice.as_deref(),
+            );
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -806,7 +811,10 @@ impl Tool for PtyBashTool {
                         if output.is_empty() {
                             output = "(no output)".to_string();
                         }
-                        reduce_output(&params.command, output, exit_code, output_mode)
+                        crate::coordination::append_execution_notice(
+                            reduce_output(&params.command, output, exit_code, output_mode),
+                            coordination_notice.as_deref(),
+                        )
                     }
                     Err(e) => ToolResult::error(e),
                 };
@@ -852,7 +860,10 @@ impl Tool for PtyBashTool {
                     if output.is_empty() {
                         output = "(no output)".to_string();
                     }
-                    reduce_output(&params.command, output, exit_code, output_mode)
+                    crate::coordination::append_execution_notice(
+                        reduce_output(&params.command, output, exit_code, output_mode),
+                        coordination_notice.as_deref(),
+                    )
                 }
                 Err(e) => ToolResult::error(e),
             };
@@ -919,7 +930,10 @@ impl Tool for PtyBashTool {
                         output = "(no output)".to_string();
                     }
 
-                    reduce_output(&params.command, output, exit_code, output_mode)
+                    crate::coordination::append_execution_notice(
+                        reduce_output(&params.command, output, exit_code, output_mode),
+                        coordination_notice.as_deref(),
+                    )
                 }
                 Ok(Err(e)) => ToolResult::error(format!("PTY execution failed: {}", e)),
                 Err(_) => ToolResult::error(format!("Command timed out after {}ms", timeout_ms)),

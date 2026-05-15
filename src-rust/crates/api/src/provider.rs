@@ -36,6 +36,14 @@ pub struct ModelInfo {
 
     /// Maximum number of tokens the model can emit in a single response.
     pub max_output_tokens: u32,
+
+    /// Provider-advertised default reasoning/intelligence level for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_level: Option<String>,
+
+    /// Provider-advertised supported reasoning/intelligence levels for this model.
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

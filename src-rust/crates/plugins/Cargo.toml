@@ -31,7 +31,7 @@ walkdir = { workspace = true }
 dirs = { workspace = true }
 
 # HTTP (marketplace downloads)
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 
 # Hash verification
 sha2 = { workspace = true }

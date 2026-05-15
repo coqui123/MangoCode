@@ -1,6 +1,6 @@
 // render.rs â€” All ratatui rendering logic.
 
-use std::cell::RefCell;
+use std::{borrow::Cow, cell::RefCell};
 
 use crate::agents_view::render_agents_menu;
 use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
@@ -235,15 +235,15 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-fn truncate_end(text: &str, max_width: usize) -> String {
+fn truncate_end(text: &str, max_width: usize) -> Cow<'_, str> {
     if max_width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if max_width <= 1 {
-        return "\u{2026}".to_string();
+        return Cow::Borrowed("\u{2026}");
     }
     let mut out = String::new();
     let mut width = 0usize;
@@ -256,7 +256,7 @@ fn truncate_end(text: &str, max_width: usize) -> String {
         width += ch_width;
     }
     out.push('\u{2026}');
-    out
+    Cow::Owned(out)
 }
 
 fn provider_status_name(provider_id: &str) -> &'static str {
@@ -272,12 +272,12 @@ fn provider_status_name(provider_id: &str) -> &'static str {
     }
 }
 
-fn truncate_middle(text: &str, max_width: usize) -> String {
+fn truncate_middle(text: &str, max_width: usize) -> Cow<'_, str> {
     if max_width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
     if max_width <= 3 {
         return truncate_end(text, max_width);
@@ -292,12 +292,15 @@ fn truncate_middle(text: &str, max_width: usize) -> String {
         .into_iter()
         .rev()
         .collect();
-    format!("{left}\u{2026}{right}")
+    Cow::Owned(format!("{left}\u{2026}{right}"))
 }
 
-fn truncate_text(text: &str, max_width: usize) -> String {
+fn truncate_text(text: &str, max_width: usize) -> Cow<'_, str> {
     if max_width == 0 {
-        return String::new();
+        return Cow::Borrowed("");
+    }
+    if text.width() <= max_width {
+        return Cow::Borrowed(text);
     }
     let mut out = String::new();
     for ch in text.chars() {
@@ -310,7 +313,7 @@ fn truncate_text(text: &str, max_width: usize) -> String {
         }
         out.push(ch);
     }
-    out
+    Cow::Owned(out)
 }
 
 // -----------------------------------------------------------------------
@@ -330,7 +333,7 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                truncate_end(summary, max_width),
+                truncate_end(summary, max_width).into_owned(),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -365,7 +368,7 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(" remote ", Style::default().fg(Color::Red)),
                 Span::styled(
-                    truncate_end(reason, max_width),
+                    truncate_end(reason, max_width).into_owned(),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -377,7 +380,7 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(" link ", Style::default().fg(CLAUDE_ORANGE)),
             Span::styled(
-                truncate_end(url, max_width),
+                truncate_end(url, max_width).into_owned(),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -399,7 +402,8 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     "You have launched claude in your home directory. \
                      For the best experience, launch it in a project directory instead.",
                     max_width,
-                ),
+                )
+                .into_owned(),
                 Style::default().fg(Color::Yellow),
             ),
         ]));
@@ -410,7 +414,7 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(" +dir ", Style::default().fg(Color::Cyan)),
             Span::styled(
-                truncate_end(&dir.display().to_string(), max_width),
+                truncate_end(&dir.display().to_string(), max_width).into_owned(),
                 Style::default().fg(Color::DarkGray),
             ),
         ]));
@@ -1047,7 +1051,7 @@ mod tests {
     fn truncate_end_handles_unicode_display_width() {
         let truncated = truncate_end("ab中def", 5);
 
-        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 5);
+        assert!(UnicodeWidthStr::width(truncated.as_ref()) <= 5);
         assert!(truncated.ends_with('…'));
     }
 

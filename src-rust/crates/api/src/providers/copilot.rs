@@ -453,6 +453,8 @@ impl CopilotProvider {
                 name: "Claude Sonnet 4.6 (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 32_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("claude-sonnet-4.5"),
@@ -460,6 +462,8 @@ impl CopilotProvider {
                 name: "Claude Sonnet 4.5 (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 32_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("claude-haiku-4.5"),
@@ -467,6 +471,8 @@ impl CopilotProvider {
                 name: "Claude Haiku 4.5 (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 32_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-4.1"),
@@ -474,6 +480,8 @@ impl CopilotProvider {
                 name: "GPT-4.1 (Copilot)".into(),
                 context_window: 64_000,
                 max_output_tokens: 16_384,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-4o"),
@@ -481,6 +489,8 @@ impl CopilotProvider {
                 name: "GPT-4o (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-4o-mini"),
@@ -488,6 +498,8 @@ impl CopilotProvider {
                 name: "GPT-4o Mini (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 16_384,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-5.4"),
@@ -495,6 +507,8 @@ impl CopilotProvider {
                 name: "GPT-5.4 (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 128_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gpt-5-mini"),
@@ -502,6 +516,8 @@ impl CopilotProvider {
                 name: "GPT-5 Mini (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 128_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("o3-mini"),
@@ -509,6 +525,8 @@ impl CopilotProvider {
                 name: "o3-mini (Copilot)".into(),
                 context_window: 200_000,
                 max_output_tokens: 100_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("o4-mini"),
@@ -516,6 +534,8 @@ impl CopilotProvider {
                 name: "o4-mini (Copilot)".into(),
                 context_window: 200_000,
                 max_output_tokens: 100_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("gemini-3-flash-preview"),
@@ -523,6 +543,8 @@ impl CopilotProvider {
                 name: "Gemini 3 Flash (Copilot)".into(),
                 context_window: 128_000,
                 max_output_tokens: 64_000,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
         ]
     }
@@ -1238,6 +1260,8 @@ impl LlmProvider for CopilotProvider {
                                 name: name.to_string(),
                                 context_window: ctx,
                                 max_output_tokens: max_out,
+                                default_reasoning_level: None,
+                                supported_reasoning_levels: Vec::new(),
                             });
                         }
                     }

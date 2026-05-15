@@ -1,5 +1,7 @@
 //! Session browser overlay (/session, /resume, /rename, /export).
 
+use std::borrow::Cow;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -173,12 +175,12 @@ fn fmt_cost(usd: f64) -> String {
 }
 
 /// Truncate `s` to fit within `max_width` display columns, appending `…` if cut.
-fn truncate_display(s: &str, max_width: usize) -> String {
+fn truncate_display(s: &str, max_width: usize) -> Cow<'_, str> {
     if s.width() <= max_width {
-        return s.to_string();
+        return Cow::Borrowed(s);
     }
     if max_width <= 1 {
-        return "…".to_string();
+        return Cow::Borrowed("…");
     }
     let mut out = String::new();
     let mut width = 0usize;
@@ -190,7 +192,7 @@ fn truncate_display(s: &str, max_width: usize) -> String {
         out.push(ch);
         width += ch_width;
     }
-    format!("{}…", out)
+    Cow::Owned(format!("{}…", out))
 }
 
 // ---------------------------------------------------------------------------

@@ -41,10 +41,12 @@ use mangocode_core::keybindings::{
 use mangocode_core::types::{ContentBlock, Message, Role};
 use mangocode_file_search::{FileSearchIndex, SearchKind};
 use mangocode_query::QueryEvent;
+use mangocode_sleep_inhibitor::SleepInhibitor;
 use mangocode_tools;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Stdout;
 use std::sync::{Arc, Mutex};
@@ -626,6 +628,8 @@ pub struct App {
     /// Whether the app has valid API credentials configured.
     /// False = show the in-TUI provider setup dialog on startup.
     pub has_credentials: bool,
+    /// Prevents system idle sleep while an agent turn or tool is active.
+    pub sleep_inhibitor: SleepInhibitor,
     /// Current effort level (controls extended-thinking budget_tokens).
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
@@ -931,6 +935,8 @@ pub struct App {
     pub paste_burst_until: Option<std::time::Instant>,
     /// Cursor position when the current paste burst started (for collapse).
     pub paste_burst_start_cursor: Option<usize>,
+    /// Follow-up prompts queued with Tab while a turn is running.
+    queued_user_messages: VecDeque<String>,
     /// After a Ctrl+V clipboard paste, some terminals emit the same payload as
     /// `Event::Paste`. Suppress one matching bracketed-paste within this window.
     suppress_duplicate_terminal_paste: Option<(std::time::Instant, String)>,
@@ -1083,6 +1089,7 @@ fn format_elapsed(secs: u64) -> String {
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
         let model_name = config.effective_model().to_string();
+        let prevent_idle_sleep = config.prevent_idle_sleep;
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
         let project_root = config
             .project_dir
@@ -1116,6 +1123,7 @@ impl App {
             cost_usd: 0.0,
             model_name,
             has_credentials: true, // overridden by caller when no key is configured
+            sleep_inhibitor: SleepInhibitor::new(prevent_idle_sleep),
             effort_level: EffortLevel::Normal,
             fast_mode: false,
             agent_mode: None,
@@ -1658,6 +1666,7 @@ impl App {
             paste_burst_last_printable_at: None,
             paste_burst_until: None,
             paste_burst_start_cursor: None,
+            queued_user_messages: VecDeque::new(),
             suppress_duplicate_terminal_paste: None,
         }
     }
@@ -2783,6 +2792,66 @@ impl App {
         }
         self.refresh_prompt_input();
         input
+    }
+
+    fn queue_current_input(&mut self) {
+        if self.prompt_input.text.trim_start().starts_with('/') {
+            self.status_message =
+                Some("Slash commands cannot be queued while a turn is running.".to_string());
+            return;
+        }
+        if !self.prompt_input.pending_images.is_empty()
+            || !self.prompt_input.pending_documents.is_empty()
+        {
+            self.status_message = Some(
+                "Prompts with attachments cannot be queued while a turn is running.".to_string(),
+            );
+            return;
+        }
+
+        let input = self.take_input();
+        if input.trim().is_empty() {
+            return;
+        }
+        self.queued_user_messages.push_back(input);
+        let count = self.queued_user_messages.len();
+        self.status_message = Some(if count == 1 {
+            "Queued 1 follow-up message".to_string()
+        } else {
+            format!("Queued {} follow-up messages", count)
+        });
+    }
+
+    pub fn take_next_queued_input(&mut self) -> Option<String> {
+        let input = self.queued_user_messages.pop_front()?;
+        if !self.queued_user_messages.is_empty() {
+            self.status_message = Some(format!(
+                "{} follow-up message(s) still queued",
+                self.queued_user_messages.len()
+            ));
+        }
+        Some(input)
+    }
+
+    pub fn restore_queued_input_for_editing(&mut self) {
+        if self.queued_user_messages.is_empty() {
+            return;
+        }
+
+        let mut restored: Vec<String> = self.queued_user_messages.drain(..).collect();
+        if !self.prompt_input.text.trim().is_empty() {
+            restored.push(self.prompt_input.take_expanded());
+        }
+        self.prompt_input.replace_text(restored.join("\n"));
+        self.status_message = Some("Restored queued follow-up message(s) for editing".to_string());
+        self.refresh_prompt_input();
+    }
+
+    pub fn restore_input_and_queued_for_editing(&mut self, input: String) {
+        if !input.trim().is_empty() {
+            self.queued_user_messages.push_front(input);
+        }
+        self.restore_queued_input_for_editing();
     }
 
     /// Compute the number of lines to scroll per wheel/trackpad event.
@@ -3965,6 +4034,7 @@ impl App {
             self.streaming_text.clear();
             self.tool_use_blocks.clear();
             self.status_message = Some("Cancelled.".to_string());
+            self.restore_queued_input_for_editing();
             return false;
         }
 
@@ -4088,6 +4158,17 @@ impl App {
             && self.current_key_context() == KeyContext::Chat
             && self.toggle_tool_output_expand()
         {
+            return false;
+        }
+
+        if key.code == KeyCode::Tab && self.is_streaming {
+            if self.prompt_has_active_suggestions() && self.prompt_input.suggestion_index.is_some()
+            {
+                self.prompt_input.accept_suggestion();
+                self.refresh_prompt_input();
+            } else {
+                self.queue_current_input();
+            }
             return false;
         }
 
@@ -4258,6 +4339,7 @@ impl App {
                     self.streaming_text.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
+                    self.restore_queued_input_for_editing();
                 } else {
                     self.should_quit = true;
                 }
@@ -4410,7 +4492,6 @@ impl App {
                     self.refresh_prompt_input();
                 }
             }
-
             // ---- Shift+Tab: cycle permission mode ----------------------
             // Default → AcceptEdits → BypassPermissions → Default
             KeyCode::BackTab if !self.is_streaming => {
@@ -4885,6 +4966,7 @@ impl App {
                     self.streaming_text.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
+                    self.restore_queued_input_for_editing();
                 } else {
                     self.should_quit = true;
                 }
@@ -5771,6 +5853,7 @@ impl App {
                     }
                 }
                 self.is_streaming = true;
+                self.sleep_inhibitor.set_turn_running(true);
                 match stream_evt {
                     mangocode_api::AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
                         // Reset stall timer on any incoming delta — we're making progress.
@@ -5788,6 +5871,7 @@ impl App {
                     }
                     mangocode_api::AnthropicStreamEvent::MessageStop => {
                         self.is_streaming = false;
+                        self.sleep_inhibitor.set_turn_running(false);
                         self.spinner_verb = None;
                         self.stall_start = None;
                         if !self.streaming_text.is_empty() {
@@ -5816,6 +5900,7 @@ impl App {
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
                 }
                 self.is_streaming = true;
+                self.sleep_inhibitor.set_turn_running(true);
                 self.status_message = Some(format!("Running {}…", tool_name));
                 if let Some(existing) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     existing.status = ToolStatus::Running;
@@ -5873,6 +5958,7 @@ impl App {
             } => {
                 debug!(turn, stop_reason, "Turn complete");
                 self.is_streaming = false;
+                self.sleep_inhibitor.set_turn_running(false);
                 self.spinner_verb = None;
                 self.status_message = None;
                 self.stall_start = None;
@@ -5902,12 +5988,14 @@ impl App {
 
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
+                self.sleep_inhibitor.set_turn_running(false);
                 self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
                 self.status_message = Some(err_msg);
+                self.restore_queued_input_for_editing();
             }
             QueryEvent::TokenWarning { state, pct_used } => {
                 // Push a notification for context window warnings (notification + threshold tracking).
@@ -6049,6 +6137,21 @@ impl App {
                                                 id: m.id.to_string(),
                                                 display_name: m.name.clone(),
                                                 description: format!("{}K context", ctx_k),
+                                                default_effort: m
+                                                    .default_reasoning_level
+                                                    .as_deref()
+                                                    .and_then(
+                                                        crate::model_picker::effort_from_reasoning_level,
+                                                    ),
+                                                supported_efforts: m
+                                                    .supported_reasoning_levels
+                                                    .iter()
+                                                    .filter_map(|level| {
+                                                        crate::model_picker::effort_from_reasoning_level(
+                                                            level,
+                                                        )
+                                                    })
+                                                    .collect(),
                                                 is_current: false,
                                             }
                                         })
@@ -6734,6 +6837,139 @@ mod tests {
         let submit = app.handle_key_event(key_press(KeyCode::Enter, KeyModifiers::NONE));
         assert!(submit);
         assert_eq!(app.prompt_input.text, "hi");
+    }
+
+    #[test]
+    fn test_tab_queues_prompt_while_streaming() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.set_prompt_text("follow up".to_string());
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "");
+        assert_eq!(
+            app.queued_user_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_tab_while_streaming_ignores_stale_suggestion_and_queues() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.prompt_input.text = "follow up".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.prompt_input.suggestions = vec![TypeaheadSuggestion {
+            text: "/help".to_string(),
+            description: "Show help".to_string(),
+            source: TypeaheadSource::SlashCommand,
+        }];
+        app.prompt_input.suggestion_index = Some(0);
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "");
+        assert_eq!(
+            app.queued_user_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_tab_while_streaming_keeps_slash_command_in_composer() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.set_prompt_text("/compact".to_string());
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "/compact");
+        assert!(app.queued_user_messages.is_empty());
+    }
+
+    #[test]
+    fn test_tab_while_streaming_keeps_attachment_prompt_in_composer() {
+        let mut app = make_app();
+        app.is_streaming = true;
+        app.set_prompt_text("describe this".to_string());
+        app.prompt_input.add_image(crate::image_paste::PastedImage {
+            path: std::path::PathBuf::from("clipboard.png"),
+            label: "clipboard.png".to_string(),
+            dimensions: Some((10, 10)),
+        });
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert_eq!(app.prompt_input.text, "describe this");
+        assert_eq!(app.prompt_input.pending_images.len(), 1);
+        assert!(app.queued_user_messages.is_empty());
+    }
+
+    #[test]
+    fn test_turn_complete_allows_next_queued_prompt_to_drain() {
+        let mut app = make_app();
+        app.queued_user_messages.push_back("first".to_string());
+        app.queued_user_messages.push_back("second".to_string());
+        app.is_streaming = true;
+
+        app.handle_query_event(QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+
+        assert!(!app.is_streaming);
+        assert_eq!(app.take_next_queued_input(), Some("first".to_string()));
+        assert_eq!(
+            app.queued_user_messages.iter().cloned().collect::<Vec<_>>(),
+            vec!["second".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_error_restores_queued_prompt_for_editing() {
+        let mut app = make_app();
+        app.queued_user_messages
+            .push_back("queued follow up".to_string());
+        app.is_streaming = true;
+
+        app.handle_query_event(QueryEvent::Error("network failed".to_string()));
+
+        assert!(!app.is_streaming);
+        assert!(app.queued_user_messages.is_empty());
+        assert_eq!(app.prompt_input.text, "queued follow up");
+    }
+
+    #[test]
+    fn test_cancel_restores_queued_prompt_for_editing() {
+        let mut app = make_app();
+        app.queued_user_messages
+            .push_back("queued follow up".to_string());
+        app.is_streaming = true;
+
+        let should_submit = app.handle_key_event(key_press(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!should_submit);
+        assert!(!app.is_streaming);
+        assert!(app.queued_user_messages.is_empty());
+        assert_eq!(app.prompt_input.text, "queued follow up");
+    }
+
+    #[test]
+    fn test_restore_input_and_queued_preserves_order_for_editing() {
+        let mut app = make_app();
+        app.queued_user_messages.push_back("second".to_string());
+        app.queued_user_messages.push_back("third".to_string());
+
+        app.restore_input_and_queued_for_editing("first".to_string());
+
+        assert!(app.queued_user_messages.is_empty());
+        assert_eq!(app.prompt_input.text, "first\nsecond\nthird");
     }
 
     #[test]

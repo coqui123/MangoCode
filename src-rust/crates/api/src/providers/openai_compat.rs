@@ -1325,6 +1325,8 @@ impl LlmProvider for OpenAiCompatProvider {
                     name: m.name.clone(),
                     context_window: 128_000,
                     max_output_tokens: 16_384,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
                 })
                 .collect());
         }
@@ -1376,6 +1378,8 @@ impl LlmProvider for OpenAiCompatProvider {
                     name: id.to_string(),
                     context_window: 128_000,
                     max_output_tokens: 16_384,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
                 })
             })
             .collect();

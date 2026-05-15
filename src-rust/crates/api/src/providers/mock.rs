@@ -197,6 +197,8 @@ impl LlmProvider for MockProvider {
             name: "Mock Model".to_string(),
             context_window: 200_000,
             max_output_tokens: 8_192,
+            default_reasoning_level: None,
+            supported_reasoning_levels: Vec::new(),
         }])
     }
 

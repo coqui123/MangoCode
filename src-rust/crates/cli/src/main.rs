@@ -52,7 +52,7 @@ use parking_lot::Mutex as ParkingMutex;
 use rpassword::prompt_password;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tracing::{debug, info, warn};
@@ -174,6 +174,111 @@ fn effective_model_for_query_config(
         registry.load_standard_cache();
         mangocode_api::effective_model_for_config(config, &registry)
     }
+}
+
+fn sync_approval_reviewer_runtime(config: &Config) {
+    let critic = mangocode_core::global_critic();
+    let mut critic_config = critic.get_config();
+    critic_config.enabled = config.critic_mode || config.approvals_reviewer.is_auto_review();
+    if let Some(model) = config
+        .critic_model
+        .as_ref()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+    {
+        critic_config.model = model.to_string();
+    }
+    critic.update_config(critic_config);
+}
+
+enum PromptSubmitHookOutcome {
+    Allowed(String),
+    Blocked { reason: String, input: String },
+}
+
+async fn run_user_prompt_submit_hooks(
+    input: String,
+    config: &Config,
+    working_dir: &Path,
+    session_id: &str,
+) -> PromptSubmitHookOutcome {
+    let has_prompt_submit_hooks = !config.hooks.is_empty()
+        || mangocode_plugins::has_global_hooks_for_event(
+            mangocode_plugins::HookEventKind::UserPromptSubmit,
+        );
+    if !has_prompt_submit_hooks {
+        return PromptSubmitHookOutcome::Allowed(input);
+    }
+
+    let mut input = input;
+    let hook_ctx = mangocode_core::hooks::HookContext {
+        event: "UserPromptSubmit".to_string(),
+        tool_name: None,
+        tool_input: None,
+        tool_output: Some(input.clone()),
+        is_error: None,
+        session_id: Some(session_id.to_string()),
+    };
+    let core_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        mangocode_core::hooks::run_hooks(
+            &config.hooks,
+            mangocode_core::config::HookEvent::UserPromptSubmit,
+            &hook_ctx,
+            working_dir,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        eprintln!("Hooks timed out after 5s, continuing query");
+        mangocode_core::hooks::HookOutcome::Allowed
+    });
+
+    match core_outcome {
+        mangocode_core::hooks::HookOutcome::Blocked(reason) => {
+            return PromptSubmitHookOutcome::Blocked {
+                reason: format!("Prompt blocked by hook: {reason}"),
+                input,
+            };
+        }
+        mangocode_core::hooks::HookOutcome::Modified(modified) if !modified.trim().is_empty() => {
+            input = modified;
+        }
+        _ => {}
+    }
+
+    if mangocode_plugins::has_global_hooks_for_event(
+        mangocode_plugins::HookEventKind::UserPromptSubmit,
+    ) {
+        let prompt_for_plugin_hooks = input.clone();
+        let session_id_for_plugin_hooks = session_id.to_string();
+        let plugin_hook = tokio::task::spawn_blocking(move || {
+            mangocode_plugins::run_global_user_prompt_submit_hook(
+                &prompt_for_plugin_hooks,
+                Some(&session_id_for_plugin_hooks),
+            )
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(5), plugin_hook).await {
+            Ok(Ok(mangocode_plugins::HookOutcome::Deny(reason))) => {
+                return PromptSubmitHookOutcome::Blocked {
+                    reason: format!("Prompt blocked by plugin hook: {reason}"),
+                    input,
+                };
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    error = %err,
+                    "Plugin UserPromptSubmit hook task failed"
+                );
+            }
+            Err(_) => {
+                warn!("Plugin UserPromptSubmit hooks timed out after 5s, continuing query");
+            }
+        }
+    }
+
+    PromptSubmitHookOutcome::Allowed(input)
 }
 
 fn append_system_prompt_configured(config: &Config) -> bool {
@@ -1751,6 +1856,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref mcp_config) = cli.mcp_config {
         apply_mcp_config_override(&mut config, mcp_config)?;
     }
+    sync_approval_reviewer_runtime(&config);
 
     // --list-models fast path
     if cli.list_models {
@@ -1995,13 +2101,26 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let resolved_auth = config.resolve_auth_async().await.or_else(|| {
-        cached_tokens.as_ref().and_then(|tokens| {
-            tokens
-                .effective_credential()
-                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+    let stored_anthropic_key = if config.provider.as_deref().unwrap_or("anthropic") == "anthropic" {
+        mangocode_core::AuthStore::load().api_key_for("anthropic")
+    } else {
+        None
+    };
+    let has_stored_anthropic_key = stored_anthropic_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+
+    let resolved_auth = config
+        .resolve_auth_async()
+        .await
+        .or_else(|| {
+            cached_tokens.as_ref().and_then(|tokens| {
+                tokens
+                    .effective_credential()
+                    .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+            })
         })
-    });
+        .or_else(|| stored_anthropic_key.clone().map(|key| (key, false)));
 
     let (api_key, use_bearer_auth) = match resolved_auth {
         Some(auth) => auth,
@@ -2169,6 +2288,13 @@ async fn main() -> anyhow::Result<()> {
     query_config.has_append_system_prompt = append_system_prompt_configured(&config);
     cost_tracker.set_model(&query_config.model);
     query_config.max_turns = cli.max_turns;
+
+    let coordination_heartbeat = mangocode_core::coordination::spawn_presence_heartbeat(
+        mangocode_core::coordination::process_session_id(&session_id),
+        cwd.clone(),
+        query_config.model.clone(),
+        None,
+    );
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
@@ -2295,10 +2421,13 @@ async fn main() -> anyhow::Result<()> {
             cost_tracker,
             resume_id: cli.resume,
             bridge_config,
+            coordination_heartbeat,
             // has_credentials: true if we have an Anthropic key, OR if a
             // non-Anthropic provider is selected (its own auth is checked at
             // request time - we don't want to block TUI startup here).
-            has_credentials: !api_key.is_empty() || is_non_anthropic_provider,
+            has_credentials: !api_key.is_empty()
+                || is_non_anthropic_provider
+                || has_stored_anthropic_key,
             model_registry,
             client_config,
         })
@@ -3200,6 +3329,7 @@ struct InteractiveRunArgs {
     cost_tracker: Arc<CostTracker>,
     resume_id: Option<String>,
     bridge_config: Option<mangocode_bridge::BridgeConfig>,
+    coordination_heartbeat: mangocode_core::coordination::PresenceHeartbeat,
     has_credentials: bool,
     model_registry: Arc<mangocode_api::ModelRegistry>,
     /// Base client config used to build the Anthropic default provider. Kept
@@ -3251,6 +3381,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         cost_tracker,
         resume_id,
         bridge_config,
+        coordination_heartbeat,
         has_credentials,
         model_registry,
         client_config,
@@ -3327,6 +3458,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     );
     base_query_config.has_append_system_prompt = append_system_prompt_configured(&live_config);
     base_query_config.append_system_prompt = None;
+    coordination_heartbeat.update(
+        mangocode_core::coordination::process_session_id(&session.id),
+        tool_ctx.working_dir.clone(),
+        base_query_config.model.clone(),
+        session.title.clone(),
+    );
 
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.model_name = base_query_config.model.clone();
@@ -3622,6 +3759,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 ct.cancel();
                             }
                             app.is_streaming = false;
+                            app.restore_queued_input_for_editing();
                             app.status_message = Some("Cancelled.".to_string());
                             continue;
                         } else {
@@ -3676,6 +3814,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             ct.cancel();
                         }
                         app.is_streaming = false;
+                        app.restore_queued_input_for_editing();
                         app.status_message = Some("Cancelled.".to_string());
                         continue;
                     }
@@ -3833,6 +3972,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         base_query_config.effort_level = Some(level);
                                         app.effort_level = core_effort_to_tui(level);
                                     }
+                                    sync_approval_reviewer_runtime(&new_cfg);
                                     cmd_ctx.config = new_cfg.clone();
                                     cmd_ctx.effort_level = current_effort;
                                     tool_ctx.config = new_cfg.clone();
@@ -3966,6 +4106,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     app.session_id = Some(session.id.clone());
                                     app.session_title = session.title.clone();
                                     app.remote_session_url = session.remote_session_url.clone();
+                                    coordination_heartbeat.update(
+                                        mangocode_core::coordination::process_session_id(
+                                            &session.id,
+                                        ),
+                                        tool_ctx.working_dir.clone(),
+                                        base_query_config.model.clone(),
+                                        session.title.clone(),
+                                    );
                                     app.status_message = Some(format!(
                                         "Resumed session {}.",
                                         truncate_bytes_prefix(&session.id, 8)
@@ -3992,6 +4140,14 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     base_query_config.has_append_system_prompt =
                                         append_system_prompt_configured(&cmd_ctx.config);
                                     base_query_config.append_system_prompt = None;
+                                    coordination_heartbeat.update(
+                                        mangocode_core::coordination::process_session_id(
+                                            &tool_ctx.session_id,
+                                        ),
+                                        tool_ctx.working_dir.clone(),
+                                        base_query_config.model.clone(),
+                                        session.title.clone(),
+                                    );
                                     session.working_dir = Some(new_dir.display().to_string());
                                     session.updated_at = chrono::Utc::now();
                                     clear_session_shell_state(&tool_ctx.session_id);
@@ -4057,6 +4213,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     base_query_config.append_system_prompt = None;
                                     base_query_config.working_directory =
                                         Some(tool_ctx.working_dir.display().to_string());
+                                    sync_approval_reviewer_runtime(&new_cfg);
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
                                     tool_ctx.permission_mode = new_cfg.permission_mode.clone();
@@ -4101,6 +4258,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         new_cfg.permission_mode,
                                         mangocode_core::config::PermissionMode::Plan
                                     );
+                                    app.sleep_inhibitor.set_enabled(new_cfg.prevent_idle_sleep);
                                     app.status_message = Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
@@ -4125,6 +4283,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                     base_query_config.append_system_prompt = None;
                                     base_query_config.working_directory =
                                         Some(tool_ctx.working_dir.display().to_string());
+                                    sync_approval_reviewer_runtime(&new_cfg);
                                     cmd_ctx.config = new_cfg.clone();
                                     tool_ctx.config = new_cfg.clone();
                                     tool_ctx.permission_mode = new_cfg.permission_mode.clone();
@@ -4151,6 +4310,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                         new_cfg.permission_mode,
                                         mangocode_core::config::PermissionMode::Plan
                                     );
+                                    app.sleep_inhibitor.set_enabled(new_cfg.prevent_idle_sleep);
                                     app.config = new_cfg.clone();
                                     app.output_style = tui_output_style_for_config(&new_cfg);
                                     if reconnect_mcp {
@@ -4286,85 +4446,24 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             }
                         }
 
-                        // Fire UserPromptSubmit hooks before the prompt is committed.
-                        // Blocking hooks are submission gates; non-blocking failures still allow.
-                        let has_prompt_submit_hooks = !cmd_ctx.config.hooks.is_empty()
-                            || mangocode_plugins::has_global_hooks_for_event(
-                                mangocode_plugins::HookEventKind::UserPromptSubmit,
-                            );
-                        if has_prompt_submit_hooks {
-                            let hooks = cmd_ctx.config.hooks.clone();
-                            let working_dir = tool_ctx.working_dir.clone();
-                            let session_id_for_plugin_hooks = tool_ctx.session_id.clone();
-                            let hook_ctx = mangocode_core::hooks::HookContext {
-                                event: "UserPromptSubmit".to_string(),
-                                tool_name: None,
-                                tool_input: None,
-                                tool_output: Some(input.clone()),
-                                is_error: None,
-                                session_id: Some(tool_ctx.session_id.clone()),
-                            };
-                            let core_outcome = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                mangocode_core::hooks::run_hooks(
-                                    &hooks,
-                                    mangocode_core::config::HookEvent::UserPromptSubmit,
-                                    &hook_ctx,
-                                    &working_dir,
-                                ),
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                eprintln!("Hooks timed out after 5s, continuing query");
-                                mangocode_core::hooks::HookOutcome::Allowed
-                            });
-
-                            match core_outcome {
-                                mangocode_core::hooks::HookOutcome::Blocked(reason) => {
-                                    app.status_message =
-                                        Some(format!("Prompt blocked by hook: {reason}"));
-                                    continue;
-                                }
-                                mangocode_core::hooks::HookOutcome::Modified(modified)
-                                    if !modified.trim().is_empty() =>
-                                {
-                                    input = modified;
-                                }
-                                _ => {}
+                        match run_user_prompt_submit_hooks(
+                            input,
+                            &cmd_ctx.config,
+                            &tool_ctx.working_dir,
+                            &tool_ctx.session_id,
+                        )
+                        .await
+                        {
+                            PromptSubmitHookOutcome::Allowed(updated_input) => {
+                                input = updated_input;
                             }
-
-                            if mangocode_plugins::has_global_hooks_for_event(
-                                mangocode_plugins::HookEventKind::UserPromptSubmit,
-                            ) {
-                                let prompt_for_plugin_hooks = input.clone();
-                                let plugin_hook = tokio::task::spawn_blocking(move || {
-                                    mangocode_plugins::run_global_user_prompt_submit_hook(
-                                        &prompt_for_plugin_hooks,
-                                        Some(&session_id_for_plugin_hooks),
-                                    )
-                                });
-                                match tokio::time::timeout(Duration::from_secs(5), plugin_hook)
-                                    .await
-                                {
-                                    Ok(Ok(mangocode_plugins::HookOutcome::Deny(reason))) => {
-                                        app.status_message = Some(format!(
-                                            "Prompt blocked by plugin hook: {reason}"
-                                        ));
-                                        continue;
-                                    }
-                                    Ok(Ok(_)) => {}
-                                    Ok(Err(err)) => {
-                                        warn!(
-                                            error = %err,
-                                            "Plugin UserPromptSubmit hook task failed"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        warn!(
-                                            "Plugin UserPromptSubmit hooks timed out after 5s, continuing query"
-                                        );
-                                    }
-                                }
+                            PromptSubmitHookOutcome::Blocked {
+                                reason,
+                                input: blocked_input,
+                            } => {
+                                app.set_prompt_text(blocked_input);
+                                app.status_message = Some(reason);
+                                continue;
                             }
                         }
 
@@ -4547,6 +4646,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                             &base_query_config,
                         );
                     }
+                    sync_approval_reviewer_runtime(&app_config);
                     sync_tool_context_visibility_for_query_agent(
                         &mut tool_ctx,
                         &tools_arc,
@@ -4734,11 +4834,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         session_url,
                         session_id: conn_sid,
                     }) => {
-                        let short = if session_url.len() > 60 {
-                            truncate_bytes_with_ellipsis(&session_url, 60)
-                        } else {
-                            session_url.clone()
-                        };
+                        let short = truncate_bytes_with_ellipsis(&session_url, 60);
                         app.bridge_state = BridgeConnectionState::Connected {
                             session_url: session_url.clone(),
                             peer_count: 0,
@@ -4889,6 +4985,7 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 ct.cancel();
                             }
                             app.is_streaming = false;
+                            app.restore_queued_input_for_editing();
                             app.status_message = Some("Cancelled by remote control.".to_string());
                         }
                     }
@@ -5259,6 +5356,89 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     app.tool_use_blocks.clear();
                     app.status_message = None;
                     terminal.print_new_messages(&app)?;
+
+                    if let Some(mut input) = app.take_next_queued_input() {
+                        if !input.is_empty() {
+                            match run_user_prompt_submit_hooks(
+                                input,
+                                &cmd_ctx.config,
+                                &tool_ctx.working_dir,
+                                &tool_ctx.session_id,
+                            )
+                            .await
+                            {
+                                PromptSubmitHookOutcome::Allowed(updated_input) => {
+                                    input = updated_input;
+                                }
+                                PromptSubmitHookOutcome::Blocked {
+                                    reason,
+                                    input: blocked_input,
+                                } => {
+                                    app.restore_input_and_queued_for_editing(blocked_input);
+                                    app.status_message = Some(reason);
+                                    input = String::new();
+                                }
+                            }
+
+                            if input.is_empty() {
+                                // The queued prompt was restored to the composer by a hook gate.
+                                // Fall through so the completed turn is still persisted.
+                            } else {
+                                terminal.print_user_input(&app, &input)?;
+                                let user_msg = mangocode_core::types::Message::user(input.clone());
+                                messages.push(user_msg.clone());
+                                app.push_message(user_msg);
+                                session.messages = messages.clone();
+                                session.updated_at = chrono::Utc::now();
+
+                                app.is_streaming = true;
+                                app.streaming_text.clear();
+
+                                let ct = CancellationToken::new();
+                                cancel = Some(ct.clone());
+
+                                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                                let msgs_arc_clone = msgs_arc.clone();
+
+                                let tools_arc_clone = tools_arc.clone();
+                                let ctx_clone = tool_ctx.clone();
+                                let mut qcfg = base_query_config.clone();
+                                sync_query_config_for_runtime(
+                                    &mut qcfg,
+                                    &cmd_ctx.config,
+                                    &tool_ctx.working_dir,
+                                    &model_registry,
+                                );
+                                qcfg.system_prompt = base_query_config.system_prompt.clone();
+                                if let Some(level) = current_effort {
+                                    qcfg.effort_level = Some(level);
+                                }
+                                let tracker = cost_tracker.clone();
+                                let tx = event_tx.clone();
+                                let client_clone = client.clone();
+
+                                let handle = tokio::spawn(async move {
+                                    let mut msgs = msgs_arc_clone.lock().await.clone();
+                                    let outcome = mangocode_query::run_query_loop(
+                                        client_clone.as_ref(),
+                                        &mut msgs,
+                                        tools_arc_clone.as_slice(),
+                                        &ctx_clone,
+                                        &qcfg,
+                                        tracker,
+                                        Some(tx),
+                                        ct,
+                                        None,
+                                    )
+                                    .await;
+                                    *msgs_arc_clone.lock().await = msgs;
+                                    outcome
+                                });
+
+                                current_query = Some((handle, msgs_arc));
+                            }
+                        }
+                    }
 
                     // Persist session and search index in background so UI loop stays responsive.
                     let session_clone = session.clone();

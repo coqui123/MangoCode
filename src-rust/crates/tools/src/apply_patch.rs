@@ -20,6 +20,8 @@ struct ApplyPatchInput {
     patch: String,
     #[serde(default)]
     dry_run: bool,
+    #[serde(default)]
+    confirm_conflicts: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +307,10 @@ impl Tool for ApplyPatchTool {
                 "dry_run": {
                     "type": "boolean",
                     "description": "If true, validate the patch without applying it (default: false)"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for patched paths."
                 }
             },
             "required": ["patch"],
@@ -344,6 +350,24 @@ impl Tool for ApplyPatchTool {
                 return ToolResult::error(e.to_string());
             }
         }
+
+        let conflict_paths: Vec<std::path::PathBuf> = file_patches
+            .iter()
+            .map(|fp| ctx.resolve_path(&fp.path))
+            .collect();
+        let coordination_conflicts = if params.dry_run {
+            None
+        } else {
+            match crate::coordination::preflight_write_conflicts(
+                ctx,
+                self.name(),
+                &conflict_paths,
+                params.confirm_conflicts,
+            ) {
+                Ok(conflicts) => conflicts,
+                Err(result) => return result,
+            }
+        };
 
         // ----------------------------------------------------------------
         // Process each file in the patch
@@ -503,17 +527,21 @@ impl Tool for ApplyPatchTool {
             );
         }
 
-        ToolResult::success(format!(
-            "Applied patch to {} file(s) (+{} -{} lines).",
-            to_write.len(),
-            total_added,
-            total_removed,
-        ))
-        .with_metadata(json!({
+        let content = crate::coordination::append_confirmed_conflict_note(
+            format!(
+                "Applied patch to {} file(s) (+{} -{} lines).",
+                to_write.len(),
+                total_added,
+                total_removed,
+            ),
+            coordination_conflicts.as_deref(),
+        );
+        ToolResult::success(content).with_metadata(json!({
             "dry_run": false,
             "files": file_summaries,
             "total_lines_added": total_added,
             "total_lines_removed": total_removed,
+            "coordination_conflicts": coordination_conflicts,
         }))
     }
 }

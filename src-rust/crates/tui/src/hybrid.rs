@@ -4,10 +4,11 @@
 //! The live composer is rendered from ratatui widgets into an offscreen buffer
 //! and repainted in reserved bottom rows.
 
-use std::io::{self, Stdout, Write};
 use std::{
+    borrow::Cow,
     collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
+    io::{self, Stdout, Write},
 };
 
 use crossterm::{
@@ -1077,13 +1078,13 @@ fn to_ct_color(color: RtColor) -> Option<CtColor> {
     })
 }
 
-fn truncate(text: &str, max_chars: usize) -> String {
+fn truncate(text: &str, max_chars: usize) -> Cow<'_, str> {
     if text.chars().count() <= max_chars {
-        text.to_string()
+        Cow::Borrowed(text)
     } else {
         let mut s: String = text.chars().take(max_chars).collect();
         s.push('…');
-        s
+        Cow::Owned(s)
     }
 }
 

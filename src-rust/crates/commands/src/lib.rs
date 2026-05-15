@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use mangocode_core::analytics::SessionMetrics;
-use mangocode_core::config::{Config, Settings, Theme};
+use mangocode_core::config::{ApprovalsReviewer, Config, Settings, Theme};
 use mangocode_core::context_collapse::{estimate_message_tokens, load_collapse_state};
 use mangocode_core::cost::CostTracker;
 use mangocode_core::effort::EffortLevel;
@@ -221,6 +221,7 @@ pub struct VersionCommand;
 pub struct ResumeCommand;
 pub struct WorkspaceCommand;
 pub struct StatusCommand;
+pub struct CoordinationCommand;
 pub struct DiffCommand;
 pub struct MemoryCommand;
 pub struct BugCommand;
@@ -236,6 +237,7 @@ pub struct ReviewCommand;
 pub struct HooksCommand;
 pub struct McpCommand;
 pub struct PermissionsCommand;
+pub struct ApprovalsReviewerCommand;
 pub struct PlanCommand;
 pub struct GoalCommand;
 pub struct TasksCommand;
@@ -274,6 +276,7 @@ pub struct SecurityReviewCommand;
 pub struct TerminalSetupCommand;
 pub struct ExtraUsageCommand;
 pub struct FastCommand;
+pub struct SleepCommand;
 pub struct ThinkBackCommand;
 pub struct ThinkBackPlayCommand;
 pub struct FeedbackCommand;
@@ -302,6 +305,45 @@ fn same_mcp_server_config(
     right: &mangocode_core::config::McpServerConfig,
 ) -> bool {
     serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalsReviewerAction {
+    Status,
+    Set(ApprovalsReviewer),
+}
+
+fn parse_approvals_reviewer_action(
+    args: &str,
+    current: ApprovalsReviewer,
+) -> Result<ApprovalsReviewerAction, String> {
+    let arg = args.trim().to_ascii_lowercase();
+    match arg.as_str() {
+        "" => Ok(ApprovalsReviewerAction::Set(match current {
+            ApprovalsReviewer::User => ApprovalsReviewer::AutoReview,
+            ApprovalsReviewer::AutoReview => ApprovalsReviewer::User,
+        })),
+        "status" => Ok(ApprovalsReviewerAction::Status),
+        "on" | "enable" | "enabled" | "true" | "1" | "auto" | "auto_review" | "auto-review"
+        | "guardian_subagent" => Ok(ApprovalsReviewerAction::Set(ApprovalsReviewer::AutoReview)),
+        "off" | "disable" | "disabled" | "false" | "0" | "user" | "manual" => {
+            Ok(ApprovalsReviewerAction::Set(ApprovalsReviewer::User))
+        }
+        other => Err(format!(
+            "Unknown argument '{}'. Use: /approvals-reviewer [auto_review|user|on|off|status]",
+            other
+        )),
+    }
+}
+
+fn critic_state_message(critic_mode: bool, approvals_reviewer: ApprovalsReviewer) -> String {
+    match (critic_mode, approvals_reviewer.is_auto_review()) {
+        (true, _) => "Permission critic enabled.".to_string(),
+        (false, true) => {
+            "Permission critic standalone mode disabled; approvals_reviewer=auto_review keeps approval auto-review active.".to_string()
+        }
+        (false, false) => "Permission critic disabled.".to_string(),
+    }
 }
 
 fn sync_plugin_mcp_servers_into_config(
@@ -1142,6 +1184,10 @@ impl SlashCommand for ConfigCommand {
                     "permission-mode = {:?}",
                     ctx.config.permission_mode
                 )),
+                "approvals-reviewer" | "approvals_reviewer" => CommandResult::Message(format!(
+                    "approvals-reviewer = {}",
+                    ctx.config.approvals_reviewer.label()
+                )),
                 other => CommandResult::Error(format!("Unknown config key '{}'", other)),
             };
         }
@@ -1295,6 +1341,33 @@ impl SlashCommand for ConfigCommand {
                 CommandResult::ConfigChangeMessage(
                     new_config,
                     format!("Permission mode set to {}.", value.trim().to_lowercase()),
+                )
+            }
+            "approvals-reviewer" | "approvals_reviewer" => {
+                let reviewer =
+                    match parse_approvals_reviewer_action(value, ctx.config.approvals_reviewer) {
+                        Ok(ApprovalsReviewerAction::Set(reviewer)) => reviewer,
+                        Ok(ApprovalsReviewerAction::Status) => {
+                            return CommandResult::Error(
+                                "Approvals reviewer must be one of: user, auto_review".to_string(),
+                            );
+                        }
+                        Err(_) => {
+                            return CommandResult::Error(
+                                "Approvals reviewer must be one of: user, auto_review".to_string(),
+                            );
+                        }
+                    };
+                let mut new_config = ctx.config.clone();
+                new_config.approvals_reviewer = reviewer;
+                if let Err(err) = save_settings_mutation(|settings| {
+                    settings.config.approvals_reviewer = reviewer;
+                }) {
+                    return CommandResult::Error(format!("Failed to save configuration: {}", err));
+                }
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    format!("Approvals reviewer set to {}.", reviewer.label()),
                 )
             }
             other => CommandResult::Error(format!("Unknown config key '{}'", other)),
@@ -1769,6 +1842,104 @@ impl SlashCommand for WorkspaceCommand {
             canonical.clone(),
             format!("Active workspace is now {}.", canonical.display()),
         )
+    }
+}
+
+// ---- /coordination -------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for CoordinationCommand {
+    fn name(&self) -> &str {
+        "coordination"
+    }
+
+    fn aliases(&self) -> Vec<&str> {
+        vec!["sessions"]
+    }
+
+    fn description(&self) -> &str {
+        "Show active local MangoCode sessions, claims, and unread messages"
+    }
+
+    fn help(&self) -> &str {
+        "Usage: /coordination [all] [read]\n\nShows local MangoCode coordination state. Use `all` to include every local repo and `read` to mark returned inbox messages as read."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let all_repos = args
+            .split_whitespace()
+            .any(|arg| arg.eq_ignore_ascii_case("all"));
+        let mark_read = args
+            .split_whitespace()
+            .any(|arg| arg.eq_ignore_ascii_case("read"));
+        let store = match mangocode_core::coordination::CoordinationStore::open_default() {
+            Ok(store) => store,
+            Err(e) => {
+                return CommandResult::Error(format!("Failed to open coordination store: {e}"))
+            }
+        };
+        let model = effective_model_for_command_config(&ctx.config, ctx.model_registry.as_deref());
+        let coordination_session_id =
+            mangocode_core::coordination::process_session_id(&ctx.session_id);
+        let _ = store.register_session(
+            &coordination_session_id,
+            &ctx.working_dir,
+            &model,
+            ctx.session_title.as_deref(),
+        );
+        let repo_filter = (!all_repos).then_some(ctx.working_dir.as_path());
+        let sessions = match store.list_sessions(repo_filter) {
+            Ok(sessions) => sessions,
+            Err(e) => return CommandResult::Error(format!("Failed to list sessions: {e}")),
+        };
+        let claims = match store.list_claims(repo_filter) {
+            Ok(claims) => claims,
+            Err(e) => return CommandResult::Error(format!("Failed to list claims: {e}")),
+        };
+        let inbox = match store.inbox(&coordination_session_id, &ctx.working_dir, mark_read) {
+            Ok(messages) => messages,
+            Err(e) => return CommandResult::Error(format!("Failed to read inbox: {e}")),
+        };
+
+        let mut lines = vec![format!(
+            "Coordination: {} active session(s), {} active claim(s), {} unread message(s).",
+            sessions.len(),
+            claims.len(),
+            inbox.len()
+        )];
+        for session in sessions.iter().take(10) {
+            lines.push(format!(
+                "- session {} pid {} repo {}{}",
+                truncate_bytes_prefix(&session.session_id, 8),
+                session.pid,
+                session.repo_root,
+                session
+                    .title
+                    .as_ref()
+                    .map(|title| format!(" title {title}"))
+                    .unwrap_or_default()
+            ));
+        }
+        for claim in claims.iter().take(10) {
+            lines.push(format!(
+                "- claim {} by {}: {} ({})",
+                truncate_bytes_prefix(&claim.claim_id, 8),
+                truncate_bytes_prefix(&claim.session_id, 8),
+                claim.scope,
+                claim.summary.as_deref().unwrap_or(&claim.claim_type)
+            ));
+        }
+        for message in inbox.iter().take(10) {
+            lines.push(format!(
+                "- message from {}: {}",
+                truncate_bytes_prefix(&message.from_session_id, 8),
+                message.body
+            ));
+        }
+        if mark_read && !inbox.is_empty() {
+            lines.push("Marked returned messages as read.".to_string());
+        }
+        CommandResult::Message(lines.join("\n"))
     }
 }
 
@@ -5854,12 +6025,17 @@ impl SlashCommand for PermissionsCommand {
                 "Tool Visibility and Permission Settings\n\
                  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                  Mode:          {:?}\n\
+                 Reviewer:      {}\n\
                  Tool allowlist: {}\n\
                  Hidden/denied:  {}\n\n\
                  Use /permissions set <mode> to change the permission mode.\n\
+                 Use /approvals-reviewer to toggle auto-review.\n\
                  Use /permissions allow|deny <tool> to change tool visibility.\n\
                  Use /permissions reset to clear all overrides.",
-                ctx.config.permission_mode, allowed_display, denied_display,
+                ctx.config.permission_mode,
+                ctx.config.approvals_reviewer.label(),
+                allowed_display,
+                denied_display,
             ));
         }
 
@@ -5995,6 +6171,63 @@ impl SlashCommand for PermissionsCommand {
     }
 }
 
+// ---- /approvals-reviewer ------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ApprovalsReviewerCommand {
+    fn name(&self) -> &str {
+        "approvals-reviewer"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["approval-reviewer", "auto-review"]
+    }
+    fn description(&self) -> &str {
+        "Toggle auto-review for approval decisions"
+    }
+    fn help(&self) -> &str {
+        "Usage: /approvals-reviewer [auto_review|user|on|off|status]\n\n\
+         When set to auto_review, MangoCode routes non-read tool approval review\n\
+         through the permission critic before execution. The setting is persisted\n\
+         to ~/.mangocode/settings.json."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let action = match parse_approvals_reviewer_action(args, ctx.config.approvals_reviewer) {
+            Ok(action) => action,
+            Err(message) => return CommandResult::Error(message),
+        };
+
+        match action {
+            ApprovalsReviewerAction::Status => CommandResult::Message(format!(
+                "Approvals reviewer: {}",
+                ctx.config.approvals_reviewer.label()
+            )),
+            ApprovalsReviewerAction::Set(reviewer) => {
+                let mut new_config = ctx.config.clone();
+                new_config.approvals_reviewer = reviewer;
+                if let Err(err) = save_settings_mutation(|settings| {
+                    settings.config.approvals_reviewer = reviewer;
+                }) {
+                    return CommandResult::Error(format!(
+                        "Failed to save approvals reviewer setting: {}",
+                        err
+                    ));
+                }
+
+                CommandResult::ConfigChangeMessage(
+                    new_config,
+                    if reviewer.is_auto_review() {
+                        "approvals_reviewer=auto_review. MangoCode will auto-review approval decisions with the permission critic.".to_string()
+                    } else {
+                        "approvals_reviewer=user. MangoCode will use normal user approval routing."
+                            .to_string()
+                    },
+                )
+            }
+        }
+    }
+}
+
 // ---- /critic -------------------------------------------------------------
 
 #[async_trait]
@@ -6024,15 +6257,13 @@ impl SlashCommand for CriticCommand {
 
         match args {
             "" => {
-                let new_state = critic.toggle();
                 let mut new_config = ctx.config.clone();
+                let new_state = !new_config.critic_mode;
                 new_config.critic_mode = new_state;
+                critic.set_enabled(new_state || new_config.approvals_reviewer.is_auto_review());
                 CommandResult::ConfigChangeMessage(
                     new_config,
-                    format!(
-                        "Permission critic {}.",
-                        if new_state { "enabled" } else { "disabled" }
-                    ),
+                    critic_state_message(new_state, ctx.config.approvals_reviewer),
                 )
             }
             "on" => {
@@ -6045,12 +6276,12 @@ impl SlashCommand for CriticCommand {
                 )
             }
             "off" => {
-                critic.set_enabled(false);
                 let mut new_config = ctx.config.clone();
                 new_config.critic_mode = false;
+                critic.set_enabled(new_config.approvals_reviewer.is_auto_review());
                 CommandResult::ConfigChangeMessage(
                     new_config,
-                    "Permission critic disabled.".to_string(),
+                    critic_state_message(false, ctx.config.approvals_reviewer),
                 )
             }
             "status" => {
@@ -6059,9 +6290,13 @@ impl SlashCommand for CriticCommand {
                     "Permission Critic\n\
                      â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n\
                      Enabled:  {}\n\
+                     Reviewer: {}\n\
                      Model:    {}\n\
                      Fallback: {}",
-                    cfg.enabled, cfg.model, cfg.fallback_to_classifier,
+                    cfg.enabled,
+                    ctx.config.approvals_reviewer.label(),
+                    cfg.model,
+                    cfg.fallback_to_classifier,
                 ))
             }
             "history" => {
@@ -6386,11 +6621,7 @@ impl SlashCommand for SessionCommand {
                 // If a bridge remote URL is active, show it prominently.
                 if let Some(ref url) = ctx.remote_session_url {
                     let border = "â”€".repeat(url.len().min(60) + 4);
-                    let display_url = if url.len() > 60 {
-                        truncate_bytes_with_ellipsis(url, 60)
-                    } else {
-                        url.clone()
-                    };
+                    let display_url = truncate_bytes_with_ellipsis(url, 60);
                     CommandResult::Message(format!(
                         "Remote session active\n\
                          â”Œ{border}â”\n\
@@ -8506,6 +8737,61 @@ impl SlashCommand for VimCommand {
             )),
             Err(e) => CommandResult::Error(format!("Failed to save setting: {}", e)),
         }
+    }
+}
+
+// ---- /sleep --------------------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for SleepCommand {
+    fn name(&self) -> &str {
+        "sleep"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["prevent-sleep", "awake"]
+    }
+    fn description(&self) -> &str {
+        "Toggle sleep prevention while turns run"
+    }
+    fn help(&self) -> &str {
+        "Usage: /sleep [on|off]\n\n\
+         When enabled, MangoCode asks the OS to prevent idle system sleep while an agent turn or tool is running.\n\
+         The setting is persisted to ~/.mangocode/settings.json."
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let currently_enabled = ctx.config.prevent_idle_sleep;
+        let arg = args.trim().to_ascii_lowercase();
+        let enable = match arg.as_str() {
+            "on" | "enable" | "enabled" | "true" | "1" => true,
+            "off" | "disable" | "disabled" | "false" | "0" => false,
+            "" => !currently_enabled,
+            other => {
+                return CommandResult::Error(format!(
+                    "Unknown argument '{}'. Use: /sleep [on|off]",
+                    other
+                ));
+            }
+        };
+
+        let mut new_config = ctx.config.clone();
+        new_config.prevent_idle_sleep = enable;
+        if let Err(err) = save_settings_mutation(|settings| {
+            settings.config.prevent_idle_sleep = enable;
+        }) {
+            return CommandResult::Error(format!("Failed to save sleep setting: {}", err));
+        }
+
+        CommandResult::ConfigChangeMessage(
+            new_config,
+            if enable {
+                "Sleep prevention ON. MangoCode will keep the system awake while turns run."
+                    .to_string()
+            } else {
+                "Sleep prevention OFF. MangoCode will no longer request idle sleep prevention."
+                    .to_string()
+            },
+        )
     }
 }
 
@@ -11145,6 +11431,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(WorkspaceCommand),
         Box::new(ReloadPluginsCommand),
         Box::new(StatusCommand),
+        Box::new(CoordinationCommand),
         Box::new(DiffCommand),
         Box::new(MemoryCommand),
         Box::new(BugCommand),
@@ -11160,6 +11447,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(HooksCommand),
         Box::new(McpCommand),
         Box::new(PermissionsCommand),
+        Box::new(ApprovalsReviewerCommand),
         Box::new(CriticCommand),
         Box::new(PlanCommand),
         Box::new(GoalCommand),
@@ -11282,6 +11570,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(TerminalSetupCommand),
         Box::new(ExtraUsageCommand),
         Box::new(FastCommand),
+        Box::new(SleepCommand),
         Box::new(ThinkBackCommand),
         Box::new(ThinkBackPlayCommand),
         Box::new(FeedbackCommand),
@@ -12344,6 +12633,34 @@ mod tests {
     #[test]
     fn test_all_commands_non_empty() {
         assert!(!all_commands().is_empty());
+    }
+
+    #[test]
+    fn approvals_reviewer_action_parses_codex_values() {
+        assert_eq!(
+            parse_approvals_reviewer_action("", ApprovalsReviewer::User).unwrap(),
+            ApprovalsReviewerAction::Set(ApprovalsReviewer::AutoReview)
+        );
+        assert_eq!(
+            parse_approvals_reviewer_action("", ApprovalsReviewer::AutoReview).unwrap(),
+            ApprovalsReviewerAction::Set(ApprovalsReviewer::User)
+        );
+        assert_eq!(
+            parse_approvals_reviewer_action("auto_review", ApprovalsReviewer::User).unwrap(),
+            ApprovalsReviewerAction::Set(ApprovalsReviewer::AutoReview)
+        );
+        assert_eq!(
+            parse_approvals_reviewer_action("guardian_subagent", ApprovalsReviewer::User).unwrap(),
+            ApprovalsReviewerAction::Set(ApprovalsReviewer::AutoReview)
+        );
+        assert_eq!(
+            parse_approvals_reviewer_action("user", ApprovalsReviewer::AutoReview).unwrap(),
+            ApprovalsReviewerAction::Set(ApprovalsReviewer::User)
+        );
+        assert_eq!(
+            parse_approvals_reviewer_action("status", ApprovalsReviewer::User).unwrap(),
+            ApprovalsReviewerAction::Status
+        );
     }
 
     #[test]

@@ -121,12 +121,18 @@ impl Tool for SendMessageTool {
         });
 
         if params.to == "*" {
+            if let Ok(store) = mangocode_core::coordination::CoordinationStore::open_default() {
+                let session_id = mangocode_core::coordination::process_session_id(&ctx.session_id);
+                let _ = store.register_session(&session_id, &ctx.working_dir, "", None);
+                let _ =
+                    store.send_message(&session_id, None, Some(&ctx.working_dir), &params.message);
+            }
             // Broadcast: deliver to every existing inbox key
             let recipients: Vec<String> = INBOX.iter().map(|e| e.key().clone()).collect();
 
             if recipients.is_empty() {
                 return ToolResult::success(
-                    "Broadcast queued (no active recipient inboxes yet).".to_string(),
+                    "Broadcast queued for local MangoCode sessions.".to_string(),
                 );
             }
 
@@ -143,6 +149,11 @@ impl Tool for SendMessageTool {
 
         // Directed message
         INBOX.entry(params.to.clone()).or_default().push(msg);
+        if let Ok(store) = mangocode_core::coordination::CoordinationStore::open_default() {
+            let session_id = mangocode_core::coordination::process_session_id(&ctx.session_id);
+            let _ = store.register_session(&session_id, &ctx.working_dir, "", None);
+            let _ = store.send_message(&session_id, Some(&params.to), None, &params.message);
+        }
 
         ToolResult::success(format!("Message sent to '{}': {}", params.to, preview))
     }

@@ -1,5 +1,7 @@
 //! Text truncation utilities.
 
+use std::borrow::Cow;
+
 /// Return a prefix of `text` with at most `max_bytes` UTF-8 bytes, never splitting a `char` boundary.
 pub fn truncate_bytes_prefix(text: &str, max_bytes: usize) -> &str {
     if text.len() <= max_bytes {
@@ -13,11 +15,11 @@ pub fn truncate_bytes_prefix(text: &str, max_bytes: usize) -> &str {
 }
 
 /// Truncate to a UTF-8-safe prefix of at most `max_bytes` bytes, appending `…` when shortened.
-pub fn truncate_bytes_with_ellipsis(text: &str, max_bytes: usize) -> String {
+pub fn truncate_bytes_with_ellipsis(text: &str, max_bytes: usize) -> Cow<'_, str> {
     if text.len() <= max_bytes {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
-    format!("{}…", truncate_bytes_prefix(text, max_bytes))
+    Cow::Owned(format!("{}…", truncate_bytes_prefix(text, max_bytes)))
 }
 
 /// Shrink `s` to at most `max_bytes` UTF-8 bytes without splitting a codepoint (for in-place truncation).
@@ -34,13 +36,13 @@ pub fn truncate_string_to_max_bytes(s: &mut String, max_bytes: usize) {
 
 /// Truncate `text` to at most `max_chars` characters.
 /// If truncated, appends `… (truncated)`.
-pub fn truncate_text(text: &str, max_chars: usize) -> String {
+pub fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
     if text.chars().count() <= max_chars {
-        return text.to_string();
+        return Cow::Borrowed(text);
     }
 
     let prefix: String = text.chars().take(max_chars).collect();
-    format!("{prefix}… (truncated)")
+    Cow::Owned(format!("{prefix}… (truncated)"))
 }
 
 /// Truncate a list of lines to at most `max_lines`.
@@ -61,23 +63,27 @@ pub fn truncate_lines(lines: &[String], max_lines: usize) -> (Vec<String>, bool)
 
 /// Truncate tool output to a safe display length.
 /// Returns `(truncated_text, was_truncated)`.
-pub fn truncate_tool_output(text: &str, max_chars: usize) -> (String, bool) {
+pub fn truncate_tool_output(text: &str, max_chars: usize) -> (Cow<'_, str>, bool) {
     let char_count = text.chars().count();
     if char_count <= max_chars {
-        return (text.to_string(), false);
+        return (Cow::Borrowed(text), false);
     }
 
     let prefix: String = text.chars().take(max_chars).collect();
     (
-        format!("{}… [{} chars truncated]", prefix, char_count - max_chars),
+        Cow::Owned(format!(
+            "{}… [{} chars truncated]",
+            prefix,
+            char_count - max_chars
+        )),
         true,
     )
 }
 
 /// Truncate a file path for display, keeping the filename and shortening the directory.
-pub fn truncate_path(path: &str, max_chars: usize) -> String {
+pub fn truncate_path(path: &str, max_chars: usize) -> Cow<'_, str> {
     if path.chars().count() <= max_chars {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
     let filename = std::path::Path::new(path)
         .file_name()
@@ -86,7 +92,7 @@ pub fn truncate_path(path: &str, max_chars: usize) -> String {
     let filename_chars = filename.chars().count();
     const ELLIPSIZED_DIR_OVERHEAD_CHARS: usize = 3; // "…/" plus "/" before filename.
     if filename_chars >= max_chars || filename_chars + ELLIPSIZED_DIR_OVERHEAD_CHARS >= max_chars {
-        return filename.to_string();
+        return Cow::Owned(filename.to_string());
     }
     let prefix_len = max_chars - filename_chars - ELLIPSIZED_DIR_OVERHEAD_CHARS;
     let dir = std::path::Path::new(path)
@@ -95,11 +101,11 @@ pub fn truncate_path(path: &str, max_chars: usize) -> String {
         .unwrap_or("");
     let dir_chars = dir.chars().count();
     if dir_chars <= prefix_len {
-        return path.to_string();
+        return Cow::Borrowed(path);
     }
     let start = dir_chars.saturating_sub(prefix_len);
     let dir_suffix: String = dir.chars().skip(start).collect();
-    format!("…/{}/{}", dir_suffix, filename)
+    Cow::Owned(format!("…/{}/{}", dir_suffix, filename))
 }
 
 #[cfg(test)]

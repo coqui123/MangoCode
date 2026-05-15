@@ -25,6 +25,8 @@ struct BatchEditInput {
     edits: Vec<SingleEdit>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    confirm_conflicts: bool,
 }
 
 #[async_trait]
@@ -73,6 +75,10 @@ impl Tool for BatchEditTool {
                 "description": {
                     "type": "string",
                     "description": "Optional human-readable description of what this batch edit does"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for these paths."
                 }
             },
             "required": ["edits"]
@@ -96,6 +102,21 @@ impl Tool for BatchEditTool {
         {
             return ToolResult::error(e.to_string());
         }
+
+        let conflict_paths: Vec<std::path::PathBuf> = params
+            .edits
+            .iter()
+            .map(|edit| ctx.resolve_path(&edit.file_path))
+            .collect();
+        let coordination_conflicts = match crate::coordination::preflight_write_conflicts(
+            ctx,
+            self.name(),
+            &conflict_paths,
+            params.confirm_conflicts,
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(result) => return result,
+        };
 
         // ----------------------------------------------------------------
         // Phase 1: read all files and validate every edit before writing
@@ -217,10 +238,16 @@ impl Tool for BatchEditTool {
             if file_count != 1 { "s" } else { "" },
         );
 
+        let summary = crate::coordination::append_confirmed_conflict_note(
+            summary,
+            coordination_conflicts.as_deref(),
+        );
+
         ToolResult::success(summary).with_metadata(json!({
             "edits_applied": edit_count,
             "files_modified": file_count,
             "files": prepared.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+            "coordination_conflicts": coordination_conflicts,
         }))
     }
 }

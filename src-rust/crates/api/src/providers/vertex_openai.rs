@@ -670,6 +670,8 @@ impl VertexOpenAiProvider {
                 name: "Gemini 2.5 Flash".into(),
                 context_window: 1_000_000,
                 max_output_tokens: 8_192,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("google/gemini-2.5-pro"),
@@ -677,6 +679,8 @@ impl VertexOpenAiProvider {
                 name: "Gemini 2.5 Pro".into(),
                 context_window: 1_000_000,
                 max_output_tokens: 8_192,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("google/gemini-2.0-flash-001"),
@@ -684,6 +688,8 @@ impl VertexOpenAiProvider {
                 name: "Gemini 2.0 Flash".into(),
                 context_window: 1_000_000,
                 max_output_tokens: 8_192,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
             ModelInfo {
                 id: ModelId::new("google/gemini-1.5-pro-002"),
@@ -691,6 +697,8 @@ impl VertexOpenAiProvider {
                 name: "Gemini 1.5 Pro".into(),
                 context_window: 2_000_000,
                 max_output_tokens: 8_192,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
             },
         ]
     }
@@ -1146,6 +1154,8 @@ impl LlmProvider for VertexOpenAiProvider {
                         name: display,
                         context_window: ctx,
                         max_output_tokens: 8_192,
+                        default_reasoning_level: None,
+                        supported_reasoning_levels: Vec::new(),
                     });
                 }
             }
@@ -1178,6 +1188,8 @@ impl LlmProvider for VertexOpenAiProvider {
                     name: name.to_string(),
                     context_window: 200_000,
                     max_output_tokens: 8_192,
+                    default_reasoning_level: None,
+                    supported_reasoning_levels: Vec::new(),
                 });
             }
         }
