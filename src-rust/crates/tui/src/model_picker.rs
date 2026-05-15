@@ -464,6 +464,13 @@ pub fn models_for_provider_from_registry(
     provider_id: &str,
     registry: &mangocode_api::ModelRegistry,
 ) -> Vec<ModelEntry> {
+    if matches!(provider_id, "openai-codex" | "codex") {
+        // OpenAI Codex OAuth has its own authenticated /models endpoint. Do
+        // not seed the picker with the static fallback catalog here, otherwise
+        // a slow or failed live fetch looks like a stale but valid model list.
+        return Vec::new();
+    }
+
     let entries = registry.list_by_provider(provider_id);
     if !entries.is_empty() {
         entries
@@ -1609,6 +1616,14 @@ mod tests {
         assert!(ids.contains(&"gpt-4o-mini"));
         // Must NOT contain Claude models
         assert!(!ids.iter().any(|id| id.contains("claude")));
+    }
+
+    #[test]
+    fn models_for_provider_from_registry_does_not_seed_openai_codex_static_models() {
+        let registry = mangocode_api::ModelRegistry::new();
+        let models = models_for_provider_from_registry("openai-codex", &registry);
+
+        assert!(models.is_empty());
     }
 
     #[test]

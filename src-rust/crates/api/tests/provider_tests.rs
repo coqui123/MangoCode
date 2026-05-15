@@ -491,6 +491,23 @@ async fn openai_codex_list_models_falls_back_to_static_catalog_when_dynamic_is_e
 }
 
 #[tokio::test]
+async fn openai_codex_list_models_surfaces_dynamic_fetch_errors() {
+    let (base, _req_rx) = spawn_json_server(json!({ "unexpected": [] })).await;
+    let provider = OpenAiCodexProvider::new("test-oauth-token".to_string())
+        .with_endpoint(format!("{base}/responses"))
+        .with_skip_disk(true);
+
+    let err = provider
+        .list_models()
+        .await
+        .expect_err("invalid Codex model payload should not silently use static models");
+
+    assert!(err
+        .to_string()
+        .contains("Codex models response parse error"));
+}
+
+#[tokio::test]
 async fn openai_codex_includes_conversation_and_session_headers_with_prompt_cache_key() {
     let response = json!({
         "output": [{

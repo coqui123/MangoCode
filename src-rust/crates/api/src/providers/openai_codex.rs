@@ -832,7 +832,8 @@ impl LlmProvider for OpenAiCodexProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         match self.fetch_live_models().await {
             Ok(models) if !models.is_empty() => Ok(models),
-            Ok(_) | Err(_) => Ok(self.static_models()),
+            Ok(_) => Ok(self.static_models()),
+            Err(err) => Err(err),
         }
     }
 
