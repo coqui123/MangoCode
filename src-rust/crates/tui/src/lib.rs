@@ -1159,6 +1159,7 @@ mod tests {
             tool_use_id: "toolu_1".to_string(),
             content: ToolResultContent::Text("boom".to_string()),
             is_error: Some(true),
+            metadata: None,
         }]);
 
         let rendered = messages::render_message(&msg, &messages::RenderContext::default());
@@ -1213,9 +1214,43 @@ mod tests {
             tool_id: "t1".to_string(),
             result: "output".to_string(),
             is_error: false,
+            metadata: None,
             parent_tool_use_id: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Done);
+    }
+
+    #[test]
+    fn test_handle_tool_end_uses_structured_metadata_for_live_output() {
+        let mut app = make_app();
+        app.tool_use_blocks.push(ToolUseBlock {
+            id: "plan-1".to_string(),
+            name: "update_plan".to_string(),
+            status: ToolStatus::Running,
+            output_preview: None,
+            full_output: None,
+            input_json: r#"{"plan":[]}"#.to_string(),
+        });
+
+        app.handle_query_event(mangocode_query::QueryEvent::ToolEnd {
+            tool_name: "update_plan".to_string(),
+            tool_id: "plan-1".to_string(),
+            result: "Plan updated".to_string(),
+            is_error: false,
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": [{ "step": "Show live structured output", "status": "pending" }]
+                }
+            })),
+            parent_tool_use_id: None,
+        });
+
+        assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Done);
+        let full = app.tool_use_blocks[0].full_output.as_deref().unwrap();
+        assert!(full.contains("Updated Plan"));
+        assert!(full.contains("[ ] Show live structured output"));
+        assert!(!full.contains("Plan updated"));
     }
 
     #[test]
@@ -1234,6 +1269,7 @@ mod tests {
             tool_id: "t2".to_string(),
             result: "file not found".to_string(),
             is_error: true,
+            metadata: None,
             parent_tool_use_id: None,
         });
         assert_eq!(app.tool_use_blocks[0].status, ToolStatus::Error);

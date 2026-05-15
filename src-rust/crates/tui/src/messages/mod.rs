@@ -13,7 +13,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod markdown;
 pub use markdown::render_markdown;
@@ -274,6 +274,338 @@ fn render_file_op_result(is_create: bool) -> Vec<Line<'static>> {
 }
 
 /// Render a tool result (success variant) — generic fallback.
+pub fn render_structured_tool_result(
+    metadata: Option<&serde_json::Value>,
+    width: u16,
+) -> Option<Vec<Line<'static>>> {
+    let display = metadata?.get("transcript_display")?;
+    match display.get("kind").and_then(|v| v.as_str()) {
+        Some("updated_plan") => Some(render_updated_plan(display, width)),
+        Some("file_changes") => Some(render_file_changes(display, width)),
+        _ => None,
+    }
+}
+
+fn render_updated_plan(display: &serde_json::Value, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  * ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "Updated Plan",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let text_width = (width as usize).saturating_sub(6).max(12);
+    if let Some(explanation) = display
+        .get("explanation")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        for wrapped in wrap_plain_text(explanation, text_width) {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(wrapped, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    let Some(plan) = display.get("plan").and_then(|v| v.as_array()) else {
+        return lines;
+    };
+    if plan.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "    [ ] No steps",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )]));
+        return lines;
+    }
+
+    for item in plan {
+        let step = item
+            .get("step")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
+        let (mark, style) = match status {
+            "completed" => (
+                "[x]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+            ),
+            "in_progress" => (
+                "[ ]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            _ => (
+                "[ ]",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        };
+        let wrapped = wrap_plain_text(step, text_width.saturating_sub(4));
+        for (idx, chunk) in wrapped.into_iter().enumerate() {
+            let prefix = if idx == 0 {
+                format!("    {mark} ")
+            } else {
+                "        ".to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(chunk, style),
+            ]));
+        }
+    }
+
+    lines
+}
+
+fn render_file_changes(display: &serde_json::Value, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let files = display
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let max_rendered_diff_lines = 160usize;
+    let mut rendered_diff_lines = 0usize;
+
+    for file in files {
+        let path = file
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let change_type = file
+            .get("change_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("update");
+        let added = file
+            .get("lines_added")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let removed = file
+            .get("lines_removed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let action = match change_type {
+            "add" => "Added",
+            "delete" => "Deleted",
+            "rename" => "Renamed",
+            _ => "Edited",
+        };
+        let move_path = file.get("move_path").and_then(|v| v.as_str());
+        let header_path = move_path
+            .map(|old| format!("{old} -> {path}"))
+            .unwrap_or_else(|| path.to_string());
+
+        lines.push(Line::from(vec![
+            Span::styled("  * ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{action} {header_path} "),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("(+{added} -{removed})"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        if file
+            .get("binary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            lines.push(Line::from(vec![Span::styled(
+                "    Binary file changed",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )]));
+            continue;
+        }
+
+        let diff_text = file
+            .get("unified_diff")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        for rendered in render_compact_unified_diff(diff_text, width) {
+            if rendered_diff_lines >= max_rendered_diff_lines {
+                lines.push(Line::from(vec![Span::styled(
+                    "    ... diff truncated for display",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )]));
+                return lines;
+            }
+            lines.push(rendered);
+            rendered_diff_lines += 1;
+        }
+    }
+
+    lines
+}
+
+fn render_compact_unified_diff(diff_text: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut old_line = 0usize;
+    let mut new_line = 0usize;
+    let gutter_width = 6usize;
+    let content_width = (width as usize).saturating_sub(gutter_width + 8).max(20);
+
+    for raw in diff_text.lines() {
+        if raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff --git ") {
+            continue;
+        }
+        if raw.starts_with("@@ ") {
+            if let Some((old_start, new_start)) = parse_compact_hunk_header(raw) {
+                old_line = old_start;
+                new_line = new_start;
+            }
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(raw.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+            continue;
+        }
+        if raw.starts_with('\\') {
+            continue;
+        }
+
+        let (line_no, marker, content, style) = if let Some(content) = raw.strip_prefix('+') {
+            let line_no = new_line;
+            new_line = new_line.saturating_add(1);
+            (line_no, "+", content, Style::default().fg(Color::Green))
+        } else if let Some(content) = raw.strip_prefix('-') {
+            let line_no = old_line;
+            old_line = old_line.saturating_add(1);
+            (line_no, "-", content, Style::default().fg(Color::Red))
+        } else if let Some(content) = raw.strip_prefix(' ') {
+            let line_no = new_line;
+            old_line = old_line.saturating_add(1);
+            new_line = new_line.saturating_add(1);
+            (line_no, " ", content, Style::default().fg(Color::Gray))
+        } else {
+            continue;
+        };
+
+        for (idx, chunk) in wrap_diff_content(content, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            let gutter = if idx == 0 {
+                format!("    {:>width$} {marker}", line_no, width = gutter_width)
+            } else {
+                format!("    {:>width$}  ", "", width = gutter_width)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+                Span::styled(chunk, style),
+            ]));
+        }
+    }
+
+    lines
+}
+
+fn parse_compact_hunk_header(header: &str) -> Option<(usize, usize)> {
+    let mut parts = header.split_whitespace();
+    parts.next()?;
+    let old = parts.next()?;
+    let new = parts.next()?;
+    Some((parse_hunk_start(old), parse_hunk_start(new)))
+}
+
+fn parse_hunk_start(part: &str) -> usize {
+    part.trim_start_matches(['-', '+'])
+        .split(',')
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for paragraph in text.lines() {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let word_width = word.width();
+            if current.is_empty() {
+                if word_width > width {
+                    out.extend(split_by_display_width(word, width));
+                } else {
+                    current.push_str(word);
+                }
+            } else if current.width() + 1 + word_width <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                out.push(current);
+                current = String::new();
+                if word_width > width {
+                    out.extend(split_by_display_width(word, width));
+                } else {
+                    current.push_str(word);
+                }
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        } else if paragraph.is_empty() {
+            out.push(String::new());
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn wrap_diff_content(text: &str, width: usize) -> Vec<String> {
+    let chunks = split_by_display_width(text, width.max(1));
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn split_by_display_width(text: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            chunks.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 pub fn render_tool_result_success(
     output: &str,
     truncated: bool,
@@ -840,6 +1172,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 tool_use_id,
                 content,
                 is_error,
+                metadata,
             } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let text = tool_result_text(&content);
@@ -847,6 +1180,10 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 let expanded = ctx.expanded_tool_outputs.contains(&tool_use_id);
                 let rendered = if is_error.unwrap_or(false) {
                     render_tool_result_error(&text)
+                } else if let Some(rendered) =
+                    render_structured_tool_result(metadata.as_ref(), ctx.width)
+                {
+                    rendered
                 } else {
                     match tool_name {
                         Some("Bash") | Some("PowerShell") => {
@@ -1176,6 +1513,182 @@ mod tests {
             .collect::<String>()
     }
 
+    fn lines_text(lines: Vec<Line<'static>>) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn render_updated_plan_with_explanation_and_all_statuses() {
+        let display = serde_json::json!({
+            "kind": "updated_plan",
+            "explanation": "Shifting focus to the verified path.",
+            "plan": [
+                { "step": "Finished discovery", "status": "completed" },
+                { "step": "Wire renderer", "status": "in_progress" },
+                { "step": "Run verification", "status": "pending" }
+            ]
+        });
+
+        let rendered = lines_text(render_updated_plan(&display, 80));
+
+        assert!(rendered.contains("Updated Plan"));
+        assert!(rendered.contains("Shifting focus"));
+        assert!(rendered.contains("[x] Finished discovery"));
+        assert!(rendered.contains("[ ] Wire renderer"));
+        assert!(rendered.contains("[ ] Run verification"));
+    }
+
+    #[test]
+    fn render_updated_plan_without_explanation_handles_empty_plan() {
+        let display = serde_json::json!({
+            "kind": "updated_plan",
+            "plan": []
+        });
+
+        let rendered = lines_text(render_updated_plan(&display, 80));
+
+        assert!(rendered.contains("Updated Plan"));
+        assert!(rendered.contains("[ ] No steps"));
+    }
+
+    #[test]
+    fn render_updated_plan_wraps_long_step_text() {
+        let display = serde_json::json!({
+            "kind": "updated_plan",
+            "plan": [
+                {
+                    "step": "This step is intentionally long so the checklist renderer must wrap it cleanly",
+                    "status": "in_progress"
+                }
+            ]
+        });
+
+        let rendered = render_updated_plan(&display, 34);
+        let text = lines_text(rendered.clone());
+
+        assert!(rendered.len() > 2);
+        assert!(text.contains("intentionally"));
+        assert!(text.contains("renderer"));
+    }
+
+    #[test]
+    fn render_file_changes_covers_add_delete_update_multi_and_counts() {
+        let display = serde_json::json!({
+            "kind": "file_changes",
+            "files": [
+                {
+                    "path": "created.rs",
+                    "change_type": "add",
+                    "lines_added": 1,
+                    "lines_removed": 0,
+                    "binary": false,
+                    "unified_diff": "--- /dev/null\n+++ b/created.rs\n@@ -0,0 +1 @@\n+new\n"
+                },
+                {
+                    "path": "deleted.rs",
+                    "change_type": "delete",
+                    "lines_added": 0,
+                    "lines_removed": 1,
+                    "binary": false,
+                    "unified_diff": "--- a/deleted.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+                },
+                {
+                    "path": "src/lib.rs",
+                    "change_type": "update",
+                    "lines_added": 1,
+                    "lines_removed": 1,
+                    "binary": false,
+                    "unified_diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -3,2 +3,2 @@\n context\n-old\n+new\n"
+                }
+            ]
+        });
+
+        let rendered = lines_text(render_file_changes(&display, 80));
+
+        assert!(rendered.contains("Added created.rs (+1 -0)"));
+        assert!(rendered.contains("Deleted deleted.rs (+0 -1)"));
+        assert!(rendered.contains("Edited src/lib.rs (+1 -1)"));
+        assert!(rendered.contains("+new"));
+        assert!(rendered.contains("-old"));
+        assert!(rendered.contains(" context"));
+    }
+
+    #[test]
+    fn render_file_changes_supports_rename_and_wrapping() {
+        let display = serde_json::json!({
+            "kind": "file_changes",
+            "files": [
+                {
+                    "path": "new-name.rs",
+                    "move_path": "old-name.rs",
+                    "change_type": "rename",
+                    "lines_added": 1,
+                    "lines_removed": 0,
+                    "binary": false,
+                    "unified_diff": "--- a/old-name.rs\n+++ b/new-name.rs\n@@ -1 +1,2 @@\n same\n+abcdefghijklmnopqrstuvwxyz0123456789\n"
+                }
+            ]
+        });
+
+        let rendered = render_file_changes(&display, 32);
+        let text = lines_text(rendered.clone());
+
+        assert!(text.contains("Renamed old-name.rs -> new-name.rs (+1 -0)"));
+        assert!(
+            rendered.len() > 3,
+            "long diff content should wrap into continuation lines"
+        );
+    }
+
+    #[test]
+    fn render_message_uses_structured_metadata_for_file_changes_and_plan() {
+        let mut tool_names = HashMap::new();
+        tool_names.insert("edit-1".to_string(), "Edit".to_string());
+        tool_names.insert("plan-1".to_string(), "update_plan".to_string());
+        let ctx = RenderContext {
+            tool_names,
+            ..Default::default()
+        };
+        let msg = Message::user_blocks(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "edit-1".to_string(),
+                content: ToolResultContent::Text("Successfully edited file".to_string()),
+                is_error: Some(false),
+                metadata: Some(serde_json::json!({
+                    "transcript_display": {
+                        "kind": "file_changes",
+                        "files": [{
+                            "path": "src/lib.rs",
+                            "change_type": "update",
+                            "lines_added": 1,
+                            "lines_removed": 0,
+                            "binary": false,
+                            "unified_diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n same\n+new\n"
+                        }]
+                    }
+                })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "plan-1".to_string(),
+                content: ToolResultContent::Text("Plan updated".to_string()),
+                is_error: Some(false),
+                metadata: Some(serde_json::json!({
+                    "transcript_display": {
+                        "kind": "updated_plan",
+                        "plan": [{ "step": "Check output", "status": "pending" }]
+                    }
+                })),
+            },
+        ]);
+
+        let rendered = lines_text(render_message(&msg, &ctx));
+
+        assert!(rendered.contains("Edited src/lib.rs (+1 -0)"));
+        assert!(rendered.contains("Updated Plan"));
+        assert!(rendered.contains("[ ] Check output"));
+        assert!(!rendered.contains("Updated file"));
+    }
+
     #[test]
     fn render_message_uses_message_families_for_assistant_blocks() {
         let msg = Message::assistant_blocks(vec![
@@ -1195,6 +1708,7 @@ mod tests {
                 tool_use_id: "tool-1".to_string(),
                 content: ToolResultContent::Text("file contents".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
         ]);
         let ctx = RenderContext {
@@ -1484,6 +1998,7 @@ mod tests {
             tool_use_id: "tu-bash-1".to_string(),
             content: ToolResultContent::Text("hello world\nline2".to_string()),
             is_error: Some(false),
+            metadata: None,
         }]);
         let rendered = render_message(&msg, &ctx)
             .into_iter()
@@ -1504,6 +2019,7 @@ mod tests {
             tool_use_id: "tu-read-1".to_string(),
             content: ToolResultContent::Text("file content here".to_string()),
             is_error: Some(false),
+            metadata: None,
         }]);
         // No tool_names → falls back to render_tool_result_success (no separate header)
         let rendered = render_message(&msg, &RenderContext::default())

@@ -334,6 +334,31 @@ pub struct ToolUseBlock {
     pub input_json: String,
 }
 
+fn structured_tool_end_output(
+    result: &str,
+    is_error: bool,
+    metadata: Option<&serde_json::Value>,
+) -> String {
+    if !is_error {
+        if let Some(lines) = crate::messages::render_structured_tool_result(metadata, 100) {
+            let rendered = lines
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !rendered.trim().is_empty() {
+                return rendered;
+            }
+        }
+    }
+    result.to_string()
+}
+
 /// State for Ctrl+R history search mode (legacy inline struct, kept for test
 /// compatibility — the overlay version lives in `overlays::HistorySearchOverlay`).
 #[derive(Debug, Clone)]
@@ -5925,10 +5950,13 @@ impl App {
                 tool_id,
                 result,
                 is_error,
+                metadata,
                 ..
             } => {
+                let display_result =
+                    structured_tool_end_output(&result, is_error, metadata.as_ref());
                 // Build a multi-line preview: show up to 3 lines, truncate if more.
-                let all_lines: Vec<&str> = result.lines().collect();
+                let all_lines: Vec<&str> = display_result.lines().collect();
                 let preview_lines = all_lines.len().min(3);
                 let mut preview = all_lines[..preview_lines].join("\n");
                 let remaining = all_lines.len().saturating_sub(preview_lines);
@@ -5936,7 +5964,7 @@ impl App {
                     preview.push_str(&format!("\n\u{2026} {} more lines", remaining));
                 }
                 if is_error {
-                    self.status_message = Some(format!("Tool error: {}", &result));
+                    self.status_message = Some(format!("Tool error: {}", &display_result));
                 } else {
                     self.status_message = None;
                 }
@@ -5947,7 +5975,7 @@ impl App {
                         ToolStatus::Done
                     };
                     block.output_preview = Some(preview);
-                    block.full_output = Some(result);
+                    block.full_output = Some(display_result);
                 }
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();

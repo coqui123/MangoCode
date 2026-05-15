@@ -80,6 +80,7 @@ tool-team-delete = ["mangocode-tools/tool-team-delete"]
 tool-todo-write = ["mangocode-tools/tool-todo-write"]
 tool-tool-log-read = ["mangocode-tools/tool-tool-log-read"]
 tool-tool-search = ["mangocode-tools/tool-tool-search"]
+tool-update-plan = ["mangocode-tools/tool-update-plan"]
 tool-update-goal = ["mangocode-tools/tool-update-goal"]
 tool-view-image = ["mangocode-tools/tool-view-image"]
 tool-web-fetch = ["mangocode-tools/tool-web-fetch"]
@@ -91,6 +92,7 @@ mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
 mangocode-plugins = { workspace = true }
 mangocode-tools = { workspace = true, default-features = false }
+mangocode-turn-diff = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }

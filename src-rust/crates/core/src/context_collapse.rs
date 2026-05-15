@@ -687,6 +687,7 @@ mod tests {
                 tool_use_id: "t1".to_string(),
                 content: ToolResultContent::Text("A".repeat(300)),
                 is_error: None,
+                metadata: None,
             },
         ])];
 
@@ -762,6 +763,7 @@ mod tests {
                     tool_use_id: "tool-1".to_string(),
                     content: ToolResultContent::Text("line\n".repeat(400)),
                     is_error: None,
+                    metadata: None,
                 },
             ]),
             long_code_message(),

@@ -284,6 +284,7 @@ mod tests {
                 tool_use_id: "☃☃☃tool".to_string(),
                 content: ToolResultContent::Text("ok".to_string()),
                 is_error: None,
+                metadata: None,
             }]),
             uuid: None,
             cost: None,

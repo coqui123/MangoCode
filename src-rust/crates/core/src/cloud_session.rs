@@ -31,8 +31,9 @@ pub struct CloudSessionDetail {
 
 /// A message in the cloud API format.
 ///
-/// `content` is a JSON array of Anthropic API content-block objects so that
-/// structured blocks (tool_use, tool_result, image, …) survive a round-trip
+/// `content` is a JSON array of Anthropic-style content-block objects plus
+/// MangoCode transcript extensions so that structured blocks (tool_use,
+/// tool_result, image, rich transcript metadata, …) survive a round-trip
 /// through the cloud without being collapsed to plain text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudMessage {
@@ -60,8 +61,9 @@ fn content_to_blocks(content: &MessageContent) -> Vec<ContentBlock> {
 
 /// Convert an internal `Message` to a `CloudMessage`.
 ///
-/// Every `ContentBlock` is serialised to its Anthropic API JSON
-/// representation; no information is discarded.
+/// Every `ContentBlock` is serialised to its transcript JSON representation;
+/// no information is discarded. Use `message_to_external_value` for provider
+/// or share payloads where transcript-only metadata must be stripped.
 pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) -> CloudMessage {
     let role = match msg.role {
         Role::User => "user".to_string(),

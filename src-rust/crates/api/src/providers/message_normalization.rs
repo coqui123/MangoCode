@@ -124,6 +124,7 @@ mod tests {
                 tool_use_id: "call:1/abc".to_string(),
                 content: ToolResultContent::Text("done".to_string()),
                 is_error: Some(false),
+                metadata: None,
             }]),
         ];
 

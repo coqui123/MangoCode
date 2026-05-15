@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::message_utils::message_to_external_value;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareRequest {
     pub session_id: String,
@@ -32,10 +34,7 @@ pub async fn share_session(
     let req = ShareRequest {
         session_id: session_id.to_string(),
         title: title.map(|t| t.to_string()),
-        messages: messages
-            .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
-            .collect(),
+        messages: messages.iter().map(message_to_external_value).collect(),
         created_at: chrono::Utc::now().to_rfc3339(),
         model: model.to_string(),
     };

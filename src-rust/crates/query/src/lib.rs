@@ -1001,6 +1001,7 @@ pub enum QueryEvent {
         tool_id: String,
         result: String,
         is_error: bool,
+        metadata: Option<Value>,
         parent_tool_use_id: Option<String>,
     },
     /// The model finished a turn.
@@ -1058,6 +1059,7 @@ fn record_query_event(
             tool_id,
             result,
             is_error,
+            metadata,
             parent_tool_use_id,
         } => {
             recorder.record(
@@ -1069,6 +1071,7 @@ fn record_query_event(
                     "tool_name": tool_name,
                     "result": result,
                     "is_error": is_error,
+                    "metadata": metadata,
                     "parent_tool_use_id": parent_tool_use_id,
                 }),
             );
@@ -3140,6 +3143,7 @@ async fn run_query_loop_inner(
                                     tool_id: p.id.clone(),
                                     result: result.content.clone(),
                                     is_error: result.is_error,
+                                    metadata: result.metadata.clone(),
                                     parent_tool_use_id: None,
                                 });
                             }
@@ -3150,6 +3154,7 @@ async fn run_query_loop_inner(
                                     result.content,
                                 ),
                                 is_error: Some(result.is_error),
+                                metadata: result.metadata,
                             });
                         }
 
@@ -3889,6 +3894,7 @@ async fn run_query_loop_inner(
                             tool_id: p.id.clone(),
                             result: result.content.clone(),
                             is_error: result.is_error,
+                            metadata: result.metadata.clone(),
                             parent_tool_use_id: None,
                         });
                     }
@@ -3897,6 +3903,7 @@ async fn run_query_loop_inner(
                         tool_use_id: p.id.clone(),
                         content: ToolResultContent::Text(result.content),
                         is_error: if result.is_error { Some(true) } else { None },
+                        metadata: result.metadata,
                     });
                 }
 
@@ -4476,7 +4483,18 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
                 "Executing tool"
             );
             let snapshots = collect_tool_pre_snapshots(req.ctx, canonical_name, req.input);
+            let file_history_start = req.ctx.file_history.lock().len();
             let result = tool.execute(req.input.clone(), req.ctx).await;
+            let result = if result.is_error {
+                result
+            } else {
+                attach_transcript_display_metadata(
+                    result,
+                    req.ctx,
+                    canonical_name,
+                    file_history_start,
+                )
+            };
             if !result.is_error {
                 persist_tool_snapshots(
                     req.ctx,
@@ -4506,6 +4524,182 @@ async fn execute_tool(req: ExecuteToolRequest<'_>) -> ToolResult {
             result
         }
     }
+}
+
+fn attach_transcript_display_metadata(
+    mut result: ToolResult,
+    ctx: &ToolContext,
+    tool_name: &str,
+    file_history_start: usize,
+) -> ToolResult {
+    if !tool_records_file_changes(tool_name) {
+        return result;
+    }
+
+    let entries = {
+        let history = ctx.file_history.lock();
+        history
+            .entries()
+            .iter()
+            .skip(file_history_start)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if entries.is_empty() {
+        return result;
+    }
+
+    let files = squash_transcript_file_changes(entries)
+        .into_iter()
+        .map(|entry| {
+            let relative_path = relative_tool_path(&entry.path, &ctx.working_dir);
+            let change_type = match (entry.before_exists, entry.after_exists) {
+                (false, true) => "add",
+                (true, false) => "delete",
+                _ => "update",
+            };
+            let full_unified_diff = if entry.binary {
+                format!("Binary file changed: {relative_path}\n")
+            } else {
+                mangocode_turn_diff::unified_diff_with_existence(
+                    &relative_path,
+                    entry.before_text.as_deref().unwrap_or_default(),
+                    entry.after_text.as_deref().unwrap_or_default(),
+                    entry.before_exists,
+                    entry.after_exists,
+                )
+            };
+            let (lines_added, lines_removed) = diff_line_counts(&full_unified_diff);
+            let (unified_diff, diff_truncated) = truncate_transcript_diff(full_unified_diff);
+            serde_json::json!({
+                "path": relative_path,
+                "change_type": change_type,
+                "lines_added": lines_added,
+                "lines_removed": lines_removed,
+                "binary": entry.binary,
+                "unified_diff": unified_diff,
+                "diff_truncated": diff_truncated,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if files.is_empty() {
+        return result;
+    }
+
+    let display = serde_json::json!({
+        "kind": "file_changes",
+        "files": files,
+    });
+    let mut metadata = result
+        .metadata
+        .take()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert("transcript_display".to_string(), display);
+    } else {
+        metadata = serde_json::json!({
+            "transcript_display": display,
+            "raw_metadata": metadata,
+        });
+    }
+    result.metadata = Some(metadata);
+    result
+}
+
+#[derive(Clone)]
+struct TranscriptFileChange {
+    path: std::path::PathBuf,
+    before_text: Option<String>,
+    after_text: Option<String>,
+    before_exists: bool,
+    after_exists: bool,
+    binary: bool,
+}
+
+fn squash_transcript_file_changes(
+    entries: Vec<mangocode_core::file_history::FileHistoryEntry>,
+) -> Vec<TranscriptFileChange> {
+    let mut changes = Vec::<TranscriptFileChange>::new();
+    let mut by_path = std::collections::HashMap::<std::path::PathBuf, usize>::new();
+
+    for entry in entries {
+        if let Some(existing_idx) = by_path.get(&entry.path).copied() {
+            let existing = &mut changes[existing_idx];
+            existing.after_text = entry.after_text;
+            existing.after_exists = entry.after_exists;
+            existing.binary |= entry.binary;
+        } else {
+            by_path.insert(entry.path.clone(), changes.len());
+            changes.push(TranscriptFileChange {
+                path: entry.path,
+                before_text: entry.before_text,
+                after_text: entry.after_text,
+                before_exists: entry.before_exists,
+                after_exists: entry.after_exists,
+                binary: entry.binary,
+            });
+        }
+    }
+
+    changes
+}
+
+fn tool_records_file_changes(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        mangocode_core::constants::TOOL_NAME_FILE_WRITE
+            | mangocode_core::constants::TOOL_NAME_FILE_EDIT
+            | mangocode_core::constants::TOOL_NAME_APPLY_PATCH
+            | mangocode_core::constants::TOOL_NAME_BATCH_EDIT
+            | mangocode_core::constants::TOOL_NAME_NOTEBOOK_EDIT
+    )
+}
+
+fn relative_tool_path(path: &std::path::Path, root: &std::path::Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn diff_line_counts(unified_diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in unified_diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+const TRANSCRIPT_DIFF_MAX_LINES: usize = 240;
+const TRANSCRIPT_DIFF_MAX_CHARS: usize = 32_000;
+const TRANSCRIPT_DIFF_TRUNCATED_LINE: &str = " ... diff truncated for transcript display\n";
+
+fn truncate_transcript_diff(unified_diff: String) -> (String, bool) {
+    let mut out = String::new();
+    let mut chars = 0usize;
+
+    for (line_idx, line) in unified_diff.split_inclusive('\n').enumerate() {
+        let line_chars = line.chars().count();
+        if line_idx >= TRANSCRIPT_DIFF_MAX_LINES || chars + line_chars > TRANSCRIPT_DIFF_MAX_CHARS {
+            out.push_str(TRANSCRIPT_DIFF_TRUNCATED_LINE);
+            return (out, true);
+        }
+        out.push_str(line);
+        chars += line_chars;
+    }
+
+    (unified_diff, false)
 }
 
 fn collect_tool_pre_snapshots(
@@ -5886,6 +6080,107 @@ mod tests {
             provider_registry: Some(registry),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn file_change_metadata_carries_unified_diff_for_transcript() {
+        let ctx = make_tool_context("mock");
+        let path = ctx.working_dir.join("mangocode-query-metadata-test.rs");
+        ctx.file_history.lock().record_modification(
+            path,
+            b"fn old() {}\n",
+            b"fn new() {}\n",
+            0,
+            mangocode_core::constants::TOOL_NAME_FILE_EDIT,
+        );
+
+        let result = attach_transcript_display_metadata(
+            ToolResult::success("edited"),
+            &ctx,
+            mangocode_core::constants::TOOL_NAME_FILE_EDIT,
+            0,
+        );
+
+        let display = &result.metadata.unwrap()["transcript_display"];
+        assert_eq!(display["kind"].as_str(), Some("file_changes"));
+        let files = display["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["lines_added"].as_u64(), Some(1));
+        assert_eq!(files[0]["lines_removed"].as_u64(), Some(1));
+        assert!(files[0]["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+fn new()"));
+    }
+
+    #[test]
+    fn file_change_metadata_squashes_repeated_path_entries() {
+        let ctx = make_tool_context("mock");
+        let path = ctx.working_dir.join("mangocode-query-metadata-squash.rs");
+        {
+            let mut history = ctx.file_history.lock();
+            history.record_modification(
+                path.clone(),
+                b"fn old() {}\n",
+                b"fn middle() {}\n",
+                0,
+                mangocode_core::constants::TOOL_NAME_BATCH_EDIT,
+            );
+            history.record_modification(
+                path,
+                b"fn middle() {}\n",
+                b"fn final() {}\n",
+                0,
+                mangocode_core::constants::TOOL_NAME_BATCH_EDIT,
+            );
+        }
+
+        let result = attach_transcript_display_metadata(
+            ToolResult::success("edited"),
+            &ctx,
+            mangocode_core::constants::TOOL_NAME_BATCH_EDIT,
+            0,
+        );
+
+        let display = &result.metadata.unwrap()["transcript_display"];
+        let files = display["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let diff = files[0]["unified_diff"].as_str().unwrap();
+        assert!(diff.contains("-fn old()"));
+        assert!(diff.contains("+fn final()"));
+        assert!(!diff.contains("+fn middle()"));
+    }
+
+    #[test]
+    fn file_change_metadata_truncates_large_diffs_but_keeps_full_counts() {
+        let ctx = make_tool_context("mock");
+        let path = ctx.working_dir.join("mangocode-query-metadata-large.rs");
+        let after = (0..400)
+            .map(|idx| format!("line {idx}\n"))
+            .collect::<String>();
+        ctx.file_history.lock().record_modification_with_existence(
+            path,
+            b"",
+            after.as_bytes(),
+            (false, true),
+            0,
+            mangocode_core::constants::TOOL_NAME_FILE_WRITE,
+        );
+
+        let result = attach_transcript_display_metadata(
+            ToolResult::success("written"),
+            &ctx,
+            mangocode_core::constants::TOOL_NAME_FILE_WRITE,
+            0,
+        );
+
+        let display = &result.metadata.unwrap()["transcript_display"];
+        let file = &display["files"].as_array().unwrap()[0];
+        let diff = file["unified_diff"].as_str().unwrap();
+        assert_eq!(file["lines_added"].as_u64(), Some(400));
+        assert_eq!(file["diff_truncated"].as_bool(), Some(true));
+        assert!(diff.contains("diff truncated for transcript display"));
+        assert!(diff.lines().count() <= TRANSCRIPT_DIFF_MAX_LINES + 1);
     }
 
     #[test]

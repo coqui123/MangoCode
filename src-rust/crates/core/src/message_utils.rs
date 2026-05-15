@@ -162,6 +162,36 @@ pub fn format_tool_result(result: &Value) -> String {
     }
 }
 
+/// Serialize a message for external APIs that expect provider-style content.
+///
+/// Local transcripts may keep `ToolResult.metadata` so the UI can render rich
+/// plan/file-change blocks, but that metadata is not part of provider wire
+/// schemas and should not be uploaded to share/model endpoints.
+pub fn message_to_external_value(msg: &Message) -> Value {
+    let mut value = serde_json::to_value(msg).unwrap_or(Value::Null);
+    strip_tool_result_transcript_metadata(&mut value);
+    value
+}
+
+pub fn strip_tool_result_transcript_metadata(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                strip_tool_result_transcript_metadata(item);
+            }
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("tool_result") {
+                map.remove("metadata");
+            }
+            for item in map.values_mut() {
+                strip_tool_result_transcript_metadata(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +233,27 @@ mod tests {
         if let ContentBlock::Text { text } = &merged[0] {
             assert_eq!(text, "a\nb");
         }
+    }
+
+    #[test]
+    fn external_message_value_strips_tool_result_transcript_metadata() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: crate::types::ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": []
+                }
+            })),
+        }]);
+
+        let value = message_to_external_value(&msg);
+
+        assert_eq!(value["content"][0]["type"], "tool_result");
+        assert_eq!(value["content"][0]["content"], "done");
+        assert!(value["content"][0].get("metadata").is_none());
+        assert!(!value.to_string().contains("transcript_display"));
     }
 }

@@ -6,7 +6,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{hash_map::DefaultHasher, HashMap},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet},
     hash::{Hash, Hasher},
     io::{self, Stdout, Write},
 };
@@ -40,7 +40,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::App,
-    messages::{render_message, RenderContext},
+    messages::{render_message, render_structured_tool_result, RenderContext},
     prompt_input::{input_height, render_prompt_input, InputMode},
     render::{
         build_tool_names, compact_model_label, flush_sixel_blit_with_cursor, render_app,
@@ -63,6 +63,7 @@ pub struct HybridTerminal {
     composer_buffer: Option<Buffer>,
     fullscreen_buffer: Option<Buffer>,
     screen_lines: HashMap<u16, (Line<'static>, Option<String>)>,
+    rendered_structured_tool_outputs: HashSet<String>,
     expansion_fingerprint: u64,
     deferred_new_messages: bool,
     last_terminal_size: Option<(u16, u16)>,
@@ -89,6 +90,7 @@ impl HybridTerminal {
             composer_buffer: None,
             fullscreen_buffer: None,
             screen_lines: HashMap::new(),
+            rendered_structured_tool_outputs: HashSet::new(),
             expansion_fingerprint: expansion_fingerprint(app),
             deferred_new_messages: false,
             last_terminal_size: None,
@@ -135,6 +137,7 @@ impl HybridTerminal {
             self.composer_buffer = None;
             self.fullscreen_buffer = None;
             self.screen_lines.clear();
+            self.rendered_structured_tool_outputs.clear();
             self.deferred_new_messages = false;
             app.tool_row_map.borrow_mut().clear();
             app.message_row_map.borrow_mut().clear();
@@ -153,6 +156,7 @@ impl HybridTerminal {
         self.composer_buffer = None;
         self.fullscreen_buffer = None;
         self.screen_lines.clear();
+        self.rendered_structured_tool_outputs.clear();
         self.deferred_new_messages = false;
         app.tool_row_map.borrow_mut().clear();
         app.message_row_map.borrow_mut().clear();
@@ -339,9 +343,27 @@ impl HybridTerminal {
                 tool_id,
                 result,
                 is_error,
+                metadata,
                 ..
             } => {
                 self.move_to_transcript_end()?;
+                if !*is_error {
+                    let width = terminal::size()
+                        .unwrap_or((80, 24))
+                        .0
+                        .saturating_sub(1)
+                        .max(1);
+                    if let Some(rendered) = render_structured_tool_result(metadata.as_ref(), width)
+                    {
+                        for line in rendered {
+                            self.write_line_with_tool(&line, Some(tool_id.as_str()), Some(app))?;
+                        }
+                        self.rendered_structured_tool_outputs
+                            .insert(tool_id.clone());
+                        self.write_blank_line_for_app(app)?;
+                        return self.render_live(app);
+                    }
+                }
                 let color = if *is_error { RtColor::Red } else { MANGO };
                 let label = if *is_error { "Tool error" } else { "Tool done" };
                 self.write_styled_line_with_tool(
@@ -449,6 +471,7 @@ impl HybridTerminal {
             self.composer_buffer = None;
             self.fullscreen_buffer = None;
             self.screen_lines.clear();
+            self.rendered_structured_tool_outputs.clear();
         }
         Ok(())
     }
@@ -465,7 +488,8 @@ impl HybridTerminal {
         self.move_to_transcript_end()?;
         let start = self.printed_messages;
         for (offset, msg) in app.messages[start..].iter().enumerate() {
-            if let Some(msg) = live_transcript_message(msg) {
+            if let Some(msg) = live_transcript_message(msg, &self.rendered_structured_tool_outputs)
+            {
                 app.message_row_map
                     .borrow_mut()
                     .insert(self.transcript_row, start + offset);
@@ -849,17 +873,26 @@ fn composer_cursor(app: &App, width: u16, top: u16) -> (u16, u16) {
     (input_top.saturating_add(line_count), col.saturating_add(2))
 }
 
-fn live_transcript_message(msg: &Message) -> Option<Message> {
+fn live_transcript_message(
+    msg: &Message,
+    rendered_structured_tool_outputs: &HashSet<String>,
+) -> Option<Message> {
     match &msg.content {
         MessageContent::Text(_) => Some(msg.clone()),
         MessageContent::Blocks(blocks) => {
             let visible = blocks
                 .iter()
-                .filter(|block| {
-                    !matches!(
-                        block,
-                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
-                    )
+                .filter(|block| match block {
+                    ContentBlock::ToolUse { .. } => false,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        metadata,
+                        ..
+                    } => {
+                        structured_tool_result_kind(metadata.as_ref()).is_some()
+                            && !rendered_structured_tool_outputs.contains(tool_use_id)
+                    }
+                    _ => true,
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -874,6 +907,14 @@ fn live_transcript_message(msg: &Message) -> Option<Message> {
                 })
             }
         }
+    }
+}
+
+fn structured_tool_result_kind(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    let kind = metadata?.get("transcript_display")?.get("kind")?.as_str()?;
+    match kind {
+        "updated_plan" | "file_changes" => Some(kind),
+        _ => None,
     }
 }
 
@@ -1131,15 +1172,54 @@ mod tests {
                 tool_use_id: "tool-1".to_string(),
                 content: ToolResultContent::Text("hi".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
             ContentBlock::Text {
                 text: "done".to_string(),
             },
         ]);
 
-        let visible = live_transcript_message(&msg).expect("final text should remain visible");
+        let visible = live_transcript_message(&msg, &HashSet::new())
+            .expect("final text should remain visible");
         assert_eq!(visible.content_blocks().len(), 1);
         assert_eq!(visible.get_all_text(), "done");
+    }
+
+    #[test]
+    fn live_transcript_message_keeps_unrendered_structured_tool_result() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: ToolResultContent::Text("Plan updated".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": []
+                }
+            })),
+        }]);
+
+        let visible = live_transcript_message(&msg, &HashSet::new())
+            .expect("unrendered structured tool result should be replayed");
+        assert_eq!(visible.content_blocks().len(), 1);
+    }
+
+    #[test]
+    fn live_transcript_message_skips_structured_tool_result_already_rendered_live() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: ToolResultContent::Text("Plan updated".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": []
+                }
+            })),
+        }]);
+        let rendered = HashSet::from(["tool-1".to_string()]);
+
+        assert!(live_transcript_message(&msg, &rendered).is_none());
     }
 
     #[test]

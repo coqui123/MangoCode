@@ -574,6 +574,7 @@ async fn summarise_head(
                         tool_use_id,
                         content,
                         is_error,
+                        ..
                     } => {
                         let result_text = match content {
                             mangocode_core::types::ToolResultContent::Text(t) => {
@@ -1458,6 +1459,7 @@ mod tests {
                         tool_use_id: format!("tool-{}", i),
                         content: ToolResultContent::Text("line\n".repeat(400)),
                         is_error: Some(false),
+                        metadata: None,
                     },
                 ]));
             } else {
@@ -1502,11 +1504,13 @@ mod tests {
                 tool_use_id: "t1".to_string(),
                 content: ToolResultContent::Text("same payload".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "t2".to_string(),
                 content: ToolResultContent::Text("same payload".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
         ])];
 

@@ -1306,12 +1306,14 @@ fn attach_parent_to_event(
             tool_id,
             result,
             is_error,
+            metadata,
             parent_tool_use_id,
         } => crate::QueryEvent::ToolEnd {
             tool_name,
             tool_id,
             result,
             is_error,
+            metadata,
             parent_tool_use_id: Some(
                 parent_tool_use_id.unwrap_or_else(|| default_parent_tool_use_id.to_string()),
             ),
@@ -1700,14 +1702,28 @@ mod tests {
             tool_id: "tool-2".to_string(),
             result: "ok".to_string(),
             is_error: false,
+            metadata: Some(serde_json::json!({
+                "transcript_display": { "kind": "updated_plan", "plan": [] }
+            })),
             parent_tool_use_id: None,
         };
 
         let out = attach_parent_to_event(evt, "fallback-parent");
         match out {
             crate::QueryEvent::ToolEnd {
-                parent_tool_use_id, ..
-            } => assert_eq!(parent_tool_use_id.as_deref(), Some("fallback-parent")),
+                parent_tool_use_id,
+                metadata,
+                ..
+            } => {
+                assert_eq!(parent_tool_use_id.as_deref(), Some("fallback-parent"));
+                assert_eq!(
+                    metadata
+                        .as_ref()
+                        .and_then(|m| m.pointer("/transcript_display/kind"))
+                        .and_then(|v| v.as_str()),
+                    Some("updated_plan")
+                );
+            }
             _ => panic!("expected ToolEnd"),
         }
     }

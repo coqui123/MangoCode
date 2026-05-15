@@ -197,11 +197,13 @@ async fn context_overflow_triggers_compaction() {
                 tool_use_id: "t1".to_string(),
                 content: ToolResultContent::Text(big.clone()),
                 is_error: Some(false),
+                metadata: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "t2".to_string(),
                 content: ToolResultContent::Text(big.clone()),
                 is_error: Some(false),
+                metadata: None,
             },
         ]),
         Message::user("Final question"),

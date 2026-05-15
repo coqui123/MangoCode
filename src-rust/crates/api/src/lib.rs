@@ -12,6 +12,7 @@
 use futures::StreamExt;
 use mangocode_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
 use mangocode_core::error::ClaudeError;
+use mangocode_core::message_utils::strip_tool_result_transcript_metadata;
 use mangocode_core::types::{
     ContentBlock, Message, MessageContent, Role, ToolDefinition, UsageInfo,
 };
@@ -198,15 +199,19 @@ pub mod types {
             };
             let content = match &msg.content {
                 MessageContent::Text(t) => Value::String(t.clone()),
-                MessageContent::Blocks(blocks) => {
-                    serde_json::to_value(blocks).unwrap_or(Value::Null)
-                }
+                MessageContent::Blocks(blocks) => content_blocks_to_wire_value(blocks),
             };
             Self {
                 role: role.to_string(),
                 content,
             }
         }
+    }
+
+    fn content_blocks_to_wire_value(blocks: &[ContentBlock]) -> Value {
+        let mut value = serde_json::to_value(blocks).unwrap_or(Value::Null);
+        strip_tool_result_transcript_metadata(&mut value);
+        value
     }
 
     /// Tool definition in the API wire format.
@@ -1218,6 +1223,27 @@ mod tests {
         assert_eq!(req.model, "claude-opus-4-6");
         assert_eq!(req.max_tokens, 4096);
         assert!(req.stream);
+    }
+
+    #[test]
+    fn api_message_strips_transcript_metadata_from_tool_results() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "tool-1".to_string(),
+            content: mangocode_core::types::ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": []
+                }
+            })),
+        }]);
+
+        let wire = ApiMessage::from(&msg);
+
+        assert_eq!(wire.content[0]["type"].as_str(), Some("tool_result"));
+        assert!(wire.content[0].get("metadata").is_none());
+        assert_eq!(wire.content[0]["content"].as_str(), Some("done"));
     }
 
     #[test]

@@ -102,6 +102,8 @@ pub mod team_tool;
 pub mod todo_write;
 #[cfg(feature = "tool-tool-search")]
 pub mod tool_search;
+#[cfg(feature = "tool-update-plan")]
+pub mod update_plan;
 #[cfg(feature = "tool-view-image")]
 pub mod view_image;
 #[cfg(feature = "tool-web-fetch")]
@@ -221,6 +223,8 @@ pub use team_tool::{register_agent_runner, AgentRunFn};
 pub use todo_write::TodoWriteTool;
 #[cfg(feature = "tool-tool-search")]
 pub use tool_search::ToolSearchTool;
+#[cfg(feature = "tool-update-plan")]
+pub use update_plan::UpdatePlanTool;
 #[cfg(feature = "tool-view-image")]
 pub use view_image::ViewImageTool;
 #[cfg(feature = "tool-web-fetch")]
@@ -610,6 +614,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(TaskOutputTool),
         #[cfg(feature = "tool-todo-write")]
         Box::new(TodoWriteTool),
+        #[cfg(feature = "tool-update-plan")]
+        Box::new(UpdatePlanTool),
         #[cfg(feature = "tool-ask-user")]
         Box::new(AskUserQuestionTool),
         #[cfg(feature = "tool-enter-plan-mode")]
@@ -912,7 +918,7 @@ pub fn default_aliases_for_tool(name: &str) -> Vec<String> {
         "BatchEdit" => vec!["batch_edit"],
         "Glob" => vec!["glob"],
         "Grep" => vec!["grep"],
-        "TodoWrite" => vec!["update_plan", "todo_write"],
+        "TodoWrite" => vec!["todo_write"],
         "get_goal" => vec!["GetGoal"],
         "create_goal" => vec!["CreateGoal"],
         "update_goal" => vec!["UpdateGoal"],
@@ -1052,6 +1058,7 @@ fn is_stateful_or_interactive_tool(name: &str) -> bool {
         "AskUserQuestion"
             | "EnterPlanMode"
             | "ExitPlanMode"
+            | "update_plan"
             | "TodoWrite"
             | "Sleep"
             | "CronCreate"
@@ -1385,14 +1392,19 @@ mod tests {
             feature = "tool-apply-patch",
             feature = "tool-get-goal",
             feature = "tool-todo-write",
+            feature = "tool-update-plan",
             feature = "tool-web-fetch",
             feature = "tool-web-search"
         ))]
         let plan = build_registry_plan(&tools);
         #[cfg(feature = "tool-apply-patch")]
         assert_eq!(plan.canonical_name("apply_patch"), Some("ApplyPatch"));
+        #[cfg(feature = "tool-update-plan")]
+        assert_eq!(plan.canonical_name("update_plan"), Some("update_plan"));
         #[cfg(feature = "tool-todo-write")]
-        assert_eq!(plan.canonical_name("update_plan"), Some("TodoWrite"));
+        assert_eq!(plan.canonical_name("TodoWrite"), Some("TodoWrite"));
+        #[cfg(feature = "tool-todo-write")]
+        assert_eq!(plan.canonical_name("todo_write"), Some("TodoWrite"));
         #[cfg(feature = "tool-get-goal")]
         assert_eq!(plan.canonical_name("GetGoal"), Some("get_goal"));
         #[cfg(feature = "tool-web-search")]
@@ -1440,6 +1452,23 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "WebSearch");
+    }
+
+    #[cfg(all(feature = "tool-todo-write", feature = "tool-update-plan"))]
+    #[test]
+    fn test_update_plan_and_todo_write_visibility_are_distinct() {
+        let todo_only = filter_tools_by_name_config(all_tools(), &["TodoWrite".to_string()], &[]);
+        assert!(todo_only.iter().any(|tool| tool.name() == "TodoWrite"));
+        assert!(!todo_only.iter().any(|tool| tool.name() == "update_plan"));
+
+        let plan_only = filter_tools_by_name_config(all_tools(), &["update_plan".to_string()], &[]);
+        assert!(plan_only.iter().any(|tool| tool.name() == "update_plan"));
+        assert!(!plan_only.iter().any(|tool| tool.name() == "TodoWrite"));
+
+        let without_todo =
+            filter_tools_by_name_config(all_tools(), &[], &["TodoWrite".to_string()]);
+        assert!(!without_todo.iter().any(|tool| tool.name() == "TodoWrite"));
+        assert!(without_todo.iter().any(|tool| tool.name() == "update_plan"));
     }
 
     #[cfg(all(feature = "tool-bash", feature = "tool-tool-search"))]
@@ -1558,6 +1587,12 @@ mod tests {
             "update_goal",
             &serde_json::json!({ "status": "complete" })
         ));
+        #[cfg(feature = "tool-update-plan")]
+        assert!(!tool_supports_parallel(
+            &tools,
+            "update_plan",
+            &serde_json::json!({ "plan": [] })
+        ));
     }
 
     #[test]
@@ -1570,6 +1605,7 @@ mod tests {
             ("Glob", cfg!(feature = "tool-glob")),
             ("Grep", cfg!(feature = "tool-grep")),
             ("TodoWrite", cfg!(feature = "tool-todo-write")),
+            ("update_plan", cfg!(feature = "tool-update-plan")),
             ("get_goal", cfg!(feature = "tool-get-goal")),
             ("create_goal", cfg!(feature = "tool-create-goal")),
             ("update_goal", cfg!(feature = "tool-update-goal")),

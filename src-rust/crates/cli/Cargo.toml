@@ -145,6 +145,7 @@ tool-team-delete = ["mangocode-acp/tool-team-delete", "mangocode-commands/tool-t
 tool-todo-write = ["mangocode-acp/tool-todo-write", "mangocode-commands/tool-todo-write", "mangocode-query/tool-todo-write", "mangocode-tools/tool-todo-write", "mangocode-tui/tool-todo-write"]
 tool-tool-log-read = ["mangocode-acp/tool-tool-log-read", "mangocode-commands/tool-tool-log-read", "mangocode-query/tool-tool-log-read", "mangocode-tools/tool-tool-log-read", "mangocode-tui/tool-tool-log-read"]
 tool-tool-search = ["mangocode-acp/tool-tool-search", "mangocode-commands/tool-tool-search", "mangocode-query/tool-tool-search", "mangocode-tools/tool-tool-search", "mangocode-tui/tool-tool-search"]
+tool-update-plan = ["mangocode-acp/tool-update-plan", "mangocode-commands/tool-update-plan", "mangocode-query/tool-update-plan", "mangocode-tools/tool-update-plan", "mangocode-tui/tool-update-plan"]
 tool-update-goal = ["mangocode-acp/tool-update-goal", "mangocode-commands/tool-update-goal", "mangocode-query/tool-update-goal", "mangocode-tools/tool-update-goal", "mangocode-tui/tool-update-goal"]
 tool-view-image = ["mangocode-acp/tool-view-image", "mangocode-commands/tool-view-image", "mangocode-query/tool-view-image", "mangocode-tools/tool-view-image", "mangocode-tui/tool-view-image"]
 tool-web-fetch = ["mangocode-acp/tool-web-fetch", "mangocode-commands/tool-web-fetch", "mangocode-query/tool-web-fetch", "mangocode-tools/tool-web-fetch", "mangocode-tui/tool-web-fetch"]

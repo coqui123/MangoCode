@@ -6904,6 +6904,7 @@ fn export_message_to_markdown(
                                 tool_use_id,
                                 content,
                                 is_error,
+                                metadata,
                             } = nb
                             {
                                 if tool_use_id.as_str() == *tool_id {
@@ -6921,16 +6922,29 @@ fn export_message_to_markdown(
                                             .collect::<Vec<_>>()
                                             .join(""),
                                     };
-                                    let label = if is_error.unwrap_or(false) {
-                                        "Error"
+                                    found_output = if !is_error.unwrap_or(false) {
+                                        structured_tool_result_export_text(metadata.as_ref()).map(
+                                            |structured| {
+                                                format!(
+                                                    "**Output:**\n\n```text\n{structured}\n```\n"
+                                                )
+                                            },
+                                        )
                                     } else {
-                                        "Output"
+                                        None
                                     };
-                                    found_output = Some(format!(
-                                        "**{}:** `{}`\n",
-                                        label,
-                                        text.lines().next().unwrap_or(&text).trim()
-                                    ));
+                                    if found_output.is_none() {
+                                        let label = if is_error.unwrap_or(false) {
+                                            "Error"
+                                        } else {
+                                            "Output"
+                                        };
+                                        found_output = Some(format!(
+                                            "**{}:** `{}`\n",
+                                            label,
+                                            text.lines().next().unwrap_or(&text).trim()
+                                        ));
+                                    }
                                     break 'search;
                                 }
                             }
@@ -6947,6 +6961,175 @@ fn export_message_to_markdown(
     }
 
     out
+}
+
+fn structured_tool_result_export_text(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let display = metadata?.get("transcript_display")?;
+    match display.get("kind").and_then(|v| v.as_str()) {
+        Some("updated_plan") => Some(structured_plan_export_text(display)),
+        Some("file_changes") => Some(structured_file_changes_export_text(display)),
+        _ => None,
+    }
+}
+
+fn structured_plan_export_text(display: &serde_json::Value) -> String {
+    let mut lines = vec!["Updated Plan".to_string()];
+    if let Some(explanation) = display
+        .get("explanation")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        lines.push(explanation.to_string());
+    }
+    if let Some(plan) = display.get("plan").and_then(|v| v.as_array()) {
+        if plan.is_empty() {
+            lines.push("[ ] No steps".to_string());
+        } else {
+            for item in plan {
+                let step = item
+                    .get("step")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let mark = match item.get("status").and_then(|v| v.as_str()) {
+                    Some("completed") => "[x]",
+                    _ => "[ ]",
+                };
+                lines.push(format!("{mark} {step}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn structured_file_changes_export_text(display: &serde_json::Value) -> String {
+    let mut lines = Vec::new();
+    let max_diff_lines = 160usize;
+    let mut rendered_diff_lines = 0usize;
+    let files = display
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for file in files {
+        let path = file
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let action = match file.get("change_type").and_then(|v| v.as_str()) {
+            Some("add") => "Added",
+            Some("delete") => "Deleted",
+            Some("rename") => "Renamed",
+            _ => "Edited",
+        };
+        let added = file
+            .get("lines_added")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let removed = file
+            .get("lines_removed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let header_path = file
+            .get("move_path")
+            .and_then(|v| v.as_str())
+            .map(|old| format!("{old} -> {path}"))
+            .unwrap_or_else(|| path.to_string());
+        lines.push(format!("{action} {header_path} (+{added} -{removed})"));
+
+        if file
+            .get("binary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            lines.push("Binary file changed".to_string());
+            continue;
+        }
+
+        if let Some(diff) = file.get("unified_diff").and_then(|v| v.as_str()) {
+            for line in diff.lines() {
+                if rendered_diff_lines >= max_diff_lines {
+                    lines.push("... diff truncated for display".to_string());
+                    return lines.join("\n");
+                }
+                lines.push(line.to_string());
+                rendered_diff_lines += 1;
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use mangocode_core::types::{ContentBlock, Message, ToolResultContent};
+
+    #[test]
+    fn markdown_export_uses_structured_plan_metadata() {
+        let assistant = Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "plan-1".to_string(),
+            name: "update_plan".to_string(),
+            input: serde_json::json!({
+                "plan": [{ "step": "Export structured plan", "status": "pending" }]
+            }),
+        }]);
+        let user = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "plan-1".to_string(),
+            content: ToolResultContent::Text("Plan updated".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": [{ "step": "Export structured plan", "status": "pending" }]
+                }
+            })),
+        }]);
+        let messages = vec![assistant, user];
+
+        let exported = export_message_to_markdown(&messages[0], &messages, 0);
+
+        assert!(exported.contains("Updated Plan"));
+        assert!(exported.contains("[ ] Export structured plan"));
+        assert!(!exported.contains("`Plan updated`"));
+    }
+
+    #[test]
+    fn markdown_export_uses_structured_file_change_metadata() {
+        let assistant = Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "edit-1".to_string(),
+            name: "Edit".to_string(),
+            input: serde_json::json!({ "file_path": "src/lib.rs" }),
+        }]);
+        let user = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "edit-1".to_string(),
+            content: ToolResultContent::Text("Successfully edited file".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "file_changes",
+                    "files": [{
+                        "path": "src/lib.rs",
+                        "change_type": "update",
+                        "lines_added": 1,
+                        "lines_removed": 0,
+                        "binary": false,
+                        "unified_diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n same\n+new\n"
+                    }]
+                }
+            })),
+        }]);
+        let messages = vec![assistant, user];
+
+        let exported = export_message_to_markdown(&messages[0], &messages, 0);
+
+        assert!(exported.contains("Edited src/lib.rs (+1 -0)"));
+        assert!(exported.contains("+new"));
+        assert!(!exported.contains("`Successfully edited file`"));
+    }
 }
 
 /// Build the full markdown export string.
@@ -10020,16 +10203,14 @@ impl SlashCommand for ShareCommand {
             );
         };
 
-        // Build the request body: serialize the message list as JSON
-        let messages_json = match serde_json::to_value(&ctx.messages) {
-            Ok(v) => v,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Failed to serialize session messages: {}",
-                    e
-                ));
-            }
-        };
+        // Build the request body with provider-style content blocks. Internal
+        // transcript metadata is useful locally but is not accepted by share APIs.
+        let messages_json = serde_json::Value::Array(
+            ctx.messages
+                .iter()
+                .map(mangocode_core::message_utils::message_to_external_value)
+                .collect(),
+        );
 
         let body = serde_json::json!({
             "session_id": ctx.session_id,

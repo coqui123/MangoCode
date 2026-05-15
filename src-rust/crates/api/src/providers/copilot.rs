@@ -1376,6 +1376,32 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_omits_tool_result_transcript_metadata() {
+        let mut request = base_request("gpt-5.2");
+        request.system_prompt = None;
+        request.messages = vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(json!({
+                "transcript_display": {
+                    "kind": "updated_file",
+                    "path": "src/lib.rs"
+                }
+            })),
+        }])];
+
+        let input = CopilotProvider::to_responses_input(&request);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], json!("function_call_output"));
+        assert_eq!(input[0]["call_id"], json!("call_1"));
+        assert_eq!(input[0]["output"], json!("done"));
+        assert!(input[0].get("metadata").is_none());
+        assert!(!input[0].to_string().contains("transcript_display"));
+    }
+
+    #[test]
     fn request_has_image_detects_multimodal_messages() {
         let request = ProviderRequest {
             model: "gpt-5.2".to_string(),

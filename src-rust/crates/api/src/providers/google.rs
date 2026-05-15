@@ -1593,6 +1593,7 @@ mod tests {
                 tool_use_id: "call_search_2".to_string(),
                 content: ToolResultContent::Text("ok".to_string()),
                 is_error: Some(false),
+                metadata: None,
             }]),
         ]);
 
@@ -1606,6 +1607,29 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_omits_tool_result_transcript_metadata() {
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_search".to_string(),
+            content: ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": []
+                }
+            })),
+        }])]);
+
+        let body = provider.build_request_body(&request);
+        let response = &body["contents"][0]["parts"][0]["functionResponse"];
+
+        assert_eq!(response["name"], json!("search"));
+        assert_eq!(response["response"], json!({ "content": "done" }));
+        assert!(!body.to_string().contains("transcript_display"));
+    }
+
+    #[test]
     fn build_request_body_preserves_tool_result_order() {
         let provider = GoogleProvider::new("test".to_string());
         let request = test_request(vec![Message::user_blocks(vec![
@@ -1616,6 +1640,7 @@ mod tests {
                 tool_use_id: "call_search".to_string(),
                 content: ToolResultContent::Text("done".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
             ContentBlock::Text {
                 text: "after".to_string(),

@@ -7,6 +7,7 @@
 //! - JSON: Serialized message data
 //! - Selection only: Selected text only
 
+use crate::messages::render_structured_tool_result;
 use mangocode_core::Message;
 use serde_json::json;
 use std::io::Write;
@@ -43,12 +44,18 @@ pub fn copy_as_markdown(message: &Message) -> String {
                         tool_use_id: _,
                         content,
                         is_error,
+                        metadata,
                     } => {
                         let error_marker = if is_error.unwrap_or(false) {
                             "ERROR: "
                         } else {
                             ""
                         };
+                        if !is_error.unwrap_or(false) {
+                            if let Some(text) = structured_tool_result_text(metadata.as_ref()) {
+                                return Some(format!("```\n{}\n```", text));
+                            }
+                        }
                         let result_text = match content {
                             mangocode_core::ToolResultContent::Text(text) => text.clone(),
                             mangocode_core::ToolResultContent::Blocks(blocks) => blocks
@@ -91,13 +98,21 @@ pub fn copy_as_plaintext(message: &Message) -> String {
                     serde_json::to_string_pretty(input).unwrap_or_default()
                 )),
                 mangocode_core::ContentBlock::ToolResult {
-                    content, is_error, ..
+                    tool_use_id: _,
+                    content,
+                    is_error,
+                    metadata,
                 } => {
                     let error_marker = if is_error.unwrap_or(false) {
                         "[ERROR] "
                     } else {
                         ""
                     };
+                    if !is_error.unwrap_or(false) {
+                        if let Some(text) = structured_tool_result_text(metadata.as_ref()) {
+                            return Some(text);
+                        }
+                    }
                     let result_text = match content {
                         mangocode_core::ToolResultContent::Text(text) => text.clone(),
                         mangocode_core::ToolResultContent::Blocks(blocks) => blocks
@@ -335,12 +350,18 @@ fn format_block_for_json(block: &mangocode_core::ContentBlock) -> String {
             tool_use_id: _,
             content,
             is_error,
+            metadata,
         } => {
             let error_marker = if is_error.unwrap_or(false) {
                 "[ERROR] "
             } else {
                 ""
             };
+            if !is_error.unwrap_or(false) {
+                if let Some(text) = structured_tool_result_text(metadata.as_ref()) {
+                    return text;
+                }
+            }
             let result_text = match content {
                 mangocode_core::ToolResultContent::Text(text) => text.clone(),
                 mangocode_core::ToolResultContent::Blocks(blocks) => blocks
@@ -357,6 +378,21 @@ fn format_block_for_json(block: &mangocode_core::ContentBlock) -> String {
         mangocode_core::ContentBlock::Thinking { thinking, .. } => thinking.clone(),
         _ => "[Unsupported content type]".to_string(),
     }
+}
+
+fn structured_tool_result_text(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let lines = render_structured_tool_result(metadata, 100)?;
+    let text = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
 }
 
 // ============================================================================
@@ -425,7 +461,77 @@ pub fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mangocode_core::{ContentBlock, Message, ToolResultContent};
 
+    #[test]
+    fn markdown_copy_uses_structured_plan_metadata() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "plan-1".to_string(),
+            content: ToolResultContent::Text("Plan updated".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": [{ "step": "Check copy path", "status": "pending" }]
+                }
+            })),
+        }]);
+
+        let copied = copy_as_markdown(&msg);
+
+        assert!(copied.contains("Updated Plan"));
+        assert!(copied.contains("[ ] Check copy path"));
+        assert!(!copied.contains("Plan updated"));
+    }
+
+    #[test]
+    fn plaintext_copy_uses_structured_file_change_metadata() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "edit-1".to_string(),
+            content: ToolResultContent::Text("Successfully edited file".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "file_changes",
+                    "files": [{
+                        "path": "src/lib.rs",
+                        "change_type": "update",
+                        "lines_added": 1,
+                        "lines_removed": 0,
+                        "binary": false,
+                        "unified_diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n same\n+new\n"
+                    }]
+                }
+            })),
+        }]);
+
+        let copied = copy_as_plaintext(&msg);
+
+        assert!(copied.contains("Edited src/lib.rs (+1 -0)"));
+        assert!(copied.contains("+new"));
+        assert!(!copied.contains("Successfully edited file"));
+    }
+
+    #[test]
+    fn json_copy_uses_structured_tool_result_text() {
+        let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "plan-1".to_string(),
+            content: ToolResultContent::Text("Plan updated".to_string()),
+            is_error: Some(false),
+            metadata: Some(serde_json::json!({
+                "transcript_display": {
+                    "kind": "updated_plan",
+                    "plan": [{ "step": "Export structured text", "status": "completed" }]
+                }
+            })),
+        }]);
+
+        let copied = copy_as_json(&msg);
+
+        assert!(copied.contains("Updated Plan"));
+        assert!(copied.contains("[x] Export structured text"));
+        assert!(!copied.contains("Plan updated"));
+    }
     #[test]
     fn test_strip_markdown() {
         assert_eq!(strip_markdown("**bold**"), "bold");

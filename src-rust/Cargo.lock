@@ -3556,6 +3556,7 @@ dependencies = [
  "mangocode-core",
  "mangocode-plugins",
  "mangocode-tools",
+ "mangocode-turn-diff",
  "notify",
  "once_cell",
  "parking_lot",

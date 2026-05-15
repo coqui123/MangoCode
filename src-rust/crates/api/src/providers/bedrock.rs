@@ -388,6 +388,7 @@ impl BedrockProvider {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 let result_content = match content {
                     ToolResultContent::Text(t) => vec![json!({ "text": t })],
@@ -1036,4 +1037,32 @@ fn parse_bedrock_event(
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_transcript_metadata_stays_out_of_converse_blocks() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(json!({
+                "transcript_display": {
+                    "kind": "updated_file",
+                    "path": "src/lib.rs"
+                }
+            })),
+        };
+
+        let value = BedrockProvider::content_block_to_converse(&block, &Role::User)
+            .expect("tool result should serialize");
+
+        assert_eq!(value["toolResult"]["toolUseId"], json!("call_1"));
+        assert_eq!(value["toolResult"]["content"][0]["text"], json!("done"));
+        assert!(value["toolResult"].get("metadata").is_none());
+        assert!(!value.to_string().contains("transcript_display"));
+    }
 }

@@ -208,6 +208,7 @@ impl OpenAiProvider {
                 tool_use_id,
                 content,
                 is_error,
+                ..
             } => {
                 // Tool results become separate `role: tool` messages at the
                 // conversation level — handled in append_user_messages.
@@ -996,6 +997,7 @@ mod tests {
                 tool_use_id: "call_1".to_string(),
                 content: ToolResultContent::Text("done".to_string()),
                 is_error: Some(false),
+                metadata: None,
             }]),
         ];
 
@@ -1017,6 +1019,32 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_transcript_metadata_stays_out_of_wire_messages() {
+        let messages = vec![Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".to_string(),
+            content: ToolResultContent::Text("done".to_string()),
+            is_error: Some(false),
+            metadata: Some(json!({
+                "transcript_display": {
+                    "kind": "updated_file",
+                    "path": "src/lib.rs"
+                }
+            })),
+        }])];
+
+        let wire = OpenAiProvider::to_openai_messages(&messages, None);
+
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("tool"));
+        assert_eq!(
+            wire[0].get("content").and_then(|v| v.as_str()),
+            Some("done")
+        );
+        assert!(wire[0].get("metadata").is_none());
+        assert!(!wire[0].to_string().contains("transcript_display"));
+    }
+
+    #[test]
     fn mixed_user_content_flushes_before_tool_result() {
         let messages = vec![Message::user_blocks(vec![
             ContentBlock::Text {
@@ -1026,6 +1054,7 @@ mod tests {
                 tool_use_id: "call_2".to_string(),
                 content: ToolResultContent::Text("ok".to_string()),
                 is_error: Some(false),
+                metadata: None,
             },
         ])];
 

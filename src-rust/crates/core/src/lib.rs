@@ -251,6 +251,10 @@ pub mod types {
             content: ToolResultContent,
             #[serde(skip_serializing_if = "Option::is_none")]
             is_error: Option<bool>,
+            /// Transcript-only structured metadata. Providers ignore this when
+            /// converting messages for model context.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            metadata: Option<Value>,
         },
         Thinking {
             thinking: String,
@@ -1806,6 +1810,7 @@ pub mod constants {
     pub const TOOL_NAME_AGENT: &str = "Agent";
     pub const TOOL_NAME_WEB_FETCH: &str = "WebFetch";
     pub const TOOL_NAME_WEB_SEARCH: &str = "WebSearch";
+    pub const TOOL_NAME_UPDATE_PLAN: &str = "update_plan";
     pub const TOOL_NAME_TODO_WRITE: &str = "TodoWrite";
     pub const TOOL_NAME_TASK_CREATE: &str = "TaskCreate";
     pub const TOOL_NAME_TASK_GET: &str = "TaskGet";
