@@ -1571,6 +1571,10 @@ const MAX_TOKENS_RECOVERY_MSG: &str =
      you were doing. Pick up mid-thought if that is where the cut happened. \
      Break remaining work into smaller pieces.";
 
+fn max_turns_exceeded(turn: u32, max_turns: u32) -> bool {
+    max_turns > 0 && turn > max_turns
+}
+
 /// Run the agentic query loop.
 ///
 /// This sends the conversation to the API, handles tool calls in a loop, and
@@ -1909,7 +1913,7 @@ async fn run_query_loop_inner(
         tool_ctx
             .current_turn
             .store(turn as usize, std::sync::atomic::Ordering::Relaxed);
-        if turn > effective_max_turns {
+        if max_turns_exceeded(turn, effective_max_turns) {
             info!(turns = turn, "Max turns reached");
             if let Some(ref tx) = event_tx {
                 let _ = tx.send(QueryEvent::Status(format!(
@@ -5882,6 +5886,14 @@ mod tests {
             provider_registry: Some(registry),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn zero_max_turns_disables_turn_cap() {
+        assert!(!max_turns_exceeded(1, 0));
+        assert!(!max_turns_exceeded(u32::MAX, 0));
+        assert!(!max_turns_exceeded(8, 8));
+        assert!(max_turns_exceeded(9, 8));
     }
 
     fn has_assistant_text(messages: &[mangocode_core::types::Message], needle: &str) -> bool {

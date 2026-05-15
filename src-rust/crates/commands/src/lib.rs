@@ -6453,9 +6453,7 @@ fn execute_goal_command_with_store(
             Some(mangocode_core::goals::ThreadGoalStatus::Active),
             None,
         ) {
-            Ok(Some(goal)) => {
-                CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
-            }
+            Ok(Some(goal)) => CommandResult::UserMessage(goal_start_user_message(&goal)),
             Ok(None) => CommandResult::Message("No goal is set.".to_string()),
             Err(e) => CommandResult::Error(format!("Failed to resume goal: {}", e)),
         },
@@ -6517,13 +6515,25 @@ fn execute_goal_command_with_store(
                 )
             };
             match result {
-                Ok(goal) => {
-                    CommandResult::Message(mangocode_core::goals::format_goal_summary(&goal))
-                }
+                Ok(goal) => CommandResult::UserMessage(goal_start_user_message(&goal)),
                 Err(e) => CommandResult::Error(format!("Failed to set goal: {}", e)),
             }
         }
     }
+}
+
+fn goal_start_user_message(goal: &mangocode_core::goals::ThreadGoal) -> String {
+    let budget = goal
+        .token_budget
+        .map(|budget| budget.to_string())
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "Goal set for this session.\n\nObjective: {}\nStatus: {}\nToken budget: {}\n\nBegin working on this goal now. Use the available context and tools to take the next concrete step. Continue until the goal is complete or blocked, and call update_goal with status=\"complete\" only when no required work remains.",
+        goal.objective,
+        goal.status.label(),
+        budget,
+    )
 }
 
 fn parse_goal_objective_args(args: &str) -> Result<(String, Option<i64>), String> {
@@ -7554,6 +7564,23 @@ fn parse_effort_level_alias(value: &str) -> Option<EffortLevel> {
     }
 }
 
+fn effort_max_tokens(level: EffortLevel) -> Option<u32> {
+    match level {
+        EffortLevel::Low => Some(4096),
+        EffortLevel::Medium => None,
+        EffortLevel::High | EffortLevel::Max => Some(32768),
+    }
+}
+
+fn apply_effort_to_config(config: &mut Config, level: EffortLevel) {
+    config.effort = Some(level.as_str().to_string());
+    config.max_tokens = effort_max_tokens(level);
+}
+
+fn apply_effort_to_settings(settings: &mut Settings, level: EffortLevel) {
+    apply_effort_to_config(&mut settings.config, level);
+}
+
 #[async_trait]
 impl SlashCommand for EffortCommand {
     fn name(&self) -> &str {
@@ -7587,13 +7614,17 @@ impl SlashCommand for EffortCommand {
             ));
         };
 
+        let mut new_config = ctx.config.clone();
+        apply_effort_to_config(&mut new_config, level);
+        if let Err(err) = save_settings_mutation(|settings| {
+            apply_effort_to_settings(settings, level);
+        }) {
+            return CommandResult::Error(format!("Failed to save effort setting: {}", err));
+        }
+
         ctx.effort_level = Some(level);
-        ctx.config.max_tokens = match level {
-            EffortLevel::Low => Some(4096),
-            EffortLevel::Medium => None,
-            EffortLevel::High | EffortLevel::Max => Some(32768),
-        };
-        CommandResult::ConfigChange(ctx.config.clone())
+        ctx.config = new_config.clone();
+        CommandResult::ConfigChangeMessage(new_config, format!("Effort set to {}.", level.as_str()))
     }
 }
 
@@ -12880,7 +12911,7 @@ mod tests {
 
         let result =
             execute_goal_command_with_store(&store, session_id, "ship local goals --budget 10");
-        assert!(matches!(result, CommandResult::Message(_)));
+        assert!(matches!(result, CommandResult::UserMessage(_)));
 
         let limited = store
             .account_thread_goal_usage(session_id, 3, 10)
@@ -12894,7 +12925,11 @@ mod tests {
 
         let result =
             execute_goal_command_with_store(&store, session_id, "ship local goals --budget 20");
-        assert!(matches!(result, CommandResult::Message(_)));
+        let CommandResult::UserMessage(prompt) = result else {
+            panic!("expected goal reactivation to queue a model turn");
+        };
+        assert!(prompt.contains("Begin working on this goal now."));
+        assert!(prompt.contains("Objective: ship local goals"));
 
         let updated = store.get_thread_goal(session_id).unwrap().unwrap();
         assert_eq!(updated.goal_id, original_goal_id);
@@ -12905,6 +12940,45 @@ mod tests {
             updated.status,
             mangocode_core::goals::ThreadGoalStatus::Active
         );
+    }
+
+    #[test]
+    fn goal_command_setting_goal_queues_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = mangocode_core::sqlite_storage::SqliteSessionStore::open(&db).unwrap();
+
+        let result = execute_goal_command_with_store(&store, "session-1", "finish the project");
+        let CommandResult::UserMessage(prompt) = result else {
+            panic!("expected setting a goal to queue a model turn");
+        };
+
+        assert!(prompt.contains("Goal set for this session."));
+        assert!(prompt.contains("Objective: finish the project"));
+        assert!(prompt.contains("Begin working on this goal now."));
+    }
+
+    #[test]
+    fn goal_command_resume_queues_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let store = mangocode_core::sqlite_storage::SqliteSessionStore::open(&db).unwrap();
+        store
+            .replace_thread_goal(
+                "session-1",
+                "finish paused work",
+                mangocode_core::goals::ThreadGoalStatus::Paused,
+                None,
+            )
+            .unwrap();
+
+        let result = execute_goal_command_with_store(&store, "session-1", "resume");
+        let CommandResult::UserMessage(prompt) = result else {
+            panic!("expected resuming a goal to queue a model turn");
+        };
+
+        assert!(prompt.contains("Objective: finish paused work"));
+        assert!(prompt.contains("Begin working on this goal now."));
     }
 
     #[test]
@@ -13226,11 +13300,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn effort_command_accepts_current_effort_aliases() {
-        let mut ctx = make_ctx();
-        let cmd = find_command("effort").unwrap();
-
+    #[test]
+    fn effort_command_accepts_current_effort_aliases() {
         for (arg, expected) in [
             ("low", EffortLevel::Low),
             ("normal", EffortLevel::Medium),
@@ -13238,12 +13309,18 @@ mod tests {
             ("high", EffortLevel::High),
             ("max", EffortLevel::Max),
         ] {
-            let result = cmd.execute(arg, &mut ctx).await;
-            match result {
-                CommandResult::ConfigChange(_) => assert_eq!(ctx.effort_level, Some(expected)),
-                other => panic!("expected ConfigChange for {arg}, got {:?}", other),
-            }
+            assert_eq!(parse_effort_level_alias(arg), Some(expected));
         }
+    }
+
+    #[test]
+    fn effort_setting_updates_persisted_config_shape() {
+        let mut settings = mangocode_core::config::Settings::default();
+
+        apply_effort_to_settings(&mut settings, EffortLevel::High);
+
+        assert_eq!(settings.config.effort.as_deref(), Some("high"));
+        assert_eq!(settings.config.max_tokens, Some(32768));
     }
 
     #[tokio::test]

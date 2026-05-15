@@ -9,12 +9,14 @@ proactive = ["mangocode-core/proactive"]
 default-tools = [
     "mangocode-tools/default-tools",
     "tool-agent",
+    "tool-coordination",
     "tool-team-create",
     "tool-team-delete",
 ]
 default-tools-no-web-research = [
     "mangocode-tools/default-tools-no-web-research",
     "tool-agent",
+    "tool-coordination",
     "tool-team-create",
     "tool-team-delete",
 ]
@@ -36,6 +38,7 @@ tool-brief = ["mangocode-tools/tool-brief"]
 tool-browser = ["mangocode-tools/tool-browser"]
 tool-computer-use = ["mangocode-tools/tool-computer-use"]
 tool-config = ["mangocode-tools/tool-config"]
+tool-coordination = ["mangocode-tools/tool-coordination"]
 tool-cron-create = ["mangocode-tools/tool-cron-create"]
 tool-cron-delete = ["mangocode-tools/tool-cron-delete"]
 tool-cron-list = ["mangocode-tools/tool-cron-list"]

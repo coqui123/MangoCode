@@ -62,6 +62,7 @@ default-tools = [
     "mangocode-tools/default-tools",
     "mangocode-tui/default-tools",
     "tool-agent",
+    "tool-coordination",
     "tool-team-create",
     "tool-team-delete",
 ]
@@ -72,6 +73,7 @@ default-tools-no-web-research = [
     "mangocode-tools/default-tools-no-web-research",
     "mangocode-tui/default-tools-no-web-research",
     "tool-agent",
+    "tool-coordination",
     "tool-team-create",
     "tool-team-delete",
 ]
@@ -95,6 +97,7 @@ tool-brief = ["mangocode-acp/tool-brief", "mangocode-commands/tool-brief", "mang
 tool-browser = ["mangocode-acp/tool-browser", "mangocode-commands/tool-browser", "mangocode-query/tool-browser", "mangocode-tools/tool-browser", "mangocode-tui/tool-browser"]
 tool-computer-use = ["mangocode-acp/tool-computer-use", "mangocode-commands/tool-computer-use", "mangocode-query/tool-computer-use", "mangocode-tools/tool-computer-use", "mangocode-tui/tool-computer-use"]
 tool-config = ["mangocode-acp/tool-config", "mangocode-commands/tool-config", "mangocode-query/tool-config", "mangocode-tools/tool-config", "mangocode-tui/tool-config"]
+tool-coordination = ["mangocode-acp/tool-coordination", "mangocode-commands/tool-coordination", "mangocode-query/tool-coordination", "mangocode-tools/tool-coordination", "mangocode-tui/tool-coordination"]
 tool-cron-create = ["mangocode-acp/tool-cron-create", "mangocode-commands/tool-cron-create", "mangocode-query/tool-cron-create", "mangocode-tools/tool-cron-create", "mangocode-tui/tool-cron-create"]
 tool-cron-delete = ["mangocode-acp/tool-cron-delete", "mangocode-commands/tool-cron-delete", "mangocode-query/tool-cron-delete", "mangocode-tools/tool-cron-delete", "mangocode-tui/tool-cron-delete"]
 tool-cron-list = ["mangocode-acp/tool-cron-list", "mangocode-commands/tool-cron-list", "mangocode-query/tool-cron-list", "mangocode-tools/tool-cron-list", "mangocode-tui/tool-cron-list"]

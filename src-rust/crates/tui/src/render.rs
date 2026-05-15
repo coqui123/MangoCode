@@ -2134,6 +2134,11 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
                     Style::default().fg(Color::White),
                 ),
                 Span::styled("\u{00b7}", Style::default().fg(dim)),
+                Span::styled(
+                    format!(" effort:{} ", app.effort_level.label()),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("\u{00b7}", Style::default().fg(dim)),
                 Span::styled(format!(" {} ", agent_mode), Style::default().fg(pink)),
                 Span::styled("\u{00b7}", Style::default().fg(dim)),
                 Span::styled(" Ctrl+A: model  Ctrl+K: commands", Style::default().fg(dim)),

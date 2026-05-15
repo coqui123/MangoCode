@@ -758,6 +758,7 @@ pub mod config {
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
+        pub effort: Option<String>,
         pub max_tokens: Option<u32>,
         pub permission_mode: PermissionMode,
         /// Reviewer used for approval decisions.
@@ -1526,6 +1527,7 @@ pub mod config {
             let merged_config = Config {
                 api_key: over.config.api_key.or(base.config.api_key),
                 model: over.config.model.or(base.config.model),
+                effort: over.config.effort.or(base.config.effort),
                 max_tokens: over.config.max_tokens.or(base.config.max_tokens),
                 permission_mode: over.config.permission_mode,
                 approvals_reviewer: if over.explicit_config_keys.contains("approvals_reviewer")
@@ -1777,7 +1779,8 @@ pub mod constants {
     pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
     pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
     pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
-    pub const MAX_TURNS_DEFAULT: u32 = 10;
+    /// Default maximum number of agentic turns. Zero means no implicit turn cap.
+    pub const MAX_TURNS_DEFAULT: u32 = 0;
     pub const MAX_TOOL_ERRORS: u32 = 3;
 
     // API endpoints & headers

@@ -83,6 +83,27 @@ fn parse_effort_level_arg(value: &str) -> Option<mangocode_core::effort::EffortL
     }
 }
 
+fn effort_max_tokens(level: mangocode_core::effort::EffortLevel) -> Option<u32> {
+    match level {
+        mangocode_core::effort::EffortLevel::Low => Some(4096),
+        mangocode_core::effort::EffortLevel::Medium => None,
+        mangocode_core::effort::EffortLevel::High | mangocode_core::effort::EffortLevel::Max => {
+            Some(32768)
+        }
+    }
+}
+
+fn apply_effort_to_config(config: &mut Config, level: mangocode_core::effort::EffortLevel) {
+    config.effort = Some(level.as_str().to_string());
+    config.max_tokens = effort_max_tokens(level);
+}
+
+fn persist_effort_setting(level: mangocode_core::effort::EffortLevel) -> anyhow::Result<()> {
+    let mut settings = Settings::load_sync()?;
+    apply_effort_to_config(&mut settings.config, level);
+    settings.save_sync()
+}
+
 #[derive(Default, serde::Deserialize)]
 struct PersistedUiSettings {
     editor_mode: Option<String>,
@@ -330,6 +351,9 @@ fn sync_query_config_for_runtime(
     query_config.oauth_provider = oauth_provider_for_config_and_model(config, &query_config.model);
     query_config.has_append_system_prompt = append_system_prompt_configured(config);
     query_config.append_system_prompt = None;
+    if let Some(level) = config.effort.as_deref().and_then(parse_effort_level_arg) {
+        query_config.effort_level = Some(level);
+    }
 }
 
 fn tui_output_style_for_config(config: &Config) -> String {
@@ -356,6 +380,9 @@ fn sync_tui_runtime_state_from_config(
         app.model_name = effective_model;
     }
     app.output_style = tui_output_style_for_config(&app.config);
+    if let Some(level) = query_config.effort_level {
+        app.effort_level = core_effort_to_tui(level);
+    }
 }
 
 fn apply_session_model_if_present(config: &mut Config, session_model: &str) -> bool {
@@ -683,6 +710,7 @@ mod tests {
     fn runtime_query_config_sync_refreshes_dispatch_fields() {
         let config = Config {
             provider: Some("anthropic-max".to_string()),
+            effort: Some("high".to_string()),
             max_tokens: Some(1234),
             append_system_prompt: Some("Extra instructions".to_string()),
             ..Default::default()
@@ -709,6 +737,10 @@ mod tests {
         assert_eq!(query_config.append_system_prompt, None);
         assert!(query_config.has_append_system_prompt);
         assert_eq!(
+            query_config.effort_level,
+            Some(mangocode_core::effort::EffortLevel::High)
+        );
+        assert_eq!(
             query_config.oauth_provider,
             mangocode_core::system_prompt::OAuthProvider::AnthropicMax
         );
@@ -718,6 +750,7 @@ mod tests {
     fn tui_runtime_sync_refreshes_all_dispatch_fields() {
         let config = Config {
             provider: Some("openai".to_string()),
+            effort: Some("max".to_string()),
             max_tokens: Some(2345),
             append_system_prompt: Some("Extra runtime context".to_string()),
             output_style: Some("verbose".to_string()),
@@ -749,6 +782,11 @@ mod tests {
         assert!(query_config.has_append_system_prompt);
         assert_eq!(query_config.append_system_prompt, None);
         assert_eq!(app.output_style, "verbose");
+        assert_eq!(
+            query_config.effort_level,
+            Some(mangocode_core::effort::EffortLevel::Max)
+        );
+        assert_eq!(app.effort_level, mangocode_tui::EffortLevel::Max);
         assert_eq!(
             query_config.oauth_provider,
             mangocode_core::system_prompt::OAuthProvider::None
@@ -1198,8 +1236,8 @@ struct Cli {
     #[arg(long = "resume")]
     resume: Option<String>,
 
-    /// Maximum number of agentic turns
-    #[arg(long = "max-turns", default_value_t = 10)]
+    /// Maximum number of agentic turns; 0 disables the limit
+    #[arg(long = "max-turns", default_value_t = mangocode_core::constants::MAX_TURNS_DEFAULT)]
     max_turns: u32,
 
     /// Custom system prompt
@@ -2301,8 +2339,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
+    if let Some(level) = config.effort.as_deref().and_then(parse_effort_level_arg) {
+        query_config.effort_level = Some(level);
+    }
     if let Some(ref level_str) = cli.effort {
-        if let Some(level) = mangocode_core::effort::EffortLevel::parse(level_str) {
+        if let Some(level) = parse_effort_level_arg(level_str) {
             query_config.effort_level = Some(level);
         } else {
             eprintln!(
@@ -3871,6 +3912,13 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                                 let level = tui_effort_to_core(app.effort_level);
                                 current_effort = Some(level);
                                 base_query_config.effort_level = Some(level);
+                                apply_effort_to_config(&mut app.config, level);
+                                apply_effort_to_config(&mut cmd_ctx.config, level);
+                                apply_effort_to_config(&mut tool_ctx.config, level);
+                                if let Err(err) = persist_effort_setting(level) {
+                                    app.status_message =
+                                        Some(format!("Failed to save effort setting: {}", err));
+                                }
                             }
 
                             // Honour exit/quit triggered by TUI intercept immediately.
@@ -4615,6 +4663,11 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                         let level = tui_effort_to_core(app.effort_level);
                         current_effort = Some(level);
                         base_query_config.effort_level = Some(level);
+                        apply_effort_to_config(&mut app.config, level);
+                        if let Err(err) = persist_effort_setting(level) {
+                            app.status_message =
+                                Some(format!("Failed to save effort setting: {}", err));
+                        }
                     }
                     if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
                         terminal.reset_transcript(&app, &messages)?;

@@ -134,6 +134,7 @@ pub fn reduce_command_output(
     mode: OutputMode,
 ) -> ReducedOutput {
     let original_bytes = output.len();
+    let original_tokens = estimate_tokens(output);
     if mode == OutputMode::Raw {
         let content = truncate_raw(output);
         return ReducedOutput {
@@ -146,34 +147,52 @@ pub fn reduce_command_output(
     }
 
     let raw_log_path = save_raw_log(command, output).ok();
-    let reducer = detect_reducer(command);
+    let cleaned = strip_ansi(output);
+    let output_for_reducer = cleaned.as_ref();
+    let reducer = detect_reducer(command, output_for_reducer);
     let reduced = match reducer.as_str() {
-        "git-diff" => reduce_git_diff(output),
-        "git-status" => reduce_git_status(output),
-        "directory-listing" => reduce_directory_listing(output),
-        "cargo" | "pytest" | "javascript" | "typescript" => reduce_test_or_build(output),
-        _ => reduce_generic(output),
+        "git-diff" => reduce_git_diff(output_for_reducer),
+        "git-status" => reduce_git_status(output_for_reducer),
+        "git-log" => reduce_git_log(output_for_reducer),
+        "grep" => reduce_grep_matches(output_for_reducer),
+        "find" => reduce_find_paths(output_for_reducer),
+        "directory-listing" => reduce_directory_listing_cow(output_for_reducer).into_owned(),
+        "cargo" | "pytest" | "javascript" | "typescript" => {
+            reduce_test_or_build(output_for_reducer)
+        }
+        _ => reduce_generic(output_for_reducer),
     };
 
     let should_keep_raw = mode == OutputMode::Auto
         && reduced.len() >= output.len()
         && output.len() <= MAX_RAW_OUTPUT_CHARS;
-    let body = if should_keep_raw {
-        output.to_string()
+    let body: Cow<'_, str> = if should_keep_raw {
+        Cow::Borrowed(output)
     } else {
-        reduced
+        Cow::Owned(reduced)
     };
-    let body = truncate_raw(&body);
+    let body = truncate_owned_or_borrowed(body);
+    let reduced_tokens = estimate_tokens(&body);
+    let saved_tokens = original_tokens.saturating_sub(reduced_tokens);
+    let saved_pct = if original_tokens == 0 {
+        0
+    } else {
+        (saved_tokens * 100) / original_tokens
+    };
     let raw_path = raw_log_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(not written)".to_string());
     let content = format!(
-        "[tool-output reducer={} exit_code={} original={}B reduced={}B raw_log={} recall=\"ToolLogRead path='<raw_log>'\"]\n{}",
+        "[tool-output reducer={} exit_code={} original={}B/{}tok reduced={}B/{}tok saved={}tok/{}% raw_log={} recall=\"ToolLogRead path='<raw_log>'\"]\n{}",
         reducer,
         exit_code,
         original_bytes,
+        original_tokens,
         body.len(),
+        reduced_tokens,
+        saved_tokens,
+        saved_pct,
         raw_path,
         body
     );
@@ -264,13 +283,27 @@ fn newest_tool_log(base: &std::path::Path) -> Result<PathBuf, String> {
         .ok_or_else(|| "No raw tool logs found.".to_string())
 }
 
-fn detect_reducer(command: &str) -> String {
+fn detect_reducer(command: &str, output: &str) -> String {
     let lower = command.to_ascii_lowercase();
     if lower.contains("git diff") {
         "git-diff"
     } else if lower.contains("git status") {
         "git-status"
-    } else if lower.contains("cargo test") || lower.contains("cargo build") {
+    } else if lower.contains("git log") || lower.contains("git show") {
+        "git-log"
+    } else if lower.contains("rg --files") || lower.contains("fd ") {
+        "find"
+    } else if lower.contains("cargo test")
+        || lower.contains("cargo build")
+        || lower.contains("cargo check")
+        || lower.contains("cargo clippy")
+        || lower.contains("cargo install")
+        || lower.contains("cargo nextest")
+        || lower.contains("go test")
+        || lower.contains("go build")
+        || lower.contains("mypy")
+        || lower.contains("ruff ")
+    {
         "cargo"
     } else if lower.contains("pytest") {
         "pytest"
@@ -283,19 +316,43 @@ fn detect_reducer(command: &str) -> String {
         || lower.contains("jest")
     {
         "javascript"
+    } else if command_starts_with(&lower, &["rg", "grep", "select-string"]) {
+        "grep"
+    } else if command_starts_with(&lower, &["find", "fd"]) {
+        "find"
     } else if lower.trim_start().starts_with("ls")
         || lower.trim_start().starts_with("tree")
         || lower.trim_start().starts_with("dir")
         || lower.contains("get-childitem")
     {
         "directory-listing"
+    } else if looks_like_grep_output(output) {
+        "grep"
+    } else if looks_like_find_output(output) {
+        "find"
     } else {
         "generic"
     }
     .to_string()
 }
 
+fn command_starts_with(command: &str, names: &[&str]) -> bool {
+    let command = command.trim_start();
+    names.iter().any(|name| {
+        command == *name
+            || command
+                .strip_prefix(name)
+                .map(|rest| rest.starts_with(char::is_whitespace))
+                .unwrap_or(false)
+    })
+}
+
 fn reduce_test_or_build(output: &str) -> String {
+    let compact = reduce_cargo_like_summary(output);
+    if !compact.trim().is_empty() {
+        return compact;
+    }
+
     let mut selected = Vec::new();
     for line in collapse_repeated_lines(output).lines() {
         let lower = line.to_ascii_lowercase();
@@ -324,6 +381,143 @@ fn reduce_test_or_build(output: &str) -> String {
     } else {
         selected.join("\n")
     }
+}
+
+fn reduce_cargo_like_summary(output: &str) -> String {
+    let mut compiled = 0usize;
+    let mut warnings = 0usize;
+    let mut errors = 0usize;
+    let mut finished = None;
+    let mut test_results = Vec::new();
+    let mut failure_blocks = Vec::new();
+    let mut in_failure = false;
+    let mut current_failure = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Compiling ")
+            || trimmed.starts_with("Checking ")
+            || trimmed.starts_with("Building ")
+        {
+            compiled += 1;
+            continue;
+        }
+        if trimmed.starts_with("Finished ") {
+            finished = Some(trimmed.to_string());
+            continue;
+        }
+        if trimmed.starts_with("warning:") || trimmed.starts_with("warning[") {
+            warnings += 1;
+        }
+        if trimmed.starts_with("error:") || trimmed.starts_with("error[") {
+            errors += 1;
+        }
+        if line.starts_with("test result:") {
+            test_results.push(line.trim().to_string());
+            in_failure = false;
+            if !current_failure.is_empty() {
+                failure_blocks.push(current_failure.join("\n"));
+                current_failure.clear();
+            }
+            continue;
+        }
+        if line.starts_with("---- ") {
+            if !current_failure.is_empty() {
+                failure_blocks.push(current_failure.join("\n"));
+                current_failure.clear();
+            }
+            in_failure = true;
+        }
+        if in_failure {
+            current_failure.push(line.to_string());
+            if current_failure.len() >= 30 {
+                failure_blocks.push(current_failure.join("\n"));
+                current_failure.clear();
+                in_failure = false;
+            }
+        }
+    }
+    if !current_failure.is_empty() {
+        failure_blocks.push(current_failure.join("\n"));
+    }
+
+    if compiled == 0 && warnings == 0 && errors == 0 && test_results.is_empty() {
+        return String::new();
+    }
+
+    let mut out = Vec::new();
+    if !test_results.is_empty() {
+        if let Some(aggregate) = aggregate_rust_test_results(&test_results) {
+            out.push(aggregate);
+        } else {
+            out.extend(test_results);
+        }
+    } else if errors == 0 && warnings == 0 {
+        out.push(format!("build ok: {compiled} crates compiled"));
+        if let Some(finished) = finished {
+            out.push(finished);
+        }
+    } else {
+        out.push(format!(
+            "build summary: {errors} errors, {warnings} warnings, {compiled} crates compiled"
+        ));
+    }
+
+    for block in failure_blocks.into_iter().take(5) {
+        out.push(block);
+    }
+    if errors > 0 || warnings > 0 {
+        out.extend(
+            output
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("error:")
+                        || trimmed.starts_with("error[")
+                        || trimmed.starts_with("warning:")
+                        || trimmed.starts_with("warning[")
+                        || trimmed.starts_with("-->")
+                })
+                .take(80)
+                .map(str::to_string),
+        );
+    }
+    out.join("\n")
+}
+
+fn aggregate_rust_test_results(lines: &[String]) -> Option<String> {
+    let mut suites = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut ignored = 0usize;
+    let mut measured = 0usize;
+    let mut filtered = 0usize;
+    let mut all_parsed = true;
+
+    for line in lines {
+        let Some(after) = line.strip_prefix("test result:") else {
+            all_parsed = false;
+            break;
+        };
+        suites += 1;
+        let lower = after.to_ascii_lowercase();
+        passed += metric_before(&lower, "passed").unwrap_or(0);
+        failed += metric_before(&lower, "failed").unwrap_or(0);
+        ignored += metric_before(&lower, "ignored").unwrap_or(0);
+        measured += metric_before(&lower, "measured").unwrap_or(0);
+        filtered += metric_before(&lower, "filtered").unwrap_or(0);
+    }
+
+    all_parsed.then(|| {
+        format!(
+            "cargo test: {passed} passed, {failed} failed ({suites} suites, {ignored} ignored, {measured} measured, {filtered} filtered)"
+        )
+    })
+}
+
+fn metric_before(text: &str, label: &str) -> Option<usize> {
+    let index = text.find(label)?;
+    text[..index].split_whitespace().last()?.parse().ok()
 }
 
 fn reduce_git_diff(output: &str) -> String {
@@ -355,6 +549,24 @@ fn reduce_git_diff(output: &str) -> String {
     }
 }
 
+fn reduce_git_log(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(80)
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let hash = fields.next().unwrap_or("");
+            if hash.len() >= 7 {
+                line.to_string()
+            } else {
+                line.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn reduce_git_status(output: &str) -> String {
     output
         .lines()
@@ -376,15 +588,93 @@ fn reduce_git_status(output: &str) -> String {
         .join("\n")
 }
 
-fn reduce_directory_listing(output: &str) -> String {
+fn reduce_grep_matches(output: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let mut by_file: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    let mut total = 0usize;
+    for line in output.lines() {
+        let mut parts = line.splitn(3, ':');
+        let file = parts.next().unwrap_or("");
+        let line_number = parts.next().unwrap_or("");
+        let content = parts.next().unwrap_or("");
+        if file.is_empty() || line_number.parse::<usize>().is_err() {
+            continue;
+        }
+        total += 1;
+        by_file
+            .entry(file)
+            .or_default()
+            .push((line_number, content));
+    }
+
+    if total == 0 {
+        return reduce_generic(output);
+    }
+
+    let mut out = vec![format!("{total} matches in {} files", by_file.len())];
+    for (file, matches) in by_file.iter().take(40) {
+        out.push(format!("{file} ({})", matches.len()));
+        for (line_number, content) in matches.iter().take(8) {
+            out.push(format!("  {line_number}: {}", content.trim()));
+        }
+        if matches.len() > 8 {
+            out.push(format!("  +{} more", matches.len() - 8));
+        }
+    }
+    if by_file.len() > 40 {
+        out.push(format!("+{} more files", by_file.len() - 40));
+    }
+    out.join("\n")
+}
+
+fn reduce_find_paths(output: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let paths: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_path_like_line(line))
+        .collect();
+    if paths.len() < 3 {
+        return reduce_generic(output);
+    }
+
+    let mut by_dir: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for path in &paths {
+        let normalized = path.trim_end_matches(std::path::MAIN_SEPARATOR);
+        let split = normalized
+            .rfind(['/', '\\'])
+            .map(|index| (&normalized[..index], &normalized[index + 1..]))
+            .unwrap_or((".", normalized));
+        by_dir.entry(split.0).or_default().push(split.1);
+    }
+
+    let mut out = vec![format!("{} paths in {} dirs", paths.len(), by_dir.len())];
+    for (dir, files) in by_dir.iter().take(30) {
+        out.push(format!("{dir}/ ({})", files.len()));
+        for file in files.iter().take(8) {
+            out.push(format!("  {file}"));
+        }
+        if files.len() > 8 {
+            out.push(format!("  +{} more", files.len() - 8));
+        }
+    }
+    if by_dir.len() > 30 {
+        out.push(format!("+{} more dirs", by_dir.len() - 30));
+    }
+    out.join("\n")
+}
+
+fn reduce_directory_listing_cow(output: &str) -> Cow<'_, str> {
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() <= MAX_SUMMARY_LINES {
-        return output.to_string();
+        return Cow::Borrowed(output);
     }
-    let mut selected = lines.iter().take(120).copied().collect::<Vec<_>>();
-    selected.push("...");
-    selected.extend(lines.iter().rev().take(40).rev().copied());
-    selected.join("\n")
+    let mut selected: Vec<String> = lines.iter().take(120).map(|s| (*s).to_string()).collect();
+    selected.push("...".to_string());
+    selected.extend(lines.iter().rev().take(40).rev().map(|s| (*s).to_string()));
+    Cow::Owned(selected.join("\n"))
 }
 
 fn reduce_generic(output: &str) -> String {
@@ -394,6 +684,76 @@ fn reduce_generic(output: &str) -> String {
     } else {
         collapsed
     }
+}
+
+fn looks_like_grep_output(output: &str) -> bool {
+    let mut checked = 0usize;
+    let mut matches = 0usize;
+    for line in output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(8)
+    {
+        checked += 1;
+        let parts: Vec<_> = line.splitn(3, ':').collect();
+        if parts.len() == 3 && parts[1].parse::<usize>().is_ok() {
+            matches += 1;
+        }
+    }
+    checked >= 2 && matches * 2 >= checked
+}
+
+fn looks_like_find_output(output: &str) -> bool {
+    let mut checked = 0usize;
+    for line in output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(8)
+    {
+        checked += 1;
+        let line = line.trim();
+        if !is_path_like_line(line) {
+            return false;
+        }
+    }
+    checked >= 3
+}
+
+fn is_path_like_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty()
+        && !line.contains(':')
+        && !line.starts_with("--- ")
+        && (line.starts_with('.')
+            || line.starts_with('/')
+            || line.contains('/')
+            || line.contains('\\'))
+}
+
+fn strip_ansi(text: &str) -> Cow<'_, str> {
+    if !text.as_bytes().contains(&0x1b) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
 }
 
 fn collapse_repeated_lines(output: &str) -> String {
@@ -427,18 +787,28 @@ fn collapse_repeated_lines(output: &str) -> String {
 }
 
 fn take_head_tail(output: &str, head: usize, tail: usize) -> String {
+    take_head_tail_cow(output, head, tail).into_owned()
+}
+
+fn take_head_tail_cow(output: &str, head: usize, tail: usize) -> Cow<'_, str> {
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() <= head + tail {
-        return output.to_string();
+        return Cow::Borrowed(output);
     }
     let omitted = lines.len() - head - tail;
-    let mut selected = lines.iter().take(head).copied().collect::<Vec<_>>();
-    selected.push("...");
-    let omitted_line = format!("[{} lines omitted]", omitted);
-    selected.push(&omitted_line);
-    selected.push("...");
-    selected.extend(lines.iter().rev().take(tail).rev().copied());
-    selected.join("\n")
+    let mut selected: Vec<String> = lines.iter().take(head).map(|s| (*s).to_string()).collect();
+    selected.push("...".to_string());
+    selected.push(format!("[{} lines omitted]", omitted));
+    selected.push("...".to_string());
+    selected.extend(
+        lines
+            .iter()
+            .rev()
+            .take(tail)
+            .rev()
+            .map(|s| (*s).to_string()),
+    );
+    Cow::Owned(selected.join("\n"))
 }
 
 pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> Cow<'_, str> {
@@ -463,6 +833,19 @@ pub(crate) fn truncate_middle_bytes(output: &str, max_bytes: usize) -> Cow<'_, s
 
 fn truncate_raw(output: &str) -> String {
     truncate_middle_bytes(output, MAX_RAW_OUTPUT_CHARS).into_owned()
+}
+
+fn truncate_owned_or_borrowed(output: Cow<'_, str>) -> Cow<'_, str> {
+    match output {
+        Cow::Borrowed(output) => truncate_middle_bytes(output, MAX_RAW_OUTPUT_CHARS),
+        Cow::Owned(output) => {
+            if output.len() <= MAX_RAW_OUTPUT_CHARS {
+                Cow::Owned(output)
+            } else {
+                Cow::Owned(truncate_raw(&output))
+            }
+        }
+    }
 }
 
 fn save_raw_log(command: &str, output: &str) -> anyhow::Result<PathBuf> {
@@ -526,6 +909,7 @@ mod tests {
         let reduced = reduce_command_output("cargo test", out, 101, OutputMode::Summary);
         assert!(reduced.content.contains("error[E000]"));
         assert!(reduced.content.contains("reducer=cargo"));
+        assert!(reduced.content.contains("saved="));
     }
 
     #[test]
@@ -562,5 +946,46 @@ mod tests {
             .and_then(|metadata| metadata.get("raw_log_path"))
             .and_then(Value::as_str);
         assert!(raw_log_path.is_some());
+    }
+
+    #[test]
+    fn cargo_success_collapses_compile_noise() {
+        let out = "   Compiling a v0.1.0\n   Compiling b v0.1.0\n    Finished dev [unoptimized + debuginfo] target(s) in 1.23s\n";
+        let reduced = reduce_command_output("cargo build", out, 0, OutputMode::Summary);
+        assert!(reduced.content.contains("build ok: 2 crates compiled"));
+        assert!(!reduced.content.contains("Compiling a"));
+    }
+
+    #[test]
+    fn cargo_test_results_are_aggregated() {
+        let out = "running 5 tests\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let reduced = reduce_command_output("cargo test", out, 0, OutputMode::Summary);
+        assert!(reduced
+            .content
+            .contains("cargo test: 7 passed, 0 failed (2 suites"));
+    }
+
+    #[test]
+    fn grep_output_groups_by_file() {
+        let input = "src/a.rs:1:alpha\nsrc/a.rs:2:beta\nsrc/b.rs:9:gamma\n";
+        let reduced = reduce_command_output("rg alpha", input, 0, OutputMode::Summary);
+        assert!(reduced.content.contains("3 matches in 2 files"));
+        assert!(reduced.content.contains("src/a.rs (2)"));
+    }
+
+    #[test]
+    fn rg_files_output_uses_find_reducer() {
+        let input = "./src/main.rs\n./src/lib.rs\n./tests/smoke.rs\n";
+        let reduced = reduce_command_output("rg --files", input, 0, OutputMode::Summary);
+        assert!(reduced.content.contains("reducer=find"));
+        assert!(reduced.content.contains("3 paths"));
+    }
+
+    #[test]
+    fn ansi_sequences_are_removed_before_reduction() {
+        let input = "\u{1b}[31merror: bad\u{1b}[0m\n";
+        let reduced = reduce_command_output("cargo check", input, 101, OutputMode::Summary);
+        assert!(reduced.content.contains("error: bad"));
+        assert!(!reduced.content.contains("\u{1b}[31m"));
     }
 }
