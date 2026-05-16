@@ -18,6 +18,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// Anti-bot HTML heuristics (shared by research HTTP + browser tooling).
+#[cfg(any(
+    feature = "tool-web-fetch",
+    feature = "tool-doc-search",
+    feature = "tool-doc-read",
+    feature = "tool-deep-read",
+    feature = "tool-rendered-fetch",
+    feature = "tool-browser"
+))]
+pub(crate) mod bot_wall_sniff;
+
 // Sub-modules – each contains a full tool implementation.
 #[cfg(feature = "tool-apply-patch")]
 pub mod apply_patch;
@@ -30,6 +41,8 @@ pub mod batch_edit;
 #[cfg(feature = "tool-brief")]
 pub mod brief;
 pub mod browser_tool;
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+pub mod browser_antibot;
 #[cfg(feature = "tool-skill")]
 pub mod bundled_skills;
 #[cfg(feature = "tool-computer-use")]

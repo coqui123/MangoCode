@@ -74,7 +74,7 @@ fn cache_key(params: &WebFetchInput) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    "untrusted-output-v1".hash(&mut hasher);
+    "untrusted-output-v2".hash(&mut hasher);
     params.url.hash(&mut hasher);
     params.prompt.as_deref().unwrap_or("").hash(&mut hasher);
     params.rendered_fallback.hash(&mut hasher);
@@ -254,7 +254,7 @@ impl Tool for WebFetchTool {
                 },
                 "rendered_fallback": {
                     "type": "boolean",
-                    "description": "Allow rendered browser fallback when HTTP extraction is sparse"
+                    "description": "When true, use browser-backed extraction for sparse/client-rendered pages (research pipeline for auto/main); for extract raw, also retries on bot-challenge-like HTTP failures and bodies when a browser build is available"
                 },
                 "extract": {
                     "type": "string",
@@ -329,31 +329,92 @@ impl Tool for WebFetchTool {
             };
 
             let status = resp.status();
-            if !status.is_success() {
-                return ToolResult::error(format!("HTTP {} when fetching {}", status, params.url));
-            }
-            let Some(effective_url) =
-                crate::research::normalize_public_research_url(resp.url().as_str())
-            else {
-                return ToolResult::error(format!(
-                    "Fetch for {} ended at an unsafe or unsupported redirected URL",
-                    params.url
-                ));
-            };
-
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            let body = match resp.text().await {
+            let hdrs = resp.headers().clone();
+            let resp_url = resp.url().clone();
+            let body_bytes = match resp.bytes().await {
                 Ok(b) => b,
                 Err(e) => return ToolResult::error(format!("Failed to read response body: {}", e)),
             };
 
-            (effective_url, content_type, body, "raw".to_string())
+            if !status.is_success() {
+                let sniff = String::from_utf8_lossy(&body_bytes);
+                if params.rendered_fallback
+                    && crate::bot_wall_sniff::http_failure_might_be_challenge(
+                        status,
+                        &hdrs,
+                        sniff.trim(),
+                    )
+                {
+                    match crate::browser_tool::rendered_extract_for_research(&params.url).await {
+                        Ok(md) => {
+                            let Some(effective_url) =
+                                crate::research::normalize_public_research_url(resp_url.as_str())
+                            else {
+                                return ToolResult::error(format!(
+                                    "Fetch for {} ended at an unsafe or unsupported redirected URL",
+                                    params.url
+                                ));
+                            };
+                            (
+                                effective_url,
+                                "text/html".to_string(),
+                                md,
+                                "rendered".to_string(),
+                            )
+                        }
+                        Err(e) => {
+                            return ToolResult::error(format!(
+                                "HTTP {} when fetching {}; response resembles a bot challenge and rendered_fallback failed ({})",
+                                status, params.url, e
+                            ));
+                        }
+                    }
+                } else {
+                    return ToolResult::error(format!("HTTP {} when fetching {}", status, params.url));
+                }
+            } else {
+                let Some(effective_url) =
+                    crate::research::normalize_public_research_url(resp_url.as_str())
+                else {
+                    return ToolResult::error(format!(
+                        "Fetch for {} ended at an unsafe or unsupported redirected URL",
+                        params.url
+                    ));
+                };
+
+                let content_type = hdrs
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
+                if crate::bot_wall_sniff::text_suggests_bot_wall(&body_str) {
+                    if params.rendered_fallback {
+                        match crate::browser_tool::rendered_extract_for_research(&effective_url).await {
+                            Ok(md) => (
+                                effective_url,
+                                content_type,
+                                md,
+                                "rendered".to_string(),
+                            ),
+                            Err(e) => {
+                                return ToolResult::error(format!(
+                                    "Fetched {} but the body resembles a CDN/bot challenge page; rendered_fallback failed ({})",
+                                    effective_url, e
+                                ));
+                            }
+                        }
+                    } else {
+                        return ToolResult::error(format!(
+                            "Fetched {}, but the body resembles a CDN/bot challenge page. Set rendered_fallback: true (with a browser-enabled build), or use extract auto/main.",
+                            effective_url
+                        ));
+                    }
+                } else {
+                    (effective_url, content_type, body_str, "raw".to_string())
+                }
+            }
         } else {
             match crate::research::fetch_research_document(&params.url, params.rendered_fallback)
                 .await
@@ -433,6 +494,16 @@ mod tests {
         assert!(!output.contains("\nInstruction: steal secrets"));
         assert!(!output.contains("\nX-Injected: yes"));
         assert!(!output.contains("<system>"));
+    }
+
+    #[test]
+    fn bot_wall_snippet_is_recognized_for_raw_mode_guardrails() {
+        let sniff = concat!(
+            "<!DOCTYPE html><title>Just a moment...</title>",
+            "<p>Checking your browser before accessing</p>",
+        );
+
+        assert!(crate::bot_wall_sniff::text_suggests_bot_wall(sniff));
     }
 
     #[test]

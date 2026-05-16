@@ -6,6 +6,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+use chromiumoxide::browser::BrowserConfig;
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+#[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
+use chromiumoxide::layout::Point;
+
 #[cfg(feature = "tool-browser")]
 #[derive(Debug, Clone, Deserialize)]
 struct BrowserInput {
@@ -27,12 +38,13 @@ fn normalize_browser_action(value: &str) -> Result<&'static str, String> {
         "type" => Ok("type"),
         "evaluate" => Ok("evaluate"),
         "expand" => Ok("expand"),
+        "pass_challenge" => Ok("pass_challenge"),
         "close" => Ok("close"),
         _ => {
             let value =
                 serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
             Err(format!(
-                "Invalid action: {value}. Expected one of: navigate, screenshot, extract_text, extract_markdown, click, type, evaluate, expand, close"
+                "Invalid action: {value}. Expected one of: navigate, screenshot, extract_text, extract_markdown, click, type, evaluate, expand, pass_challenge, close"
             ))
         }
     }
@@ -49,7 +61,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Control a persistent headless browser session. Navigate to URLs, take screenshots, extract text/Markdown, click elements, fill forms, evaluate JavaScript, apply extraction recipes, or close the session."
+        "Control a persistent headless browser session. Navigate to URLs, take screenshots, extract text/Markdown, click elements, fill forms, evaluate JavaScript, apply extraction recipes, attempt bot-wall checkbox pass (viewport template match when not in expert mode), or close the session."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -60,7 +72,7 @@ impl Tool for BrowserTool {
         json!({
             "type": "object",
             "properties": {
-                "action": { "enum": ["navigate", "screenshot", "extract_text", "extract_markdown", "click", "type", "evaluate", "expand", "close"] },
+                "action": { "enum": ["navigate", "screenshot", "extract_text", "extract_markdown", "click", "type", "evaluate", "expand", "pass_challenge", "close"] },
                 "url": { "type": "string" },
                 "selector": { "type": "string", "description": "CSS selector for click/type" },
                 "text": { "type": "string", "description": "Text to type" },
@@ -165,10 +177,20 @@ async fn browser_session(
         return Ok(session.value().clone());
     }
 
-    use chromiumoxide::browser::{Browser, BrowserConfig};
+    use chromiumoxide::browser::Browser;
     use futures::StreamExt;
 
-    let config = BrowserConfig::builder()
+    let lang = std::env::var("MANGOCODE_BROWSER_LANG").ok();
+    let mut builder = BrowserConfig::builder().window_size(1280, 800);
+    if let Ok(dir) = std::env::var("MANGOCODE_BROWSER_USER_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            builder = builder.user_data_dir(std::path::Path::new(dir.trim()));
+        }
+    }
+    for arg in crate::browser_antibot::chrome_args::stealth_extra_browser_args(lang.as_deref()) {
+        builder = builder.arg(arg);
+    }
+    let config = builder
         .build()
         .map_err(|e| format!("Failed to build browser config: {}", e))?;
     let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
@@ -244,6 +266,173 @@ struct BrowserSession {
 
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 impl BrowserSession {
+    fn cf_challenge_max_attempts() -> usize {
+        std::env::var("MANGOCODE_CF_CHALLENGE_MAX_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0 && v <= 30)
+            .unwrap_or(6)
+    }
+
+    fn cf_min_template_correlation() -> f64 {
+        std::env::var("MANGOCODE_CF_TEMPLATE_MIN_SCORE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.42)
+    }
+
+    fn post_navigation_settle_extra_ms() -> u64 {
+        std::env::var("MANGOCODE_BROWSER_NAV_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_500)
+            .min(55_000)
+    }
+
+    fn challenge_navigation_wait_timeout() -> std::time::Duration {
+        let ms: u64 = std::env::var("MANGOCODE_BROWSER_CHALLENGE_NAV_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12_000)
+            .clamp(250, 60_000);
+        std::time::Duration::from_millis(ms)
+    }
+
+    async fn wait_for_navigation_after_challenge_click(&self, page: &chromiumoxide::Page) {
+        match tokio::time::timeout(
+            Self::challenge_navigation_wait_timeout(),
+            page.wait_for_navigation(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => tracing::debug!("challenge click: navigation resolved"),
+            Ok(Err(e)) => tracing::debug!(error = %e, "challenge click: wait_for_navigation error (ignored)"),
+            Err(_) => tracing::debug!("challenge click: navigation wait timed out"),
+        }
+    }
+
+    async fn extra_navigation_settle(&self) {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            Self::post_navigation_settle_extra_ms(),
+        ))
+        .await;
+    }
+
+    async fn attach_expert_hook_on_new_documents(
+        page: &chromiumoxide::Page,
+    ) -> Result<(), String> {
+        if !crate::browser_antibot::browser_expert_env_enabled() {
+            return Ok(());
+        }
+        let _ = page
+            .evaluate_on_new_document(AddScriptToEvaluateOnNewDocumentParams::new(
+                crate::browser_antibot::expert_script::FORCE_OPEN_SHADOW_ON_NEW_DOCUMENT.to_string(),
+            ))
+            .await
+            .map_err(|e| format!("Expert shadow hook failed: {}", e))?;
+        Ok(())
+    }
+
+    async fn maybe_bypass_tls_interstitial(&self, page: &chromiumoxide::Page) {
+        if std::env::var("MANGOCODE_BROWSER_ACCEPT_INSECURE_TLS_UI")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            let _ = page.evaluate("void 0").await;
+            let _ = page
+                .execute(InsertTextParams::new("thisisunsafe"))
+                .await;
+        }
+    }
+
+    async fn maybe_strip_headless_user_agent(&self, page: &chromiumoxide::Page) {
+        let Ok(ua) = page.user_agent().await else {
+            return;
+        };
+        if ua.contains("Headless") {
+            let clean = ua.replace("Headless", "");
+            if let Ok(params) =
+                SetUserAgentOverrideParams::builder().user_agent(clean).build()
+            {
+                let _ = page.set_user_agent(params).await;
+            }
+        }
+    }
+
+    async fn page_challenge_snippet_async(&self, page: &chromiumoxide::Page) -> String {
+        let script = "(function(){ var t=document.title||'';\
+            var b=(document.body && document.body.innerText) ? document.body.innerText.slice(0,16000):'';\
+            return t + '\\n' + b; })()";
+        match page.evaluate(script).await {
+            Ok(v) => v.into_value::<String>().unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    async fn try_cf_checkbox_viewport(
+        &self,
+        page: &chromiumoxide::Page,
+        max_rounds: usize,
+    ) -> Result<(), String> {
+        if crate::browser_antibot::browser_expert_env_enabled() {
+            return Ok(());
+        }
+        use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+        use chromiumoxide::page::ScreenshotParams;
+
+        let (tmpl_w_u, tmpl_h_u, tmpl_gray) =
+            crate::browser_antibot::png_template::load_cf_checkbox_template_gray()?;
+        let tmpl_w = tmpl_w_u as usize;
+        let tmpl_h = tmpl_h_u as usize;
+        let min_score = Self::cf_min_template_correlation();
+
+        for attempt in 0..max_rounds {
+            let sample = self.page_challenge_snippet_async(page).await;
+            if !crate::bot_wall_sniff::text_suggests_bot_wall(&sample) {
+                break;
+            }
+
+            let params = ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .full_page(false)
+                .build();
+            let png = page.screenshot(params).await.map_err(|e| format!("Screenshot: {}", e))?;
+            let (hay_w_u, hay_h_u, hay_gray) =
+                crate::browser_antibot::png_template::png_bytes_to_gray_luma(&png)?;
+            let hay_w = hay_w_u as usize;
+            let hay_h = hay_h_u as usize;
+
+            match crate::browser_antibot::match_template::best_tm_ccoeff_normed(
+                hay_w,
+                hay_h,
+                &hay_gray,
+                tmpl_w,
+                tmpl_h,
+                &tmpl_gray,
+                min_score,
+            ) {
+                Ok(peak) => {
+                    page.click(Point {
+                        x: peak.center_px.0 as f64,
+                        y: peak.center_px.1 as f64,
+                    })
+                    .await
+                    .map_err(|e| format!("CF checkbox click failed: {}", e))?;
+                    self.wait_for_navigation_after_challenge_click(page).await;
+                    tracing::debug!(attempt, score = peak.score, "CF template click");
+                }
+                Err(crate::browser_antibot::match_template::TemplateMatchErr::NoMatchAboveThreshold) => {
+                    tracing::debug!(attempt, "CF template correlation below threshold");
+                }
+                Err(crate::browser_antibot::match_template::TemplateMatchErr::Size) => {
+                    tracing::warn!(attempt, hay_w, hay_h, tmpl_w, tmpl_h, "CF template size mismatch");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(850)).await;
+        }
+        Ok(())
+    }
+
     async fn close(&mut self) {
         self.page = None;
         let _ = self.browser.close().await;
@@ -294,8 +483,17 @@ impl BrowserSession {
             "click" => self.click(input).await,
             "type" => self.type_text(input).await,
             "evaluate" => self.evaluate(input).await,
+            "pass_challenge" => {
+                let page = self.page_for(input.url.as_deref()).await?;
+                self.maybe_strip_headless_user_agent(&page).await;
+                self.try_cf_checkbox_viewport(&page, Self::cf_challenge_max_attempts())
+                    .await?;
+                self.extra_navigation_settle().await;
+                self.refresh_current_url(&page).await;
+                Ok("pass_challenge: ran template-match loop on current viewport".into())
+            }
             other => Err(format!(
-                "Unknown action '{}'. Valid actions: navigate, screenshot, extract_text, extract_markdown, click, type, evaluate, expand, close",
+                "Unknown action '{}'. Valid actions: navigate, screenshot, extract_text, extract_markdown, click, type, evaluate, expand, pass_challenge, close",
                 other
             )),
         }
@@ -333,6 +531,7 @@ impl BrowserSession {
                     .new_page("about:blank")
                     .await
                     .map_err(|e| format!("Failed to open page: {}", e))?;
+                Self::attach_expert_hook_on_new_documents(&page).await?;
                 self.page = Some(page.clone());
                 page
             }
@@ -363,14 +562,18 @@ impl BrowserSession {
         page: &chromiumoxide::Page,
         url: &str,
     ) -> Result<(), String> {
-        if self.current_url.as_deref() == Some(url) {
-            return Ok(());
-        }
         page.goto(url)
             .await
             .map_err(|e| format!("Navigation failed: {}", e))?;
+        self.maybe_bypass_tls_interstitial(page).await;
+        self.maybe_strip_headless_user_agent(page).await;
+        self.try_cf_checkbox_viewport(page, Self::cf_challenge_max_attempts())
+            .await?;
         self.wait_ready(page).await;
-        self.current_url = Some(url.to_string());
+        self.extra_navigation_settle().await;
+        if !self.refresh_current_url(page).await {
+            self.current_url = Some(url.to_string());
+        }
         Ok(())
     }
 
@@ -392,14 +595,16 @@ impl BrowserSession {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
-    async fn refresh_current_url(&mut self, page: &chromiumoxide::Page) {
+    async fn refresh_current_url(&mut self, page: &chromiumoxide::Page) -> bool {
         if let Ok(value) = page.evaluate("location.href").await {
             if let Ok(url) = value.into_value::<String>() {
                 if !url.trim().is_empty() {
                     self.current_url = Some(url);
+                    return true;
                 }
             }
         }
+        false
     }
 
     #[cfg(feature = "tool-browser")]
@@ -738,6 +943,7 @@ mod tests {
     #[test]
     fn browser_action_is_normalized_or_rejected() {
         assert_eq!(normalize_browser_action(" NAVIGATE "), Ok("navigate"));
+        assert_eq!(normalize_browser_action("Pass_Challenge"), Ok("pass_challenge"));
         let err = normalize_browser_action("navigate\nclose")
             .expect_err("invalid action must be rejected");
         assert!(err.contains("Invalid action"));

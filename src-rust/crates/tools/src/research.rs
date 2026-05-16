@@ -817,7 +817,21 @@ pub async fn fetch_research_document(
         Err(e) => return Err(e),
     };
 
+    let final_url_owned = resp.url().clone();
     let status = resp.status();
+    let hdrs = resp.headers().clone();
+    let content_type = hdrs
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    let body_str_lossy = String::from_utf8_lossy(&body).into_owned();
+
     if !status.is_success() {
         if is_docs_rs_url(url) {
             return Ok(docs_rs_fallback_document(
@@ -825,33 +839,68 @@ pub async fn fetch_research_document(
                 &format!("HTTP {} when fetching {}", status, url),
             ));
         }
+
+        if rendered_fallback
+            && crate::bot_wall_sniff::http_failure_might_be_challenge(status, &hdrs, body_str_lossy.trim())
+        {
+            match crate::browser_tool::rendered_extract_for_research(url).await {
+                Ok(content) => {
+                    let rendered_quality = score_content_quality(&content);
+                    let doc = ResearchDocument {
+                        url: url.to_string(),
+                        title: None,
+                        quality_score: rendered_quality,
+                        content_type: "text/html".to_string(),
+                        retrieved_at: chrono::Utc::now().to_rfc3339(),
+                        rendered_fallback_used: true,
+                        verified_at_read_time: true,
+                        from_cache: false,
+                        content: if content.len() > MAX_DOC_CHARS {
+                            format!(
+                                "{}\n\n... (truncated, {} total characters)",
+                                mangocode_core::truncate::truncate_bytes_prefix(&content, MAX_DOC_CHARS),
+                                content.len()
+                            )
+                        } else {
+                            content
+                        },
+                    };
+                    let _ = save_cached_document(&doc);
+                    let _ = upsert_research_index(&doc);
+                    return Ok(doc);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "HTTP {} when fetching {} (rendered fallback also failed after bot-wall hint: {})",
+                        status, url, e
+                    ));
+                }
+            }
+        }
+
         return Err(format!("HTTP {} when fetching {}", status, url));
     }
-    let effective_url = normalize_public_research_url(resp.url().as_str()).ok_or_else(|| {
+
+    let effective_url = normalize_public_research_url(final_url_owned.as_str()).ok_or_else(|| {
         format!(
             "Fetch for {} ended at an unsafe or unsupported redirected URL",
             url
         )
     })?;
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
-    let title = extract_title(&body);
+    let title = extract_title(&body_str_lossy);
     let mut content = if content_type.contains("html") {
-        html_to_markdownish(&body)
+        html_to_markdownish(&body_str_lossy)
     } else {
-        body
+        body_str_lossy.clone()
     };
     let mut quality_score = score_content_quality(&content);
     let mut rendered_fallback_used = false;
-    if rendered_fallback && quality_score < 0.35 {
+
+    let body_snippet: String = body_str_lossy.chars().take(96_000).collect();
+    let looks_like_challenge = crate::bot_wall_sniff::text_suggests_bot_wall(body_snippet.as_str())
+        || crate::bot_wall_sniff::text_suggests_bot_wall(&content);
+
+    if rendered_fallback && (quality_score < 0.35 || looks_like_challenge) {
         let rendered =
             match crate::browser_tool::rendered_extract_for_research(&effective_url).await {
                 Ok(markdown) => markdown,
@@ -953,7 +1002,8 @@ async fn perform_research_get(
 }
 
 fn should_upgrade_cached_doc(doc: &ResearchDocument) -> bool {
-    !doc.rendered_fallback_used && doc.quality_score < 0.35
+    !doc.rendered_fallback_used
+        && (doc.quality_score < 0.35 || crate::bot_wall_sniff::text_suggests_bot_wall(&doc.content))
 }
 
 fn is_docs_rs_url(url: &str) -> bool {

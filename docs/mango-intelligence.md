@@ -60,9 +60,35 @@ Tools:
 - `DocSearch` finds official or primary docs first and also searches MangoCode's local research index.
 - `DocRead` reads one URL or local doc into clean Markdown with citation metadata.
 - `DeepRead` reads multiple sources and returns a concise research brief with facts, source list, staleness notes, examples, and implementation implications.
+- `WebFetch` fetches any public HTTP(S) URL to text/Markdown. `extract`=`auto`|`main` uses the research-style pipeline; **`extract`=`raw`** returns the response body—set **`rendered_fallback`:** **`true`** when raw HTML looks like a CDN/bot gate (or use **`auto`**/ **`main`**) so MangoCode can use browser extraction instead of silently caching useless challenge pages.
 - In `full-tools` or explicit `tool-rendered-fetch` builds, `RenderedFetch` forces the browser-backed rendered extraction path directly when a docs page is heavily client-rendered or hidden behind tabs/accordions.
 
 The source index lives at `~/.mangocode/research/research-v1/source-index.json`. Every successful `DocRead` or fetched research document is indexed, so future searches can reuse trusted docs even when web search is weak or offline.
+
+### CDN / bot challenge pages
+
+Some sites return short HTML challenges (often Cloudflare) to programmatic HTTP clients. MangoCode detects **challenge-shaped** snippets (markers like “checking your browser”, embedded challenge scripts, Turnstiles, compact Cloudflare error pages), and when relevant uses **HTTP status** and **`cf-ray` / Server** hints.
+
+Where a browser-enabled build is present (`tool-browser` and/or `tool-rendered-fetch`, as with **full-tools**):
+
+- The research **`fetch_research_document`** path (`DocRead` / `DeepRead` / **`auto`**/ **`main`** **`WebFetch`**) can escalate to rendered extraction when bodies look walled or unusually sparse after HTTP success.
+- **`WebFetch`** with **`extract`=`raw`**: rejects obvious challenge HTML unless **`rendered_fallback`:** **`true`**; on challenge-like **`4xx`**/ **`429`** when headers/body hint a gate, **`rendered_fallback`** can retry in the browser before failing.
+- The **`Browser`** tool supports stealth-oriented launch (**headless UA** cleanup, nodriver-ish args, optional **`MANGOCODE_BROWSER_EXPERT`** shadow hooks), **`navigate`** (runs challenge helpers on load), **`pass_challenge`** (viewport PNG template match loop without re-navigating), and optional **`MANGOCODE_BROWSER_ACCEPT_INSECURE_TLS_UI`** for Chrome’s **`thisisunsafe`** interstitial keystroke (**dev-only** caution).
+
+`WebFetch` stores cache files under `~/.mangocode/web_cache`. Keys include **`extract`**, **`rendered_fallback`**, and related options, with an updated key prefix so stale challenge HTML cached under older builds will not collide.
+
+Environment knobs:
+
+| Variable | Role |
+|---|---|
+| `MANGOCODE_BROWSER_USER_DATA_DIR` | Optional persistent Chromium profile. |
+| `MANGOCODE_BROWSER_LANG` | Passed into stealth launch `Accept-Language` hints. |
+| `MANGOCODE_BROWSER_NAV_TIMEOUT_MS` | Extra ms to sleep after navigations settle (bounded). |
+| `MANGOCODE_BROWSER_CHALLENGE_NAV_TIMEOUT_MS` | Bounded `wait_for_navigation` wait after checkbox clicks (default 12s, clamped). |
+| `MANGOCODE_BROWSER_ACCEPT_INSECURE_TLS_UI` | `1` / `true`: send `thisisunsafe` on Chrome TLS interstitial. |
+| `MANGOCODE_BROWSER_EXPERT` | `1` / `true`: expert args plus shadow probing; skips template checkbox matcher. |
+| `MANGOCODE_CF_CHALLENGE_MAX_ATTEMPTS` | Max template rounds (≤30, default 6). |
+| `MANGOCODE_CF_TEMPLATE_MIN_SCORE` | Minimum correlation for template peaks (default 0.42). |
 
 Rendered browser fallback for `DocRead`/`DeepRead` is optional and uses MangoCode's browser-backed extraction build:
 
