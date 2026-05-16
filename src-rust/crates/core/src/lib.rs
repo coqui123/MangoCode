@@ -61,6 +61,9 @@ pub mod status_notices;
 pub mod token_budget;
 pub mod truncate;
 
+/// Chrome DevTools `Runtime.evaluate` string helpers (shared by `/chrome` and Browser tool).
+pub mod chrome_js;
+
 // Remote session sync and cloud session API (T3-1, T3-2).
 pub mod cloud_session;
 pub mod remote_session;

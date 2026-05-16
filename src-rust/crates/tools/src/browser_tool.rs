@@ -702,8 +702,9 @@ impl BrowserSession {
             .script
             .as_ref()
             .ok_or_else(|| "evaluate requires 'script'".to_string())?;
+        let prepared = mangocode_core::chrome_js::prepare_eval_expression(script.as_str());
         let result = page
-            .evaluate(script.as_str())
+            .evaluate(prepared.as_str())
             .await
             .map_err(|e| format!("evaluate failed: {}", e))?;
         self.refresh_current_url(&page).await;
