@@ -81,13 +81,15 @@ async fn run_scheduler_loop(
 
             tokio::spawn(async move {
                 let mut messages = vec![Message::user(task.prompt.clone())];
+                let mut background_query_config = query_config.clone();
+                background_query_config.inject_coordination_inbox = false;
 
                 let outcome = run_query_loop(
                     client.as_ref(),
                     &mut messages,
                     &tools,
                     &tool_ctx,
-                    &query_config,
+                    &background_query_config,
                     cost_tracker,
                     None, // background — no UI event channel
                     cancel_child,

@@ -351,6 +351,8 @@ impl ProactiveAgent {
             let mut messages = vec![Message::user(prompt)];
             let cost_tracker = tool_ctx.cost_tracker.clone();
             let cancel_child = cancel.child_token();
+            let mut background_query_config = query_config.clone();
+            background_query_config.inject_coordination_inbox = false;
 
             // Run a mini query loop with restricted tools.
             let outcome = run_query_loop(
@@ -358,7 +360,7 @@ impl ProactiveAgent {
                 &mut messages,
                 &allowed_tools,
                 &tool_ctx,
-                &query_config,
+                &background_query_config,
                 cost_tracker,
                 None, // no UI event channel
                 cancel_child,

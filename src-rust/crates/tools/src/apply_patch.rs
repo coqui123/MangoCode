@@ -368,6 +368,19 @@ impl Tool for ApplyPatchTool {
                 Err(result) => return result,
             }
         };
+        let _coordination_write_claim = if params.dry_run {
+            None
+        } else {
+            match crate::coordination::begin_transient_write_claim(
+                ctx,
+                self.name(),
+                &conflict_paths,
+                params.confirm_conflicts,
+            ) {
+                Ok(guard) => guard,
+                Err(result) => return result,
+            }
+        };
 
         // ----------------------------------------------------------------
         // Process each file in the patch
@@ -665,6 +678,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "apply-patch-delete-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: std::sync::Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),
@@ -716,6 +732,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "apply-patch-partial-failure-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: std::sync::Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),

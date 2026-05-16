@@ -78,6 +78,15 @@ impl Tool for FileWriteTool {
             Ok(conflicts) => conflicts,
             Err(result) => return result,
         };
+        let _coordination_write_claim = match crate::coordination::begin_transient_write_claim(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(guard) => guard,
+            Err(result) => return result,
+        };
 
         // Ensure parent directories exist
         if let Some(parent) = path.parent() {

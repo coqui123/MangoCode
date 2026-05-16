@@ -1883,11 +1883,12 @@ impl SlashCommand for CoordinationCommand {
         let model = effective_model_for_command_config(&ctx.config, ctx.model_registry.as_deref());
         let coordination_session_id =
             mangocode_core::coordination::process_session_id(&ctx.session_id);
-        let _ = store.register_session(
+        let _ = store.register_session_with_parent(
             &coordination_session_id,
             &ctx.working_dir,
             &model,
             ctx.session_title.as_deref(),
+            None,
         );
         let repo_filter = (!all_repos).then_some(ctx.working_dir.as_path());
         let sessions = match store.list_sessions(repo_filter) {
@@ -1898,23 +1899,47 @@ impl SlashCommand for CoordinationCommand {
             Ok(claims) => claims,
             Err(e) => return CommandResult::Error(format!("Failed to list claims: {e}")),
         };
-        let inbox = match store.inbox(&coordination_session_id, &ctx.working_dir, mark_read) {
-            Ok(messages) => messages,
-            Err(e) => return CommandResult::Error(format!("Failed to read inbox: {e}")),
+        let unread_count = match store.unread_count(&coordination_session_id, &ctx.working_dir) {
+            Ok(count) => count,
+            Err(e) => return CommandResult::Error(format!("Failed to count inbox: {e}")),
+        };
+        let inbox =
+            match store.inbox_with_limit(&coordination_session_id, &ctx.working_dir, mark_read, 50)
+            {
+                Ok(messages) => messages,
+                Err(e) => return CommandResult::Error(format!("Failed to read inbox: {e}")),
+            };
+        let remaining_unread_count = if mark_read && !inbox.is_empty() {
+            match store.unread_count(&coordination_session_id, &ctx.working_dir) {
+                Ok(count) => count,
+                Err(e) => return CommandResult::Error(format!("Failed to count inbox: {e}")),
+            }
+        } else {
+            unread_count
         };
 
+        let unread_label = if mark_read {
+            format!("{unread_count} before read, {remaining_unread_count} remaining")
+        } else {
+            unread_count.to_string()
+        };
         let mut lines = vec![format!(
-            "Coordination: {} active session(s), {} active claim(s), {} unread message(s).",
+            "Coordination: {} active actor(s), {} active claim(s), {} unread message(s).",
             sessions.len(),
             claims.len(),
-            inbox.len()
+            unread_label
         )];
         for session in sessions.iter().take(10) {
             lines.push(format!(
-                "- session {} pid {} repo {}{}",
-                truncate_bytes_prefix(&session.session_id, 8),
+                "- actor {} pid {} repo {}{}{}",
+                session.session_id,
                 session.pid,
                 session.repo_root,
+                session
+                    .parent_session_id
+                    .as_ref()
+                    .map(|parent| format!(" parent {}", parent))
+                    .unwrap_or_default(),
                 session
                     .title
                     .as_ref()
@@ -1932,10 +1957,22 @@ impl SlashCommand for CoordinationCommand {
             ));
         }
         for message in inbox.iter().take(10) {
+            let target = message
+                .to_session_id
+                .as_deref()
+                .map(|target| format!("direct to {target}"))
+                .unwrap_or_else(|| "repo broadcast".to_string());
+            let read_state = message.read_at.as_deref().unwrap_or("unread");
             lines.push(format!(
-                "- message from {}: {}",
-                truncate_bytes_prefix(&message.from_session_id, 8),
-                message.body
+                "- message {target} from actor {} at {} ({read_state}): {}",
+                message.from_session_id, message.created_at, message.body
+            ));
+        }
+        if unread_count > inbox.len() {
+            lines.push(format!(
+                "Showing {} of {} unread message(s).",
+                inbox.len(),
+                unread_count
             ));
         }
         if mark_read && !inbox.is_empty() {
@@ -8565,11 +8602,7 @@ impl SlashCommand for ChromeCommand {
 
             "newtab" => {
                 let url = rest.trim();
-                let u = if url.is_empty() {
-                    None
-                } else {
-                    Some(url)
-                };
+                let u = if url.is_empty() { None } else { Some(url) };
                 match chrome_cdp::new_tab(u).await {
                     Ok(msg) => CommandResult::Message(msg),
                     Err(e) => CommandResult::Error(e.to_string()),
@@ -8607,12 +8640,10 @@ impl SlashCommand for ChromeCommand {
                         Ok(msg) => CommandResult::Message(msg),
                         Err(e) => CommandResult::Error(e.to_string()),
                     },
-                    "dismiss" | "reject" => {
-                        match chrome_cdp::handle_js_dialog(false, None).await {
-                            Ok(msg) => CommandResult::Message(msg),
-                            Err(e) => CommandResult::Error(e.to_string()),
-                        }
-                    }
+                    "dismiss" | "reject" => match chrome_cdp::handle_js_dialog(false, None).await {
+                        Ok(msg) => CommandResult::Message(msg),
+                        Err(e) => CommandResult::Error(e.to_string()),
+                    },
                     "prompt" => {
                         if tail.is_empty() {
                             return CommandResult::Error(

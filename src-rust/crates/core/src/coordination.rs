@@ -9,15 +9,21 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::Settings;
 
 const HEARTBEAT_STALE_SECONDS: i64 = 90;
+const RETAIN_STALE_SESSION_SECONDS: i64 = 24 * 60 * 60;
+const MESSAGE_RETENTION_SECONDS: i64 = 14 * 24 * 60 * 60;
+const DEFAULT_INBOX_LIMIT: usize = 50;
+const MAX_INBOX_LIMIT: usize = 200;
 
 pub fn process_session_id(session_id: &str) -> String {
     let suffix = format!("@{}", std::process::id());
-    if session_id.ends_with(&suffix) {
+    let hierarchical_suffix = format!("{suffix}:");
+    if session_id.ends_with(&suffix) || session_id.contains(&hierarchical_suffix) {
         session_id.to_string()
     } else {
         format!("{session_id}{suffix}")
@@ -27,6 +33,7 @@ pub fn process_session_id(session_id: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionPresence {
     pub session_id: String,
+    pub parent_session_id: Option<String>,
     pub pid: u32,
     pub cwd: String,
     pub repo_root: String,
@@ -70,13 +77,21 @@ pub struct ConflictWarning {
     pub heartbeat_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionTargetResolution {
+    Found(SessionPresence),
+    NotFound,
+    Ambiguous(Vec<SessionPresence>),
+    Stale(Vec<SessionPresence>),
+}
+
 pub struct CoordinationStore {
     conn: rusqlite::Connection,
 }
 
-#[derive(Clone)]
 pub struct PresenceHeartbeat {
     state: Arc<Mutex<PresenceHeartbeatState>>,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -85,6 +100,7 @@ struct PresenceHeartbeatState {
     cwd: PathBuf,
     model: String,
     title: Option<String>,
+    parent_session_id: Option<String>,
 }
 
 pub fn spawn_presence_heartbeat(
@@ -93,34 +109,58 @@ pub fn spawn_presence_heartbeat(
     model: String,
     title: Option<String>,
 ) -> PresenceHeartbeat {
+    spawn_presence_heartbeat_with_parent(session_id, cwd, model, title, None)
+}
+
+pub fn spawn_presence_heartbeat_with_parent(
+    session_id: String,
+    cwd: PathBuf,
+    model: String,
+    title: Option<String>,
+    parent_session_id: Option<String>,
+) -> PresenceHeartbeat {
     let state = Arc::new(Mutex::new(PresenceHeartbeatState {
         session_id,
         cwd,
         model,
         title,
+        parent_session_id,
     }));
+    let cancel = CancellationToken::new();
     let task_state = state.clone();
+    let task_cancel = cancel.clone();
     tokio::spawn(async move {
         loop {
-            if let Ok(store) = CoordinationStore::open_default() {
-                if let Ok(heartbeat) = task_state.lock() {
-                    let _ = store.register_session(
-                        &heartbeat.session_id,
-                        &heartbeat.cwd,
-                        &heartbeat.model,
-                        heartbeat.title.as_deref(),
-                    );
-                    let _ = store.heartbeat(&heartbeat.session_id);
-                }
+            if task_cancel.is_cancelled() {
+                unregister_heartbeat_state(&task_state);
+                break;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            register_heartbeat_state(&task_state);
+            tokio::select! {
+                _ = task_cancel.cancelled() => {
+                    unregister_heartbeat_state(&task_state);
+                    break;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+            }
         }
     });
-    PresenceHeartbeat { state }
+    PresenceHeartbeat { state, cancel }
 }
 
 impl PresenceHeartbeat {
     pub fn update(&self, session_id: String, cwd: PathBuf, model: String, title: Option<String>) {
+        self.update_with_parent(session_id, cwd, model, title, None);
+    }
+
+    pub fn update_with_parent(
+        &self,
+        session_id: String,
+        cwd: PathBuf,
+        model: String,
+        title: Option<String>,
+        parent_session_id: Option<String>,
+    ) {
         let (previous_session, previous_cwd, current_cwd) = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -131,6 +171,7 @@ impl PresenceHeartbeat {
             state.cwd = cwd.clone();
             state.model = model;
             state.title = title;
+            state.parent_session_id = parent_session_id;
             (previous, previous_cwd, cwd)
         };
         if previous_session != session_id {
@@ -142,6 +183,39 @@ impl PresenceHeartbeat {
                 let _ = store.release_claims(&session_id, None);
             }
         }
+        register_heartbeat_state(&self.state);
+    }
+}
+
+fn register_heartbeat_state(state: &Arc<Mutex<PresenceHeartbeatState>>) {
+    let Ok(heartbeat) = state.lock() else {
+        return;
+    };
+    if let Ok(store) = CoordinationStore::open_default() {
+        let _ = store.register_session_with_parent(
+            &heartbeat.session_id,
+            &heartbeat.cwd,
+            &heartbeat.model,
+            heartbeat.title.as_deref(),
+            heartbeat.parent_session_id.as_deref(),
+        );
+        let _ = store.heartbeat(&heartbeat.session_id);
+    }
+}
+
+fn unregister_heartbeat_state(state: &Arc<Mutex<PresenceHeartbeatState>>) {
+    let Ok(heartbeat) = state.lock() else {
+        return;
+    };
+    if let Ok(store) = CoordinationStore::open_default() {
+        let _ = store.unregister_session(&heartbeat.session_id);
+    }
+}
+
+impl Drop for PresenceHeartbeat {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        unregister_heartbeat_state(&self.state);
     }
 }
 
@@ -162,6 +236,7 @@ impl CoordinationStore {
 
             CREATE TABLE IF NOT EXISTS coord_sessions (
                 session_id   TEXT PRIMARY KEY,
+                parent_session_id TEXT,
                 pid          INTEGER NOT NULL,
                 cwd          TEXT NOT NULL,
                 repo_root    TEXT NOT NULL,
@@ -208,14 +283,23 @@ impl CoordinationStore {
             );
             CREATE INDEX IF NOT EXISTS idx_coord_message_reads_session
                 ON coord_message_reads(session_id, read_at);
-
-            INSERT OR IGNORE INTO coord_message_reads (message_id, session_id, read_at)
-            SELECT message_id, to_session_id, read_at
-            FROM coord_messages
-            WHERE read_at IS NOT NULL AND to_session_id IS NOT NULL;
             ",
         )?;
-        Ok(Self { conn })
+        let _ = conn.execute(
+            "ALTER TABLE coord_sessions ADD COLUMN parent_session_id TEXT",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE coord_messages ADD COLUMN read_at TEXT", []);
+        conn.execute(
+            "INSERT OR IGNORE INTO coord_message_reads (message_id, session_id, read_at)
+             SELECT message_id, to_session_id, read_at
+             FROM coord_messages
+             WHERE read_at IS NOT NULL AND to_session_id IS NOT NULL",
+            [],
+        )?;
+        let store = Self { conn };
+        let _ = store.prune_stale_coordination();
+        Ok(store)
     }
 
     pub fn register_session(
@@ -225,34 +309,61 @@ impl CoordinationStore {
         model: &str,
         title: Option<&str>,
     ) -> anyhow::Result<SessionPresence> {
+        self.register_session_with_parent(session_id, cwd, model, title, None)
+    }
+
+    pub fn register_session_with_parent(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        model: &str,
+        title: Option<&str>,
+        parent_session_id: Option<&str>,
+    ) -> anyhow::Result<SessionPresence> {
         let now = now_string();
         let repo_root = canonical_project_root(cwd);
         let cwd_s = canonical_path_string(cwd);
         let repo_s = repo_root.to_string_lossy().to_string();
         let pid = std::process::id();
+        let stale_cutoff = stale_cutoff();
         self.conn.execute(
             "INSERT INTO coord_sessions
-             (session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             (session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
              ON CONFLICT(session_id) DO UPDATE SET
+                parent_session_id = excluded.parent_session_id,
                 pid = excluded.pid,
                 cwd = excluded.cwd,
                 repo_root = excluded.repo_root,
                 model = COALESCE(NULLIF(excluded.model, ''), coord_sessions.model),
                 title = COALESCE(excluded.title, coord_sessions.title),
+                started_at = CASE
+                    WHEN coord_sessions.repo_root != excluded.repo_root THEN excluded.started_at
+                    WHEN coord_sessions.heartbeat_at < ?9 THEN excluded.started_at
+                    ELSE coord_sessions.started_at
+                END,
                 heartbeat_at = excluded.heartbeat_at",
-            rusqlite::params![session_id, pid, cwd_s, repo_s, model, title, now],
+            rusqlite::params![
+                session_id,
+                parent_session_id,
+                pid,
+                cwd_s,
+                repo_s,
+                model,
+                title,
+                now,
+                stale_cutoff
+            ],
         )?;
-        Ok(SessionPresence {
-            session_id: session_id.to_string(),
-            pid,
-            cwd: cwd_s,
-            repo_root: repo_s,
-            model: model.to_string(),
-            title: title.map(str::to_string),
-            started_at: now.clone(),
-            heartbeat_at: now,
-        })
+        self.conn
+            .query_row(
+                "SELECT session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
+             FROM coord_sessions
+             WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                session_from_row,
+            )
+            .map_err(Into::into)
     }
 
     pub fn heartbeat(&self, session_id: &str) -> anyhow::Result<()> {
@@ -276,12 +387,12 @@ impl CoordinationStore {
         let cutoff = stale_cutoff();
         let repo = repo_root.map(|p| canonical_project_root(p).to_string_lossy().to_string());
         let sql = if repo.is_some() {
-            "SELECT session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
+            "SELECT session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
              FROM coord_sessions
              WHERE repo_root = ?1 AND heartbeat_at >= ?2
              ORDER BY heartbeat_at DESC"
         } else {
-            "SELECT session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
+            "SELECT session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
              FROM coord_sessions
              WHERE heartbeat_at >= ?1
              ORDER BY heartbeat_at DESC"
@@ -294,6 +405,74 @@ impl CoordinationStore {
             let rows = stmt.query_map(rusqlite::params![cutoff], session_from_row)?;
             collect_rows(rows)
         }
+    }
+
+    pub fn resolve_session_target(
+        &self,
+        cwd: &Path,
+        target: &str,
+    ) -> anyhow::Result<SessionTargetResolution> {
+        let target = target.trim();
+        if target.is_empty() {
+            return Ok(SessionTargetResolution::NotFound);
+        }
+        let sessions = self.list_sessions(Some(cwd))?;
+        let exact_matches = matching_exact_sessions(&sessions, target);
+        if let Some(session) = exact_matches.first() {
+            return Ok(SessionTargetResolution::Found(session.clone()));
+        }
+        let stale_exact_matches = self.stale_exact_session_target_matches(cwd, target)?;
+        if !stale_exact_matches.is_empty() {
+            return Ok(SessionTargetResolution::Stale(stale_exact_matches));
+        }
+        let matches = matching_prefix_or_title_sessions(sessions, target);
+
+        match matches.len() {
+            0 => {
+                let stale_matches = self.stale_session_target_matches(cwd, target)?;
+                if stale_matches.is_empty() {
+                    Ok(SessionTargetResolution::NotFound)
+                } else {
+                    Ok(SessionTargetResolution::Stale(stale_matches))
+                }
+            }
+            1 => Ok(SessionTargetResolution::Found(matches[0].clone())),
+            _ => Ok(SessionTargetResolution::Ambiguous(matches)),
+        }
+    }
+
+    fn stale_exact_session_target_matches(
+        &self,
+        cwd: &Path,
+        target: &str,
+    ) -> anyhow::Result<Vec<SessionPresence>> {
+        let repo = canonical_project_root(cwd).to_string_lossy().to_string();
+        let cutoff = stale_cutoff();
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
+             FROM coord_sessions
+             WHERE repo_root = ?1 AND heartbeat_at < ?2 AND session_id = ?3
+             ORDER BY heartbeat_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo, cutoff, target], session_from_row)?;
+        collect_rows(rows)
+    }
+
+    fn stale_session_target_matches(
+        &self,
+        cwd: &Path,
+        target: &str,
+    ) -> anyhow::Result<Vec<SessionPresence>> {
+        let repo = canonical_project_root(cwd).to_string_lossy().to_string();
+        let cutoff = stale_cutoff();
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, parent_session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at
+             FROM coord_sessions
+             WHERE repo_root = ?1 AND heartbeat_at < ?2
+             ORDER BY heartbeat_at DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo, cutoff], session_from_row)?;
+        Ok(matching_target_sessions(collect_rows(rows)?, target))
     }
 
     pub fn create_claim(
@@ -499,7 +678,18 @@ impl CoordinationStore {
         cwd: &Path,
         mark_read: bool,
     ) -> anyhow::Result<Vec<CoordinationMessage>> {
+        self.inbox_with_limit(session_id, cwd, mark_read, DEFAULT_INBOX_LIMIT)
+    }
+
+    pub fn inbox_with_limit(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        mark_read: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<CoordinationMessage>> {
         let repo_root = canonical_project_root(cwd).to_string_lossy().to_string();
+        let limit = limit.clamp(1, MAX_INBOX_LIMIT) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT m.message_id, m.from_session_id, m.to_session_id, m.repo_root,
                     m.body, m.created_at, r.read_at
@@ -509,25 +699,137 @@ impl CoordinationStore {
              WHERE r.read_at IS NULL
                AND (
                     m.to_session_id = ?1
-                    OR (m.to_session_id IS NULL AND m.repo_root = ?2 AND m.from_session_id != ?1)
+                    OR (
+                        m.to_session_id IS NULL
+                        AND m.repo_root = ?2
+                        AND m.from_session_id != ?1
+                        AND EXISTS (
+                            SELECT 1 FROM coord_sessions s
+                            WHERE s.session_id = ?1
+                              AND s.repo_root = ?2
+                              AND s.started_at <= m.created_at
+                        )
+                    )
                )
              ORDER BY m.created_at ASC
-             LIMIT 50",
+             LIMIT ?3",
         )?;
-        let rows = stmt.query_map(rusqlite::params![session_id, repo_root], message_from_row)?;
-        let messages = collect_rows(rows)?;
+        let rows = stmt.query_map(
+            rusqlite::params![session_id, repo_root, limit],
+            message_from_row,
+        )?;
+        let mut messages = collect_rows(rows)?;
         if mark_read && !messages.is_empty() {
             let now = now_string();
-            for message in &messages {
+            for message in &mut messages {
                 self.conn.execute(
                     "INSERT OR REPLACE INTO coord_message_reads
                      (message_id, session_id, read_at)
                      VALUES (?1, ?2, ?3)",
                     rusqlite::params![message.message_id, session_id, now],
                 )?;
+                message.read_at = Some(now.clone());
             }
         }
         Ok(messages)
+    }
+
+    pub fn unread_count(&self, session_id: &str, cwd: &Path) -> anyhow::Result<usize> {
+        let repo_root = canonical_project_root(cwd).to_string_lossy().to_string();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM coord_messages m
+             LEFT JOIN coord_message_reads r
+                ON r.message_id = m.message_id AND r.session_id = ?1
+             WHERE r.read_at IS NULL
+               AND (
+                    m.to_session_id = ?1
+                    OR (
+                        m.to_session_id IS NULL
+                        AND m.repo_root = ?2
+                        AND m.from_session_id != ?1
+                        AND EXISTS (
+                            SELECT 1 FROM coord_sessions s
+                            WHERE s.session_id = ?1
+                              AND s.repo_root = ?2
+                              AND s.started_at <= m.created_at
+                        )
+                    )
+               )",
+            rusqlite::params![session_id, repo_root],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn mark_messages_read(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        message_ids: &[String],
+    ) -> anyhow::Result<usize> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let repo_root = canonical_project_root(cwd).to_string_lossy().to_string();
+        let now = now_string();
+        let mut changed = 0;
+        for message_id in message_ids {
+            changed += self.conn.execute(
+                "INSERT OR REPLACE INTO coord_message_reads
+                 (message_id, session_id, read_at)
+                 SELECT m.message_id, ?2, ?3
+                 FROM coord_messages m
+                 WHERE m.message_id = ?1
+                   AND (
+                        m.to_session_id = ?2
+                        OR (
+                            m.to_session_id IS NULL
+                            AND m.repo_root = ?4
+                            AND m.from_session_id != ?2
+                            AND EXISTS (
+                                SELECT 1 FROM coord_sessions s
+                                WHERE s.session_id = ?2
+                                  AND s.repo_root = ?4
+                                  AND s.started_at <= m.created_at
+                            )
+                        )
+                   )",
+                rusqlite::params![message_id, session_id, now, repo_root],
+            )?;
+        }
+        Ok(changed)
+    }
+
+    pub fn prune_stale_coordination(&self) -> anyhow::Result<()> {
+        let stale_session_cutoff = (Utc::now() - Duration::seconds(RETAIN_STALE_SESSION_SECONDS))
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        self.conn.execute(
+            "DELETE FROM coord_claims
+             WHERE session_id IN (
+                SELECT session_id FROM coord_sessions WHERE heartbeat_at < ?1
+             )",
+            rusqlite::params![stale_session_cutoff],
+        )?;
+        self.conn.execute(
+            "DELETE FROM coord_sessions WHERE heartbeat_at < ?1",
+            rusqlite::params![stale_session_cutoff],
+        )?;
+
+        let message_cutoff = (Utc::now() - Duration::seconds(MESSAGE_RETENTION_SECONDS))
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        self.conn.execute(
+            "DELETE FROM coord_message_reads
+             WHERE message_id IN (
+                SELECT message_id FROM coord_messages WHERE created_at < ?1
+             )",
+            rusqlite::params![message_cutoff],
+        )?;
+        self.conn.execute(
+            "DELETE FROM coord_messages WHERE created_at < ?1",
+            rusqlite::params![message_cutoff],
+        )?;
+        Ok(())
     }
 }
 
@@ -709,17 +1011,56 @@ fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> anyhow::R
     Ok(out)
 }
 
+fn matching_target_sessions(sessions: Vec<SessionPresence>, target: &str) -> Vec<SessionPresence> {
+    let exact = matching_exact_sessions(&sessions, target);
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    matching_prefix_or_title_sessions(sessions, target)
+}
+
+fn matching_exact_sessions(sessions: &[SessionPresence], target: &str) -> Vec<SessionPresence> {
+    sessions
+        .iter()
+        .filter(|session| session.session_id == target)
+        .cloned()
+        .collect()
+}
+
+fn matching_prefix_or_title_sessions(
+    sessions: Vec<SessionPresence>,
+    target: &str,
+) -> Vec<SessionPresence> {
+    let target_lc = target.to_ascii_lowercase();
+    sessions
+        .into_iter()
+        .filter(|session| {
+            session
+                .session_id
+                .to_ascii_lowercase()
+                .starts_with(&target_lc)
+                || session
+                    .title
+                    .as_deref()
+                    .map(|title| title.to_ascii_lowercase().starts_with(&target_lc))
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionPresence> {
-    let pid: i64 = row.get(1)?;
+    let pid: i64 = row.get(2)?;
     Ok(SessionPresence {
         session_id: row.get(0)?,
+        parent_session_id: row.get(1)?,
         pid: pid.max(0) as u32,
-        cwd: row.get(2)?,
-        repo_root: row.get(3)?,
-        model: row.get(4)?,
-        title: row.get(5)?,
-        started_at: row.get(6)?,
-        heartbeat_at: row.get(7)?,
+        cwd: row.get(3)?,
+        repo_root: row.get(4)?,
+        model: row.get(5)?,
+        title: row.get(6)?,
+        started_at: row.get(7)?,
+        heartbeat_at: row.get(8)?,
     })
 }
 
@@ -872,6 +1213,9 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let db = dir.path().join("coordination.db");
         let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("b", dir.path(), "model", Some("receiver"))
+            .unwrap();
         store.send_message("a", Some("b"), None, "direct").unwrap();
         store
             .send_message("a", None, Some(dir.path()), "repo")
@@ -879,7 +1223,79 @@ mod tests {
 
         let inbox = store.inbox("b", dir.path(), true).unwrap();
         assert_eq!(inbox.len(), 2);
+        assert!(inbox.iter().all(|message| message.read_at.is_some()));
         assert!(store.inbox("b", dir.path(), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbox_respects_requested_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store.send_message("a", Some("b"), None, "one").unwrap();
+        store.send_message("a", Some("b"), None, "two").unwrap();
+        store.send_message("a", Some("b"), None, "three").unwrap();
+
+        let inbox = store.inbox_with_limit("b", dir.path(), false, 2).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox[0].body, "one");
+        assert_eq!(inbox[1].body, "two");
+    }
+
+    #[test]
+    fn unread_count_is_not_capped_by_inbox_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store.send_message("a", Some("b"), None, "one").unwrap();
+        store.send_message("a", Some("b"), None, "two").unwrap();
+        store.send_message("a", Some("b"), None, "three").unwrap();
+
+        let inbox = store.inbox_with_limit("b", dir.path(), true, 2).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(store.unread_count("b", dir.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn mark_messages_read_only_marks_selected_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        let first = store.send_message("a", Some("b"), None, "one").unwrap();
+        let _second = store.send_message("a", Some("b"), None, "two").unwrap();
+
+        let inbox = store.inbox_with_limit("b", dir.path(), false, 2).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(
+            store
+                .mark_messages_read("b", dir.path(), &[first.message_id])
+                .unwrap(),
+            1
+        );
+
+        let remaining = store.inbox_with_limit("b", dir.path(), false, 2).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].body, "two");
+    }
+
+    #[test]
+    fn mark_messages_read_ignores_messages_not_visible_to_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        let message = store.send_message("a", Some("c"), None, "secret").unwrap();
+
+        assert_eq!(
+            store
+                .mark_messages_read("b", dir.path(), &[message.message_id])
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.unread_count("c", dir.path()).unwrap(), 1);
     }
 
     #[test]
@@ -888,6 +1304,12 @@ mod tests {
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let db = dir.path().join("coordination.db");
         let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("a", dir.path(), "model", Some("sender"))
+            .unwrap();
+        store
+            .register_session("b", dir.path(), "model", Some("receiver"))
+            .unwrap();
         store
             .send_message("a", None, Some(dir.path()), "repo")
             .unwrap();
@@ -903,6 +1325,12 @@ mod tests {
         let db = dir.path().join("coordination.db");
         let store = CoordinationStore::open(&db).unwrap();
         store
+            .register_session("b", dir.path(), "model", Some("receiver-b"))
+            .unwrap();
+        store
+            .register_session("c", dir.path(), "model", Some("receiver-c"))
+            .unwrap();
+        store
             .send_message("a", None, Some(dir.path()), "repo")
             .unwrap();
 
@@ -912,20 +1340,380 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_refresh_does_not_erase_existing_metadata() {
+    fn repo_broadcasts_do_not_backfill_to_later_sessions() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
         let db = dir.path().join("coordination.db");
         let store = CoordinationStore::open(&db).unwrap();
         store
+            .register_session("b", dir.path(), "model", Some("early"))
+            .unwrap();
+        store
+            .send_message("a", None, Some(dir.path()), "first")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .register_session("c", dir.path(), "model", Some("late"))
+            .unwrap();
+        store
+            .send_message("a", None, Some(dir.path()), "second")
+            .unwrap();
+
+        let b_messages = store.inbox("b", dir.path(), false).unwrap();
+        let c_messages = store.inbox("c", dir.path(), false).unwrap();
+
+        assert_eq!(
+            b_messages
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(
+            c_messages
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second"]
+        );
+    }
+
+    #[test]
+    fn repo_broadcasts_do_not_backfill_to_stale_reregistered_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("sender", dir.path(), "model", Some("sender"))
+            .unwrap();
+        store
+            .register_session("actor", dir.path(), "model", Some("actor"))
+            .unwrap();
+        let stale_time =
+            (Utc::now() - Duration::minutes(10)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE coord_sessions SET heartbeat_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![stale_time, "actor"],
+            )
+            .unwrap();
+
+        store
+            .send_message("sender", None, Some(dir.path()), "while-stale")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .register_session("actor", dir.path(), "model", Some("actor"))
+            .unwrap();
+
+        assert!(store.inbox("actor", dir.path(), false).unwrap().is_empty());
+        store
+            .send_message("sender", None, Some(dir.path()), "after-return")
+            .unwrap();
+        let messages = store.inbox("actor", dir.path(), false).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after-return"]
+        );
+    }
+
+    #[test]
+    fn repo_broadcast_delivery_uses_repo_join_time_after_repo_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let repo_a = root.path().join("repo-a");
+        let repo_b = root.path().join("repo-b");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        let db = root.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+
+        store
+            .register_session("actor", &repo_a, "model", Some("worker"))
+            .unwrap();
+        store
+            .send_message("sender", None, Some(&repo_b), "old")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .register_session("actor", &repo_b, "model", Some("worker"))
+            .unwrap();
+        store
+            .send_message("sender", None, Some(&repo_b), "new")
+            .unwrap();
+
+        let messages = store.inbox("actor", &repo_b, false).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new"]
+        );
+    }
+
+    #[test]
+    fn heartbeat_refresh_does_not_erase_existing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        let refreshed = store
             .register_session("a", dir.path(), "model-a", Some("title-a"))
             .unwrap();
-        store.register_session("a", dir.path(), "", None).unwrap();
+        assert_eq!(refreshed.model, "model-a");
+        assert_eq!(refreshed.title.as_deref(), Some("title-a"));
+        let refreshed = store.register_session("a", dir.path(), "", None).unwrap();
 
         let sessions = store.list_sessions(Some(dir.path())).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].model, "model-a");
         assert_eq!(sessions[0].title.as_deref(), Some("title-a"));
+        assert_eq!(refreshed.model, "model-a");
+        assert_eq!(refreshed.title.as_deref(), Some("title-a"));
+    }
+
+    #[test]
+    fn session_presence_tracks_parent_actor_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session_with_parent(
+                "parent:agent:child",
+                dir.path(),
+                "model-a",
+                Some("child"),
+                Some("parent"),
+            )
+            .unwrap();
+
+        let sessions = store.list_sessions(Some(dir.path())).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "parent:agent:child");
+        assert_eq!(sessions[0].parent_session_id.as_deref(), Some("parent"));
+    }
+
+    #[test]
+    fn session_registration_clears_stale_parent_actor_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session_with_parent(
+                "actor",
+                dir.path(),
+                "model-a",
+                Some("actor"),
+                Some("old-parent"),
+            )
+            .unwrap();
+
+        let refreshed = store
+            .register_session("actor", dir.path(), "", None)
+            .unwrap();
+
+        assert_eq!(refreshed.parent_session_id, None);
+        assert_eq!(refreshed.model, "model-a");
+        assert_eq!(refreshed.title.as_deref(), Some("actor"));
+        let sessions = store.list_sessions(Some(dir.path())).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].parent_session_id, None);
+    }
+
+    #[test]
+    fn target_resolution_requires_unambiguous_active_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("alpha-111", dir.path(), "model", Some("build"))
+            .unwrap();
+        store
+            .register_session("alpha-222", dir.path(), "model", Some("test"))
+            .unwrap();
+        store
+            .register_session("beta-111", dir.path(), "model", Some("review"))
+            .unwrap();
+
+        match store.resolve_session_target(dir.path(), "alpha").unwrap() {
+            SessionTargetResolution::Ambiguous(candidates) => assert_eq!(candidates.len(), 2),
+            other => panic!("expected ambiguous target, got {other:?}"),
+        }
+        match store.resolve_session_target(dir.path(), "review").unwrap() {
+            SessionTargetResolution::Found(session) => assert_eq!(session.session_id, "beta-111"),
+            other => panic!("expected title match, got {other:?}"),
+        }
+        assert_eq!(
+            store.resolve_session_target(dir.path(), "missing").unwrap(),
+            SessionTargetResolution::NotFound
+        );
+    }
+
+    #[test]
+    fn target_resolution_returns_stale_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("stale-111", dir.path(), "model", Some("review"))
+            .unwrap();
+        let stale_at = (Utc::now() - Duration::seconds(HEARTBEAT_STALE_SECONDS + 10))
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE coord_sessions SET heartbeat_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![stale_at, "stale-111"],
+            )
+            .unwrap();
+
+        match store.resolve_session_target(dir.path(), "stale").unwrap() {
+            SessionTargetResolution::Stale(candidates) => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].session_id, "stale-111");
+            }
+            other => panic!("expected stale candidates, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_resolution_prefers_exact_stale_id_over_active_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        store
+            .register_session("actor-123", dir.path(), "model", Some("old"))
+            .unwrap();
+        let stale_at = (Utc::now() - Duration::seconds(HEARTBEAT_STALE_SECONDS + 10))
+            .to_rfc3339_opts(SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE coord_sessions SET heartbeat_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![stale_at, "actor-123"],
+            )
+            .unwrap();
+        store
+            .register_session("actor-123-child", dir.path(), "model", Some("new"))
+            .unwrap();
+
+        match store
+            .resolve_session_target(dir.path(), "actor-123")
+            .unwrap()
+        {
+            SessionTargetResolution::Stale(candidates) => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].session_id, "actor-123");
+            }
+            other => panic!("expected exact stale target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prune_removes_old_messages_and_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let store = CoordinationStore::open(&db).unwrap();
+        let message = store.send_message("a", Some("b"), None, "old").unwrap();
+        let _ = store.inbox("b", dir.path(), true).unwrap();
+        drop(store);
+
+        let old = (Utc::now() - Duration::days(30)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE coord_messages SET created_at = ?1 WHERE message_id = ?2",
+            rusqlite::params![old, message.message_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = CoordinationStore::open(&db).unwrap();
+        store.prune_stale_coordination().unwrap();
+        assert!(store.inbox("b", dir.path(), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_migrates_legacy_schema_without_message_read_at() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let db = dir.path().join("coordination.db");
+        let now = now_string();
+        let repo_root = canonical_project_root(dir.path())
+            .to_string_lossy()
+            .to_string();
+        let cwd = canonical_path_string(dir.path());
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE coord_sessions (
+                session_id   TEXT PRIMARY KEY,
+                pid          INTEGER NOT NULL,
+                cwd          TEXT NOT NULL,
+                repo_root    TEXT NOT NULL,
+                model        TEXT NOT NULL DEFAULT '',
+                title        TEXT,
+                started_at   TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL
+            );
+            CREATE TABLE coord_messages (
+                message_id       TEXT PRIMARY KEY,
+                from_session_id  TEXT NOT NULL,
+                to_session_id    TEXT,
+                repo_root        TEXT,
+                body             TEXT NOT NULL,
+                created_at       TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coord_sessions
+             (session_id, pid, cwd, repo_root, model, title, started_at, heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            rusqlite::params!["b", 123_i64, cwd, repo_root, "model", "legacy", now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coord_messages
+             (message_id, from_session_id, to_session_id, repo_root, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "message-legacy",
+                "a",
+                "b",
+                Option::<String>::None,
+                "legacy",
+                now
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = CoordinationStore::open(&db).unwrap();
+        let sessions = store.list_sessions(Some(dir.path())).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].parent_session_id, None);
+
+        let unread = store.inbox("b", dir.path(), false).unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].body, "legacy");
+        assert_eq!(unread[0].read_at, None);
+
+        let read = store.inbox("b", dir.path(), true).unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(read[0].read_at.is_some());
+        assert_eq!(store.unread_count("b", dir.path()).unwrap(), 0);
     }
 
     #[test]
@@ -935,5 +1723,8 @@ mod tests {
         assert_ne!(process_id, base);
         assert!(process_id.starts_with(base));
         assert_eq!(process_session_id(&process_id), process_id);
+
+        let child_actor_id = format!("{process_id}:agent:child");
+        assert_eq!(process_session_id(&child_actor_id), child_actor_id);
     }
 }

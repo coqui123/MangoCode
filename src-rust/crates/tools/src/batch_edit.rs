@@ -117,6 +117,15 @@ impl Tool for BatchEditTool {
             Ok(conflicts) => conflicts,
             Err(result) => return result,
         };
+        let _coordination_write_claim = match crate::coordination::begin_transient_write_claim(
+            ctx,
+            self.name(),
+            &conflict_paths,
+            params.confirm_conflicts,
+        ) {
+            Ok(guard) => guard,
+            Err(result) => return result,
+        };
 
         // ----------------------------------------------------------------
         // Phase 1: read all files and validate every edit before writing
@@ -267,6 +276,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "batch-edit-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),

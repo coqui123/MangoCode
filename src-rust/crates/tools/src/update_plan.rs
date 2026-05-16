@@ -215,6 +215,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: session_id.clone(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),
@@ -266,6 +269,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "update-plan-multiple-in-progress-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),

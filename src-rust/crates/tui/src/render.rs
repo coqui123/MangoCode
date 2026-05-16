@@ -2667,6 +2667,23 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // 8b. Update available indicator — shown when a newer version was found.
+        if app.coordination_unread_count > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let label = if app.coordination_unread_count > 99 {
+                "coord 99+".to_string()
+            } else {
+                format!("coord {}", app.coordination_unread_count)
+            };
+            parts.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+
         if let Some(ref version) = app.update_available {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));

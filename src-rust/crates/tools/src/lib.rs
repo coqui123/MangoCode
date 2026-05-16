@@ -13,6 +13,7 @@ use mangocode_tool_runtime::{
     ToolOutputEnvelope, ToolRegistryPlan, ToolSpec,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,9 +41,9 @@ pub mod bash;
 pub mod batch_edit;
 #[cfg(feature = "tool-brief")]
 pub mod brief;
-pub mod browser_tool;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 pub mod browser_antibot;
+pub mod browser_tool;
 #[cfg(feature = "tool-skill")]
 pub mod bundled_skills;
 #[cfg(feature = "tool-computer-use")]
@@ -145,7 +146,8 @@ pub use computer_use::ComputerUseTool;
 pub use config_tool::ConfigTool;
 #[cfg(feature = "tool-coordination")]
 pub use coordination::{
-    ClaimWorkTool, CoordinationMessageTool, CoordinationStatusTool, ReleaseWorkTool,
+    ClaimWorkTool, CoordinationInboxTool, CoordinationMessageTool, CoordinationStatusTool,
+    ReleaseWorkTool,
 };
 #[cfg(feature = "tool-cron-create")]
 pub use cron::CronCreateTool;
@@ -402,6 +404,16 @@ pub struct ToolContext {
     pub cost_tracker: Arc<CostTracker>,
     pub session_metrics: Option<Arc<mangocode_core::analytics::SessionMetrics>>,
     pub session_id: String,
+    /// Optional local coordination actor id. This is distinct from `session_id`
+    /// so sub-agents can be addressable without changing session-scoped state.
+    pub coordination_actor_id: Option<String>,
+    /// Optional parent coordination actor id for actor-tree display and
+    /// targetability. This is separate from `session_id` because session
+    /// lifecycle identity is still shared by nested runtime loops.
+    pub coordination_parent_actor_id: Option<String>,
+    /// Whether tools spawned from this context should allow automatic
+    /// coordination inbox injection in nested query loops.
+    pub inject_coordination_inbox: bool,
     pub file_history: Arc<parking_lot::Mutex<mangocode_core::file_history::FileHistory>>,
     pub current_turn: Arc<AtomicUsize>,
     /// If true, suppress interactive prompts (batch / CI mode).
@@ -413,6 +425,26 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn coordination_actor_id(&self) -> String {
+        let base = self
+            .coordination_actor_id
+            .as_deref()
+            .unwrap_or(&self.session_id);
+        mangocode_core::coordination::process_session_id(base)
+    }
+
+    pub fn coordination_parent_session_id(&self) -> Option<Cow<'_, str>> {
+        if let Some(parent_actor_id) = self.coordination_parent_actor_id.as_deref() {
+            return Some(Cow::Borrowed(parent_actor_id));
+        }
+        if self.coordination_actor_id.is_some() {
+            return Some(Cow::Owned(
+                mangocode_core::coordination::process_session_id(&self.session_id),
+            ));
+        }
+        None
+    }
+
     /// Resolve a potentially relative path against the working directory.
     pub fn resolve_path(&self, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
@@ -663,6 +695,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ConfigTool),
         #[cfg(feature = "tool-coordination")]
         Box::new(CoordinationStatusTool),
+        #[cfg(feature = "tool-coordination")]
+        Box::new(CoordinationInboxTool),
         #[cfg(feature = "tool-coordination")]
         Box::new(ClaimWorkTool),
         #[cfg(feature = "tool-coordination")]
@@ -1083,6 +1117,11 @@ fn is_stateful_or_interactive_tool(name: &str) -> bool {
             | "TaskStop"
             | "Config"
             | "SendMessage"
+            | "CoordinationStatus"
+            | "CoordinationInbox"
+            | "ClaimWork"
+            | "ReleaseWork"
+            | "CoordinationMessage"
             | "Skill"
             | "Agent"
             | "REPL"
@@ -1103,6 +1142,7 @@ fn extract_path_values(input: &Value) -> Vec<String> {
         &[
             "file_path",
             "filepath",
+            "notebook_path",
             "path",
             "paths",
             "old_path",
@@ -1567,6 +1607,21 @@ mod tests {
     }
 
     #[test]
+    fn test_notebook_path_is_reported_as_affected_path() {
+        let capabilities = default_capabilities_for_tool(
+            mangocode_core::constants::TOOL_NAME_NOTEBOOK_EDIT,
+            PermissionLevel::Write,
+            &serde_json::json!({ "notebook_path": "analysis.ipynb" }),
+        );
+
+        assert_eq!(capabilities.affected_paths, vec!["analysis.ipynb"]);
+        assert!(capabilities
+            .approval_keys
+            .iter()
+            .any(|key| { key.kind == "path" && key.value == "analysis.ipynb" }));
+    }
+
+    #[test]
     fn test_mutating_tools_are_not_parallel_safe() {
         #[allow(unused_variables)]
         let tools = all_tools();
@@ -1606,6 +1661,34 @@ mod tests {
             "update_plan",
             &serde_json::json!({ "plan": [] })
         ));
+        #[cfg(feature = "tool-coordination")]
+        {
+            assert!(!tool_supports_parallel(
+                &tools,
+                "CoordinationStatus",
+                &serde_json::json!({ "include_inbox": true, "mark_read": true })
+            ));
+            assert!(!tool_supports_parallel(
+                &tools,
+                "CoordinationInbox",
+                &serde_json::json!({ "mark_read": true })
+            ));
+            assert!(!tool_supports_parallel(
+                &tools,
+                "CoordinationMessage",
+                &serde_json::json!({ "body": "hi", "repo_broadcast": true })
+            ));
+            assert!(!tool_supports_parallel(
+                &tools,
+                "ClaimWork",
+                &serde_json::json!({ "scope": "src" })
+            ));
+            assert!(!tool_supports_parallel(
+                &tools,
+                "ReleaseWork",
+                &serde_json::json!({})
+            ));
+        }
     }
 
     #[test]
@@ -1726,6 +1809,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),
@@ -1755,6 +1841,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),
@@ -1767,6 +1856,46 @@ mod tests {
         // Relative paths get joined with working_dir
         let resolved = ctx.resolve_path("src/main.rs");
         assert_eq!(resolved, PathBuf::from("/workspace/src/main.rs"));
+    }
+
+    #[test]
+    fn test_coordination_parent_fallback_uses_registered_actor_identity() {
+        use mangocode_core::config::Config;
+        use mangocode_core::permissions::AutoPermissionHandler;
+
+        let handler = Arc::new(AutoPermissionHandler {
+            mode: mangocode_core::config::PermissionMode::Default,
+        });
+        let mut ctx = ToolContext {
+            working_dir: PathBuf::from("/workspace"),
+            permission_mode: mangocode_core::config::PermissionMode::Default,
+            permission_handler: handler,
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "parent-session".to_string(),
+            coordination_actor_id: Some("child-actor".to_string()),
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
+            file_history: Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: Config::default(),
+        };
+
+        let expected_parent = mangocode_core::coordination::process_session_id("parent-session");
+        assert_eq!(
+            ctx.coordination_parent_session_id().as_deref(),
+            Some(expected_parent.as_str())
+        );
+
+        ctx.coordination_parent_actor_id = Some("explicit-parent".to_string());
+        assert_eq!(
+            ctx.coordination_parent_session_id().as_deref(),
+            Some("explicit-parent")
+        );
     }
 
     // ---- PermissionLevel tests ---------------------------------------------

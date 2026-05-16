@@ -92,6 +92,9 @@ fn test_tool_ctx(provider: &str) -> ToolContext {
         cost_tracker: CostTracker::new(),
         session_metrics: None,
         session_id: "test-session".to_string(),
+        coordination_actor_id: None,
+        coordination_parent_actor_id: None,
+        inject_coordination_inbox: true,
         file_history: std::sync::Arc::new(parking_lot::Mutex::new(
             mangocode_core::file_history::FileHistory::new(),
         )),

@@ -714,6 +714,8 @@ pub struct App {
     pub session_title: Option<String>,
     /// Stable local session id used for session-scoped artifacts.
     pub session_id: Option<String>,
+    /// Unread peer coordination messages for the current local actor.
+    pub coordination_unread_count: usize,
     /// Remote session URL (set when bridge connects; readable by commands).
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
@@ -1186,6 +1188,7 @@ impl App {
             plugin_hints: Vec::new(),
             session_title: None,
             session_id: None,
+            coordination_unread_count: 0,
             remote_session_url: None,
             mcp_manager: None,
             pending_mcp_reconnect: false,
@@ -2969,6 +2972,25 @@ impl App {
         self.command_palette
             .set_items(command_palette_items(&self.prompt_slash_commands));
         self.refresh_prompt_input();
+    }
+
+    fn refresh_coordination_inbox_badge(&mut self) {
+        let Some(session_id) = self.session_id.as_deref() else {
+            self.coordination_unread_count = 0;
+            return;
+        };
+        let cwd = self
+            .config
+            .project_dir
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let Ok(store) = mangocode_core::coordination::CoordinationStore::open_default() else {
+            self.coordination_unread_count = 0;
+            return;
+        };
+        let actor_id = mangocode_core::coordination::process_session_id(session_id);
+        self.coordination_unread_count = store.unread_count(&actor_id, &cwd).unwrap_or(0);
     }
 
     fn prompt_has_active_suggestions(&self) -> bool {
@@ -6087,6 +6109,9 @@ impl App {
             // Expire old notifications
             self.notifications.tick();
             self.memory_update_notification.tick();
+            if self.frame_count % 30 == 1 {
+                self.refresh_coordination_inbox_badge();
+            }
 
             // Drain background model-fetch results (non-blocking).
             if let Some(ref mut rx) = self.model_fetch_rx {

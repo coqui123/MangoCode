@@ -192,6 +192,16 @@ fn task_slug(description: &str) -> String {
         .collect()
 }
 
+fn subagent_actor_id(parent_actor_id: &str, agent_id: &str, description: &str) -> String {
+    let short_agent = agent_id.get(..8).unwrap_or(agent_id);
+    let slug = task_slug(description);
+    if slug.is_empty() {
+        format!("{parent_actor_id}:agent:{short_agent}")
+    } else {
+        format!("{parent_actor_id}:agent:{short_agent}:{slug}")
+    }
+}
+
 async fn remove_worktree(git_root: &Path, worktree_dir: &Path) {
     let _ = tokio::process::Command::new("git")
         .args([
@@ -382,12 +392,30 @@ fn build_subagent_context(
     parent_ctx: &ToolContext,
     agent_tools: &[Box<dyn Tool>],
     working_dir: PathBuf,
+    coordination_actor_id: String,
 ) -> ToolContext {
     let mut agent_ctx = parent_ctx.clone();
     agent_ctx.working_dir = working_dir;
+    agent_ctx.coordination_parent_actor_id = Some(parent_ctx.coordination_actor_id());
+    agent_ctx.coordination_actor_id = Some(coordination_actor_id);
     agent_ctx.config.project_dir = Some(agent_ctx.working_dir.clone());
     mangocode_tools::sync_tool_context_to_available_tools(&mut agent_ctx, agent_tools);
     agent_ctx
+}
+
+fn spawn_subagent_presence_heartbeat(
+    ctx: &ToolContext,
+    model: &str,
+    title: Option<String>,
+) -> mangocode_core::coordination::PresenceHeartbeat {
+    mangocode_core::coordination::spawn_presence_heartbeat_with_parent(
+        ctx.coordination_actor_id(),
+        ctx.working_dir.clone(),
+        model.to_string(),
+        title,
+        ctx.coordination_parent_session_id()
+            .map(|parent| parent.into_owned()),
+    )
 }
 
 #[async_trait]
@@ -589,7 +617,13 @@ impl Tool for AgentTool {
             _ => (ctx.working_dir.display().to_string(), None, None, None),
         };
 
-        let agent_ctx = build_subagent_context(ctx, &agent_tools, PathBuf::from(&working_dir_str));
+        let parent_actor_id = ctx.coordination_actor_id();
+        let agent_ctx = build_subagent_context(
+            ctx,
+            &agent_tools,
+            PathBuf::from(&working_dir_str),
+            subagent_actor_id(&parent_actor_id, &agent_id, &params.description),
+        );
 
         let skill_index =
             std::sync::Arc::new(tokio::sync::RwLock::new(crate::SkillIndex::default()));
@@ -636,6 +670,15 @@ impl Tool for AgentTool {
             skills: agent_ctx.config.skills.clone(),
             injected_skills: Vec::new(),
             skill_qa_blocks: Vec::new(),
+            agent_mode: match effective_mode {
+                AgentExecMode::Worktree => crate::coordinator::AgentMode::WorktreeWorker,
+                AgentExecMode::Fork | AgentExecMode::Teammate => {
+                    crate::coordinator::AgentMode::Worker
+                }
+            },
+            // Direct Tool::execute callers do not carry an active parent
+            // QueryConfig, so fail closed for background maintenance paths.
+            inject_coordination_inbox: false,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -660,6 +703,11 @@ impl Tool for AgentTool {
         // -----------------------------------------------------------------------
         let mut messages = vec![Message::user(params.prompt)];
         let cancel = CancellationToken::new();
+        let _coordination_heartbeat = spawn_subagent_presence_heartbeat(
+            &agent_ctx,
+            &query_config.model,
+            Some(params.description.clone()),
+        );
 
         let outcome = run_query_loop(
             client.as_ref(),
@@ -810,6 +858,11 @@ fn spawn_background_agent(spec: BackgroundAgentSpec) -> ToolResult {
     let agent_id_for_log = agent_id.clone();
 
     tokio::spawn(async move {
+        let _coordination_heartbeat = spawn_subagent_presence_heartbeat(
+            &ctx_bg,
+            &config_bg.model,
+            Some(description_for_log.clone()),
+        );
         let cancel = CancellationToken::new();
         let mut messages = vec![Message::user(prompt)];
         let outcome = run_query_loop(
@@ -1045,7 +1098,13 @@ pub async fn execute_with_runtime(
         }
     };
 
-    let agent_ctx = build_subagent_context(ctx, &agent_tools, PathBuf::from(&working_dir_str));
+    let parent_actor_id = ctx.coordination_actor_id();
+    let agent_ctx = build_subagent_context(
+        ctx,
+        &agent_tools,
+        PathBuf::from(&working_dir_str),
+        subagent_actor_id(&parent_actor_id, &agent_id, &params.description),
+    );
 
     let mut query_config = parent_query_config.clone();
     query_config.model = model;
@@ -1062,6 +1121,10 @@ pub async fn execute_with_runtime(
     query_config.oauth_provider =
         crate::oauth_provider_for_config_and_model(&agent_ctx.config, &query_config.model);
     query_config.is_non_interactive = agent_ctx.non_interactive;
+    query_config.agent_mode = match effective_mode {
+        AgentExecMode::Worktree => crate::coordinator::AgentMode::WorktreeWorker,
+        AgentExecMode::Fork | AgentExecMode::Teammate => crate::coordinator::AgentMode::Worker,
+    };
     query_config.has_append_system_prompt = query_config.has_append_system_prompt
         || query_config
             .append_system_prompt
@@ -1146,6 +1209,11 @@ pub async fn execute_with_runtime(
     };
 
     let cancel = CancellationToken::new();
+    let _coordination_heartbeat = spawn_subagent_presence_heartbeat(
+        &agent_ctx,
+        &query_config.model,
+        Some(params.description.clone()),
+    );
 
     let outcome = run_query_loop(
         runtime_client,
@@ -1398,10 +1466,16 @@ pub fn init_team_swarm_runner() {
                     build_provider_and_model_registries(&ctx, credential, use_bearer_auth);
 
                 let agent_tools = build_subagent_tools(&ctx, tools.as_deref());
+                let parent_actor_id = ctx.coordination_actor_id();
                 let agent_ctx = Arc::new(build_subagent_context(
                     ctx.as_ref(),
                     &agent_tools,
                     ctx.working_dir.clone(),
+                    subagent_actor_id(
+                        &parent_actor_id,
+                        &uuid::Uuid::new_v4().to_string(),
+                        &description,
+                    ),
                 ));
 
                 let model = mangocode_api::effective_model_for_config(
@@ -1432,11 +1506,18 @@ pub fn init_team_swarm_runner() {
                     is_non_interactive: agent_ctx.non_interactive,
                     has_append_system_prompt: false,
                     skills: agent_ctx.config.skills.clone(),
+                    agent_mode: crate::coordinator::AgentMode::Worker,
+                    inject_coordination_inbox: ctx.inject_coordination_inbox,
                     ..Default::default()
                 };
 
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let mut messages = vec![mangocode_core::types::Message::user(prompt)];
+                let _coordination_heartbeat = spawn_subagent_presence_heartbeat(
+                    &agent_ctx,
+                    &query_config.model,
+                    Some(description.clone()),
+                );
                 let outcome = crate::run_query_loop(
                     client.as_ref(),
                     &mut messages,
@@ -1497,6 +1578,17 @@ mod tests {
     ))]
     use super::build_subagent_tools;
     use super::normalize_model_override;
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-agent",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
+    use super::subagent_actor_id;
     #[cfg(any(
         feature = "default-tools",
         feature = "default-tools-no-web-research",
@@ -1569,6 +1661,9 @@ mod tests {
             cost_tracker: mangocode_core::cost::CostTracker::new(),
             session_metrics: None,
             session_id: "agent-tool-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
             file_history: Arc::new(parking_lot::Mutex::new(
                 mangocode_core::file_history::FileHistory::new(),
             )),
@@ -1642,20 +1737,49 @@ mod tests {
     ))]
     #[test]
     fn subagent_context_matches_runtime_tools_and_working_directory() {
-        let parent_ctx = test_context();
+        let mut parent_ctx = test_context();
+        parent_ctx.coordination_actor_id = Some("parent-coordinator".to_string());
+        let parent_actor = parent_ctx.coordination_actor_id();
         let allowed = vec!["Read".to_string(), "ToolSearch".to_string()];
         let tools = build_subagent_tools(&parent_ctx, Some(&allowed));
+        let child_actor_id = subagent_actor_id(&parent_actor, "1234567890abcdef", "Child Review");
 
-        let agent_ctx =
-            build_subagent_context(&parent_ctx, &tools, PathBuf::from("agent-worktree"));
+        let agent_ctx = build_subagent_context(
+            &parent_ctx,
+            &tools,
+            PathBuf::from("agent-worktree"),
+            child_actor_id.clone(),
+        );
 
         assert_eq!(agent_ctx.working_dir, PathBuf::from("agent-worktree"));
+        assert_eq!(
+            agent_ctx.coordination_actor_id.as_deref(),
+            Some(child_actor_id.as_str())
+        );
+        assert_eq!(agent_ctx.coordination_actor_id(), child_actor_id);
+        assert!(child_actor_id.starts_with(&format!("{parent_actor}:agent:12345678")));
+        assert_eq!(
+            agent_ctx.coordination_parent_session_id().as_deref(),
+            Some(parent_actor.as_str())
+        );
         assert_eq!(
             agent_ctx.config.project_dir,
             Some(PathBuf::from("agent-worktree"))
         );
         assert_eq!(agent_ctx.config.allowed_tools, vec!["Read", "ToolSearch"]);
         assert!(agent_ctx.config.disallowed_tools.is_empty());
+
+        let child_actor = agent_ctx.coordination_actor_id();
+        let nested_ctx = build_subagent_context(
+            &agent_ctx,
+            &tools,
+            PathBuf::from("nested-worktree"),
+            "agent-tool-test:agent:nested".to_string(),
+        );
+        assert_eq!(
+            nested_ctx.coordination_parent_session_id().as_deref(),
+            Some(child_actor.as_str())
+        );
     }
 
     #[test]

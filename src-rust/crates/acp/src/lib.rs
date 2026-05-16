@@ -602,6 +602,7 @@ struct QueryRuntime {
     tool_ctx: ToolContext,
     query_config: mangocode_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
+    _coordination_heartbeat: mangocode_core::coordination::PresenceHeartbeat,
 }
 
 async fn build_runtime(
@@ -655,6 +656,9 @@ async fn build_runtime(
         cost_tracker: cost_tracker.clone(),
         session_metrics: Some(mangocode_core::analytics::SessionMetrics::new()),
         session_id: session_id.to_string(),
+        coordination_actor_id: None,
+        coordination_parent_actor_id: None,
+        inject_coordination_inbox: true,
         file_history: Arc::new(ParkingMutex::new(FileHistory::new())),
         current_turn,
         non_interactive: false,
@@ -675,6 +679,12 @@ async fn build_runtime(
     query_config.provider_registry = Some(provider_registry);
     query_config.model_registry = Some(Arc::new(model_registry));
     query_config.working_directory = Some(cwd.display().to_string());
+    let coordination_heartbeat = mangocode_core::coordination::spawn_presence_heartbeat(
+        mangocode_core::coordination::process_session_id(session_id),
+        cwd.to_path_buf(),
+        query_config.model.clone(),
+        None,
+    );
 
     Ok(QueryRuntime {
         client,
@@ -682,6 +692,7 @@ async fn build_runtime(
         tool_ctx,
         query_config,
         cost_tracker,
+        _coordination_heartbeat: coordination_heartbeat,
     })
 }
 

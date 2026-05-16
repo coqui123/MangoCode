@@ -1,10 +1,8 @@
-// SendMessageTool: send a message to another agent or broadcast to all.
+// SendMessageTool: compatibility wrapper for agent/session messaging.
 //
-// Uses a simple in-process DashMap inbox that works for sub-agents spawned
-// via AgentTool.
-//
-// Messages are stored keyed by recipient name. Other agents can check
-// their inbox by calling drain_inbox() or peek_inbox().
+// SQLite coordination is the canonical cross-process delivery path. The
+// in-process inbox below remains only for older local callers that directly use
+// drain_inbox() / peek_inbox().
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -26,7 +24,7 @@ pub struct AgentMessage {
     pub timestamp: u64,
 }
 
-/// Global inbox: recipient_id → queued messages.
+/// Global inbox: recipient_id -> queued messages.
 static INBOX: Lazy<DashMap<String, Vec<AgentMessage>>> = Lazy::new(DashMap::new);
 
 /// Remove and return all messages queued for `recipient`.
@@ -47,7 +45,7 @@ pub struct SendMessageTool;
 
 #[derive(Debug, Deserialize)]
 struct SendMessageInput {
-    /// Recipient name, or "*" for broadcast.
+    /// Recipient actor target, or "*" for broadcast.
     to: String,
     /// Message body.
     message: String,
@@ -63,9 +61,9 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to another agent by name, or broadcast to all active agents with to=\"*\". \
-         Recipients accumulate messages in their inbox and can retrieve them. \
-         Use this for coordination between concurrent sub-agents."
+        "Compatibility wrapper for sending a local coordination message. Use to=\"*\" to broadcast \
+         to active MangoCode actors in this repo, or provide an exact/unique actor id or title for \
+         a direct message. Recipients read messages through CoordinationInbox."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -78,7 +76,7 @@ impl Tool for SendMessageTool {
             "properties": {
                 "to": {
                     "type": "string",
-                    "description": "Recipient agent name or session ID. Use \"*\" to broadcast to all."
+                    "description": "Recipient actor id, unique actor-id prefix, or title. Use \"*\" for a repo broadcast to active local MangoCode actors."
                 },
                 "message": {
                     "type": "string",
@@ -86,7 +84,7 @@ impl Tool for SendMessageTool {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "5–10 word preview for the UI (optional)"
+                    "description": "5-10 word preview for the UI (optional)"
                 }
             },
             "required": ["to", "message"]
@@ -109,7 +107,7 @@ impl Tool for SendMessageTool {
             .unwrap_or(0);
 
         let msg = AgentMessage {
-            from: ctx.session_id.clone(),
+            from: ctx.coordination_actor_id(),
             to: params.to.clone(),
             content: params.message.clone(),
             timestamp: now,
@@ -121,18 +119,17 @@ impl Tool for SendMessageTool {
         });
 
         if params.to == "*" {
-            if let Ok(store) = mangocode_core::coordination::CoordinationStore::open_default() {
-                let session_id = mangocode_core::coordination::process_session_id(&ctx.session_id);
-                let _ = store.register_session(&session_id, &ctx.working_dir, "", None);
-                let _ =
-                    store.send_message(&session_id, None, Some(&ctx.working_dir), &params.message);
+            if let Err(result) =
+                crate::coordination::send_coordination_message(ctx, &params.message, None, true)
+            {
+                return result;
             }
             // Broadcast: deliver to every existing inbox key
             let recipients: Vec<String> = INBOX.iter().map(|e| e.key().clone()).collect();
 
             if recipients.is_empty() {
                 return ToolResult::success(
-                    "Broadcast queued for local MangoCode sessions.".to_string(),
+                    "Broadcast queued for active local MangoCode actors in this repo.".to_string(),
                 );
             }
 
@@ -141,19 +138,26 @@ impl Tool for SendMessageTool {
             }
 
             return ToolResult::success(format!(
-                "Broadcast to {} agent(s): {}",
+                "Broadcast queued for active local MangoCode actors; also delivered to {} legacy in-process recipient(s): {}",
                 recipients.len(),
                 preview
             ));
         }
 
-        // Directed message
-        INBOX.entry(params.to.clone()).or_default().push(msg);
-        if let Ok(store) = mangocode_core::coordination::CoordinationStore::open_default() {
-            let session_id = mangocode_core::coordination::process_session_id(&ctx.session_id);
-            let _ = store.register_session(&session_id, &ctx.working_dir, "", None);
-            let _ = store.send_message(&session_id, Some(&params.to), None, &params.message);
-        }
+        let message = match crate::coordination::send_coordination_message(
+            ctx,
+            &params.message,
+            Some(&params.to),
+            false,
+        ) {
+            Ok(message) => message,
+            Err(result) => return result,
+        };
+        // Directed message compatibility path after canonical delivery accepts it.
+        let legacy_recipient = message.to_session_id.unwrap_or_else(|| params.to.clone());
+        let mut legacy_msg = msg;
+        legacy_msg.to = legacy_recipient.clone();
+        INBOX.entry(legacy_recipient).or_default().push(legacy_msg);
 
         ToolResult::success(format!("Message sent to '{}': {}", params.to, preview))
     }

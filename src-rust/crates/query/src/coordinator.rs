@@ -148,8 +148,8 @@ impl Default for ScratchpadGate {
 
 /// Filter a tool list so only tools appropriate for `mode` are included.
 ///
-/// - `AgentMode::Coordinator`: retains all tools from the already-built
-///   runtime-visible tool list.
+/// - `AgentMode::Coordinator`: retains orchestration tools while removing
+///   tools that the coordinator should delegate to workers.
 /// - `AgentMode::Worker`: COORDINATOR_ONLY_TOOLS are removed.
 /// - `AgentMode::Normal`: no filtering.
 ///   Tools that WorktreeWorker is additionally allowed to use on top of Worker tools.
@@ -159,22 +159,22 @@ pub fn filter_tools_for_mode(
     tools: &[Box<dyn mangocode_tools::Tool>],
     mode: AgentMode,
 ) -> Vec<&dyn mangocode_tools::Tool> {
+    tools
+        .iter()
+        .filter(|tool| tool_allowed_for_mode(tool.name(), mode))
+        .map(|t| t.as_ref())
+        .collect()
+}
+
+pub fn tool_allowed_for_mode(tool_name: &str, mode: AgentMode) -> bool {
     match mode {
-        AgentMode::Coordinator | AgentMode::Normal => tools.iter().map(|t| t.as_ref()).collect(),
-        AgentMode::Worker => tools
-            .iter()
-            .filter(|t| !COORDINATOR_ONLY_TOOLS.contains(&t.name()))
-            .map(|t| t.as_ref())
-            .collect(),
-        AgentMode::WorktreeWorker => tools
-            .iter()
-            .filter(|t| {
-                let name = t.name();
-                // Allow everything a Worker can use, plus worktree tools.
-                !COORDINATOR_ONLY_TOOLS.contains(&name) || WORKTREE_EXTRA_TOOLS.contains(&name)
-            })
-            .map(|t| t.as_ref())
-            .collect(),
+        AgentMode::Normal => true,
+        AgentMode::Coordinator => !COORDINATOR_BANNED_TOOLS.contains(&tool_name),
+        AgentMode::Worker => !COORDINATOR_ONLY_TOOLS.contains(&tool_name),
+        AgentMode::WorktreeWorker => {
+            !COORDINATOR_ONLY_TOOLS.contains(&tool_name)
+                || WORKTREE_EXTRA_TOOLS.contains(&tool_name)
+        }
     }
 }
 
@@ -460,6 +460,15 @@ mod tests {
         assert_ne!(AgentMode::Coordinator, AgentMode::Worker);
         assert_ne!(AgentMode::Worker, AgentMode::Normal);
         assert_eq!(AgentMode::Coordinator, AgentMode::Coordinator);
+    }
+
+    #[test]
+    fn test_tool_allowed_for_mode_separates_coordinator_and_worker_tools() {
+        assert!(!tool_allowed_for_mode("Bash", AgentMode::Coordinator));
+        assert!(tool_allowed_for_mode("Agent", AgentMode::Coordinator));
+        assert!(!tool_allowed_for_mode("Agent", AgentMode::Worker));
+        assert!(tool_allowed_for_mode("Read", AgentMode::Worker));
+        assert!(tool_allowed_for_mode("Bash", AgentMode::Normal));
     }
 
     #[test]
