@@ -1423,7 +1423,7 @@ fn kb_line<'a>(key: &str, desc: &str) -> Line<'a> {
 // Global Search Dialog (T2-7)
 // ---------------------------------------------------------------------------
 
-/// State for the global ripgrep search dialog.
+/// State for the global code search dialog.
 #[derive(Debug, Clone, Default)]
 pub struct GlobalSearchState {
     pub open: bool,
@@ -1434,7 +1434,7 @@ pub struct GlobalSearchState {
     pub searching: bool,
 }
 
-/// A single search result from ripgrep.
+/// A single global search result.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
     pub file: String,
@@ -1479,13 +1479,33 @@ impl GlobalSearchState {
         self.selected = 0;
     }
 
-    /// Run ripgrep synchronously (should be called from tokio::task::spawn_blocking).
+    /// Run code-aware chunk search first, then fall back to ripgrep-style exact matching.
     pub fn run_search(&mut self, project_root: &std::path::Path) {
         if self.query.is_empty() {
             self.results.clear();
             return;
         }
         self.searching = true;
+        self.results.clear();
+        self.total_matches = 0;
+
+        if let Ok(mut index) =
+            mangocode_file_search::FileSearchIndex::build_limited(project_root, 20_000)
+        {
+            index.add_code_chunks(2_000, 512 * 1024);
+            for hit in index.search_code(&self.query, 200) {
+                self.results.push(SearchResult {
+                    file: hit.chunk.relative_path,
+                    line: hit.chunk.start_line as u32,
+                    col: 0,
+                    text: first_non_empty_line(&hit.chunk.content),
+                    context_before: Vec::new(),
+                    context_after: Vec::new(),
+                });
+                self.total_matches += 1;
+            }
+        }
+
         let output = std::process::Command::new("rg")
             .args([
                 "--json",
@@ -1500,9 +1520,6 @@ impl GlobalSearchState {
             .output();
 
         self.searching = false;
-        self.results.clear();
-        self.total_matches = 0;
-
         if let Ok(out) = output {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
@@ -1516,6 +1533,13 @@ impl GlobalSearchState {
                             .trim_end_matches('\n')
                             .to_string();
                         let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
+                        if self
+                            .results
+                            .iter()
+                            .any(|result| result.file == file && result.line == line_no)
+                        {
+                            continue;
+                        }
                         self.results.push(SearchResult {
                             file,
                             line: line_no,
@@ -1540,6 +1564,15 @@ impl GlobalSearchState {
             .get(self.selected)
             .map(|r| format!("{}:{}", r.file, r.line))
     }
+}
+
+fn first_non_empty_line(content: &str) -> String {
+    content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// Render the global search dialog overlay.

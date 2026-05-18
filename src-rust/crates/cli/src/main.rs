@@ -1039,6 +1039,8 @@ mod tests {
         let filtered = filter_tools_for_agent(tools, "search-only");
 
         assert!(filtered.iter().any(|tool| tool.name() == "ToolSearch"));
+        #[cfg(feature = "tool-grep")]
+        assert!(filtered.iter().any(|tool| tool.name() == "CodeSearch"));
         assert!(filtered.iter().any(|tool| tool.name() == "Grep"));
         assert!(!filtered.iter().any(|tool| tool.name() == "Write"));
     }
@@ -2526,7 +2528,7 @@ fn build_tools_with_mcp(
 /// Filter the tool list based on the agent's access level.
 /// - "full"        -> runtime-visible tools allowed (no extra agent filtering)
 /// - "read-only"   -> ReadOnly tools, read-oriented Network tools, non-mutating None tools, and safe interactive helpers
-/// - "search-only" -> only Grep, Glob, Read, WebSearch, WebFetch, and ToolSearch tools
+/// - "search-only" -> only code/file/web search, Read, and ToolSearch tools
 fn filter_tools_for_agent(
     tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
     access: &str,
@@ -2643,6 +2645,7 @@ fn network_tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) ->
 
 fn tool_allowed_for_search_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
     const SEARCH_TOOLS: &[&str] = &[
+        mangocode_core::constants::TOOL_NAME_CODE_SEARCH,
         mangocode_core::constants::TOOL_NAME_GREP,
         mangocode_core::constants::TOOL_NAME_GLOB,
         mangocode_core::constants::TOOL_NAME_FILE_READ,

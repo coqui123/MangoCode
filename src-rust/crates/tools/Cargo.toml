@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 mangocode-core = { workspace = true }
 mangocode-api = { workspace = true }
+mangocode-file-search = { workspace = true }
 mangocode-mcp = { workspace = true }
 mangocode-plugins = { workspace = true }
 mangocode-tool-runtime = { workspace = true }

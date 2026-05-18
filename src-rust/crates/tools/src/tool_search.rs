@@ -355,6 +355,19 @@ mod tests {
         assert!(result.content.contains("session visibility config"));
     }
 
+    #[cfg(feature = "tool-grep")]
+    #[tokio::test]
+    async fn select_finds_code_search_tool() {
+        let ctx = test_context();
+        let result = ToolSearchTool
+            .execute(json!({ "query": "select:CodeSearch" }), &ctx)
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("CodeSearch [built-in]"));
+        assert!(result.content.contains("Search code by natural-language"));
+    }
+
     #[cfg(all(
         feature = "tool-apply-patch",
         feature = "tool-bash",

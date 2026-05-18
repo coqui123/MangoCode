@@ -1810,6 +1810,7 @@ pub mod constants {
     pub const TOOL_NAME_FILE_WRITE: &str = "Write";
     pub const TOOL_NAME_GLOB: &str = "Glob";
     pub const TOOL_NAME_GREP: &str = "Grep";
+    pub const TOOL_NAME_CODE_SEARCH: &str = "CodeSearch";
     pub const TOOL_NAME_AGENT: &str = "Agent";
     pub const TOOL_NAME_WEB_FETCH: &str = "WebFetch";
     pub const TOOL_NAME_WEB_SEARCH: &str = "WebSearch";

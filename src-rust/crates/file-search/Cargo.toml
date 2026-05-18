@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 glob = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 walkdir = { workspace = true }
 

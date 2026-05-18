@@ -3479,6 +3479,7 @@ name = "mangocode-file-search"
 version = "0.0.7"
 dependencies = [
  "glob",
+ "regex",
  "serde",
  "tempfile",
  "walkdir",
@@ -3609,6 +3610,7 @@ dependencies = [
  "image",
  "mangocode-api",
  "mangocode-core",
+ "mangocode-file-search",
  "mangocode-mcp",
  "mangocode-plugins",
  "mangocode-tool-runtime",

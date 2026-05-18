@@ -46,6 +46,8 @@ pub mod browser_antibot;
 pub mod browser_tool;
 #[cfg(feature = "tool-skill")]
 pub mod bundled_skills;
+#[cfg(feature = "tool-grep")]
+pub mod code_search_tool;
 #[cfg(feature = "tool-computer-use")]
 pub mod computer_use;
 #[cfg(feature = "tool-config")]
@@ -140,6 +142,8 @@ pub use batch_edit::BatchEditTool;
 pub use brief::BriefTool;
 #[cfg(feature = "tool-browser")]
 pub use browser_tool::BrowserTool;
+#[cfg(feature = "tool-grep")]
+pub use code_search_tool::CodeSearchTool;
 #[cfg(feature = "tool-computer-use")]
 pub use computer_use::ComputerUseTool;
 #[cfg(feature = "tool-config")]
@@ -629,6 +633,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(GlobTool),
         #[cfg(feature = "tool-grep")]
         Box::new(GrepTool),
+        #[cfg(feature = "tool-grep")]
+        Box::new(CodeSearchTool),
         #[cfg(feature = "tool-web-fetch")]
         Box::new(WebFetchTool),
         #[cfg(feature = "tool-web-search")]
@@ -1700,6 +1706,7 @@ mod tests {
             ("Write", cfg!(feature = "tool-write")),
             ("Glob", cfg!(feature = "tool-glob")),
             ("Grep", cfg!(feature = "tool-grep")),
+            ("CodeSearch", cfg!(feature = "tool-grep")),
             ("TodoWrite", cfg!(feature = "tool-todo-write")),
             ("update_plan", cfg!(feature = "tool-update-plan")),
             ("get_goal", cfg!(feature = "tool-get-goal")),
