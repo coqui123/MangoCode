@@ -90,6 +90,8 @@ pub mod output_reducers;
 #[cfg(feature = "tool-powershell")]
 pub mod powershell;
 pub mod pr_watch;
+#[cfg(feature = "tool-project-graph")]
+pub mod project_graph;
 #[cfg(feature = "tool-bash")]
 pub mod pty_bash;
 #[cfg(feature = "tool-remote-trigger")]
@@ -198,6 +200,8 @@ pub use powershell::PowerShellTool;
 pub use pr_watch::heartbeat_scan_watched_prs;
 #[cfg(feature = "tool-pr-watch")]
 pub use pr_watch::PrWatchTool;
+#[cfg(feature = "tool-project-graph")]
+pub use project_graph::ProjectGraphTool;
 #[cfg(feature = "tool-bash")]
 pub use pty_bash::PtyBashTool;
 #[cfg(feature = "tool-remote-trigger")]
@@ -695,6 +699,8 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ReadMcpResourceTool),
         #[cfg(feature = "tool-tool-search")]
         Box::new(ToolSearchTool),
+        #[cfg(feature = "tool-project-graph")]
+        Box::new(ProjectGraphTool),
         #[cfg(feature = "tool-brief")]
         Box::new(BriefTool),
         #[cfg(feature = "tool-config")]
@@ -837,7 +843,10 @@ impl Tool for McpToolWrapper {
 
         match self.manager.call_tool(&self.manager_tool_name, args).await {
             Ok(result) => {
-                let text = mangocode_mcp::mcp_result_to_string(&result);
+                let text = mangocode_core::system_prompt::wrap_untrusted_content(
+                    "mcp_tool_result",
+                    mangocode_mcp::mcp_result_to_string(&result),
+                );
                 if result.is_error {
                     ToolResult::error(text)
                 } else {
@@ -1306,6 +1315,7 @@ mod tests {
             || cfg!(feature = "tool-todo-write")
             || cfg!(feature = "tool-tool-log-read")
             || cfg!(feature = "tool-tool-search")
+            || cfg!(feature = "tool-project-graph")
             || cfg!(feature = "tool-update-goal")
             || cfg!(feature = "tool-view-image")
             || cfg!(feature = "tool-web-fetch")

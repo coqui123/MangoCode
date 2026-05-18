@@ -41,7 +41,8 @@ pub fn has_top_level_return(expression: &str) -> bool {
                     }
                     _ => {}
                 }
-                if i + 6 <= n && &expression[i..i + 6] == "return"
+                if i + 6 <= n
+                    && &expression[i..i + 6] == "return"
                     && !is_word_char(expression.as_bytes().get(i.wrapping_sub(1)).copied())
                     && !is_word_char(expression.as_bytes().get(i + 6).copied())
                 {

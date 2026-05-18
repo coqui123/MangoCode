@@ -9,11 +9,11 @@ use std::borrow::Cow;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 use chromiumoxide::browser::BrowserConfig;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
-use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 use chromiumoxide::cdp::browser_protocol::network::SetUserAgentOverrideParams;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
-use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 use chromiumoxide::layout::Point;
 
@@ -306,7 +306,9 @@ impl BrowserSession {
         .await
         {
             Ok(Ok(_)) => tracing::debug!("challenge click: navigation resolved"),
-            Ok(Err(e)) => tracing::debug!(error = %e, "challenge click: wait_for_navigation error (ignored)"),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "challenge click: wait_for_navigation error (ignored)")
+            }
             Err(_) => tracing::debug!("challenge click: navigation wait timed out"),
         }
     }
@@ -318,15 +320,14 @@ impl BrowserSession {
         .await;
     }
 
-    async fn attach_expert_hook_on_new_documents(
-        page: &chromiumoxide::Page,
-    ) -> Result<(), String> {
+    async fn attach_expert_hook_on_new_documents(page: &chromiumoxide::Page) -> Result<(), String> {
         if !crate::browser_antibot::browser_expert_env_enabled() {
             return Ok(());
         }
         let _ = page
             .evaluate_on_new_document(AddScriptToEvaluateOnNewDocumentParams::new(
-                crate::browser_antibot::expert_script::FORCE_OPEN_SHADOW_ON_NEW_DOCUMENT.to_string(),
+                crate::browser_antibot::expert_script::FORCE_OPEN_SHADOW_ON_NEW_DOCUMENT
+                    .to_string(),
             ))
             .await
             .map_err(|e| format!("Expert shadow hook failed: {}", e))?;
@@ -339,9 +340,7 @@ impl BrowserSession {
             .unwrap_or(false)
         {
             let _ = page.evaluate("void 0").await;
-            let _ = page
-                .execute(InsertTextParams::new("thisisunsafe"))
-                .await;
+            let _ = page.execute(InsertTextParams::new("thisisunsafe")).await;
         }
     }
 
@@ -351,8 +350,9 @@ impl BrowserSession {
         };
         if ua.contains("Headless") {
             let clean = ua.replace("Headless", "");
-            if let Ok(params) =
-                SetUserAgentOverrideParams::builder().user_agent(clean).build()
+            if let Ok(params) = SetUserAgentOverrideParams::builder()
+                .user_agent(clean)
+                .build()
             {
                 let _ = page.set_user_agent(params).await;
             }
@@ -396,20 +396,17 @@ impl BrowserSession {
                 .format(CaptureScreenshotFormat::Png)
                 .full_page(false)
                 .build();
-            let png = page.screenshot(params).await.map_err(|e| format!("Screenshot: {}", e))?;
+            let png = page
+                .screenshot(params)
+                .await
+                .map_err(|e| format!("Screenshot: {}", e))?;
             let (hay_w_u, hay_h_u, hay_gray) =
                 crate::browser_antibot::png_template::png_bytes_to_gray_luma(&png)?;
             let hay_w = hay_w_u as usize;
             let hay_h = hay_h_u as usize;
 
             match crate::browser_antibot::match_template::best_tm_ccoeff_normed(
-                hay_w,
-                hay_h,
-                &hay_gray,
-                tmpl_w,
-                tmpl_h,
-                &tmpl_gray,
-                min_score,
+                hay_w, hay_h, &hay_gray, tmpl_w, tmpl_h, &tmpl_gray, min_score,
             ) {
                 Ok(peak) => {
                     page.click(Point {
@@ -421,11 +418,20 @@ impl BrowserSession {
                     self.wait_for_navigation_after_challenge_click(page).await;
                     tracing::debug!(attempt, score = peak.score, "CF template click");
                 }
-                Err(crate::browser_antibot::match_template::TemplateMatchErr::NoMatchAboveThreshold) => {
+                Err(
+                    crate::browser_antibot::match_template::TemplateMatchErr::NoMatchAboveThreshold,
+                ) => {
                     tracing::debug!(attempt, "CF template correlation below threshold");
                 }
                 Err(crate::browser_antibot::match_template::TemplateMatchErr::Size) => {
-                    tracing::warn!(attempt, hay_w, hay_h, tmpl_w, tmpl_h, "CF template size mismatch");
+                    tracing::warn!(
+                        attempt,
+                        hay_w,
+                        hay_h,
+                        tmpl_w,
+                        tmpl_h,
+                        "CF template size mismatch"
+                    );
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(850)).await;
@@ -466,13 +472,19 @@ impl BrowserSession {
                 self.apply_recipes(&page).await?;
                 let text = self.extract_inner_text(&page).await?;
                 self.refresh_current_url(&page).await;
-                Ok(text)
+                Ok(mangocode_core::system_prompt::wrap_untrusted_content(
+                    "browser_text",
+                    text,
+                ))
             }
             "extract_markdown" => {
                 let page = self.page_for(input.url.as_deref()).await?;
                 let markdown = self.extract_adaptive_markdown(&page).await?;
                 self.refresh_current_url(&page).await;
-                Ok(markdown)
+                Ok(mangocode_core::system_prompt::wrap_untrusted_content(
+                    "browser_markdown",
+                    markdown,
+                ))
             }
             "expand" => {
                 let page = self.page_for(input.url.as_deref()).await?;
@@ -709,7 +721,10 @@ impl BrowserSession {
             .map_err(|e| format!("evaluate failed: {}", e))?;
         self.refresh_current_url(&page).await;
         match result.into_value::<Value>() {
-            Ok(v) => Ok(v.to_string()),
+            Ok(v) => Ok(mangocode_core::system_prompt::wrap_untrusted_content(
+                "browser_evaluate_result",
+                v.to_string(),
+            )),
             Err(e) => Ok(format!(
                 "JavaScript executed, but result was not JSON-serializable: {}",
                 e
@@ -719,13 +734,11 @@ impl BrowserSession {
 
     #[cfg(feature = "tool-browser")]
     async fn extract_inner_text(&self, page: &chromiumoxide::Page) -> Result<String, String> {
-        page.evaluate(
-            "(function(){ return document && document.body ? document.body.innerText : ''; })()",
-        )
-        .await
-        .map_err(|e| format!("extract_text evaluate failed: {}", e))?
-        .into_value()
-        .map_err(|e| format!("extract_text decode failed: {}", e))
+        page.evaluate(VISIBLE_TEXT_SCRIPT)
+            .await
+            .map_err(|e| format!("extract_text evaluate failed: {}", e))?
+            .into_value()
+            .map_err(|e| format!("extract_text decode failed: {}", e))
     }
 
     #[cfg(feature = "tool-browser")]
@@ -779,9 +792,10 @@ impl BrowserSession {
         let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let recipes = value.get("recipes").cloned().unwrap_or(Value::Null);
         let mut out = format!(
-            "# {}\n\nSource: {}\nRecipes: {}\n\n## Page Text\n\n{}",
+            "# {}\n\nSource: {}\nSecurity: {}\nRecipes: {}\n\n## Page Text\n\n{}",
             title,
             url,
+            mangocode_core::system_prompt::UNTRUSTED_CONTENT_NOTICE,
             recipes,
             truncate_browser_text(text, 80_000)
         );
@@ -795,7 +809,7 @@ impl BrowserSession {
                 .map(|block| format!("```text\n{}\n```", truncate_browser_text(block, 10_000)))
                 .collect::<Vec<_>>();
             if !code_blocks.is_empty() {
-                out.push_str("\n\n## Code Blocks\n\n");
+                out.push_str("\n\n## Code Blocks (untrusted data)\n\n");
                 out.push_str(&code_blocks.join("\n\n"));
             }
         }
@@ -808,7 +822,7 @@ impl BrowserSession {
                 .map(|block| format!("```json\n{}\n```", truncate_browser_text(block, 12_000)))
                 .collect::<Vec<_>>();
             if !structured.is_empty() {
-                out.push_str("\n\n## Structured Data\n\n");
+                out.push_str("\n\n## Structured Data (untrusted data)\n\n");
                 out.push_str(&structured.join("\n\n"));
             }
         }
@@ -828,6 +842,35 @@ fn truncate_browser_text(text: &str, max: usize) -> Cow<'_, str> {
         ))
     }
 }
+
+#[cfg(feature = "tool-browser")]
+const VISIBLE_TEXT_SCRIPT: &str = r#"
+(function(){
+  const visible = el => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || !visible(parent)) return NodeFilter.FILTER_REJECT;
+      const rect = parent.getBoundingClientRect();
+      const offscreen = rect.bottom < 0 || rect.right < 0 || rect.top > (window.innerHeight * 3) || rect.left > (window.innerWidth * 3);
+      if (offscreen) return NodeFilter.FILTER_REJECT;
+      if (parent.closest('script,style,noscript,template,meta,head,[aria-hidden="true"]')) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  const parts = [];
+  while (walker.nextNode() && parts.length < 10000) {
+    const text = (walker.currentNode.nodeValue || "").trim();
+    if (text) parts.push(text);
+  }
+  return parts.join("\n");
+})()
+"#;
 
 #[cfg(feature = "tool-browser")]
 const BROWSER_RECIPES_SCRIPT: &str = r#"
@@ -881,6 +924,31 @@ const BROWSER_RECIPES_SCRIPT: &str = r#"
 #[cfg(any(feature = "tool-browser", feature = "tool-rendered-fetch"))]
 const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
 (function(){
+  const visible = el => {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+  };
+  const visibleText = root => {
+    const walker = document.createTreeWalker(root || document.body, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+        if (!parent || !visible(parent)) return NodeFilter.FILTER_REJECT;
+        const rect = parent.getBoundingClientRect();
+        const offscreen = rect.bottom < 0 || rect.right < 0 || rect.top > (window.innerHeight * 3) || rect.left > (window.innerWidth * 3);
+        if (offscreen) return NodeFilter.FILTER_REJECT;
+        if (parent.closest('script,style,noscript,template,meta,head,[aria-hidden="true"]')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const parts = [];
+    while (walker.nextNode() && parts.length < 10000) {
+      const text = (walker.currentNode.nodeValue || "").trim();
+      if (text) parts.push(text);
+    }
+    return parts.join("\n");
+  };
   const recipes = (function(){
     const visible = el => {
       if (!el || !el.isConnected) return false;
@@ -918,6 +986,12 @@ const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
 
   const root = document.querySelector("main, article, [role='main'], .markdown-body, .theme-doc-markdown, .docs-content, .doc-content, .content, #content") || document.body;
   const codeBlocks = Array.from(document.querySelectorAll("pre, pre code, figure code"))
+    .filter(el => visible(el))
+    .filter(el => {
+      const rect = el.getBoundingClientRect();
+      return !(rect.bottom < 0 || rect.right < 0 || rect.top > (window.innerHeight * 3) || rect.left > (window.innerWidth * 3));
+    })
+    .filter(el => !el.closest('[aria-hidden="true"]'))
     .map(el => (el.innerText || el.textContent || "").trim())
     .filter(Boolean)
     .filter((value, idx, arr) => arr.indexOf(value) === idx)
@@ -929,7 +1003,7 @@ const ADAPTIVE_MARKDOWN_SCRIPT: &str = r#"
   return {
     title: document.title || "",
     url: location.href,
-    text: root ? (root.innerText || root.textContent || "") : "",
+    text: visibleText(root),
     codeBlocks,
     structuredData,
     recipes
@@ -944,10 +1018,27 @@ mod tests {
     #[test]
     fn browser_action_is_normalized_or_rejected() {
         assert_eq!(normalize_browser_action(" NAVIGATE "), Ok("navigate"));
-        assert_eq!(normalize_browser_action("Pass_Challenge"), Ok("pass_challenge"));
+        assert_eq!(
+            normalize_browser_action("Pass_Challenge"),
+            Ok("pass_challenge")
+        );
         let err = normalize_browser_action("navigate\nclose")
             .expect_err("invalid action must be rejected");
         assert!(err.contains("Invalid action"));
         assert!(err.contains("\"navigate\\nclose\""));
+    }
+
+    #[test]
+    fn extract_text_script_filters_hidden_and_metadata_nodes() {
+        assert!(VISIBLE_TEXT_SCRIPT.contains("NodeFilter.SHOW_TEXT"));
+        assert!(VISIBLE_TEXT_SCRIPT.contains("[aria-hidden=\"true\"]"));
+        assert!(VISIBLE_TEXT_SCRIPT.contains("script,style,noscript,template,meta,head"));
+        assert!(!VISIBLE_TEXT_SCRIPT.contains("innerText"));
+    }
+
+    #[test]
+    fn adaptive_markdown_filters_hidden_code_blocks() {
+        assert!(ADAPTIVE_MARKDOWN_SCRIPT.contains(".filter(el => visible(el))"));
+        assert!(ADAPTIVE_MARKDOWN_SCRIPT.contains("!el.closest('[aria-hidden=\"true\"]')"));
     }
 }

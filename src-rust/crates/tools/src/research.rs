@@ -841,7 +841,11 @@ pub async fn fetch_research_document(
         }
 
         if rendered_fallback
-            && crate::bot_wall_sniff::http_failure_might_be_challenge(status, &hdrs, body_str_lossy.trim())
+            && crate::bot_wall_sniff::http_failure_might_be_challenge(
+                status,
+                &hdrs,
+                body_str_lossy.trim(),
+            )
         {
             match crate::browser_tool::rendered_extract_for_research(url).await {
                 Ok(content) => {
@@ -858,7 +862,10 @@ pub async fn fetch_research_document(
                         content: if content.len() > MAX_DOC_CHARS {
                             format!(
                                 "{}\n\n... (truncated, {} total characters)",
-                                mangocode_core::truncate::truncate_bytes_prefix(&content, MAX_DOC_CHARS),
+                                mangocode_core::truncate::truncate_bytes_prefix(
+                                    &content,
+                                    MAX_DOC_CHARS
+                                ),
                                 content.len()
                             )
                         } else {
@@ -881,12 +888,13 @@ pub async fn fetch_research_document(
         return Err(format!("HTTP {} when fetching {}", status, url));
     }
 
-    let effective_url = normalize_public_research_url(final_url_owned.as_str()).ok_or_else(|| {
-        format!(
-            "Fetch for {} ended at an unsafe or unsupported redirected URL",
-            url
-        )
-    })?;
+    let effective_url =
+        normalize_public_research_url(final_url_owned.as_str()).ok_or_else(|| {
+            format!(
+                "Fetch for {} ended at an unsafe or unsupported redirected URL",
+                url
+            )
+        })?;
     let title = extract_title(&body_str_lossy);
     let mut content = if content_type.contains("html") {
         html_to_markdownish(&body_str_lossy)

@@ -106,6 +106,7 @@ default-tools = [
     "tool-todo-write",
     "tool-tool-log-read",
     "tool-tool-search",
+    "tool-project-graph",
     "tool-update-plan",
     "tool-update-goal",
     "tool-view-image",
@@ -159,6 +160,7 @@ default-tools-no-web-research = [
     "tool-todo-write",
     "tool-tool-log-read",
     "tool-tool-search",
+    "tool-project-graph",
     "tool-update-plan",
     "tool-update-goal",
     "tool-view-image",
@@ -223,6 +225,7 @@ tool-team-delete = []
 tool-todo-write = []
 tool-tool-log-read = []
 tool-tool-search = []
+tool-project-graph = []
 tool-update-plan = []
 tool-update-goal = []
 tool-view-image = []

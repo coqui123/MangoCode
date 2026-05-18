@@ -22,14 +22,8 @@ pub fn stealth_extra_browser_args(lang: Option<&str>) -> Vec<String> {
         "--disable-search-engine-choice-screen".into(),
         "--disable-features=IsolateOrigins,site-per-process".into(),
         "--disable-blink-features=AutomationControlled".into(),
-        format!(
-            "--lang={}",
-            lang.unwrap_or("en-US,en;q=0.9")
-        ),
-        format!(
-            "--accept-lang={}",
-            lang.unwrap_or("en-US,en;q=0.9")
-        ),
+        format!("--lang={}", lang.unwrap_or("en-US,en;q=0.9")),
+        format!("--accept-lang={}", lang.unwrap_or("en-US,en;q=0.9")),
     ];
     for a in DEV_SHM {
         out.push((*a).to_string());

@@ -48,6 +48,13 @@ pub static PROMPT_SLASH_COMMANDS: Lazy<Vec<SlashCommandSpec>> = Lazy::new(|| {
             group: "Core".into(),
         },
         SlashCommandSpec {
+            name: "graphify".into(),
+            description:
+                "Analyze, export graph/tree/callflow views, benchmark, inspect clusters, query, trace, and explain project architecture with ProjectGraph"
+                    .into(),
+            group: "Core".into(),
+        },
+        SlashCommandSpec {
             name: "doctor".into(),
             description: "Run diagnostics".into(),
             group: "Core".into(),

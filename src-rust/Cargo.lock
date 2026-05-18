@@ -3454,6 +3454,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

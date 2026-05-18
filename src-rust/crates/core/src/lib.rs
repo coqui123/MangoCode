@@ -100,7 +100,10 @@ pub use ide::{detect_ide, is_ide_terminal, IdeKind};
 
 // Background update checker — compares running version against GitHub releases.
 pub mod update_check;
-pub use update_check::{check_for_updates, UpdateInfo};
+pub use update_check::{
+    check_for_updates, is_newer, UpdateInfo, GITHUB_RELEASES_API_LATEST_URL,
+    GITHUB_RELEASES_API_URL, GITHUB_RELEASES_PAGE, GITHUB_REPO_URL,
+};
 
 // Re-export commonly used types at the crate root
 pub use config::{

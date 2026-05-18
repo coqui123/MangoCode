@@ -28,7 +28,8 @@ pub fn embedded_cf_template_gray() -> Result<(u32, u32, Vec<u8>), String> {
 /// Load grayscale template from `MANGOCODE_CF_TEMPLATE_PATH` if set, else embedded PNG.
 pub fn load_cf_checkbox_template_gray() -> Result<(u32, u32, Vec<u8>), String> {
     if let Ok(path) = std::env::var("MANGOCODE_CF_TEMPLATE_PATH") {
-        let data = std::fs::read(&path).map_err(|e| format!("Failed to read template {}: {}", path, e))?;
+        let data =
+            std::fs::read(&path).map_err(|e| format!("Failed to read template {}: {}", path, e))?;
         return png_bytes_to_gray_luma(&data);
     }
     embedded_cf_template_gray()

@@ -370,7 +370,10 @@ impl Tool for WebFetchTool {
                         }
                     }
                 } else {
-                    return ToolResult::error(format!("HTTP {} when fetching {}", status, params.url));
+                    return ToolResult::error(format!(
+                        "HTTP {} when fetching {}",
+                        status, params.url
+                    ));
                 }
             } else {
                 let Some(effective_url) =
@@ -391,13 +394,10 @@ impl Tool for WebFetchTool {
                 let body_str = String::from_utf8_lossy(&body_bytes).into_owned();
                 if crate::bot_wall_sniff::text_suggests_bot_wall(&body_str) {
                     if params.rendered_fallback {
-                        match crate::browser_tool::rendered_extract_for_research(&effective_url).await {
-                            Ok(md) => (
-                                effective_url,
-                                content_type,
-                                md,
-                                "rendered".to_string(),
-                            ),
+                        match crate::browser_tool::rendered_extract_for_research(&effective_url)
+                            .await
+                        {
+                            Ok(md) => (effective_url, content_type, md, "rendered".to_string()),
                             Err(e) => {
                                 return ToolResult::error(format!(
                                     "Fetched {} but the body resembles a CDN/bot challenge page; rendered_fallback failed ({})",

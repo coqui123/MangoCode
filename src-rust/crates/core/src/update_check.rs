@@ -6,8 +6,14 @@
 
 use std::time::Duration;
 
-const GITHUB_RELEASES_URL: &str =
-    "https://api.github.com/repos/kuberwastaken/mangocode/releases/latest";
+use semver::Version;
+
+pub const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/coqui123/MangoCode/releases";
+pub const GITHUB_RELEASES_API_LATEST_URL: &str =
+    "https://api.github.com/repos/coqui123/MangoCode/releases/latest";
+pub const GITHUB_RELEASES_PAGE: &str = "https://github.com/coqui123/MangoCode/releases";
+pub const GITHUB_REPO_URL: &str = "https://github.com/coqui123/MangoCode";
 const CHECK_INTERVAL_HOURS: u64 = 24;
 
 /// Information about an available update.
@@ -40,14 +46,14 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
                                 if cached.is_empty() {
                                     return None;
                                 }
-                                let has_update = is_newer(&cached, &current);
+                                let has_update = is_newer(&cached, &current).unwrap_or(false);
                                 if has_update {
                                     return Some(UpdateInfo {
                                         current_version: current,
                                         latest_version: cached.clone(),
                                         release_url: format!(
-                                            "https://github.com/kuberwastaken/mangocode/releases/tag/v{}",
-                                            cached
+                                            "{}/tag/v{}",
+                                            GITHUB_RELEASES_PAGE, cached
                                         ),
                                         has_update: true,
                                     });
@@ -68,7 +74,11 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
         .build()
         .ok()?;
 
-    let resp = client.get(GITHUB_RELEASES_URL).send().await.ok()?;
+    let resp = client
+        .get(GITHUB_RELEASES_API_LATEST_URL)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -79,7 +89,7 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
     let html_url = json
         .get("html_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("https://github.com/kuberwastaken/mangocode/releases")
+        .unwrap_or(GITHUB_RELEASES_PAGE)
         .to_string();
 
     // Cache the fetched version so we don't hit GitHub again for 24 h.
@@ -90,7 +100,7 @@ pub async fn check_for_updates() -> Option<UpdateInfo> {
         let _ = std::fs::write(&cache_path, &latest);
     }
 
-    let has_update = is_newer(&latest, &current);
+    let has_update = is_newer(&latest, &current).unwrap_or(false);
     if has_update {
         Some(UpdateInfo {
             current_version: current,
@@ -111,23 +121,13 @@ fn update_cache_path() -> Option<std::path::PathBuf> {
     dirs::cache_dir().map(|d| d.join("mangocode").join("update_check.txt"))
 }
 
-/// Compare two semver strings.  Returns `true` when `latest` > `current`.
-fn is_newer(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|p| p.parse().ok()).collect() };
-    let l = parse(latest);
-    let c = parse(current);
-    let max_len = l.len().max(c.len());
-    for i in 0..max_len {
-        let lv = l.get(i).copied().unwrap_or(0);
-        let cv = c.get(i).copied().unwrap_or(0);
-        if lv > cv {
-            return true;
-        }
-        if lv < cv {
-            return false;
-        }
-    }
-    false
+/// Compare two semver strings.
+///
+/// Returns `None` when either version is not valid SemVer.
+pub fn is_newer(latest: &str, current: &str) -> Option<bool> {
+    let latest = Version::parse(latest.trim().trim_start_matches('v')).ok()?;
+    let current = Version::parse(current.trim().trim_start_matches('v')).ok()?;
+    Some(latest > current)
 }
 
 #[cfg(test)]
@@ -136,21 +136,38 @@ mod tests {
 
     #[test]
     fn newer_minor() {
-        assert!(is_newer("0.1.0", "0.0.7"));
+        assert_eq!(is_newer("0.1.0", "0.0.7"), Some(true));
     }
 
     #[test]
     fn same_version() {
-        assert!(!is_newer("0.0.7", "0.0.7"));
+        assert_eq!(is_newer("0.0.7", "0.0.7"), Some(false));
     }
 
     #[test]
     fn older_version() {
-        assert!(!is_newer("0.0.5", "0.0.7"));
+        assert_eq!(is_newer("0.0.5", "0.0.7"), Some(false));
     }
 
     #[test]
     fn major_bump() {
-        assert!(is_newer("1.0.0", "0.9.9"));
+        assert_eq!(is_newer("1.0.0", "0.9.9"), Some(true));
+    }
+
+    #[test]
+    fn leading_v_is_accepted() {
+        assert_eq!(is_newer("v0.1.0", "v0.0.7"), Some(true));
+    }
+
+    #[test]
+    fn prerelease_is_ordered_by_semver() {
+        assert_eq!(is_newer("1.0.0", "1.0.0-rc.1"), Some(true));
+        assert_eq!(is_newer("1.0.0-rc.1", "1.0.0"), Some(false));
+    }
+
+    #[test]
+    fn malformed_versions_are_unknown() {
+        assert_eq!(is_newer("latest", "0.0.7"), None);
+        assert_eq!(is_newer("0.0.8", "dev"), None);
     }
 }

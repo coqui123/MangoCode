@@ -1,8 +1,8 @@
 //! Chrome DevTools Protocol client for `/chrome` slash commands.
 
-use mangocode_core::chrome_js;
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
+use mangocode_core::chrome_js;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -45,9 +45,10 @@ enum ConnectionKind {
 }
 
 fn take_session() -> anyhow::Result<ChromeSession> {
-    SESSION.lock().take().ok_or_else(|| {
-        anyhow::anyhow!("No active Chrome session. Run `/chrome connect` first.")
-    })
+    SESSION
+        .lock()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No active Chrome session. Run `/chrome connect` first."))
 }
 
 fn store_session(s: ChromeSession) {
@@ -291,10 +292,7 @@ async fn cdp_call(
         req["sessionId"] = json!(sid);
     }
 
-    session
-        .ws
-        .send(WsMessage::Text(req.to_string()))
-        .await?;
+    session.ws.send(WsMessage::Text(req.to_string())).await?;
 
     loop {
         while let Some(front) = session.event_buffer.pop_front() {
@@ -450,9 +448,10 @@ pub async fn connect(port: u16) -> anyhow::Result<String> {
             )
         })?;
 
-    let first_page = tabs
-        .as_array()
-        .and_then(|a| a.iter().find(|t| t.get("type").and_then(|x| x.as_str()) == Some("page")));
+    let first_page = tabs.as_array().and_then(|a| {
+        a.iter()
+            .find(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
+    });
 
     let t = first_page.ok_or_else(|| anyhow::anyhow!("No page tab found on port {}", port))?;
     let page_ws = t
@@ -547,7 +546,8 @@ pub async fn click(selector: &str) -> anyhow::Result<String> {
         )
         .await?;
         let full = &resp["result"];
-        let val_str = chrome_js::format_evaluate_response(full, &expr).map_err(anyhow::Error::msg)?;
+        let val_str =
+            chrome_js::format_evaluate_response(full, &expr).map_err(anyhow::Error::msg)?;
         if val_str == "ELEMENT_NOT_FOUND" {
             anyhow::bail!("No element found for selector: {}", selector);
         }
@@ -635,7 +635,11 @@ fn merge_key_event(base: &Value, typ: &str, include_text: bool) -> Value {
 }
 
 /// Real keystrokes for React/Vue-style inputs (browser-harness `fill_input` style).
-pub async fn fill_keystrokes(selector: &str, text: &str, clear_first: bool) -> anyhow::Result<String> {
+pub async fn fill_keystrokes(
+    selector: &str,
+    text: &str,
+    clear_first: bool,
+) -> anyhow::Result<String> {
     let sel = serde_json::to_string(selector)?;
     let mut s = take_session()?;
     let result = async {
@@ -838,9 +842,9 @@ Use `/chrome connect` with Chrome exposing Target.*; or set MANGOCODE_CDP_WS fro
         }
 
         let resp = cdp_call(&mut s, "Target.getTargets", json!({})).await?;
-        let targets = resp["result"]["targetInfos"].as_array().ok_or_else(|| {
-            anyhow::anyhow!("iframe: no targets")
-        })?;
+        let targets = resp["result"]["targetInfos"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("iframe: no targets"))?;
 
         let iframe = targets
             .iter()
@@ -912,11 +916,7 @@ pub async fn tabs_list() -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()?;
-    let tabs: Value = fetch_json(
-        &client,
-        &format!("http://127.0.0.1:{port}/json/list"),
-    )
-    .await?;
+    let tabs: Value = fetch_json(&client, &format!("http://127.0.0.1:{port}/json/list")).await?;
 
     let mut out = String::from("Tabs (from /json/list):\n");
     if let Some(arr) = tabs.as_array() {
@@ -994,18 +994,14 @@ pub async fn switch_tab(target_id: &str) -> anyhow::Result<String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .build()?;
-        let tabs: Value = match fetch_json(
-            &client,
-            &format!("http://127.0.0.1:{port}/json/list"),
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                store_session(s);
-                return Err(e);
-            }
-        };
+        let tabs: Value =
+            match fetch_json(&client, &format!("http://127.0.0.1:{port}/json/list")).await {
+                Ok(t) => t,
+                Err(e) => {
+                    store_session(s);
+                    return Err(e);
+                }
+            };
 
         let entry = tabs.as_array().and_then(|a| {
             a.iter()
@@ -1202,9 +1198,7 @@ pub async fn wait_network_idle(timeout_secs: f64, idle_ms: u64) -> anyhow::Resul
         }
 
         while Instant::now() < deadline {
-            if inflight.is_empty()
-                && last_activity.elapsed().as_millis() as u64 >= idle_ms
-            {
+            if inflight.is_empty() && last_activity.elapsed().as_millis() as u64 >= idle_ms {
                 store_session(s);
                 return Ok(format!(
                     "network idle (no in-flight requests for {idle_ms} ms within {} s budget)",
@@ -1242,8 +1236,7 @@ pub async fn wait_network_idle(timeout_secs: f64, idle_ms: u64) -> anyhow::Resul
                 }
                 Err(_) => {
                     // idle poll window
-                    if inflight.is_empty()
-                        && last_activity.elapsed().as_millis() as u64 >= idle_ms
+                    if inflight.is_empty() && last_activity.elapsed().as_millis() as u64 >= idle_ms
                     {
                         store_session(s);
                         return Ok(format!(

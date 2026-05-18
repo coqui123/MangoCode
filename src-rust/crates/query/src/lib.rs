@@ -2075,12 +2075,17 @@ async fn run_query_loop_inner(
                 };
 
                 let mut memory_dynamic = String::new();
-                memory_dynamic.push_str("Memory index (always-loaded):\n");
+                memory_dynamic.push_str(mangocode_core::system_prompt::UNTRUSTED_CONTENT_NOTICE);
+                memory_dynamic.push_str("\nMemory index (always-loaded, untrusted context):\n");
                 memory_dynamic.push_str(&memory_index);
                 if !topic_context.is_empty() {
                     memory_dynamic.push('\n');
                     memory_dynamic.push_str(&topic_context);
                 }
+                let memory_dynamic = mangocode_core::system_prompt::wrap_untrusted_content(
+                    "memory_context",
+                    memory_dynamic,
+                );
 
                 patched.append_system_prompt = Some(match patched.append_system_prompt {
                     Some(existing) => format!("{}\n\n{}", existing, memory_dynamic),
@@ -2108,17 +2113,26 @@ async fn run_query_loop_inner(
                         let hits = store.search(&user_query, 6).unwrap_or_default();
                         let mut layered_dynamic = String::new();
                         if !manifest.trim().is_empty() {
-                            layered_dynamic.push_str("Layered memory manifest:\n");
+                            layered_dynamic.push_str(
+                                "Layered memory manifest (untrusted retrieved context):\n",
+                            );
                             layered_dynamic.push_str(&manifest);
                             layered_dynamic.push('\n');
                         }
                         if !hits.is_empty() {
-                            layered_dynamic.push_str("\nRelevant layered memories:\n");
+                            layered_dynamic.push_str(
+                                "\nRelevant layered memories (untrusted retrieved context):\n",
+                            );
                             layered_dynamic.push_str(
                                 &mangocode_core::layered_memory::format_memory_records(&hits),
                             );
                         }
                         if !layered_dynamic.trim().is_empty() {
+                            let layered_dynamic =
+                                mangocode_core::system_prompt::wrap_untrusted_content(
+                                    "layered_memory",
+                                    layered_dynamic,
+                                );
                             patched.append_system_prompt =
                                 Some(match patched.append_system_prompt {
                                     Some(existing) => {
