@@ -1,0 +1,234 @@
+[package]
+name = "mangocode-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mangocode-core = { workspace = true }
+mangocode-api = { workspace = true }
+mangocode-file-search = { workspace = true }
+mangocode-mcp = { workspace = true }
+mangocode-plugins = { workspace = true }
+mangocode-tool-runtime = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+glob = { workspace = true }
+walkdir = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+which = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+open = { workspace = true }
+enigo = { workspace = true, optional = true }
+xcap = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"], optional = true }
+
+# PTY support — used by PtyBashTool on Unix
+portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[features]
+default = ["default-tools"]
+
+# Backwards-compatible aliases for the previously optional tools.
+computer-use = ["tool-computer-use"]
+browser = ["tool-browser"]
+
+# Convenience tool sets.
+default-tools = [
+    "tool-agent",
+    "tool-apply-patch",
+    "tool-ask-user",
+    "tool-bash",
+    "tool-batch-edit",
+    "tool-brief",
+    "tool-config",
+    "tool-coordination",
+    "tool-cron-create",
+    "tool-cron-delete",
+    "tool-cron-list",
+    "tool-create-goal",
+    "tool-deep-read",
+    "tool-doc-read",
+    "tool-doc-search",
+    "tool-edit",
+    "tool-enter-plan-mode",
+    "tool-enter-worktree",
+    "tool-exit-plan-mode",
+    "tool-exit-worktree",
+    "tool-get-goal",
+    "tool-glob",
+    "tool-grep",
+    "tool-list-mcp-resources",
+    "tool-lsp",
+    "tool-mcp-auth",
+    "tool-notebook-edit",
+    "tool-powershell",
+    "tool-pr-watch",
+    "tool-read",
+    "tool-read-mcp-resource",
+    "tool-remote-trigger",
+    "tool-repl",
+    "tool-send-message",
+    "tool-skill",
+    "tool-sleep",
+    "tool-structured-output",
+    "tool-task-create",
+    "tool-task-get",
+    "tool-task-list",
+    "tool-task-output",
+    "tool-task-stop",
+    "tool-task-update",
+    "tool-team-create",
+    "tool-team-delete",
+    "tool-todo-write",
+    "tool-tool-log-read",
+    "tool-tool-search",
+    "tool-project-graph",
+    "tool-update-plan",
+    "tool-update-goal",
+    "tool-view-image",
+    "tool-web-fetch",
+    "tool-web-search",
+    "tool-write",
+]
+default-tools-no-web-research = [
+    "tool-agent",
+    "tool-apply-patch",
+    "tool-ask-user",
+    "tool-bash",
+    "tool-batch-edit",
+    "tool-brief",
+    "tool-config",
+    "tool-coordination",
+    "tool-cron-create",
+    "tool-cron-delete",
+    "tool-cron-list",
+    "tool-create-goal",
+    "tool-edit",
+    "tool-enter-plan-mode",
+    "tool-enter-worktree",
+    "tool-exit-plan-mode",
+    "tool-exit-worktree",
+    "tool-get-goal",
+    "tool-glob",
+    "tool-grep",
+    "tool-list-mcp-resources",
+    "tool-lsp",
+    "tool-mcp-auth",
+    "tool-notebook-edit",
+    "tool-powershell",
+    "tool-pr-watch",
+    "tool-read",
+    "tool-read-mcp-resource",
+    "tool-remote-trigger",
+    "tool-repl",
+    "tool-send-message",
+    "tool-skill",
+    "tool-sleep",
+    "tool-structured-output",
+    "tool-task-create",
+    "tool-task-get",
+    "tool-task-list",
+    "tool-task-output",
+    "tool-task-stop",
+    "tool-task-update",
+    "tool-team-create",
+    "tool-team-delete",
+    "tool-todo-write",
+    "tool-tool-log-read",
+    "tool-tool-search",
+    "tool-project-graph",
+    "tool-update-plan",
+    "tool-update-goal",
+    "tool-view-image",
+    "tool-write",
+]
+full-tools = [
+    "default-tools",
+    "tool-browser",
+    "tool-computer-use",
+    "tool-rendered-fetch",
+]
+
+# Individual built-in tool flags.
+tool-agent = []
+tool-apply-patch = []
+tool-ask-user = []
+tool-bash = []
+tool-batch-edit = []
+tool-brief = []
+tool-browser = ["dep:chromiumoxide", "dep:image"]
+tool-computer-use = ["dep:enigo", "dep:xcap", "dep:image"]
+tool-config = []
+tool-coordination = []
+tool-cron-create = []
+tool-cron-delete = []
+tool-cron-list = []
+tool-create-goal = []
+tool-deep-read = []
+tool-doc-read = []
+tool-doc-search = []
+tool-edit = []
+tool-enter-plan-mode = []
+tool-enter-worktree = []
+tool-exit-plan-mode = []
+tool-exit-worktree = []
+tool-get-goal = []
+tool-glob = []
+tool-grep = []
+tool-list-mcp-resources = []
+tool-lsp = []
+tool-mcp-auth = []
+tool-notebook-edit = []
+tool-powershell = []
+tool-pr-watch = []
+tool-read = []
+tool-read-mcp-resource = []
+tool-remote-trigger = []
+tool-rendered-fetch = ["dep:chromiumoxide", "dep:image"]
+tool-repl = []
+tool-send-message = []
+tool-skill = []
+tool-sleep = []
+tool-structured-output = []
+tool-task-create = []
+tool-task-get = []
+tool-task-list = []
+tool-task-output = []
+tool-task-stop = []
+tool-task-update = []
+tool-team-create = []
+tool-team-delete = []
+tool-todo-write = []
+tool-tool-log-read = []
+tool-tool-search = []
+tool-project-graph = []
+tool-update-plan = []
+tool-update-goal = []
+tool-view-image = []
+tool-web-fetch = []
+tool-web-search = []
+tool-write = []

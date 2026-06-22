@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tool-runtime",
+    "crates/file-search",
+    "crates/turn-diff",
+    "crates/core",
+    "crates/api",
+    "crates/tools",
+    "crates/query",
+    "crates/tui",
+    "crates/sleep-inhibitor",
+    "crates/commands",
+    "crates/mcp",
+    "crates/bridge",
+    "crates/cli",
+    "crates/plugins",
+    "crates/acp",
+]
+
+[workspace.package]
+version = "0.0.7"
+edition = "2021"
+authors = ["MangoCode"]
+# Proprietary, source-available. Free for Personal Use; Commercial Use requires
+# a paid license. Not an SPDX/OSI license — see the LICENSE file.
+license-file = "LICENSE"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.44", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", features = ["native-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env", "string"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+semver = "1"
+glob = "0.3"
+walkdir = "2"
+tempfile = "3"
+dirs = "5"
+which = "7"
+once_cell = "1"
+parking_lot = "0.12"
+dashmap = "6"
+indexmap = { version = "2", features = ["serde"] }
+bytes = "1"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+getrandom = "0.2"
+enigo = "0.2"
+xcap = "0.0.13"
+url = "2"
+mime = "0.3"
+urlencoding = "2"
+open = "5"
+qrcode = { version = "0.14", default-features = false }
+rusqlite = { version = "0.31", features = ["bundled"] }
+icy_sixel = "0.5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+resvg = "0.44"
+fastembed = { version = "5", default-features = false, features = ["ort-download-binaries-native-tls", "hf-hub-native-tls"] }
+
+# Text processing
+similar = "2"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "html"] }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+
+# Process execution
+nix = { version = "0.29", features = ["process", "signal", "user"] }
+
+# Async channels
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# JSON Schema
+schemars = { version = "0.8", features = ["derive"] }
+
+# Workspace crates
+mangocode-core = { path = "crates/core" }
+mangocode-tool-runtime = { path = "crates/tool-runtime" }
+mangocode-file-search = { path = "crates/file-search" }
+mangocode-turn-diff = { path = "crates/turn-diff" }
+mangocode-sleep-inhibitor = { path = "crates/sleep-inhibitor" }
+mangocode-acp = { path = "crates/acp", default-features = false }
+mangocode-api = { path = "crates/api" }
+mangocode-tools = { path = "crates/tools", default-features = false }
+mangocode-query = { path = "crates/query", default-features = false }
+mangocode-tui = { path = "crates/tui", default-features = false }
+mangocode-commands = { path = "crates/commands", default-features = false }
+mangocode-mcp = { path = "crates/mcp" }
+mangocode-bridge = { path = "crates/bridge" }
+mangocode-plugins = { path = "crates/plugins" }

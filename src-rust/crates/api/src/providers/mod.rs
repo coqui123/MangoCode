@@ -1,0 +1,53 @@
+pub mod anthropic;
+pub use anthropic::AnthropicProvider;
+
+pub(crate) mod message_normalization;
+pub(crate) mod request_options;
+
+pub mod openai;
+pub use openai::OpenAiProvider;
+
+pub mod google;
+pub use google::GoogleProvider;
+
+pub mod minimax;
+pub use minimax::MinimaxProvider;
+
+pub mod openai_compat;
+pub use openai_compat::OpenAiCompatProvider;
+
+pub mod copilot_pirate_tools;
+
+pub mod openai_compat_providers;
+pub use openai_compat_providers::{
+    baseten, cerebras, deepinfra, deepseek, discover_installed_ollama_models, fireworks, friendli,
+    groq, huggingface, llama_cpp, lm_studio, mistral, moonshot, native_ollama_base_url, nebius,
+    novita, nvidia, ollama, ollama_native_base_from_env, openrouter, ovhcloud,
+    parse_ollama_tags_response, perplexity, qwen, sambanova, scaleway, siliconflow, stepfun,
+    together_ai, upstage, venice, vultr_ai, xai, zhipu, OllamaDiscoveryError, OllamaInstalledModel,
+    OllamaModelDetails,
+};
+
+pub mod cohere;
+pub use cohere::CohereProvider;
+
+pub mod azure;
+pub use azure::AzureProvider;
+
+pub mod bedrock;
+pub use bedrock::BedrockProvider;
+
+pub mod copilot;
+pub use copilot::CopilotProvider;
+
+pub mod vertex_openai;
+pub use vertex_openai::VertexOpenAiProvider;
+
+pub mod mock;
+pub use mock::MockProvider;
+
+pub mod anthropic_oauth;
+pub use anthropic_oauth::AnthropicMaxProvider;
+
+pub mod openai_codex;
+pub use openai_codex::OpenAiCodexProvider;

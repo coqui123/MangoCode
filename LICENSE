@@ -1,0 +1,229 @@
+MangoCode Personal Use License
+Version 1.0 — 18 June 2026
+
+Copyright (c) 2026 Alex ("MangoCode"). All rights reserved.
+
+This is a proprietary, source-available license. It is NOT an Open Source
+license as defined by the Open Source Initiative, and it is NOT a free
+software license as defined by the Free Software Foundation. The Software is
+free of charge for Personal Use. Any Commercial Use, including Enterprise
+Use, requires a separate paid Commercial License from the Licensor.
+
+By downloading, copying, installing, running, or otherwise using the
+Software, You accept and agree to be bound by the terms of this License. If
+You do not agree, You must not use the Software.
+
+================================================================================
+1. DEFINITIONS
+================================================================================
+
+1.1 "Software" means the MangoCode software program made available in the
+    repository in which this License file appears, including its source code,
+    object code, build scripts, configuration, and documentation, together
+    with any updates or modifications provided by the Licensor.
+
+1.2 "Licensor" means Alex (operating as "MangoCode"), the copyright holder of
+    the Software.
+
+1.3 "You" or "Your" means the individual or legal entity exercising rights
+    under this License.
+
+1.4 "Personal Use" means use by a single natural person, acting solely on
+    their own behalf and not on behalf of any other person or entity, for
+    private, personal, and non-commercial purposes. Personal Use includes
+    personal projects, private experimentation, self-directed learning,
+    evaluation of the Software, and personal contributions to non-commercial
+    open-source projects. Personal Use expressly EXCLUDES any Commercial Use.
+
+1.5 "Commercial Use" means any use that is primarily intended for or directed
+    toward commercial advantage, monetary compensation, or the operations of
+    any business or organization. Without limiting the foregoing, each of the
+    following is Commercial Use:
+      (a) use by, for, or on behalf of any for-profit person or entity;
+      (b) use by an employee, officer, contractor, or agent in the course of
+          work for any person or entity;
+      (c) use to develop, provide, host, or support any product or service
+          made available to one or more third parties, whether or not for a
+          fee;
+      (d) use that generates revenue, directly or indirectly;
+      (e) use in or to support the production, internal business, or
+          operational systems of any organization; and
+      (f) Enterprise Use.
+
+1.6 "Enterprise Use" means any Commercial Use by or within an organization of
+    any kind — including a company, partnership, sole proprietorship,
+    government body, educational institution, or non-profit operating entity —
+    and includes use by all of that organization's affiliates, employees, and
+    contractors.
+
+1.7 "Commercial License" means a separate written license agreement, offered
+    for purchase by the Licensor, that grants the right to make Commercial Use
+    of the Software.
+
+================================================================================
+2. GRANT OF LICENSE FOR PERSONAL USE
+================================================================================
+
+2.1 Subject to Your full compliance with this License, the Licensor grants You
+    a worldwide, royalty-free, non-exclusive, non-transferable,
+    non-sublicensable, and revocable license to install, run, use, copy, and
+    modify the Software, and to make and keep copies of the Software and Your
+    modifications, in each case solely for Your Personal Use.
+
+2.2 You may share verbatim or modified copies of the Software with other
+    natural persons for their Personal Use, provided that (a) You do so without
+    charge or other commercial consideration, (b) You include a complete,
+    unmodified copy of this License with every copy, (c) You retain all
+    copyright and license notices, and (d) the recipient agrees to be bound by
+    this License.
+
+================================================================================
+3. COMMERCIAL USE REQUIRES A PAID LICENSE
+================================================================================
+
+3.1 This License grants NO right to make any Commercial Use, including any
+    Enterprise Use, of the Software.
+
+3.2 If You wish to make any Commercial Use of the Software, You must first
+    obtain a valid Commercial License from the Licensor. To purchase a
+    Commercial License, contact: alex@coqui.me.
+
+3.3 Any Commercial Use of the Software without a valid Commercial License is
+    unauthorized, immediately terminates the rights granted in Section 2, and
+    constitutes copyright infringement under the United States Copyright Act
+    (17 U.S.C. § 101 et seq., including § 501) and applicable international law.
+
+================================================================================
+4. CONDITIONS AND RESTRICTIONS
+================================================================================
+
+4.1 You must retain, in all copies and modified versions of the Software, all
+    copyright, patent, trademark, and attribution notices, together with a copy
+    of this License.
+
+4.2 If You modify the Software, You must cause the modified files to carry
+    prominent notices stating that You changed the files and the date of any
+    change.
+
+4.3 Except as expressly permitted in Section 2.2, You may not sell, rent,
+    lease, loan, distribute, publish, sublicense, offer as a service, or
+    otherwise make the Software (in whole or in part, in original or modified
+    form) available to any third party.
+
+4.4 You may not remove, alter, or obscure any notices, or use the Licensor's
+    name, "MangoCode," or any related trademark, except to provide attribution
+    required by this License. This License grants no trademark rights.
+
+4.5 You may not use the Software to violate any applicable law or the rights of
+    any third party.
+
+================================================================================
+5. THIRD-PARTY COMPONENTS
+================================================================================
+
+The Software may incorporate or depend on third-party components that are
+licensed under their own separate terms (for example, open-source licenses).
+Those components remain governed by their respective licenses, and nothing in
+this License limits, supersedes, or grants rights beyond those separate terms.
+To the extent of any conflict, the third-party license governs that component.
+A list of such components and their licenses, where applicable, is provided in
+the repository's dependency manifests and any accompanying NOTICE or
+THIRD-PARTY file.
+
+================================================================================
+6. OWNERSHIP
+================================================================================
+
+The Software is licensed, not sold. The Licensor and its licensors retain all
+right, title, and interest in and to the Software, including all intellectual
+property rights therein. The Software is protected by United States copyright
+law (17 U.S.C.) and by international copyright treaties. All rights not
+expressly granted in this License are reserved by the Licensor.
+
+================================================================================
+7. TERM AND TERMINATION
+================================================================================
+
+7.1 This License is effective until terminated. Your rights under this License
+    terminate automatically and without notice if You breach any of its terms,
+    including any unauthorized Commercial Use.
+
+7.2 If Your rights terminate, You must immediately cease all use of the
+    Software and destroy all copies in Your possession or control.
+
+7.3 If You cease all violation of this License, Your rights under Section 2 may
+    be reinstated at the Licensor's sole discretion. A valid Commercial License,
+    if obtained, governs Commercial Use under its own terms.
+
+7.4 Sections 1 and 3 through 11 survive termination.
+
+================================================================================
+8. DISCLAIMER OF WARRANTY
+================================================================================
+
+THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY
+KIND. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR
+EXPRESSLY DISCLAIMS ALL WARRANTIES AND CONDITIONS, WHETHER EXPRESS, IMPLIED,
+STATUTORY, OR OTHERWISE, INCLUDING WITHOUT LIMITATION ANY IMPLIED WARRANTIES OR
+CONDITIONS OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NON-INFRINGEMENT (SEE U.C.C. § 2-316). THE LICENSOR DOES NOT WARRANT THAT THE
+SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, OR SECURE. YOU ASSUME THE ENTIRE
+RISK AS TO THE QUALITY AND PERFORMANCE OF THE SOFTWARE.
+
+================================================================================
+9. LIMITATION OF LIABILITY
+================================================================================
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL,
+EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE, DATA, OR
+GOODWILL, ARISING OUT OF OR RELATING TO THIS LICENSE OR THE USE OF OR INABILITY
+TO USE THE SOFTWARE, WHETHER IN CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT
+LIABILITY, OR OTHERWISE, EVEN IF THE LICENSOR HAS BEEN ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGES. THE LICENSOR'S TOTAL AGGREGATE LIABILITY FOR ALL
+CLAIMS RELATING TO THE SOFTWARE UNDER THIS LICENSE SHALL NOT EXCEED FIVE U.S.
+DOLLARS (US $5.00). SOME JURISDICTIONS DO NOT ALLOW CERTAIN LIMITATIONS, SO
+SOME OF THE ABOVE MAY NOT APPLY TO YOU.
+
+================================================================================
+10. EXPORT CONTROL AND U.S. GOVERNMENT RIGHTS
+================================================================================
+
+10.1 You must comply with all applicable export control and sanctions laws and
+     regulations, including the U.S. Export Administration Regulations (EAR) and
+     regulations administered by the U.S. Office of Foreign Assets Control
+     (OFAC). You may not export, re-export, or use the Software in violation of
+     those laws.
+
+10.2 The Software is "commercial computer software" and "commercial computer
+     software documentation" as those terms are used in FAR 12.212 and DFARS
+     227.7202. Any use by or for the U.S. Government is subject solely to the
+     rights granted under this License.
+
+================================================================================
+11. GENERAL
+================================================================================
+
+11.1 Governing Law. This License is governed by the laws of the State of
+     Illinois, United States, excluding its conflict-of-laws rules. The U.N.
+     Convention on Contracts for the International Sale of Goods does not apply.
+     The state and federal courts located in Illinois shall have exclusive
+     jurisdiction over any dispute arising out of or relating to this License,
+     and You consent to personal jurisdiction and venue there.
+
+11.2 Severability. If any provision of this License is held unenforceable, that
+     provision shall be enforced to the maximum extent permissible, and the
+     remaining provisions shall remain in full force and effect.
+
+11.3 No Waiver. The Licensor's failure to enforce any provision is not a waiver
+     of its right to do so later.
+
+11.4 Entire Agreement. This License is the entire agreement between You and the
+     Licensor regarding Personal Use of the Software and supersedes all prior
+     understandings on that subject. Commercial Use is governed by a separate
+     Commercial License.
+
+11.5 Reservation of Rights. All rights not expressly granted are reserved by
+     the Licensor.
+
+For commercial and enterprise licensing, contact: alex@coqui.me

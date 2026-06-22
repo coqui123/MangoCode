@@ -1,0 +1,61 @@
+# Rust build artifacts
+src-rust/target/
+
+# Claude Code local session data (contains local paths and dev commands)
+.claude/
+
+# MangoCode local runtime caches and memory DBs
+**/.mangocode/
+
+# Environment / secrets
+.env
+.env.local
+*.local
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows executables in repo root
+*.exe
+*.dll
+*.pdb
+
+src-rust/qwen-stream.jsonl
+
+# Rust compiler intermediates (stray .o / .rlib outside target/)
+*.rcgu.o
+*.rlib
+NUL.*
+
+# Clippy artifacts
+*.clippy_diff*
+
+# Docs / logs that are dev-only
+docs/headless-issues-log.md
+docs/TODO-mcts-plan-search.md
+
+# Misc build junk
+*.d
+*.rmeta
+
+# rustfmt backup files
+*.rs.bk
+
+# Log files
+*.log
+
+# Release / distribution artifacts
+dist/
+release/
+*.tar.gz
+*.zip
+
+# Local Cargo config overrides
+.cargo/config.local.toml

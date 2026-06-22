@@ -1,0 +1,660 @@
+// Task management tools: TaskCreate, TaskGet, TaskUpdate, TaskList, TaskStop, TaskOutput.
+//
+// Implements a simple in-process task store backed by a global Arc<Mutex<HashMap>>.
+// Tasks have id, subject, description, status, owner, blocks/blocked-by dependencies,
+// and optional output.
+
+#![cfg_attr(
+    not(any(
+        feature = "tool-task-create",
+        feature = "tool-task-get",
+        feature = "tool-task-list",
+        feature = "tool-task-output",
+        feature = "tool-task-stop",
+        feature = "tool-task-update"
+    )),
+    allow(dead_code, unused_imports)
+)]
+
+#[cfg(feature = "tool-task-output")]
+use crate::output_reducers::{reduce_command_output, OutputMode};
+use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use async_trait::async_trait;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::sync::Arc;
+#[cfg(feature = "tool-task-create")]
+use tracing::debug;
+#[cfg(feature = "tool-task-create")]
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Task store (global singleton)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Deleted,
+    Running, // for background shell tasks
+    Failed,
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Deleted => "deleted",
+            TaskStatus::Running => "running",
+            TaskStatus::Failed => "failed",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[cfg(any(feature = "tool-task-update", test))]
+fn normalize_task_update_status(value: &str) -> Result<TaskStatus, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pending" => Ok(TaskStatus::Pending),
+        "in_progress" | "in-progress" => Ok(TaskStatus::InProgress),
+        "completed" => Ok(TaskStatus::Completed),
+        "deleted" => Ok(TaskStatus::Deleted),
+        "failed" => Ok(TaskStatus::Failed),
+        _ => {
+            let value =
+                serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            Err(format!(
+                "Invalid status: {value}. Expected one of: pending, in_progress, completed, deleted, failed"
+            ))
+        }
+    }
+}
+
+fn json_tool_success(value: Value) -> ToolResult {
+    match serde_json::to_string_pretty(&value) {
+        Ok(json) => ToolResult::success(json),
+        Err(e) => ToolResult::error(format!("Failed to serialize task response: {}", e)),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub subject: String,
+    pub description: String,
+    pub status: TaskStatus,
+    pub owner: Option<String>,
+    /// IDs of tasks this task blocks (i.e., those tasks depend on this one completing).
+    pub blocks: Vec<String>,
+    /// IDs of tasks that must complete before this task can start.
+    pub blocked_by: Vec<String>,
+    pub metadata: Option<Value>,
+    pub output: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Task {
+    #[cfg(feature = "tool-task-create")]
+    fn new(subject: impl Into<String>, description: impl Into<String>) -> Self {
+        let now = chrono::Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            subject: subject.into(),
+            description: description.into(),
+            status: TaskStatus::Pending,
+            owner: None,
+            blocks: vec![],
+            blocked_by: vec![],
+            metadata: None,
+            output: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[cfg(feature = "tool-task-list")]
+    fn to_summary_value(&self) -> Value {
+        // Compute effective blocked_by (exclude completed tasks)
+        let blocked_by = self.blocked_by.clone();
+        json!({
+            "id": self.id,
+            "subject": self.subject,
+            "status": self.status.to_string(),
+            "owner": self.owner,
+            "blocked_by": blocked_by,
+        })
+    }
+
+    #[cfg(any(feature = "tool-task-get", feature = "tool-task-output"))]
+    fn to_full_value(&self) -> Value {
+        json!({
+            "id": self.id,
+            "subject": self.subject,
+            "description": self.description,
+            "status": self.status.to_string(),
+            "owner": self.owner,
+            "blocks": self.blocks,
+            "blocked_by": self.blocked_by,
+            "metadata": self.metadata,
+            "output": self.output,
+            "created_at": self.created_at.to_rfc3339(),
+            "updated_at": self.updated_at.to_rfc3339(),
+        })
+    }
+}
+
+/// Global task store shared across all tool invocations.
+/// Public so the TUI can access and display tasks.
+pub static TASK_STORE: Lazy<Arc<DashMap<String, Task>>> = Lazy::new(|| Arc::new(DashMap::new()));
+
+// ---------------------------------------------------------------------------
+// TaskCreate
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-create")]
+pub struct TaskCreateTool;
+
+#[cfg(feature = "tool-task-create")]
+#[derive(Debug, Deserialize)]
+struct TaskCreateInput {
+    subject: String,
+    description: String,
+    #[serde(default)]
+    metadata: Option<Value>,
+}
+
+#[cfg(feature = "tool-task-create")]
+#[async_trait]
+impl Tool for TaskCreateTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_CREATE
+    }
+    fn description(&self) -> &str {
+        "Create a new task to track work items. Returns the task ID."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string", "description": "Brief title for the task" },
+                "description": { "type": "string", "description": "Detailed description of what needs to be done" },
+                "metadata": { "type": "object", "description": "Optional arbitrary metadata" }
+            },
+            "required": ["subject", "description"]
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let params: TaskCreateInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+
+        let mut task = Task::new(&params.subject, &params.description);
+        task.metadata = params.metadata;
+        let task_id = task.id.clone();
+
+        debug!(task_id = %task_id, subject = %params.subject, "Creating task");
+        TASK_STORE.insert(task_id.clone(), task);
+
+        json_tool_success(json!({
+            "task_id": task_id,
+            "subject": params.subject,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskGet
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-get")]
+pub struct TaskGetTool;
+
+#[cfg(feature = "tool-task-get")]
+#[derive(Debug, Deserialize)]
+struct TaskGetInput {
+    #[serde(alias = "taskId")]
+    task_id: String,
+}
+
+#[cfg(feature = "tool-task-get")]
+#[async_trait]
+impl Tool for TaskGetTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_GET
+    }
+    fn description(&self) -> &str {
+        "Get full details of a task by ID."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "Task ID to retrieve" }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let params: TaskGetInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+
+        match TASK_STORE.get(&params.task_id) {
+            Some(task) => json_tool_success(task.to_full_value()),
+            None => json_tool_success(json!(null)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskUpdate
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-update")]
+pub struct TaskUpdateTool;
+
+#[cfg(feature = "tool-task-update")]
+#[derive(Debug, Deserialize)]
+struct TaskUpdateInput {
+    #[serde(alias = "taskId")]
+    task_id: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default, rename = "addBlocks")]
+    add_blocks: Option<Vec<String>>,
+    #[serde(default, rename = "addBlockedBy")]
+    add_blocked_by: Option<Vec<String>>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+#[cfg(feature = "tool-task-update")]
+#[async_trait]
+impl Tool for TaskUpdateTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_UPDATE
+    }
+    fn description(&self) -> &str {
+        "Update a task's properties (status, subject, description, etc.)."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "Task ID to update" },
+                "subject": { "type": "string" },
+                "description": { "type": "string" },
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed", "deleted", "failed"]
+                },
+                "owner": { "type": "string" },
+                "addBlocks": { "type": "array", "items": { "type": "string" } },
+                "addBlockedBy": { "type": "array", "items": { "type": "string" } },
+                "metadata": { "type": "object" },
+                "output": { "type": "string" }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let params: TaskUpdateInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+        let status_update = match params.status.as_deref() {
+            Some(status) => match normalize_task_update_status(status) {
+                Ok(status) => Some(status),
+                Err(e) => return ToolResult::error(e),
+            },
+            None => None,
+        };
+
+        let mut task = match TASK_STORE.get_mut(&params.task_id) {
+            Some(t) => t,
+            None => return ToolResult::error(format!("Task '{}' not found", params.task_id)),
+        };
+
+        let mut updated_fields: Vec<&str> = vec![];
+
+        if let Some(subject) = &params.subject {
+            task.subject = subject.clone();
+            updated_fields.push("subject");
+        }
+        if let Some(desc) = &params.description {
+            task.description = desc.clone();
+            updated_fields.push("description");
+        }
+        if let Some(status) = status_update {
+            task.status = status;
+            updated_fields.push("status");
+        }
+        if let Some(owner) = &params.owner {
+            task.owner = Some(owner.clone());
+            updated_fields.push("owner");
+        }
+        if let Some(blocks) = &params.add_blocks {
+            for b in blocks {
+                if !task.blocks.contains(b) {
+                    task.blocks.push(b.clone());
+                }
+            }
+            updated_fields.push("blocks");
+        }
+        if let Some(blocked_by) = &params.add_blocked_by {
+            for b in blocked_by {
+                if !task.blocked_by.contains(b) {
+                    task.blocked_by.push(b.clone());
+                }
+            }
+            updated_fields.push("blocked_by");
+        }
+        if let Some(meta) = &params.metadata {
+            task.metadata = Some(meta.clone());
+            updated_fields.push("metadata");
+        }
+        if let Some(out) = &params.output {
+            task.output = Some(out.clone());
+            updated_fields.push("output");
+        }
+
+        task.updated_at = chrono::Utc::now();
+
+        // Handle deletion
+        let task_id = task.id.clone();
+        let task_status = task.status.clone();
+        drop(task); // release the lock
+
+        if task_status == TaskStatus::Deleted {
+            TASK_STORE.remove(&task_id);
+        }
+
+        json_tool_success(json!({
+            "success": true,
+            "task_id": task_id,
+            "updated_fields": updated_fields,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskList
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-list")]
+pub struct TaskListTool;
+
+#[cfg(feature = "tool-task-list")]
+#[async_trait]
+impl Tool for TaskListTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_LIST
+    }
+    fn description(&self) -> &str {
+        "List all active tasks (excluding deleted/completed)."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "include_completed": {
+                    "type": "boolean",
+                    "description": "Include completed tasks (default false)"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let include_completed = input
+            .get("include_completed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let tasks: Vec<Value> = TASK_STORE
+            .iter()
+            .filter(|entry| {
+                let status = &entry.value().status;
+                match status {
+                    TaskStatus::Deleted => false,
+                    TaskStatus::Completed => include_completed,
+                    _ => true,
+                }
+            })
+            .map(|entry| entry.value().to_summary_value())
+            .collect();
+
+        json_tool_success(json!(tasks))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskStop
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-stop")]
+pub struct TaskStopTool;
+
+#[cfg(feature = "tool-task-stop")]
+#[derive(Debug, Deserialize)]
+struct TaskStopInput {
+    #[serde(alias = "shell_id")]
+    task_id: String,
+}
+
+#[cfg(feature = "tool-task-stop")]
+#[async_trait]
+impl Tool for TaskStopTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_STOP
+    }
+    fn description(&self) -> &str {
+        "Stop a running background task."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Execute
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "ID of the task to stop" }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let params: TaskStopInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Stop task {}", params.task_id), false)
+        {
+            return ToolResult::error(e.to_string());
+        }
+
+        match TASK_STORE.get_mut(&params.task_id) {
+            Some(mut task) => {
+                if task.status != TaskStatus::Running && task.status != TaskStatus::InProgress {
+                    return ToolResult::error(format!(
+                        "Task '{}' is not running (status: {})",
+                        params.task_id, task.status
+                    ));
+                }
+                task.status = TaskStatus::Completed;
+                task.updated_at = chrono::Utc::now();
+                json_tool_success(json!({
+                    "message": "Task stopped",
+                    "task_id": params.task_id,
+                }))
+            }
+            None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TaskOutput
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "tool-task-output")]
+pub struct TaskOutputTool;
+
+#[cfg(feature = "tool-task-output")]
+#[derive(Debug, Deserialize)]
+struct TaskOutputInput {
+    task_id: String,
+    #[serde(default = "default_block")]
+    block: bool,
+    #[serde(default)]
+    output_mode: Option<OutputMode>,
+}
+
+#[cfg(feature = "tool-task-output")]
+fn default_block() -> bool {
+    true
+}
+
+#[cfg(feature = "tool-task-output")]
+#[async_trait]
+impl Tool for TaskOutputTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_TASK_OUTPUT
+    }
+    fn description(&self) -> &str {
+        "Get the output of a task."
+    }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task_id": { "type": "string", "description": "Task ID to get output for" },
+                "block": { "type": "boolean", "description": "Wait for task to complete (default true)" },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["auto", "raw", "summary"],
+                    "description": "Control RTK-style output reduction for task output (default auto)"
+                }
+            },
+            "required": ["task_id"]
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let params: TaskOutputInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+        let output_mode = params
+            .output_mode
+            .unwrap_or_else(|| OutputMode::from_config(&ctx.config.tool_output.reduction));
+
+        match TASK_STORE.get(&params.task_id) {
+            Some(task) => {
+                let retrieval_status = match &task.status {
+                    TaskStatus::Completed | TaskStatus::Failed => "success",
+                    TaskStatus::Running | TaskStatus::InProgress => {
+                        if params.block {
+                            "success"
+                        } else {
+                            "not_ready"
+                        }
+                    }
+                    _ => "success",
+                };
+                let mut task_value = task.to_full_value();
+                if let Some(output) = task.output.as_deref() {
+                    if let Some(obj) = task_value.as_object_mut() {
+                        let reduced = reduce_command_output(
+                            &task.subject,
+                            output,
+                            if task.status == TaskStatus::Failed {
+                                1
+                            } else {
+                                0
+                            },
+                            output_mode,
+                        );
+                        obj.insert("output".to_string(), json!(reduced.content));
+                    }
+                }
+                json_tool_success(json!({
+                    "retrieval_status": retrieval_status,
+                    "task": task_value,
+                }))
+            }
+            None => ToolResult::error(format!("Task '{}' not found", params.task_id)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_update_status_is_normalized_or_rejected() {
+        assert_eq!(
+            normalize_task_update_status(" in-progress "),
+            Ok(TaskStatus::InProgress)
+        );
+        assert_eq!(
+            normalize_task_update_status(" FAILED "),
+            Ok(TaskStatus::Failed)
+        );
+
+        let injected = normalize_task_update_status("pending\nfailed")
+            .expect_err("invalid status must be rejected");
+        let running = normalize_task_update_status("running")
+            .expect_err("model-updatable status must match schema");
+
+        assert!(injected.contains("Invalid status"));
+        assert!(injected.contains("\"pending\\nfailed\""));
+        assert!(running.contains("Invalid status"));
+    }
+}

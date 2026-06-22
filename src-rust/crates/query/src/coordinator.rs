@@ -1,0 +1,491 @@
+//! Coordinator mode: multi-worker agent orchestration
+
+pub const COORDINATOR_ENV_VAR: &str = "MANGOCODE_COORDINATOR_MODE";
+
+/// Tools that belong exclusively to the coordinator — not exposed to workers.
+pub const COORDINATOR_ONLY_TOOLS: &[&str] = &[
+    "Agent",
+    "SendMessage",
+    "TaskStop",
+    "TeamCreate",
+    "TeamDelete",
+    "StructuredOutput",
+];
+
+/// Tools that workers are allowed to use in simple mode (MANGOCODE_SIMPLE=1).
+pub const WORKER_SIMPLE_TOOLS: &[&str] = &["Bash", "Read", "Edit"];
+
+/// Tools explicitly banned in coordinator mode (coordinator delegates these to workers).
+pub const COORDINATOR_BANNED_TOOLS: &[&str] = &[
+    // Coordinator should orchestrate, not execute directly.
+    "Bash",
+];
+
+/// Agent mode for a session: either the coordinator itself or a worker spawned by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    Coordinator,
+    Worker,
+    /// Worker running in an isolated git worktree — has all Worker tools plus
+    /// EnterWorktree/ExitWorktree for managing worktree state.
+    WorktreeWorker,
+    Normal,
+}
+
+pub fn is_coordinator_mode() -> bool {
+    std::env::var(COORDINATOR_ENV_VAR)
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+}
+
+/// System prompt sections injected when coordinator mode is active
+pub fn coordinator_system_prompt() -> &'static str {
+    r#"
+## Coordinator Mode
+
+You are operating as an orchestrator for parallel worker agents.
+
+### Your Role
+- Orchestrate workers using available agent and coordination tools
+- Continue communication with running workers when a messaging tool is available
+- Cancel workers that are no longer needed when a stop/cancel tool is available
+- Synthesize findings across workers before presenting to the user
+- Answer directly when the question doesn't need delegation
+
+### Task Workflow
+1. **Research Phase**: Gather information directly or with workers in parallel when available
+2. **Synthesis Phase**: Collect and merge worker findings
+3. **Implementation Phase**: Delegate implementation tasks to specialized workers when available
+4. **Verification Phase**: Validate results directly or with verification workers when available
+
+### Worker Guidelines
+- Worker prompts must be fully self-contained (workers cannot see your conversation)
+- Always synthesize findings before spawning follow-up workers
+- Workers have access only to tools exposed by the current build, session config, permission mode, and MCP connections
+- Use task-tracking tools to track parallel work when they are available
+
+### Internal Tools (do not delegate to workers)
+- Coordination-only tools exposed in the current runtime tool list
+"#
+}
+
+/// Tools that should NOT be passed to worker agents (alias kept for
+/// backwards-compatibility with existing callers in this file).
+pub const INTERNAL_COORDINATOR_TOOLS: &[&str] = COORDINATOR_ONLY_TOOLS;
+
+// ---------------------------------------------------------------------------
+// Scratchpad gate
+// ---------------------------------------------------------------------------
+
+/// Guards scratchpad-gated tools.  When the unlock signal phrase appears in
+/// model output, the gate opens and those tools become available.
+///
+/// Scratchpad-gated tools stay disabled until the model emits the unlock phrase.
+pub struct ScratchpadGate {
+    unlocked: bool,
+    /// The phrase that, when seen in content, opens the gate.
+    unlock_signal: Option<String>,
+}
+
+impl ScratchpadGate {
+    pub fn new() -> Self {
+        Self {
+            unlocked: false,
+            unlock_signal: None,
+        }
+    }
+
+    /// Create a gate with an explicit unlock phrase.
+    pub fn with_signal(signal: impl Into<String>) -> Self {
+        Self {
+            unlocked: false,
+            unlock_signal: Some(signal.into()),
+        }
+    }
+
+    /// Returns `true` when `tool_name` is currently allowed through the gate.
+    ///
+    /// Tools NOT in the gated set are always allowed.  Gated tools are only
+    /// allowed once `try_unlock` has been called with matching content.
+    pub fn check(&self, tool_name: &str) -> bool {
+        // File operations on the scratchpad dir are gated
+        const GATED: &[&str] = &["Write", "FileWrite", "Edit", "FileEdit"];
+        if GATED.contains(&tool_name) {
+            return self.unlocked;
+        }
+        true
+    }
+
+    /// Returns `true` if `content` contains the unlock signal and the gate was
+    /// opened as a result (or was already open).
+    pub fn try_unlock(&mut self, content: &str) -> bool {
+        if self.unlocked {
+            return true;
+        }
+        if let Some(ref signal) = self.unlock_signal {
+            if content.contains(signal.as_str()) {
+                self.unlocked = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        self.unlocked
+    }
+}
+
+impl Default for ScratchpadGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool filtering
+// ---------------------------------------------------------------------------
+
+/// Filter a tool list so only tools appropriate for `mode` are included.
+///
+/// - `AgentMode::Coordinator`: retains orchestration tools while removing
+///   tools that the coordinator should delegate to workers.
+/// - `AgentMode::Worker`: COORDINATOR_ONLY_TOOLS are removed.
+/// - `AgentMode::Normal`: no filtering.
+///   Tools that WorktreeWorker is additionally allowed to use on top of Worker tools.
+const WORKTREE_EXTRA_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
+
+pub fn filter_tools_for_mode(
+    tools: &[Box<dyn mangocode_tools::Tool>],
+    mode: AgentMode,
+) -> Vec<&dyn mangocode_tools::Tool> {
+    tools
+        .iter()
+        .filter(|tool| tool_allowed_for_mode(tool.name(), mode))
+        .map(|t| t.as_ref())
+        .collect()
+}
+
+pub fn tool_allowed_for_mode(tool_name: &str, mode: AgentMode) -> bool {
+    match mode {
+        AgentMode::Normal => true,
+        AgentMode::Coordinator => !COORDINATOR_BANNED_TOOLS.contains(&tool_name),
+        AgentMode::Worker => !COORDINATOR_ONLY_TOOLS.contains(&tool_name),
+        AgentMode::WorktreeWorker => {
+            !COORDINATOR_ONLY_TOOLS.contains(&tool_name)
+                || WORKTREE_EXTRA_TOOLS.contains(&tool_name)
+        }
+    }
+}
+
+/// Get the user context injected for coordinator sessions
+pub fn coordinator_user_context(available_tools: &[String], mcp_servers: &[String]) -> String {
+    let tool_list = available_tools
+        .iter()
+        .filter(|t| !INTERNAL_COORDINATOR_TOOLS.contains(&t.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mcp_section = if mcp_servers.is_empty() {
+        String::new()
+    } else {
+        format!("\nConnected MCP servers: {}", mcp_servers.join(", "))
+    };
+
+    format!("Available worker tools: {}{}\n", tool_list, mcp_section)
+}
+
+/// Check if the current runtime coordinator flag matches `stored_coordinator`.
+/// If mismatched, flips the env var to match the stored session and returns a
+/// human-readable warning string.  Returns `None` when no switch was needed.
+///
+/// This is the lower-level variant used by session-resume code that stores the
+/// mode as a plain bool.  For the typed `AgentMode` variant see
+/// `match_session_mode_from_agent_mode`.
+pub fn match_session_mode(stored_coordinator: bool) -> Option<String> {
+    let current = is_coordinator_mode();
+    if stored_coordinator == current {
+        return None;
+    }
+    if stored_coordinator {
+        // SAFETY: env-var mutation is inherently racy in multi-threaded
+        // programs, but coordinator-mode toggling only happens at session
+        // resume time before any worker threads are spawned.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var(COORDINATOR_ENV_VAR, "1");
+        }
+        Some("Entered coordinator mode to match resumed session.".to_string())
+    } else {
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(COORDINATOR_ENV_VAR);
+        }
+        Some("Exited coordinator mode to match resumed session.".to_string())
+    }
+}
+
+/// Typed variant of `match_session_mode` — accepts an `AgentMode` directly.
+/// Returns a warning string when the environment was changed, `None` otherwise.
+pub fn match_session_mode_from_agent_mode(session_mode: AgentMode) -> Option<String> {
+    match session_mode {
+        AgentMode::Coordinator => match_session_mode(true),
+        AgentMode::Normal | AgentMode::Worker | AgentMode::WorktreeWorker => {
+            match_session_mode(false)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Intent-based skill resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve which skills should be auto-loaded for a given user message by
+/// matching against each skill's declared trigger phrases.
+///
+/// Returns an ordered list of normalized skill **names** matched for this turn
+/// (most relevant first). Load templates and expand dependencies with
+/// `skill_discovery::load_skill_with_dependencies`, then build
+/// `SystemPromptOptions::injected_skills` / `skill_qa_blocks` **before** the
+/// model API call. Dependencies are resolved and deduplicated by the caller.
+///
+/// # Design
+///
+/// This is the Phase 1 bridge between the turn loop and the skill system.
+/// The query layer is expected to:
+///
+/// - Discover skills from disk/URLs (`mangocode_core::discover_skills`)
+/// - Match `user_message` against triggers (this function)
+/// - Expand dependencies depth-first (`load_skill_with_dependencies`)
+/// - Inject templates into the cacheable system prompt section
+///   (`SystemPromptOptions::injected_skills`)
+/// - Inject QA constraints into the dynamic system prompt section
+///   (`SystemPromptOptions::skill_qa_blocks`)
+/// - Install bundled scripts into a session/workspace scripts directory
+///   (`install_skill_scripts`)
+pub fn resolve_skills_for_turn(
+    user_message: &str,
+    skill_index: &std::collections::HashMap<
+        String,
+        mangocode_core::skill_discovery::DiscoveredSkill,
+    >,
+) -> Vec<String> {
+    use mangocode_core::skill_discovery::resolve_skills_for_message;
+    resolve_skills_for_message(user_message, skill_index)
+        .into_iter()
+        .filter_map(|s| normalized_skill_name_for_turn(&s.name))
+        .collect()
+}
+
+fn normalized_skill_name_for_turn(name: &str) -> Option<String> {
+    let name = strip_markdown_suffix(name.trim().trim_start_matches('/').trim()).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn strip_markdown_suffix(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 3 && bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        &name[..name.len() - 3]
+    } else {
+        name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // All tests that mutate COORDINATOR_ENV_VAR must hold this guard to avoid
+    // data races when cargo test runs them in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_is_coordinator_mode_unset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+        assert!(!is_coordinator_mode());
+    }
+
+    #[test]
+    fn test_is_coordinator_mode_set_to_one() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(COORDINATOR_ENV_VAR, "1");
+        assert!(is_coordinator_mode());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+    }
+
+    #[test]
+    fn test_is_coordinator_mode_set_to_false() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(COORDINATOR_ENV_VAR, "false");
+        assert!(!is_coordinator_mode());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+    }
+
+    #[test]
+    fn test_is_coordinator_mode_set_to_zero() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var(COORDINATOR_ENV_VAR, "0");
+        assert!(!is_coordinator_mode());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+    }
+
+    #[test]
+    fn test_coordinator_user_context_filters_internal_tools() {
+        let tools = vec![
+            "Bash".to_string(),
+            "Agent".to_string(),
+            "SendMessage".to_string(),
+            "TaskStop".to_string(),
+            "StructuredOutput".to_string(),
+            "Read".to_string(),
+        ];
+        let ctx = coordinator_user_context(&tools, &[]);
+        assert!(ctx.contains("Bash"));
+        assert!(ctx.contains("Read"));
+        assert!(!ctx.contains("Agent"));
+        assert!(!ctx.contains("SendMessage"));
+        assert!(!ctx.contains("TaskStop"));
+        assert!(!ctx.contains("StructuredOutput"));
+    }
+
+    #[test]
+    fn test_coordinator_user_context_mcp_servers() {
+        let tools = vec!["Bash".to_string()];
+        let mcps = vec!["filesystem".to_string(), "git".to_string()];
+        let ctx = coordinator_user_context(&tools, &mcps);
+        assert!(ctx.contains("filesystem"));
+        assert!(ctx.contains("git"));
+    }
+
+    #[test]
+    fn test_match_session_mode_no_change_needed() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+        // current = false, stored = false → no warning
+        assert!(match_session_mode(false).is_none());
+    }
+
+    #[test]
+    fn test_match_session_mode_switches_to_coordinator() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+        // current = false, stored = true → should flip and warn
+        let msg = match_session_mode(true);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("coordinator"));
+        // Clean up
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+    }
+
+    #[test]
+    fn test_coordinator_system_prompt_content() {
+        let prompt = coordinator_system_prompt();
+        assert!(prompt.contains("Coordinator Mode"));
+        assert!(prompt.contains("orchestrator"));
+        assert!(prompt.contains("Research Phase"));
+        assert!(prompt.contains("Synthesis Phase"));
+    }
+
+    #[test]
+    fn test_resolve_skills_for_turn_normalizes_skill_names() {
+        let mut index = std::collections::HashMap::new();
+        index.insert(
+            "projectreview".to_string(),
+            mangocode_core::skill_discovery::DiscoveredSkill {
+                name: " /ProjectReview.MD ".to_string(),
+                description: "Project review".to_string(),
+                template: "Review instructions.".to_string(),
+                source_path: std::path::PathBuf::from("review.md"),
+                triggers: vec!["review project".to_string()],
+                dependencies: Vec::new(),
+                sub_files: Default::default(),
+                scripts: Vec::new(),
+                qa_required: false,
+                qa_steps: Vec::new(),
+            },
+        );
+
+        let names = resolve_skills_for_turn("please review project", &index);
+
+        assert_eq!(names, vec!["ProjectReview".to_string()]);
+    }
+
+    #[test]
+    fn test_scratchpad_gate_unlocked_by_default_for_non_gated_tools() {
+        let gate = ScratchpadGate::new();
+        assert!(gate.check("Bash"), "Bash should always pass the gate");
+        assert!(gate.check("Read"), "Read should always pass the gate");
+    }
+
+    #[test]
+    fn test_scratchpad_gate_blocks_write_until_unlocked() {
+        let mut gate = ScratchpadGate::with_signal("SCRATCHPAD_READY");
+        assert!(
+            !gate.check("Write"),
+            "Write should be blocked before unlock"
+        );
+        assert!(
+            !gate.check("FileWrite"),
+            "FileWrite should be blocked before unlock"
+        );
+        gate.try_unlock("Some content SCRATCHPAD_READY here");
+        assert!(gate.check("Write"), "Write should be allowed after unlock");
+        assert!(
+            gate.check("FileWrite"),
+            "FileWrite should be allowed after unlock"
+        );
+    }
+
+    #[test]
+    fn test_scratchpad_gate_try_unlock_wrong_signal() {
+        let mut gate = ScratchpadGate::with_signal("SIGNAL_X");
+        let result = gate.try_unlock("no signal here");
+        assert!(!result);
+        assert!(!gate.is_unlocked());
+    }
+
+    #[test]
+    fn test_scratchpad_gate_already_unlocked() {
+        let mut gate = ScratchpadGate::with_signal("SIG");
+        gate.try_unlock("SIG");
+        assert!(gate.try_unlock("nothing")); // already open
+        assert!(gate.is_unlocked());
+    }
+
+    #[test]
+    fn test_agent_mode_enum() {
+        assert_ne!(AgentMode::Coordinator, AgentMode::Worker);
+        assert_ne!(AgentMode::Worker, AgentMode::Normal);
+        assert_eq!(AgentMode::Coordinator, AgentMode::Coordinator);
+    }
+
+    #[test]
+    fn test_tool_allowed_for_mode_separates_coordinator_and_worker_tools() {
+        assert!(!tool_allowed_for_mode("Bash", AgentMode::Coordinator));
+        assert!(tool_allowed_for_mode("Agent", AgentMode::Coordinator));
+        assert!(!tool_allowed_for_mode("Agent", AgentMode::Worker));
+        assert!(tool_allowed_for_mode("Read", AgentMode::Worker));
+        assert!(tool_allowed_for_mode("Bash", AgentMode::Normal));
+    }
+
+    #[test]
+    fn test_match_session_mode_from_agent_mode_coordinator() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+        let msg = match_session_mode_from_agent_mode(AgentMode::Coordinator);
+        assert!(msg.is_some());
+        assert!(msg.unwrap().contains("coordinator"));
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+    }
+
+    #[test]
+    fn test_match_session_mode_from_agent_mode_normal_no_change() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(COORDINATOR_ENV_VAR);
+        let msg = match_session_mode_from_agent_mode(AgentMode::Normal);
+        assert!(msg.is_none());
+    }
+}

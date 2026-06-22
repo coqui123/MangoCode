@@ -1,0 +1,5879 @@
+// mangocode-core: Core types, error handling, configuration, settings, and constants
+// for MangoCode.
+//
+// All sub-modules are defined inline below.
+
+// Branded provider / model identifier newtypes.
+pub mod provider_id;
+pub use provider_id::{ModelId, ProviderId};
+
+// Session transcript persistence (JSONL).
+pub mod session_storage;
+
+// Session sharing — HTTP upload to a share endpoint + local text export.
+pub mod session_share;
+pub use session_share::{export_session_text, share_session};
+
+// SQLite-backed session storage (faster alternative to JSONL).
+pub mod sqlite_storage;
+pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
+
+// Persistent local thread goals.
+pub mod goals;
+pub use goals::{ThreadGoal, ThreadGoalStatus};
+
+// Local multi-process session coordination.
+pub mod coordination;
+pub use coordination::{
+    ConflictWarning, CoordinationMessage, CoordinationStore, SessionPresence, WorkClaim,
+};
+
+// Durable local harness events/checkpoints/traces.
+mod command_line;
+pub use command_line::split_command_words;
+mod git_diff;
+pub use git_diff::{
+    parse_git_diff_new_path, parse_unified_diff_marker_path, strip_single_git_diff_prefix,
+};
+pub mod frontmatter;
+pub mod harness;
+pub mod layered_memory;
+
+// Attachment pipeline — assembles per-turn context attachments (T1-6).
+pub mod attachments;
+pub mod smart_attachments;
+
+// Git utilities (T4-3).
+pub mod git_utils;
+
+// Credential storage for provider API keys and OAuth tokens.
+pub mod auth_store;
+pub use auth_store::{AuthStore, StoredCredential};
+
+// Encrypted local credential vault.
+pub mod vault;
+pub use vault::{
+    clear_vault_passphrase, get_vault_passphrase, reqwest_client_builder, set_vault_passphrase,
+    GatewayConfig, Vault,
+};
+
+// GitHub Device Code Flow (RFC 8628) for OAuth device authorization.
+pub mod device_code;
+
+// Utility modules.
+pub mod auto_mode;
+pub mod crypto_utils;
+pub mod format_utils;
+pub mod status_notices;
+pub mod token_budget;
+pub mod truncate;
+
+/// Chrome DevTools `Runtime.evaluate` string helpers (shared by `/chrome` and Browser tool).
+pub mod chrome_js;
+
+// Remote session sync and cloud session API (T3-1, T3-2).
+pub mod cloud_session;
+pub mod remote_session;
+
+// AGENTS.md hierarchical memory loading (T4-1).
+pub mod claudemd;
+
+// Message manipulation utilities (T4-2).
+pub mod message_utils;
+
+// Per-session file modification history (T4-6).
+pub mod file_history;
+
+// Snapshot/undo system — tracks file changes per session for /undo support.
+pub mod snapshot;
+
+// Runtime feature flag management.
+pub mod feature_flags;
+
+// Persistent cumulative usage ledger (~/.mangocode/usage.json).
+pub mod usage_ledger;
+
+/// Initialize runtime feature flags early at process startup.
+pub fn init_runtime_feature_flags() {
+    let _ = feature_flags::FeatureFlags::ensure_initialized();
+}
+
+// MCP resource prompt template rendering with variable substitution.
+pub mod mcp_templates;
+
+// IDE environment detection (VS Code, Cursor, JetBrains, …).
+pub mod ide;
+pub use ide::{detect_ide, is_ide_terminal, IdeKind};
+
+// Background update checker — compares running version against GitHub releases.
+pub mod update_check;
+pub use update_check::{
+    check_for_updates, is_newer, UpdateInfo, GITHUB_RELEASES_API_LATEST_URL,
+    GITHUB_RELEASES_API_URL, GITHUB_RELEASES_PAGE, GITHUB_REPO_URL,
+};
+
+// Re-export commonly used types at the crate root
+pub use config::{
+    default_agents, strip_jsonc_comments, substitute_env_vars, AgentCompletionPolicy,
+    AgentDefinition, AgentReliabilityProfile, AgentSpeedProfile, ApprovalsReviewer,
+    CommandTemplate, Config, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode,
+    ProviderConfig, Settings, SkillsConfig, Theme, VerificationPolicy,
+};
+pub use error::{ClaudeError, Result};
+pub use types::{
+    CitationsConfig, ContentBlock, DocumentSource, ImageSource, Message, MessageContent,
+    MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
+};
+
+// Skill discovery: filesystem and git URL skill loading.
+pub mod skill_discovery;
+pub use cost::CostTracker;
+pub use feature_flags::{
+    FeatureFlagManager, FeatureFlags, FLAG_AUTO_LSP, FLAG_CRITIC_PERMISSIONS,
+    FLAG_EXECUTION_SCRATCHPAD, FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION,
+    FLAG_PLAN_SEARCH, FLAG_PRESERVE_THINKING, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
+    FLAG_SELF_REVIEW,
+};
+pub use history::ConversationSession;
+pub use keybindings::{
+    KeyContext, KeybindingProfile, KeybindingResolver, KeybindingResult, ParsedKeystroke,
+    UserKeybindings,
+};
+pub use permission_critic::{global_critic, CriticConfig, CriticEvaluation, PermissionCritic};
+pub use permissions::{
+    format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
+    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler, PermissionAction,
+    PermissionDecision, PermissionHandler, PermissionLevel, PermissionManager, PermissionRequest,
+    PermissionRule, PermissionScope, SerializedPermissionRule,
+};
+pub use skill_discovery::{discover_skills, parse_skill_file, DiscoveredSkill};
+pub use snapshot::SnapshotManager;
+
+// ---------------------------------------------------------------------------
+// error module
+// ---------------------------------------------------------------------------
+pub mod error {
+    use thiserror::Error;
+
+    /// The unified error type for MangoCode.
+    #[derive(Error, Debug)]
+    pub enum ClaudeError {
+        #[error("API error: {0}")]
+        Api(String),
+
+        #[error("API error {status}: {message}")]
+        ApiStatus { status: u16, message: String },
+
+        #[error("Authentication error: {0}")]
+        Auth(String),
+
+        #[error("Permission denied: {0}")]
+        PermissionDenied(String),
+
+        #[error("Tool error: {0}")]
+        Tool(String),
+
+        #[error("IO error: {0}")]
+        Io(#[from] std::io::Error),
+
+        #[error("JSON error: {0}")]
+        Json(#[from] serde_json::Error),
+
+        #[error("HTTP error: {0}")]
+        Http(#[from] reqwest::Error),
+
+        #[error("Rate limit exceeded")]
+        RateLimit,
+
+        #[error("Context window exceeded")]
+        ContextWindowExceeded,
+
+        #[error("Max tokens reached")]
+        MaxTokensReached,
+
+        #[error("Cancelled")]
+        Cancelled,
+
+        #[error("Configuration error: {0}")]
+        Config(String),
+
+        #[error("MCP error: {0}")]
+        Mcp(String),
+
+        #[error("{0}")]
+        Other(String),
+    }
+
+    /// Convenience alias used throughout the project.
+    pub type Result<T> = std::result::Result<T, ClaudeError>;
+
+    impl ClaudeError {
+        /// Return `true` when the caller should retry the request.
+        pub fn is_retryable(&self) -> bool {
+            matches!(
+                self,
+                ClaudeError::RateLimit
+                    | ClaudeError::ApiStatus { status: 429, .. }
+                    | ClaudeError::ApiStatus { status: 529, .. }
+            )
+        }
+
+        /// Return `true` for errors that mean the conversation cannot continue
+        /// without intervention (e.g. compaction or context-window reset).
+        pub fn is_context_limit(&self) -> bool {
+            matches!(
+                self,
+                ClaudeError::ContextWindowExceeded | ClaudeError::MaxTokensReached
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// types module
+// ---------------------------------------------------------------------------
+pub mod types {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+
+    // ---- Roles -----------------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Role {
+        User,
+        Assistant,
+    }
+
+    // ---- Content blocks --------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ContentBlock {
+        Text {
+            text: String,
+        },
+        Image {
+            source: ImageSource,
+        },
+        ToolUse {
+            id: String,
+            name: String,
+            input: Value,
+        },
+        ToolResult {
+            tool_use_id: String,
+            content: ToolResultContent,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_error: Option<bool>,
+            /// Transcript-only structured metadata. Providers ignore this when
+            /// converting messages for model context.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            metadata: Option<Value>,
+        },
+        Thinking {
+            thinking: String,
+            signature: String,
+        },
+        RedactedThinking {
+            data: String,
+        },
+        Document {
+            source: DocumentSource,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            context: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            citations: Option<CitationsConfig>,
+        },
+        /// A `!`-prefixed shell command invoked by the user, with its captured output.
+        /// Rendered as a faint gray block with a `!command` header.
+        UserLocalCommandOutput {
+            command: String,
+            output: String,
+        },
+        /// A skill/slash-command invocation entered by the user.
+        /// Rendered as `▸ name args` with cyan styling.
+        UserCommand {
+            name: String,
+            args: String,
+        },
+        /// A memory key/value written by the user (e.g. via `/memory`).
+        /// Rendered as `# key: value` in cyan with a `Got it.` footer.
+        UserMemoryInput {
+            key: String,
+            value: String,
+        },
+        /// A system-level API error, rendered as a red-bordered block.
+        /// Shows first 5 lines with `[expand]` hint when truncated, and an
+        /// optional `Retrying in Ns...` countdown line when `retry_secs` is set.
+        SystemAPIError {
+            message: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retry_secs: Option<u32>,
+        },
+        /// A collapsed summary of multiple read/search tool calls.
+        /// Rendered as `▸ Read N files (+ M more)` on a single line.
+        CollapsedReadSearch {
+            tool_name: String,
+            paths: Vec<String>,
+            n_hidden: usize,
+        },
+        /// A sub-task assignment in an agentic workflow.
+        /// Rendered as a cyan-bordered box with Task ID, subject, and description.
+        TaskAssignment {
+            id: String,
+            subject: String,
+            description: String,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum ToolResultContent {
+        Text(String),
+        Blocks(Vec<ContentBlock>),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ImageSource {
+        #[serde(rename = "type")]
+        pub source_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub media_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DocumentSource {
+        #[serde(rename = "type")]
+        pub source_type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub media_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CitationsConfig {
+        pub enabled: bool,
+    }
+
+    // ---- Messages --------------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Message {
+        pub role: Role,
+        pub content: MessageContent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub uuid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cost: Option<MessageCost>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum MessageContent {
+        Text(String),
+        Blocks(Vec<ContentBlock>),
+    }
+
+    impl Message {
+        /// Create a simple user text message.
+        pub fn user(content: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Text(content.into()),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a user message composed of multiple content blocks.
+        pub fn user_blocks(blocks: Vec<ContentBlock>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(blocks),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a simple assistant text message.
+        pub fn assistant(content: impl Into<String>) -> Self {
+            Self {
+                role: Role::Assistant,
+                content: MessageContent::Text(content.into()),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create an assistant message composed of multiple content blocks.
+        pub fn assistant_blocks(blocks: Vec<ContentBlock>) -> Self {
+            Self {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(blocks),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Extract the first text content from this message.
+        pub fn get_text(&self) -> Option<&str> {
+            match &self.content {
+                MessageContent::Text(t) => Some(t.as_str()),
+                MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| {
+                    if let ContentBlock::Text { text } = b {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                }),
+            }
+        }
+
+        /// Collect all text content blocks into one concatenated string.
+        pub fn get_all_text(&self) -> String {
+            match &self.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if let ContentBlock::Text { text } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            }
+        }
+
+        /// Return references to all `ToolUse` blocks in this message.
+        pub fn get_tool_use_blocks(&self) -> Vec<&ContentBlock> {
+            match &self.content {
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                    .collect(),
+                _ => vec![],
+            }
+        }
+
+        /// Return references to all `ToolResult` blocks in this message.
+        pub fn get_tool_result_blocks(&self) -> Vec<&ContentBlock> {
+            match &self.content {
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                    .collect(),
+                _ => vec![],
+            }
+        }
+
+        /// Return references to all `Thinking` blocks in this message.
+        pub fn get_thinking_blocks(&self) -> Vec<&ContentBlock> {
+            match &self.content {
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+                    .collect(),
+                _ => vec![],
+            }
+        }
+
+        /// Returns all content blocks (wrapping a single text into a vec).
+        pub fn content_blocks(&self) -> Vec<ContentBlock> {
+            match &self.content {
+                MessageContent::Text(t) => vec![ContentBlock::Text { text: t.clone() }],
+                MessageContent::Blocks(b) => b.clone(),
+            }
+        }
+
+        /// Check whether this message has any tool use blocks.
+        pub fn has_tool_use(&self) -> bool {
+            !self.get_tool_use_blocks().is_empty()
+        }
+
+        /// Create a user message representing a `!`-prefixed local shell command with output.
+        pub fn user_local_command_output(
+            command: impl Into<String>,
+            output: impl Into<String>,
+        ) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserLocalCommandOutput {
+                    command: command.into(),
+                    output: output.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a user message representing a skill/slash-command invocation.
+        pub fn user_command(name: impl Into<String>, args: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserCommand {
+                    name: name.into(),
+                    args: args.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a user message representing a memory key/value entry.
+        pub fn user_memory_input(key: impl Into<String>, value: impl Into<String>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::UserMemoryInput {
+                    key: key.into(),
+                    value: value.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing an API error (red-bordered block).
+        pub fn system_api_error(message: impl Into<String>, retry_secs: Option<u32>) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::SystemAPIError {
+                    message: message.into(),
+                    retry_secs,
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing a collapsed read/search summary.
+        pub fn collapsed_read_search(
+            tool_name: impl Into<String>,
+            paths: Vec<String>,
+            n_hidden: usize,
+        ) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::CollapsedReadSearch {
+                    tool_name: tool_name.into(),
+                    paths,
+                    n_hidden,
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+
+        /// Create a system message representing a sub-task assignment.
+        pub fn task_assignment(
+            id: impl Into<String>,
+            subject: impl Into<String>,
+            description: impl Into<String>,
+        ) -> Self {
+            Self {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::TaskAssignment {
+                    id: id.into(),
+                    subject: subject.into(),
+                    description: description.into(),
+                }]),
+                uuid: None,
+                cost: None,
+            }
+        }
+    }
+
+    // ---- Cost / usage ----------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct MessageCost {
+        pub input_tokens: u64,
+        pub output_tokens: u64,
+        pub cache_creation_input_tokens: u64,
+        pub cache_read_input_tokens: u64,
+        pub cost_usd: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ToolDefinition {
+        pub name: String,
+        pub description: String,
+        pub input_schema: Value,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct UsageInfo {
+        pub input_tokens: u64,
+        pub output_tokens: u64,
+        #[serde(default)]
+        pub cache_creation_input_tokens: u64,
+        #[serde(default)]
+        pub cache_read_input_tokens: u64,
+    }
+
+    impl UsageInfo {
+        pub fn total_input(&self) -> u64 {
+            self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+        }
+
+        pub fn total(&self) -> u64 {
+            self.total_input() + self.output_tokens
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// config module
+// ---------------------------------------------------------------------------
+pub mod config {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    // ---- Hook configuration ----------------------------------------------
+
+    /// Events that can trigger hooks.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+    #[serde(rename_all = "PascalCase")]
+    pub enum HookEvent {
+        /// Fires once when a session first becomes active.
+        SessionStart,
+        /// Fires before a tool is executed.
+        PreToolUse,
+        /// Fires after a tool has returned its result.
+        PostToolUse,
+        /// Fires before conversation compaction or collapse runs.
+        PreCompact,
+        /// Fires after conversation compaction or collapse succeeds.
+        PostCompact,
+        /// Fires when the model finishes its turn (stop).
+        Stop,
+        /// Fires after the model samples a response, before tool execution.
+        /// Corresponds to `hooks.PostModelTurn` in settings.json.
+        PostModelTurn,
+        /// Fires when the user submits a prompt.
+        UserPromptSubmit,
+        /// Fires when the session is shutting down.
+        SessionEnd,
+        /// General-purpose notification event.
+        Notification,
+    }
+
+    /// A single hook entry: a shell command to run on a specific event.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct HookEntry {
+        /// Shell command to execute. Receives event JSON on stdin.
+        pub command: String,
+        /// Optional tool name filter — only run for this tool (PreToolUse/PostToolUse).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_filter: Option<String>,
+        /// If true, a non-zero exit code blocks the operation.
+        #[serde(default)]
+        pub blocking: bool,
+    }
+
+    // ---- AgentDefinition -------------------------------------------------
+
+    fn default_agent_access() -> String {
+        "full".to_string()
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Definition of a named agent with per-agent model, permissions,
+    /// temperature, and system prompt.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AgentDefinition {
+        /// Display name / description
+        pub description: Option<String>,
+        /// Model override for this agent (e.g., "anthropic/claude-haiku-4-5")
+        pub model: Option<String>,
+        /// Temperature override
+        pub temperature: Option<f64>,
+        /// System prompt prefix (prepended before the main system prompt)
+        pub prompt: Option<String>,
+        /// Permission restriction: "full", "read-only", "search-only"
+        #[serde(default = "default_agent_access")]
+        pub access: String,
+        /// Whether to show in @agent autocomplete
+        #[serde(default = "default_true")]
+        pub visible: bool,
+        /// Max agentic turns for this agent (overrides global)
+        pub max_turns: Option<u32>,
+        /// ANSI color for display: "cyan", "magenta", "green", etc.
+        pub color: Option<String>,
+    }
+
+    impl Default for AgentDefinition {
+        fn default() -> Self {
+            Self {
+                description: None,
+                model: None,
+                temperature: None,
+                prompt: None,
+                access: default_agent_access(),
+                visible: true,
+                max_turns: None,
+                color: None,
+            }
+        }
+    }
+
+    // ---- ProviderConfig --------------------------------------------------
+
+    /// Per-provider configuration: API keys, base URLs, and options.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ProviderConfig {
+        /// API key (overrides environment variable)
+        pub api_key: Option<String>,
+        /// Override the default base URL for this provider
+        pub api_base: Option<String>,
+        /// Whether this provider is enabled (default: true)
+        #[serde(default = "default_true")]
+        pub enabled: bool,
+        /// Model ID whitelist (empty = allow all)
+        #[serde(default)]
+        pub models_whitelist: Vec<String>,
+        /// Model ID blacklist
+        #[serde(default)]
+        pub models_blacklist: Vec<String>,
+        /// Provider-specific options (passed through to provider implementation)
+        #[serde(default)]
+        pub options: HashMap<String, serde_json::Value>,
+    }
+
+    impl Default for ProviderConfig {
+        fn default() -> Self {
+            Self {
+                api_key: None,
+                api_base: None,
+                enabled: true,
+                models_whitelist: Vec::new(),
+                models_blacklist: Vec::new(),
+                options: HashMap::new(),
+            }
+        }
+    }
+
+    // ---- Config ----------------------------------------------------------
+
+    fn default_provider() -> Option<String> {
+        Some("lmstudio".to_string())
+    }
+
+    /// Top-level configuration values, merged from CLI args + settings file + env.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
+    pub struct Config {
+        pub api_key: Option<String>,
+        pub model: Option<String>,
+        pub effort: Option<String>,
+        pub max_tokens: Option<u32>,
+        pub permission_mode: PermissionMode,
+        /// Reviewer used for approval decisions.
+        #[serde(default, alias = "approvals-reviewer")]
+        pub approvals_reviewer: ApprovalsReviewer,
+        /// Agent completion enforcement policy.
+        #[serde(default, alias = "agent-completion-policy")]
+        pub agent_completion_policy: AgentCompletionPolicy,
+        /// Verification policy for coding runs that modify files.
+        #[serde(default, alias = "verification-policy")]
+        pub verification_policy: VerificationPolicy,
+        /// Reliability profile for source grounding and completion readiness.
+        #[serde(default, alias = "agent-reliability-profile")]
+        pub agent_reliability_profile: AgentReliabilityProfile,
+        /// Runtime speed/safety profile for agent tool dispatch.
+        #[serde(default, alias = "agent-speed-profile")]
+        pub agent_speed_profile: AgentSpeedProfile,
+        pub theme: Theme,
+        #[serde(default)]
+        pub output_style: Option<String>,
+        pub auto_compact: bool,
+        pub compact_threshold: f32,
+        pub verbose: bool,
+        pub output_format: OutputFormat,
+        pub mcp_servers: Vec<McpServerConfig>,
+        #[serde(default)]
+        pub lsp_servers: Vec<crate::lsp::LspServerConfig>,
+        pub allowed_tools: Vec<String>,
+        pub disallowed_tools: Vec<String>,
+        pub env: HashMap<String, String>,
+        pub enable_all_mcp_servers: bool,
+        pub custom_system_prompt: Option<String>,
+        pub append_system_prompt: Option<String>,
+        pub disable_claude_mds: bool,
+        pub project_dir: Option<PathBuf>,
+        #[serde(default)]
+        pub workspace_paths: Vec<PathBuf>,
+        /// Additional directories granted access via --add-dir.
+        #[serde(default)]
+        pub additional_dirs: Vec<PathBuf>,
+        /// Event hooks: map of event → list of hook commands.
+        #[serde(default)]
+        pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
+        /// Active provider ID (default: "lmstudio")
+        #[serde(default = "default_provider")]
+        pub provider: Option<String>,
+        /// Per-provider configurations
+        #[serde(default)]
+        pub provider_configs: HashMap<String, ProviderConfig>,
+        /// Formatter configurations (copied from Settings on load).
+        #[serde(default)]
+        pub formatter: HashMap<String, FormatterConfig>,
+        /// User-defined command templates (copied from Settings on load).
+        #[serde(default)]
+        pub commands: HashMap<String, CommandTemplate>,
+        /// Named agent definitions (copied from Settings on load).
+        #[serde(default)]
+        pub agents: HashMap<String, AgentDefinition>,
+        /// Skill-discovery configuration (copied from Settings on load).
+        #[serde(default)]
+        pub skills: SkillsConfig,
+        /// Optional URL for the session-share service.  When set, `/share`
+        /// POSTs the session to this endpoint and returns the resulting URL.
+        /// When absent, `/share` falls back to a local Markdown export.
+        #[serde(default, rename = "shareEndpoint")]
+        pub share_endpoint: Option<String>,
+        /// Enable LLM-powered permission critic (alternative to static classifiers).
+        #[serde(default)]
+        pub critic_mode: bool,
+        /// Model to use for the permission critic (default: claude-3-haiku-20240307).
+        #[serde(default)]
+        pub critic_model: Option<String>,
+        /// Request reasoning persistence across turns when supported by the model.
+        #[serde(default)]
+        pub preserve_thinking: bool,
+        /// Mango Research behavior.
+        #[serde(default)]
+        pub research: ResearchConfig,
+        /// Smart attachment behavior.
+        #[serde(default)]
+        pub attachments: AttachmentConfig,
+        /// Tool-output compression behavior.
+        #[serde(default)]
+        pub tool_output: ToolOutputConfig,
+        /// Layered durable memory behavior.
+        #[serde(default)]
+        pub memory: MemoryConfig,
+        /// Prevent system idle sleep while MangoCode is running an active turn.
+        #[serde(default)]
+        pub prevent_idle_sleep: bool,
+        /// When true, write tools (FileEdit, BatchEdit, Write, ApplyPatch)
+        /// preview changes without actually modifying files on disk.
+        #[serde(default)]
+        pub dry_run: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResearchConfig {
+        #[serde(default = "default_true")]
+        pub enable_rendered_fallback: bool,
+        #[serde(default = "default_true")]
+        pub prefer_official_sources: bool,
+    }
+
+    impl Default for ResearchConfig {
+        fn default() -> Self {
+            Self {
+                enable_rendered_fallback: true,
+                prefer_official_sources: true,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AttachmentConfig {
+        #[serde(default = "default_true")]
+        #[serde(alias = "markitdown_enabled")]
+        pub markdown_extraction_enabled: bool,
+        #[serde(default = "default_true")]
+        pub images_raw_by_default: bool,
+        #[serde(default = "default_true")]
+        pub ocr_enabled: bool,
+        #[serde(default)]
+        pub tesseract_path: Option<String>,
+        #[serde(default = "default_tesseract_lang")]
+        pub tesseract_lang: String,
+    }
+
+    impl Default for AttachmentConfig {
+        fn default() -> Self {
+            Self {
+                markdown_extraction_enabled: true,
+                images_raw_by_default: true,
+                ocr_enabled: true,
+                tesseract_path: None,
+                tesseract_lang: default_tesseract_lang(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ToolOutputConfig {
+        #[serde(default = "default_tool_output_reduction")]
+        pub reduction: String,
+    }
+
+    impl Default for ToolOutputConfig {
+        fn default() -> Self {
+            Self {
+                reduction: default_tool_output_reduction(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MemoryConfig {
+        #[serde(default = "default_true")]
+        pub layered_retrieval: bool,
+        #[serde(default = "default_embedding_provider")]
+        pub embedding_provider: String,
+        #[serde(default = "default_embedding_model")]
+        pub embedding_model: String,
+    }
+
+    impl Default for MemoryConfig {
+        fn default() -> Self {
+            Self {
+                layered_retrieval: true,
+                embedding_provider: default_embedding_provider(),
+                embedding_model: default_embedding_model(),
+            }
+        }
+    }
+
+    fn default_tool_output_reduction() -> String {
+        "auto".to_string()
+    }
+
+    fn default_tesseract_lang() -> String {
+        "eng".to_string()
+    }
+
+    fn default_embedding_provider() -> String {
+        "fastembed".to_string()
+    }
+
+    fn default_embedding_model() -> String {
+        "BAAI/bge-base-en-v1.5".to_string()
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    pub enum PermissionMode {
+        #[default]
+        Default,
+        AcceptEdits,
+        BypassPermissions,
+        Plan,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ApprovalsReviewer {
+        #[default]
+        User,
+        #[serde(alias = "guardian_subagent")]
+        AutoReview,
+    }
+
+    impl ApprovalsReviewer {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::User => "user",
+                Self::AutoReview => "auto_review",
+            }
+        }
+
+        pub fn is_auto_review(self) -> bool {
+            matches!(self, Self::AutoReview)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentCompletionPolicy {
+        Enforce,
+        #[default]
+        Warn,
+        Off,
+    }
+
+    impl AgentCompletionPolicy {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Enforce => "enforce",
+                Self::Warn => "warn",
+                Self::Off => "off",
+            }
+        }
+
+        pub fn enforces(self) -> bool {
+            matches!(self, Self::Enforce)
+        }
+
+        pub fn warns(self) -> bool {
+            matches!(self, Self::Warn)
+        }
+
+        pub fn is_off(self) -> bool {
+            matches!(self, Self::Off)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum VerificationPolicy {
+        #[default]
+        Auto,
+        Ask,
+        Off,
+    }
+
+    impl VerificationPolicy {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Auto => "auto",
+                Self::Ask => "ask",
+                Self::Off => "off",
+            }
+        }
+
+        pub fn is_off(self) -> bool {
+            matches!(self, Self::Off)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentReliabilityProfile {
+        Standard,
+        #[default]
+        Strict,
+    }
+
+    impl AgentReliabilityProfile {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Standard => "standard",
+                Self::Strict => "strict",
+            }
+        }
+
+        pub fn is_strict(self) -> bool {
+            matches!(self, Self::Strict)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AgentSpeedProfile {
+        Balanced,
+        #[default]
+        FastSafe,
+    }
+
+    impl AgentSpeedProfile {
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Balanced => "balanced",
+                Self::FastSafe => "fast_safe",
+            }
+        }
+
+        pub fn is_fast_safe(self) -> bool {
+            matches!(self, Self::FastSafe)
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "camelCase")]
+    pub enum Theme {
+        #[default]
+        Default,
+        Dark,
+        Light,
+        Custom(String),
+        Deuteranopia,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(rename_all = "lowercase")]
+    pub enum OutputFormat {
+        #[default]
+        Text,
+        Json,
+        StreamJson,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct McpServerConfig {
+        pub name: String,
+        pub command: Option<String>,
+        #[serde(default)]
+        pub args: Vec<String>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
+        pub url: Option<String>,
+        #[serde(default)]
+        pub headers: HashMap<String, String>,
+        #[serde(default)]
+        pub pipedream: Option<PipedreamMcpConfig>,
+        #[serde(rename = "type", default = "default_mcp_type")]
+        pub server_type: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct PipedreamMcpConfig {
+        #[serde(default, alias = "clientId")]
+        pub client_id: Option<String>,
+        #[serde(default, alias = "clientSecret")]
+        pub client_secret: Option<String>,
+        #[serde(default, alias = "projectId")]
+        pub project_id: Option<String>,
+        #[serde(default)]
+        pub environment: Option<String>,
+        #[serde(default, alias = "externalUserId")]
+        pub external_user_id: Option<String>,
+        #[serde(default, alias = "appSlug")]
+        pub app_slug: Option<String>,
+        #[serde(default, alias = "appDiscovery")]
+        pub app_discovery: Option<bool>,
+        #[serde(default, alias = "accountId")]
+        pub account_id: Option<String>,
+        #[serde(default, alias = "toolMode")]
+        pub tool_mode: Option<String>,
+        #[serde(default, alias = "conversationId")]
+        pub conversation_id: Option<String>,
+        #[serde(default)]
+        pub scope: Option<String>,
+        #[serde(default, alias = "tokenUrl")]
+        pub token_url: Option<String>,
+    }
+
+    fn default_mcp_type() -> String {
+        "stdio".to_string()
+    }
+
+    // ---- SkillsConfig ----------------------------------------------------
+
+    /// Configuration for the skill-discovery system.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct SkillsConfig {
+        /// Additional directories to search for skill `.md` files.
+        #[serde(default)]
+        pub paths: Vec<String>,
+        /// Git repository URLs to fetch skills from (cloned once, then cached).
+        #[serde(default)]
+        pub urls: Vec<String>,
+    }
+
+    // ---- Settings --------------------------------------------------------
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct Settings {
+        #[serde(default)]
+        pub config: Config,
+        #[serde(skip)]
+        pub explicit_config_keys: std::collections::HashSet<String>,
+        pub version: Option<u32>,
+        #[serde(default)]
+        pub projects: HashMap<String, ProjectSettings>,
+        #[serde(default, rename = "remoteControlAtStartup")]
+        pub remote_control_at_startup: bool,
+        /// Persisted permission rules saved by the user across sessions.
+        #[serde(default, rename = "permissionRules")]
+        pub permission_rules: Vec<crate::permissions::SerializedPermissionRule>,
+        /// Names of plugins that have been explicitly enabled by the user.
+        #[serde(default, rename = "enabledPlugins")]
+        pub enabled_plugins: std::collections::HashSet<String>,
+        /// Names of plugins that have been explicitly disabled by the user.
+        #[serde(default, rename = "disabledPlugins")]
+        pub disabled_plugins: std::collections::HashSet<String>,
+        /// Whether the user has completed the first-launch onboarding flow.
+        /// Serialised as `hasCompletedOnboarding` for settings file compatibility.
+        #[serde(default, rename = "hasCompletedOnboarding")]
+        pub has_completed_onboarding: bool,
+        /// App version at last launch — used to detect upgrades and show release notes.
+        #[serde(default, rename = "lastSeenVersion")]
+        pub last_seen_version: Option<String>,
+        /// Active provider ID at the settings level (e.g. "lmstudio", "openai").
+        #[serde(default = "default_provider")]
+        pub provider: Option<String>,
+        /// Per-provider configurations stored in settings.json.
+        #[serde(default)]
+        pub providers: HashMap<String, ProviderConfig>,
+        /// User-defined slash command templates.
+        #[serde(default)]
+        pub commands: HashMap<String, CommandTemplate>,
+        /// Formatter configurations keyed by a user-defined name.
+        #[serde(default)]
+        pub formatter: HashMap<String, FormatterConfig>,
+        /// Named agent definitions (overrides built-in defaults).
+        #[serde(default)]
+        pub agents: HashMap<String, AgentDefinition>,
+        /// Skill-discovery configuration (extra paths and git URLs).
+        #[serde(default)]
+        pub skills: SkillsConfig,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SettingsLoadDiagnostic {
+        pub path: PathBuf,
+        pub error: String,
+    }
+
+    impl SettingsLoadDiagnostic {
+        pub fn new(path: PathBuf, error: impl Into<String>) -> Self {
+            Self {
+                path,
+                error: error.into(),
+            }
+        }
+
+        pub fn display(&self) -> String {
+            format!("{}: {}", self.path.display(), self.error)
+        }
+    }
+
+    /// A user-defined slash command template.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct CommandTemplate {
+        /// The template string; `$ARGUMENTS` gets replaced with user input.
+        pub template: String,
+        /// Optional description shown in /help.
+        pub description: Option<String>,
+        /// Optional agent to use (e.g. "plan").
+        pub agent: Option<String>,
+        /// Optional model override (e.g. "anthropic/claude-haiku-4-5").
+        pub model: Option<String>,
+    }
+
+    /// Configuration for a file formatter tool.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct FormatterConfig {
+        /// Command to run, e.g. `["prettier", "--write"]`.
+        pub command: Vec<String>,
+        /// File extensions this formatter handles, e.g. `[".ts", ".tsx", ".js"]`.
+        pub extensions: Vec<String>,
+        /// Whether this formatter is disabled.
+        #[serde(default)]
+        pub disabled: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct ProjectSettings {
+        #[serde(default)]
+        pub allowed_tools: Vec<String>,
+        #[serde(default)]
+        pub mcp_servers: Vec<McpServerConfig>,
+        pub custom_system_prompt: Option<String>,
+    }
+
+    /// Return the three built-in named agent definitions.
+    /// User-defined agents in `settings.json` can override these by name.
+    pub fn default_agents() -> HashMap<String, AgentDefinition> {
+        let mut m = HashMap::new();
+        m.insert("build".to_string(), AgentDefinition {
+            description: Some("Implementation agent for features and fixes using the runtime-visible tool set".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the build agent. Use the runtime-visible read, write, and execution tools when they are available. Focus on implementing the requested changes completely and correctly.".to_string()),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: None,
+            color: Some("cyan".to_string()),
+        });
+        m.insert("plan".to_string(), AgentDefinition {
+            description: Some("Read-only agent for analyzing code and planning changes".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the plan agent. Use only runtime-visible read and search tools; do not write files or execute commands. Focus on understanding the codebase and describing what changes should be made.".to_string()),
+            access: "read-only".to_string(),
+            visible: true,
+            max_turns: Some(20),
+            color: Some("yellow".to_string()),
+        });
+        m.insert("explore".to_string(), AgentDefinition {
+            description: Some("Fast search-only agent for code exploration".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some("You are the explore agent. Use runtime-visible search and read tools. Focus on quickly finding relevant code and answering questions about the codebase.".to_string()),
+            access: "search-only".to_string(),
+            visible: true,
+            max_turns: Some(15),
+            color: Some("green".to_string()),
+        });
+
+        // ---- Curated specialist agents ----------------------------------
+        // Built-in, task-focused agents that sit on top of the AgentTool /
+        // TeamCreate primitive. Selectable via `--agent <name>` or `/agent`,
+        // and shadowable by a user-defined agent of the same name.
+        m.insert("review".to_string(), AgentDefinition {
+            description: Some("Read-only code reviewer: bugs, security, and quality".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some(
+                "You are the review agent: a meticulous code reviewer. Use only read and search \
+                 tools; do not modify files or run mutating commands. Focus on the changes in \
+                 scope. Report concrete findings ranked by severity, each as `file:line — issue — \
+                 suggested fix`. Prioritise correctness bugs, security issues (injection, auth, \
+                 path/`..` traversal, secret handling, unsafe deserialization), resource/error \
+                 handling, and concurrency hazards; then note simplifications and dead code. \
+                 Prefer a few high-confidence findings over a long speculative list. If you find \
+                 nothing material, say so plainly."
+                    .to_string(),
+            ),
+            access: "read-only".to_string(),
+            visible: true,
+            max_turns: Some(20),
+            color: Some("magenta".to_string()),
+        });
+        m.insert("test".to_string(), AgentDefinition {
+            description: Some("Writes and runs focused tests for changed code".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some(
+                "You are the test agent. Write focused, deterministic tests for the code in scope \
+                 and run them with the project's existing test runner. Match the repo's existing \
+                 test framework, layout, and naming conventions — discover them first, do not \
+                 introduce a new framework. Cover the happy path plus edge cases and failure \
+                 modes; assert behaviour, not implementation detail. Do not weaken or delete \
+                 existing tests to make them pass. Finish only when the new tests run green and \
+                 report the exact command used."
+                    .to_string(),
+            ),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: None,
+            color: Some("blue".to_string()),
+        });
+        m.insert("docs".to_string(), AgentDefinition {
+            description: Some("Writes and updates documentation and comments".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some(
+                "You are the docs agent. Produce clear, accurate documentation — READMEs, doc \
+                 comments, usage examples, and changelog entries — for the code in scope. Read the \
+                 code before describing it; never document behaviour you have not verified. Match \
+                 the surrounding tone and formatting. Keep examples runnable and correct. Do not \
+                 change code behaviour; limit edits to documentation and comments."
+                    .to_string(),
+            ),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: Some(20),
+            color: Some("white".to_string()),
+        });
+        m.insert("debug".to_string(), AgentDefinition {
+            description: Some("Reproduces, root-causes, and fixes a specific bug".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some(
+                "You are the debug agent. Reproduce the reported bug first, then isolate its root \
+                 cause before changing anything — state the cause explicitly. Apply the smallest \
+                 fix that addresses the root cause, not the symptom, and avoid unrelated changes. \
+                 Add or run a test that fails before the fix and passes after. Verify the original \
+                 reproduction no longer triggers and report what you changed and why."
+                    .to_string(),
+            ),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: None,
+            color: Some("red".to_string()),
+        });
+        m.insert("refactor".to_string(), AgentDefinition {
+            description: Some("Behaviour-preserving cleanup and restructuring".to_string()),
+            model: None,
+            temperature: None,
+            prompt: Some(
+                "You are the refactor agent. Improve structure, readability, and reuse without \
+                 changing observable behaviour. Work in small, verifiable steps. Run the existing \
+                 tests (and formatter/linter when available) after each step and keep them green; \
+                 do not change test expectations to accommodate a refactor. Do not add features or \
+                 fix unrelated bugs — note those separately. Report the before/after shape and how \
+                 you confirmed behaviour was preserved."
+                    .to_string(),
+            ),
+            access: "full".to_string(),
+            visible: true,
+            max_turns: None,
+            color: Some("cyan".to_string()),
+        });
+        m
+    }
+
+    /// Provider IDs that share the same `provider_configs` entry (user-facing aliases).
+    pub fn provider_config_lookup_keys(provider_id: &str) -> Vec<String> {
+        match provider_id.trim().to_ascii_lowercase().as_str() {
+            "lmstudio" | "lm-studio" => vec!["lmstudio".into(), "lm-studio".into()],
+            "llamacpp" | "llama-cpp" => vec!["llamacpp".into(), "llama-cpp".into()],
+            "togetherai" | "together-ai" => vec!["togetherai".into(), "together-ai".into()],
+            other => vec![other.to_string()],
+        }
+    }
+
+    impl Config {
+        /// Resolve the effective model, falling back to a provider-appropriate default.
+        ///
+        /// When a non-Anthropic provider is active and no model is explicitly set,
+        /// returns that provider's canonical default model instead of `DEFAULT_MODEL`
+        /// (which is Claude-specific).
+        pub fn effective_model(&self) -> &str {
+            if let Some(ref m) = self.model {
+                let model = m.trim();
+                if !model.is_empty() {
+                    return model;
+                }
+            }
+            match self.provider.as_deref() {
+                Some("openai") => "gpt-4o",
+                Some("google") | Some("google-vertex") => "gemini-2.5-flash",
+                Some("groq") => "llama-3.3-70b-versatile",
+                Some("cerebras") => "llama-3.3-70b",
+                Some("deepseek") => "deepseek-chat",
+                Some("mistral") => "mistral-large-latest",
+                Some("xai") => "grok-2",
+                Some("openrouter") => "anthropic/claude-sonnet-4",
+                Some("togetherai") | Some("together-ai") => {
+                    "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+                }
+                Some("perplexity") => "sonar-pro",
+                Some("cohere") => "command-r-plus",
+                Some("deepinfra") => "meta-llama/Llama-3.3-70B-Instruct",
+                Some("github-copilot") => "gpt-4o",
+                Some("openai-codex") | Some("codex") => crate::codex_oauth::DEFAULT_CODEX_MODEL,
+                Some("ollama") => "llama3.2",
+                Some("lmstudio") => "default",
+                Some("llamacpp") => "default",
+                Some("azure") => "gpt-4o",
+                Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
+                Some("venice") => "llama-3.3-70b",
+                _ => crate::constants::DEFAULT_MODEL, // Anthropic default
+            }
+        }
+
+        /// Look up per-provider settings using canonical aliases (e.g. `lmstudio`
+        /// ↔ `lm-studio`) so settings.json keys match either form.
+        pub fn lookup_provider_config(&self, provider_id: &str) -> Option<&ProviderConfig> {
+            for key in provider_config_lookup_keys(provider_id) {
+                if let Some(cfg) = self.provider_configs.get(&key) {
+                    return Some(cfg);
+                }
+            }
+            None
+        }
+
+        /// Resolve the effective max-tokens.
+        pub fn effective_max_tokens(&self) -> u32 {
+            self.max_tokens
+                .unwrap_or(crate::constants::DEFAULT_MAX_TOKENS)
+        }
+
+        /// Resolve the effective compact threshold (0.0 - 1.0).
+        pub fn effective_compact_threshold(&self) -> f32 {
+            if self.compact_threshold > 0.0 {
+                self.compact_threshold
+            } else {
+                crate::constants::DEFAULT_COMPACT_THRESHOLD
+            }
+        }
+
+        fn configured_output_style_name(&self) -> &str {
+            self.output_style
+                .as_deref()
+                .map(str::trim)
+                .filter(|style| !style.is_empty())
+                .unwrap_or("default")
+        }
+
+        /// Resolve the effective output style for system-prompt assembly.
+        pub fn effective_output_style(&self) -> crate::system_prompt::OutputStyle {
+            crate::system_prompt::OutputStyle::parse(self.configured_output_style_name())
+        }
+
+        /// Resolve the prompt text for the selected output style, including
+        /// user-defined styles loaded from global, project, and plugin style
+        /// registries.
+        pub fn resolve_output_style_prompt(&self) -> Option<String> {
+            let style_name = self.configured_output_style_name();
+            let styles = crate::output_styles::all_styles_with_runtime_for_project(
+                &Settings::config_dir(),
+                self.project_dir.as_deref(),
+            );
+            crate::output_styles::find_style(&styles, style_name)
+                .map(|style| style.prompt.clone())
+                .filter(|prompt| !prompt.trim().is_empty())
+        }
+
+        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        }
+
+        /// Async variant: also checks `~/.mangocode/oauth_tokens.json`.
+        /// Returns `(credential, use_bearer_auth)`.
+        /// - For Console OAuth flow: credential is the stored API key, bearer=false.
+        /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
+        /// - Silently attempts token refresh when the access token is expired.
+        pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
+            // Highest priority: explicit api_key or env var
+            if let Some(key) = self.resolve_api_key() {
+                return Some((key, false));
+            }
+            // Fall back to saved OAuth tokens
+            let tokens = crate::oauth::OAuthTokens::load().await?;
+
+            // If expired and we have a refresh token, attempt silent refresh.
+            // Clone the refresh token up-front so we don't borrow `tokens` during the async call.
+            let refresh_token_owned = tokens.refresh_token.clone();
+            let tokens = if tokens.is_expired() {
+                if let Some(rt) = refresh_token_owned {
+                    // Inline the refresh HTTP call (mangocode_core can't depend on mangocode_cli::oauth_flow).
+                    let body = serde_json::json!({
+                        "grant_type": "refresh_token",
+                        "refresh_token": rt,
+                        "client_id": crate::oauth::CLIENT_ID,
+                        "scope": crate::oauth::ALL_SCOPES.join(" "),
+                    });
+                    let refreshed = 'refresh: {
+                        let Ok(client) = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(30))
+                            .build()
+                        else {
+                            break 'refresh None;
+                        };
+                        let Ok(resp) = client
+                            .post(crate::oauth::TOKEN_URL)
+                            .header("content-type", "application/json")
+                            .json(&body)
+                            .send()
+                            .await
+                        else {
+                            break 'refresh None;
+                        };
+                        if !resp.status().is_success() {
+                            break 'refresh None;
+                        }
+                        let Ok(data) = resp.json::<serde_json::Value>().await else {
+                            break 'refresh None;
+                        };
+                        let new_at = data["access_token"].as_str().unwrap_or("").to_string();
+                        if new_at.is_empty() {
+                            break 'refresh None;
+                        }
+                        let new_rt = data["refresh_token"].as_str().map(String::from);
+                        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
+                        let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+                        let scopes: Vec<String> = data["scope"]
+                            .as_str()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .map(String::from)
+                            .collect();
+                        let mut r = tokens.clone();
+                        r.access_token = new_at;
+                        if let Some(nrt) = new_rt {
+                            r.refresh_token = Some(nrt);
+                        }
+                        r.expires_at_ms = Some(exp_ms);
+                        r.scopes = scopes;
+                        if let Err(err) = r.save().await {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to persist refreshed OAuth tokens"
+                            );
+                        }
+                        Some(r)
+                    };
+                    refreshed.unwrap_or(tokens)
+                } else {
+                    tokens // expired, no refresh token → can't fix
+                }
+            } else {
+                tokens
+            };
+
+            tokens
+                .effective_credential()
+                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+        }
+
+        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        pub fn resolve_api_base(&self) -> String {
+            std::env::var("ANTHROPIC_BASE_URL")
+                .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
+        }
+    }
+
+    impl Settings {
+        pub(crate) fn from_json_str(content: &str) -> anyhow::Result<Self> {
+            let explicit_config_keys = serde_json::from_str::<serde_json::Value>(content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("config")
+                        .and_then(|config| config.as_object())
+                        .cloned()
+                })
+                .map(|config| config.keys().cloned().collect())
+                .unwrap_or_default();
+            let mut settings = serde_json::from_str::<Self>(content)?;
+            settings.explicit_config_keys = explicit_config_keys;
+            Ok(settings)
+        }
+
+        pub fn validate_json_str(content: &str) -> anyhow::Result<()> {
+            Self::from_json_str(content).map(|_| ())
+        }
+
+        /// The per-user configuration directory (`~/.mangocode`).
+        pub fn config_dir() -> PathBuf {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".mangocode")
+        }
+
+        /// Full path to the global settings JSON file.
+        pub fn global_settings_path() -> PathBuf {
+            Self::config_dir().join("settings.json")
+        }
+
+        /// Load settings from disk, returning defaults when the file is missing.
+        pub async fn load() -> anyhow::Result<Self> {
+            let path = Self::global_settings_path();
+            if path.exists() {
+                let content = tokio::fs::read_to_string(&path).await?;
+                Self::from_json_str(&content)
+                    .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path.display(), e))
+            } else {
+                Ok(Self::default())
+            }
+        }
+
+        /// Persist settings to disk.
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let path = Self::global_settings_path();
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let content = serde_json::to_string_pretty(self)?;
+            tokio::fs::write(&path, content).await?;
+            Ok(())
+        }
+
+        fn remove_api_keys_from_provider_map(
+            providers: &mut serde_json::Map<String, serde_json::Value>,
+        ) -> bool {
+            let mut changed = false;
+            for provider in providers.values_mut() {
+                if let Some(provider_config) = provider.as_object_mut() {
+                    changed |= provider_config.remove("api_key").is_some();
+                    changed |= provider_config.remove("apiKey").is_some();
+                }
+            }
+            changed
+        }
+
+        pub(crate) fn clear_api_keys_from_settings_json(value: &mut serde_json::Value) -> bool {
+            let Some(root) = value.as_object_mut() else {
+                return false;
+            };
+
+            let mut changed = false;
+            if let Some(config) = root
+                .get_mut("config")
+                .and_then(|config| config.as_object_mut())
+            {
+                changed |= config.remove("api_key").is_some();
+                changed |= config.remove("apiKey").is_some();
+                for field in ["provider_configs", "providerConfigs"] {
+                    if let Some(providers) = config
+                        .get_mut(field)
+                        .and_then(|providers| providers.as_object_mut())
+                    {
+                        changed |= Self::remove_api_keys_from_provider_map(providers);
+                    }
+                }
+            }
+
+            if let Some(providers) = root
+                .get_mut("providers")
+                .and_then(|providers| providers.as_object_mut())
+            {
+                changed |= Self::remove_api_keys_from_provider_map(providers);
+            }
+
+            changed
+        }
+
+        pub async fn clear_global_api_keys_preserving_json() -> anyhow::Result<bool> {
+            let path = Self::global_settings_path();
+            if !path.exists() {
+                return Ok(false);
+            }
+            let content = tokio::fs::read_to_string(&path).await?;
+            let mut value: serde_json::Value = serde_json::from_str(&content)?;
+            let changed = Self::clear_api_keys_from_settings_json(&mut value);
+            if changed {
+                let content = serde_json::to_string_pretty(&value)?;
+                tokio::fs::write(&path, content).await?;
+            }
+            Ok(changed)
+        }
+
+        /// Synchronous variant used by pre-session commands.
+        pub fn load_sync() -> anyhow::Result<Self> {
+            let path = Self::global_settings_path();
+            if path.exists() {
+                let content = std::fs::read_to_string(&path)?;
+                Self::from_json_str(&content)
+                    .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path.display(), e))
+            } else {
+                Ok(Self::default())
+            }
+        }
+
+        /// Synchronous variant used by pre-session commands.
+        pub fn save_sync(&self) -> anyhow::Result<()> {
+            let path = Self::global_settings_path();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = serde_json::to_string_pretty(self)?;
+            std::fs::write(&path, content)?;
+            Ok(())
+        }
+
+        /// Return the effective `Config`, merging top-level provider settings
+        /// into the embedded `config` field.
+        ///
+        /// - `settings.provider` wins over `settings.config.provider` (if set).
+        /// - `settings.providers` entries are merged into `config.provider_configs`,
+        ///   with the embedded config values taking precedence for keys already present.
+        pub fn effective_config(&self) -> Config {
+            let mut config = self.config.clone();
+            // Top-level `provider` key overrides config.provider when set.
+            if self.provider.is_some() && config.provider.is_none() {
+                config.provider = self.provider.clone();
+            }
+            // Merge top-level `providers` map into config.provider_configs.
+            for (id, pc) in &self.providers {
+                config
+                    .provider_configs
+                    .entry(id.clone())
+                    .or_insert_with(|| pc.clone());
+            }
+            // Copy top-level formatters and commands into config.
+            for (k, v) in &self.formatter {
+                config
+                    .formatter
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+            for (k, v) in &self.commands {
+                config
+                    .commands
+                    .entry(k.clone())
+                    .or_insert_with(|| v.clone());
+            }
+            // Copy top-level agent definitions into config.
+            for (k, v) in &self.agents {
+                config.agents.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            // Copy skills config into effective config (paths and urls merged).
+            for p in &self.skills.paths {
+                if !config.skills.paths.contains(p) {
+                    config.skills.paths.push(p.clone());
+                }
+            }
+            for u in &self.skills.urls {
+                if !config.skills.urls.contains(u) {
+                    config.skills.urls.push(u.clone());
+                }
+            }
+            config
+        }
+
+        /// Load settings from all config levels and merge them.
+        /// Priority: project > global.
+        pub async fn load_hierarchical(cwd: &std::path::Path) -> Self {
+            Self::load_hierarchical_with_diagnostics(cwd).await.0
+        }
+
+        /// Load settings from all config levels and return parse/read diagnostics.
+        pub async fn load_hierarchical_with_diagnostics(
+            cwd: &std::path::Path,
+        ) -> (Self, Vec<SettingsLoadDiagnostic>) {
+            let mut diagnostics = Vec::new();
+            let mut merged = match Self::load().await {
+                Ok(settings) => settings,
+                Err(e) => {
+                    diagnostics.push(SettingsLoadDiagnostic::new(
+                        Self::global_settings_path(),
+                        e.to_string(),
+                    ));
+                    Self::default()
+                }
+            };
+            let (project_settings, project_diagnostic) =
+                Self::find_project_settings_with_diagnostic(cwd).await;
+            if let Some(diagnostic) = project_diagnostic {
+                diagnostics.push(diagnostic);
+            }
+            if let Some(project_settings) = project_settings {
+                merged = Self::merge(merged, project_settings);
+            }
+            (merged, diagnostics)
+        }
+
+        /// Walk up from `cwd` looking for `.mangocode/settings.json` or
+        /// `.mangocode/settings.jsonc`.
+        async fn find_project_settings_with_diagnostic(
+            cwd: &std::path::Path,
+        ) -> (Option<Self>, Option<SettingsLoadDiagnostic>) {
+            let global_path = Self::global_settings_path();
+            let mut dir = cwd;
+            loop {
+                // Try .json first, then .jsonc.
+                for name in &["settings.json", "settings.jsonc"] {
+                    let candidate = dir.join(".mangocode").join(name);
+                    if candidate.exists() && candidate != global_path {
+                        match tokio::fs::read_to_string(&candidate).await {
+                            Ok(content) => {
+                                let stripped = strip_jsonc_comments(&content);
+                                return match Self::from_json_str(&stripped) {
+                                    Ok(settings) => (Some(settings), None),
+                                    Err(e) => (
+                                        None,
+                                        Some(SettingsLoadDiagnostic::new(
+                                            candidate,
+                                            format!("failed to parse project settings: {}", e),
+                                        )),
+                                    ),
+                                };
+                            }
+                            Err(e) => {
+                                return (
+                                    None,
+                                    Some(SettingsLoadDiagnostic::new(
+                                        candidate,
+                                        format!("failed to read project settings: {}", e),
+                                    )),
+                                );
+                            }
+                        }
+                        // Found a file but couldn't parse — stop here, don't go up.
+                    }
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent,
+                    None => break,
+                }
+            }
+            (None, None)
+        }
+
+        /// Merge two settings with `override_settings` taking priority.
+        /// Simple strategy: override wins for all scalar fields; Vecs are
+        /// concatenated (deduped); HashMaps are merged (override wins on collision).
+        pub(crate) fn merge(base: Self, over: Self) -> Self {
+            // Helper to merge two HashMaps (over wins on key collision).
+            fn merge_map<K: std::hash::Hash + Eq + Clone, V: Clone>(
+                mut base: HashMap<K, V>,
+                over: HashMap<K, V>,
+            ) -> HashMap<K, V> {
+                for (k, v) in over {
+                    base.insert(k, v);
+                }
+                base
+            }
+            // Merge the embedded Config structs.
+            let merged_config = Config {
+                api_key: over.config.api_key.or(base.config.api_key),
+                model: over.config.model.or(base.config.model),
+                effort: over.config.effort.or(base.config.effort),
+                max_tokens: over.config.max_tokens.or(base.config.max_tokens),
+                permission_mode: over.config.permission_mode,
+                approvals_reviewer: if over.explicit_config_keys.contains("approvals_reviewer")
+                    || over.explicit_config_keys.contains("approvals-reviewer")
+                    || over.config.approvals_reviewer != ApprovalsReviewer::User
+                {
+                    over.config.approvals_reviewer
+                } else {
+                    base.config.approvals_reviewer
+                },
+                agent_completion_policy: if over
+                    .explicit_config_keys
+                    .contains("agent_completion_policy")
+                    || over
+                        .explicit_config_keys
+                        .contains("agent-completion-policy")
+                    || over.config.agent_completion_policy != AgentCompletionPolicy::default()
+                {
+                    over.config.agent_completion_policy
+                } else {
+                    base.config.agent_completion_policy
+                },
+                verification_policy: if over.explicit_config_keys.contains("verification_policy")
+                    || over.explicit_config_keys.contains("verification-policy")
+                    || over.config.verification_policy != VerificationPolicy::Auto
+                {
+                    over.config.verification_policy
+                } else {
+                    base.config.verification_policy
+                },
+                agent_reliability_profile: if over
+                    .explicit_config_keys
+                    .contains("agent_reliability_profile")
+                    || over
+                        .explicit_config_keys
+                        .contains("agent-reliability-profile")
+                    || over.config.agent_reliability_profile != AgentReliabilityProfile::default()
+                {
+                    over.config.agent_reliability_profile
+                } else {
+                    base.config.agent_reliability_profile
+                },
+                agent_speed_profile: if over.explicit_config_keys.contains("agent_speed_profile")
+                    || over.explicit_config_keys.contains("agent-speed-profile")
+                    || over.config.agent_speed_profile != AgentSpeedProfile::default()
+                {
+                    over.config.agent_speed_profile
+                } else {
+                    base.config.agent_speed_profile
+                },
+                theme: over.config.theme,
+                output_style: over.config.output_style.or(base.config.output_style),
+                auto_compact: over.config.auto_compact || base.config.auto_compact,
+                compact_threshold: if over.config.compact_threshold != 0.0 {
+                    over.config.compact_threshold
+                } else {
+                    base.config.compact_threshold
+                },
+                verbose: over.config.verbose || base.config.verbose,
+                output_format: over.config.output_format,
+                mcp_servers: {
+                    let mut v = base.config.mcp_servers;
+                    v.extend(over.config.mcp_servers);
+                    v
+                },
+                lsp_servers: {
+                    let mut v = base.config.lsp_servers;
+                    v.extend(over.config.lsp_servers);
+                    v
+                },
+                allowed_tools: {
+                    let mut v = base.config.allowed_tools;
+                    v.extend(over.config.allowed_tools);
+                    v.dedup();
+                    v
+                },
+                disallowed_tools: {
+                    let mut v = base.config.disallowed_tools;
+                    v.extend(over.config.disallowed_tools);
+                    v.dedup();
+                    v
+                },
+                env: merge_map(base.config.env, over.config.env),
+                enable_all_mcp_servers: over.config.enable_all_mcp_servers
+                    || base.config.enable_all_mcp_servers,
+                custom_system_prompt: over
+                    .config
+                    .custom_system_prompt
+                    .or(base.config.custom_system_prompt),
+                append_system_prompt: over
+                    .config
+                    .append_system_prompt
+                    .or(base.config.append_system_prompt),
+                disable_claude_mds: over.config.disable_claude_mds
+                    || base.config.disable_claude_mds,
+                project_dir: over.config.project_dir.or(base.config.project_dir),
+                workspace_paths: {
+                    let mut v = base.config.workspace_paths;
+                    v.extend(over.config.workspace_paths);
+                    v
+                },
+                additional_dirs: {
+                    let mut v = base.config.additional_dirs;
+                    v.extend(over.config.additional_dirs);
+                    v
+                },
+                hooks: merge_map(base.config.hooks, over.config.hooks),
+                provider: over.config.provider.or(base.config.provider),
+                provider_configs: merge_map(
+                    base.config.provider_configs,
+                    over.config.provider_configs,
+                ),
+                formatter: merge_map(base.config.formatter, over.config.formatter),
+                commands: merge_map(base.config.commands, over.config.commands),
+                agents: merge_map(base.config.agents, over.config.agents),
+                skills: {
+                    let mut paths = base.config.skills.paths;
+                    for p in over.config.skills.paths {
+                        if !paths.contains(&p) {
+                            paths.push(p);
+                        }
+                    }
+                    let mut urls = base.config.skills.urls;
+                    for u in over.config.skills.urls {
+                        if !urls.contains(&u) {
+                            urls.push(u);
+                        }
+                    }
+                    SkillsConfig { paths, urls }
+                },
+                share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
+                critic_mode: over.config.critic_mode || base.config.critic_mode,
+                critic_model: over.config.critic_model.or(base.config.critic_model),
+                preserve_thinking: over.config.preserve_thinking || base.config.preserve_thinking,
+                research: over.config.research,
+                attachments: over.config.attachments,
+                tool_output: over.config.tool_output,
+                memory: over.config.memory,
+                prevent_idle_sleep: over.config.prevent_idle_sleep
+                    || base.config.prevent_idle_sleep,
+                dry_run: over.config.dry_run || base.config.dry_run,
+            };
+            Self {
+                config: merged_config,
+                explicit_config_keys: {
+                    let mut s = base.explicit_config_keys;
+                    s.extend(over.explicit_config_keys);
+                    s
+                },
+                version: over.version.or(base.version),
+                projects: merge_map(base.projects, over.projects),
+                remote_control_at_startup: over.remote_control_at_startup
+                    || base.remote_control_at_startup,
+                permission_rules: {
+                    let mut v = base.permission_rules;
+                    v.extend(over.permission_rules);
+                    v
+                },
+                enabled_plugins: {
+                    let mut s = base.enabled_plugins;
+                    s.extend(over.enabled_plugins);
+                    s
+                },
+                disabled_plugins: {
+                    let mut s = base.disabled_plugins;
+                    s.extend(over.disabled_plugins);
+                    s
+                },
+                has_completed_onboarding: over.has_completed_onboarding
+                    || base.has_completed_onboarding,
+                last_seen_version: over.last_seen_version.or(base.last_seen_version),
+                provider: over.provider.or(base.provider),
+                providers: merge_map(base.providers, over.providers),
+                commands: merge_map(base.commands, over.commands),
+                formatter: merge_map(base.formatter, over.formatter),
+                agents: merge_map(base.agents, over.agents),
+                skills: {
+                    let mut paths = base.skills.paths;
+                    for p in over.skills.paths {
+                        if !paths.contains(&p) {
+                            paths.push(p);
+                        }
+                    }
+                    let mut urls = base.skills.urls;
+                    for u in over.skills.urls {
+                        if !urls.contains(&u) {
+                            urls.push(u);
+                        }
+                    }
+                    SkillsConfig { paths, urls }
+                },
+            }
+        }
+    }
+
+    /// Strip `//` line-comments and `/* */` block-comments from a JSON string
+    /// (JSONC format), preserving newlines for error-message line numbers.
+    pub fn strip_jsonc_comments(input: &str) -> String {
+        let mut result = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        let mut in_string = false;
+        let mut prev_char = '\0';
+
+        while let Some(ch) = chars.next() {
+            if in_string {
+                if ch == '"' && prev_char != '\\' {
+                    in_string = false;
+                }
+                result.push(ch);
+                prev_char = ch;
+                continue;
+            }
+            if ch == '"' {
+                in_string = true;
+                result.push(ch);
+                prev_char = ch;
+                continue;
+            }
+            if ch == '/' {
+                match chars.peek() {
+                    Some('/') => {
+                        // Line comment — skip to end of line.
+                        for c in chars.by_ref() {
+                            if c == '\n' {
+                                result.push('\n');
+                                break;
+                            }
+                        }
+                    }
+                    Some('*') => {
+                        // Block comment — skip until `*/`.
+                        chars.next();
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            if prev == '*' && c == '/' {
+                                break;
+                            }
+                            if c == '\n' {
+                                result.push('\n');
+                            }
+                            prev = c;
+                        }
+                    }
+                    _ => result.push(ch),
+                }
+                prev_char = '\0';
+                continue;
+            }
+            result.push(ch);
+            prev_char = ch;
+        }
+        result
+    }
+
+    /// Replace `{env:VARNAME}` patterns in a string with environment variable
+    /// values.  Missing variables are replaced with an empty string.
+    pub fn substitute_env_vars(s: &str) -> String {
+        let mut result = s.to_string();
+        loop {
+            match result.find("{env:") {
+                None => break,
+                Some(start) => match result[start..].find('}') {
+                    None => break,
+                    Some(rel_end) => {
+                        let var_name = result[start + 5..start + rel_end].to_string();
+                        let value = std::env::var(&var_name).unwrap_or_default();
+                        result.replace_range(start..start + rel_end + 1, &value);
+                    }
+                },
+            }
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// constants module
+// ---------------------------------------------------------------------------
+pub mod constants {
+    pub const APP_NAME: &str = "claude";
+    pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    // Models
+    pub const DEFAULT_MODEL: &str = "default";
+    pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
+    pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+    pub const OPUS_MODEL: &str = "claude-opus-4-6";
+
+    // Token limits
+    pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
+    pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
+    pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
+    /// Default maximum number of agentic turns. Zero means no implicit turn cap.
+    pub const MAX_TURNS_DEFAULT: u32 = 0;
+    pub const MAX_TOOL_ERRORS: u32 = 3;
+
+    // API endpoints & headers
+    pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+    pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+    pub const ANTHROPIC_BETA_HEADER: &str =
+        "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14,\
+         effort-2025-11-24";
+
+    // File system
+    pub const CLAUDE_MD_FILENAME: &str = "AGENTS.md";
+    pub const SETTINGS_FILENAME: &str = "settings.json";
+    pub const HISTORY_FILENAME: &str = "conversations";
+    pub const CONFIG_DIR_NAME: &str = ".mangocode";
+
+    // Tool names
+    pub const TOOL_NAME_BASH: &str = "Bash";
+    pub const TOOL_NAME_FILE_EDIT: &str = "Edit";
+    pub const TOOL_NAME_FILE_READ: &str = "Read";
+    pub const TOOL_NAME_FILE_WRITE: &str = "Write";
+    pub const TOOL_NAME_GLOB: &str = "Glob";
+    pub const TOOL_NAME_GREP: &str = "Grep";
+    pub const TOOL_NAME_CODE_SEARCH: &str = "CodeSearch";
+    pub const TOOL_NAME_AGENT: &str = "Agent";
+    pub const TOOL_NAME_WEB_FETCH: &str = "WebFetch";
+    pub const TOOL_NAME_WEB_SEARCH: &str = "WebSearch";
+    pub const TOOL_NAME_UPDATE_PLAN: &str = "update_plan";
+    pub const TOOL_NAME_TODO_WRITE: &str = "TodoWrite";
+    pub const TOOL_NAME_TASK_CREATE: &str = "TaskCreate";
+    pub const TOOL_NAME_TASK_GET: &str = "TaskGet";
+    pub const TOOL_NAME_TASK_UPDATE: &str = "TaskUpdate";
+    pub const TOOL_NAME_TASK_LIST: &str = "TaskList";
+    pub const TOOL_NAME_TASK_STOP: &str = "TaskStop";
+    pub const TOOL_NAME_TASK_OUTPUT: &str = "TaskOutput";
+    pub const TOOL_NAME_ENTER_PLAN_MODE: &str = "EnterPlanMode";
+    pub const TOOL_NAME_EXIT_PLAN_MODE: &str = "ExitPlanMode";
+    pub const TOOL_NAME_ASK_USER: &str = "AskUserQuestion";
+    pub const TOOL_NAME_MCP: &str = "mcp";
+    pub const TOOL_NAME_NOTEBOOK_EDIT: &str = "NotebookEdit";
+    pub const TOOL_NAME_BATCH_EDIT: &str = "BatchEdit";
+    pub const TOOL_NAME_APPLY_PATCH: &str = "ApplyPatch";
+
+    // Session ID prefixes
+    pub const SESSION_ID_PREFIX_BASH: &str = "b";
+    pub const SESSION_ID_PREFIX_AGENT: &str = "a";
+    pub const SESSION_ID_PREFIX_TEAMMATE: &str = "t";
+
+    // Retry budget
+    pub const MAX_OUTPUT_TOKENS_RETRIES: u32 = 3;
+    pub const MAX_COMPACT_RETRIES: u32 = 3;
+
+    // Stop sequences
+    pub const STOP_SEQUENCE_END_OF_TURN: &str = "\n\nHuman:";
+}
+
+// ---------------------------------------------------------------------------
+// context module
+// ---------------------------------------------------------------------------
+pub mod context {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use tokio::process::Command;
+
+    /// Maximum character length for git context to prevent context window bloat.
+    const MAX_GIT_CONTEXT_CHARS: usize = 2000;
+
+    /// Builds the system-level and user-level context that gets prepended to
+    /// every conversation with the model.
+    pub struct ContextBuilder {
+        cwd: PathBuf,
+        disable_claude_mds: bool,
+    }
+
+    impl ContextBuilder {
+        pub fn new(cwd: PathBuf) -> Self {
+            Self {
+                cwd,
+                disable_claude_mds: false,
+            }
+        }
+
+        pub fn disable_claude_mds(mut self, val: bool) -> Self {
+            self.disable_claude_mds = val;
+            self
+        }
+
+        /// System context (git status, platform, IDE, etc.)
+        pub async fn build_system_context(&self) -> String {
+            let mut parts = vec![];
+
+            // Platform information
+            parts.push(format!("Platform: {}", std::env::consts::OS));
+            parts.push(format!("Working directory: {}", self.cwd.display()));
+
+            if let Some(git_context) = self.get_git_context().await {
+                parts.push(git_context);
+            }
+
+            // IDE context — injected when an IDE extension is connected.
+            // Inject IDE context when an extension is connected.
+            if let Some(ide_ctx) = crate::attachments::get_ide_context() {
+                parts.push(format!("# IDE Context\n{}", ide_ctx));
+            }
+
+            parts.join("\n\n")
+        }
+
+        /// User context (date, AGENTS.md memories, etc.)
+        pub async fn build_user_context(&self) -> String {
+            let mut parts = vec![];
+
+            let date = chrono::Local::now().format("%A, %B %d, %Y").to_string();
+            parts.push(format!("Today's date is {}.", date));
+
+            if !self.disable_claude_mds {
+                if let Some(claude_md) = self.find_and_read_claude_md().await {
+                    parts.push(claude_md);
+                }
+            }
+
+            parts.join("\n\n")
+        }
+
+        /// Gather structured repository context for prompt injection.
+        async fn get_git_context(&self) -> Option<String> {
+            let branch_output = Command::new("git")
+                .args(["status", "--short", "--branch"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()?;
+
+            if !branch_output.status.success() {
+                return None;
+            }
+
+            let status_lines = String::from_utf8_lossy(&branch_output.stdout);
+            let (branch_line, tracking_line) = {
+                let mut lines = status_lines.lines();
+                let raw = lines.next().unwrap_or("").trim_start_matches("## ").trim();
+                if let Some((branch, tracking)) = raw.split_once("...") {
+                    (
+                        branch.trim().to_string(),
+                        Some(tracking.trim().to_string()).filter(|s| !s.is_empty()),
+                    )
+                } else {
+                    (raw.to_string(), None)
+                }
+            };
+
+            let mut parts = vec![];
+            let mut repo_header = String::from("# Repository Context\n");
+            if branch_line.is_empty() {
+                repo_header.push_str("Branch: (unknown)");
+            } else {
+                repo_header.push_str(&format!("Branch: {}", branch_line));
+            }
+            if let Some(tracking) = tracking_line {
+                repo_header.push_str(&format!("\nTracking: {}", tracking));
+            }
+            parts.push(repo_header);
+
+            let porcelain = Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if porcelain.is_empty() {
+                parts.push(
+                    "## Working Tree (git status --porcelain)\nClean - no uncommitted changes."
+                        .to_string(),
+                );
+            } else {
+                parts.push(format!(
+                    "## Working Tree (git status --porcelain)\n{}",
+                    porcelain
+                ));
+            }
+
+            let log_output = Command::new("git")
+                .args(["log", "--oneline", "-5"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success());
+            if let Some(out) = log_output {
+                let log = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !log.is_empty() {
+                    parts.push(format!("## Recent Commits\n{}", log));
+                }
+            }
+
+            if let Some(language_section) = self.get_language_breakdown().await {
+                parts.push(language_section);
+            }
+
+            let mut result = parts.join("\n\n");
+            if result.len() > MAX_GIT_CONTEXT_CHARS {
+                result = crate::truncate::truncate_bytes_prefix(&result, MAX_GIT_CONTEXT_CHARS)
+                    .to_string();
+                if let Some(last_newline) = result.rfind('\n') {
+                    result.truncate(last_newline);
+                }
+                result.push_str("\n... (truncated)");
+            }
+
+            Some(result)
+        }
+
+        /// Fast language breakdown by tracked file extension.
+        async fn get_language_breakdown(&self) -> Option<String> {
+            let output = Command::new("git")
+                .args(["ls-files"])
+                .current_dir(&self.cwd)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())?;
+
+            let files = String::from_utf8_lossy(&output.stdout);
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut total = 0usize;
+
+            for line in files.lines() {
+                let path = Path::new(line.trim());
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("(no ext)");
+                let lang = match ext {
+                    "rs" => "Rust",
+                    "ts" | "tsx" => "TypeScript",
+                    "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+                    "py" => "Python",
+                    "go" => "Go",
+                    "java" => "Java",
+                    "c" | "h" => "C",
+                    "cpp" | "cc" | "cxx" | "hpp" => "C++",
+                    "md" | "mdx" => "Markdown",
+                    "toml" => "TOML",
+                    "yaml" | "yml" => "YAML",
+                    "json" => "JSON",
+                    "html" => "HTML",
+                    "css" | "scss" | "sass" => "CSS",
+                    "sh" | "bash" | "zsh" => "Shell",
+                    "sql" => "SQL",
+                    "swift" => "Swift",
+                    "kt" | "kts" => "Kotlin",
+                    "rb" => "Ruby",
+                    "lock" | "sum" => continue,
+                    "(no ext)" => continue,
+                    _ => ext,
+                };
+                *counts.entry(lang.to_string()).or_default() += 1;
+                total += 1;
+            }
+
+            if total == 0 {
+                return None;
+            }
+
+            let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let mut lines: Vec<String> = sorted
+                .iter()
+                .take(5)
+                .map(|(lang, count)| {
+                    let pct = (*count as f64 / total as f64) * 100.0;
+                    format!("{}: {:.1}% ({} files)", lang, pct, count)
+                })
+                .collect();
+
+            let remainder: usize = sorted.iter().skip(5).map(|(_, c)| *c).sum();
+            if remainder > 0 {
+                let pct = (remainder as f64 / total as f64) * 100.0;
+                lines.push(format!("Other: {:.1}% ({} files)", pct, remainder));
+            }
+
+            Some(format!("## Language Breakdown\n{}", lines.join("\n")))
+        }
+
+        /// Walk up from cwd looking for AGENTS.md files and the global one.
+        async fn find_and_read_claude_md(&self) -> Option<String> {
+            let mut claude_mds = vec![];
+
+            // Global ~/.mangocode/AGENTS.md
+            if let Some(home) = dirs::home_dir() {
+                let global_claude_md = home
+                    .join(".mangocode")
+                    .join(crate::constants::CLAUDE_MD_FILENAME);
+                if global_claude_md.exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
+                        claude_mds.push(format!(
+                            "# Memory (from {})\n{}",
+                            global_claude_md.display(),
+                            content
+                        ));
+                    }
+                }
+            }
+
+            // Walk from cwd up to filesystem root, collecting AGENTS.md
+            let mut dir = Some(self.cwd.as_path());
+            let mut project_mds: Vec<String> = vec![];
+            while let Some(d) = dir {
+                let candidate = d.join(crate::constants::CLAUDE_MD_FILENAME);
+                if candidate.exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
+                        project_mds.push(format!(
+                            "# Project Memory (from {})\n{}",
+                            candidate.display(),
+                            content
+                        ));
+                    }
+                }
+                dir = d.parent();
+            }
+            // Reverse so outermost directory comes first
+            project_mds.reverse();
+            claude_mds.extend(project_mds);
+
+            if claude_mds.is_empty() {
+                None
+            } else {
+                Some(claude_mds.join("\n\n"))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// permissions module
+// ---------------------------------------------------------------------------
+pub mod permissions {
+    use serde::{Deserialize, Serialize};
+    use std::sync::{Arc, Mutex};
+
+    // -----------------------------------------------------------------------
+    // Danger level assigned to each tool type
+    // -----------------------------------------------------------------------
+
+    /// How dangerous a tool operation is — used as the default decision when
+    /// no explicit rule matches.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PermissionLevel {
+        /// Local read-only operations (Glob, Grep, Read, etc.).
+        Read,
+        /// File write/edit operations (Write, Edit).
+        Write,
+        /// Shell command execution (Bash).
+        Execute,
+        /// Outbound network access (WebSearch, WebFetch, research fetch/read,
+        /// and remote session dispatch tools).
+        Network,
+    }
+
+    impl PermissionLevel {
+        /// Derive the permission level from a well-known tool name.
+        pub fn for_tool(tool_name: &str) -> Self {
+            if tool_name == "mcp__auth" {
+                return Self::Network;
+            }
+
+            if tool_name.starts_with("mcp__") {
+                return Self::Execute;
+            }
+
+            match tool_name {
+                "Bash" | "bash" | "PowerShell" | "REPL" | "TaskStop" | "PrWatch" | "Browser"
+                | "computer" => Self::Execute,
+                "Write" | "Edit" | "NotebookEdit" | "BatchEdit" | "ApplyPatch" | "Config"
+                | "EnterWorktree" | "ExitWorktree" | "TeamCreate" | "TeamDelete" | "CronCreate"
+                | "CronDelete" => Self::Write,
+                "WebSearch" | "WebFetch" | "DocSearch" | "DocRead" | "DeepRead"
+                | "RenderedFetch" | "RemoteTrigger" | "ListMcpResources" | "ReadMcpResource" => {
+                    Self::Network
+                }
+                _ => Self::Read,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule action & scope
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PermissionAction {
+        Allow,
+        Deny,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PermissionScope {
+        /// Only lasts for the current process session.
+        Session,
+        /// Saved to settings.json and survives restarts.
+        Persistent,
+    }
+
+    // -----------------------------------------------------------------------
+    // Rule definition
+    // -----------------------------------------------------------------------
+
+    /// A single permission rule.
+    ///
+    /// Matches requests where:
+    ///   - `tool_name` is `None` (applies to every tool) OR equals the
+    ///     request tool name.
+    ///   - `path_pattern` is `None` OR the glob pattern matches the
+    ///     request path.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct PermissionRule {
+        /// `None` means "applies to all tools".
+        pub tool_name: Option<String>,
+        /// Optional glob pattern for file / command paths.
+        pub path_pattern: Option<String>,
+        pub action: PermissionAction,
+        pub scope: PermissionScope,
+    }
+
+    impl PermissionRule {
+        /// Returns `true` when this rule matches the given tool name and
+        /// optional path argument.
+        pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
+            // Tool name check
+            if let Some(ref rule_tool) = self.tool_name {
+                if rule_tool != tool_name {
+                    return false;
+                }
+            }
+            // Path pattern check — only when a pattern is specified
+            if let Some(ref pattern) = self.path_pattern {
+                let Some(p) = path else {
+                    // Rule requires a path but none was provided → no match
+                    return false;
+                };
+                let pat = match glob::Pattern::new(pattern) {
+                    Ok(pat) => pat,
+                    Err(_) => return false,
+                };
+                if !pat.matches(p) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialised rule (stored in settings.json)
+    // -----------------------------------------------------------------------
+
+    /// Serde-friendly representation of a `PermissionRule` saved to disk.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SerializedPermissionRule {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub path_pattern: Option<String>,
+        pub action: PermissionAction,
+    }
+
+    impl From<&PermissionRule> for SerializedPermissionRule {
+        fn from(r: &PermissionRule) -> Self {
+            Self {
+                tool_name: r.tool_name.clone(),
+                path_pattern: r.path_pattern.clone(),
+                action: r.action.clone(),
+            }
+        }
+    }
+
+    impl From<&SerializedPermissionRule> for PermissionRule {
+        fn from(s: &SerializedPermissionRule) -> Self {
+            Self {
+                tool_name: s.tool_name.clone(),
+                path_pattern: s.path_pattern.clone(),
+                action: s.action.clone(),
+                scope: PermissionScope::Persistent,
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Decision type
+    // -----------------------------------------------------------------------
+
+    /// The outcome of evaluating a permission request.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum PermissionDecision {
+        /// Unconditionally allow.
+        Allow,
+        /// Allow and remember permanently.
+        AllowPermanently,
+        /// Deny.
+        Deny,
+        /// Deny and remember permanently.
+        DenyPermanently,
+        /// Ask the user (show dialog) with an explanation of why.
+        Ask { reason: String },
+    }
+
+    // -----------------------------------------------------------------------
+    // Format a human-readable explanation for the dialog
+    // -----------------------------------------------------------------------
+
+    /// Build the explanation paragraph shown in the permission dialog.
+    ///
+    /// Builds the permission request message and explainer text.
+    pub fn format_permission_reason(
+        tool_name: &str,
+        description: &str,
+        path: Option<&str>,
+        level: PermissionLevel,
+    ) -> String {
+        match level {
+            PermissionLevel::Execute => {
+                let cmd = path.unwrap_or(description);
+                format!(
+                    "{} wants to run: `{}`\nThis will execute a shell command.",
+                    tool_name, cmd
+                )
+            }
+            PermissionLevel::Write => {
+                let target = path.unwrap_or(description);
+                let extra = if target.contains("/etc/") || target.contains("\\etc\\") {
+                    "\nModifying system files could affect network resolution \
+                     and system configuration."
+                } else if target.starts_with("~/.") || target.contains("/.") {
+                    "\nThis is a hidden/configuration file."
+                } else {
+                    "\nThis will write to the filesystem."
+                };
+                format!("{} wants to write to `{}`{}", tool_name, target, extra)
+            }
+            PermissionLevel::Network => {
+                let url = path.unwrap_or(description);
+                format!(
+                    "{} wants to access network: `{}`\nThis will make an outbound HTTP request.",
+                    tool_name, url
+                )
+            }
+            PermissionLevel::Read => {
+                let target = path.unwrap_or(description);
+                format!("{} wants to read: `{}`", tool_name, target)
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionManager
+    // -----------------------------------------------------------------------
+
+    /// Pending permission request waiting for resolution (e.g. from a bridge
+    /// remote peer or the interactive TUI dialog).
+    pub struct PendingPermission {
+        pub tool_use_id: String,
+        pub created_at: std::time::Instant,
+        pub resolve_tx: tokio::sync::oneshot::Sender<PermissionDecision>,
+    }
+
+    /// Central permission manager: holds mode, session rules, persistent
+    /// rules, and any in-flight pending decisions.
+    pub struct PermissionManager {
+        pub mode: crate::config::PermissionMode,
+        /// Rules added during this session only.
+        pub session_rules: Vec<PermissionRule>,
+        /// Rules loaded from / saved to settings.json.
+        pub persistent_rules: Vec<PermissionRule>,
+        /// Pending interactive decisions keyed by tool_use_id.
+        pending: Vec<PendingPermission>,
+    }
+
+    impl PermissionManager {
+        /// Construct from a mode and the current settings (which may contain
+        /// previously-persisted rules).
+        pub fn new(
+            mode: crate::config::PermissionMode,
+            settings: &crate::config::Settings,
+        ) -> Self {
+            let persistent_rules = settings
+                .permission_rules
+                .iter()
+                .map(PermissionRule::from)
+                .collect();
+            Self {
+                mode,
+                session_rules: Vec::new(),
+                persistent_rules,
+                pending: Vec::new(),
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Permission evaluation.
+        // ----------------------------------------------------------------
+
+        /// Evaluate whether `tool_name` should be allowed to run.
+        ///
+        /// Evaluation order:
+        /// 1. BypassPermissions → always Allow.
+        /// 2. Check deny rules (persistent first, then session) → if any
+        ///    matched, Deny.
+        /// 3. Check allow rules (persistent first, then session) → if any
+        ///    matched, Allow.
+        /// 4. AcceptEdits → Allow (auto-accept file edits).
+        /// 5. Plan mode → Allow reads; deny everything else.
+        /// 6. Default → derive from tool danger level.
+        pub fn evaluate(
+            &self,
+            tool_name: &str,
+            description: &str,
+            path: Option<&str>,
+        ) -> PermissionDecision {
+            use crate::config::PermissionMode;
+
+            // Step 1 — bypass everything
+            if self.mode == PermissionMode::BypassPermissions {
+                return PermissionDecision::Allow;
+            }
+
+            // Steps 2–3 — evaluate explicit rules (deny has priority over
+            // allow; persistent rules evaluated before session rules within
+            // each polarity; persistent rules evaluated before session rules)
+            let all_rules = self
+                .persistent_rules
+                .iter()
+                .chain(self.session_rules.iter());
+
+            let mut deny_matched = false;
+            let mut allow_matched = false;
+
+            for rule in all_rules {
+                if rule.matches(tool_name, path) {
+                    match rule.action {
+                        PermissionAction::Deny => {
+                            deny_matched = true;
+                        }
+                        PermissionAction::Allow => {
+                            allow_matched = true;
+                        }
+                    }
+                }
+            }
+
+            if deny_matched {
+                return PermissionDecision::Deny;
+            }
+
+            if allow_matched {
+                return PermissionDecision::Allow;
+            }
+
+            // Step 4 — AcceptEdits auto-allows everything
+            if self.mode == PermissionMode::AcceptEdits {
+                return PermissionDecision::Allow;
+            }
+
+            // Step 5 — Plan mode: reads only
+            if self.mode == PermissionMode::Plan {
+                let level = PermissionLevel::for_tool(tool_name);
+                return match level {
+                    PermissionLevel::Read => PermissionDecision::Allow,
+                    _ => PermissionDecision::Deny,
+                };
+            }
+
+            // Step 6 — Default: derive from tool danger level
+            let level = PermissionLevel::for_tool(tool_name);
+            match level {
+                PermissionLevel::Read => PermissionDecision::Allow,
+                PermissionLevel::Write | PermissionLevel::Execute | PermissionLevel::Network => {
+                    let reason = format_permission_reason(tool_name, description, path, level);
+                    PermissionDecision::Ask { reason }
+                }
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Rule management
+        // ----------------------------------------------------------------
+
+        /// Add an arbitrary rule to this manager.
+        pub fn add_rule(&mut self, rule: PermissionRule) {
+            match rule.scope {
+                PermissionScope::Session => self.session_rules.push(rule),
+                PermissionScope::Persistent => self.persistent_rules.push(rule),
+            }
+        }
+
+        /// Allow `tool_name` for the rest of this session.
+        pub fn add_session_allow(&mut self, tool_name: &str) {
+            self.session_rules.push(PermissionRule {
+                tool_name: Some(tool_name.to_string()),
+                path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            });
+        }
+
+        /// Allow `tool_name` on `path` (glob) for the rest of this session.
+        pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
+            self.session_rules.push(PermissionRule {
+                tool_name: Some(tool_name.to_string()),
+                path_pattern: Some(path.to_string()),
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            });
+        }
+
+        /// Allow `tool_name` persistently and save to settings.
+        pub fn add_persistent_allow(
+            &mut self,
+            tool_name: &str,
+            settings: &mut crate::config::Settings,
+        ) -> crate::error::Result<()> {
+            let rule = PermissionRule {
+                tool_name: Some(tool_name.to_string()),
+                path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Persistent,
+            };
+            let serialized = SerializedPermissionRule::from(&rule);
+            settings.permission_rules.push(serialized);
+            settings
+                .save_sync()
+                .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
+            self.persistent_rules.push(rule);
+            Ok(())
+        }
+
+        /// Remove a persistent rule by index and save settings.
+        pub fn remove_rule(
+            &mut self,
+            idx: usize,
+            settings: &mut crate::config::Settings,
+        ) -> crate::error::Result<()> {
+            if idx >= settings.permission_rules.len() {
+                return Err(crate::error::ClaudeError::Config(format!(
+                    "Rule index {} out of bounds",
+                    idx
+                )));
+            }
+            settings.permission_rules.remove(idx);
+            settings
+                .save_sync()
+                .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
+            // Rebuild persistent_rules from the updated settings
+            self.persistent_rules = settings
+                .permission_rules
+                .iter()
+                .map(PermissionRule::from)
+                .collect();
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------
+        // Bridge / async pending permissions
+        // ----------------------------------------------------------------
+
+        /// Register a pending permission and return a receiver.  The caller
+        /// awaits the receiver and gets a `PermissionDecision` when the user
+        /// (or a bridge peer) resolves the request.
+        pub fn register_pending(
+            &mut self,
+            id: String,
+        ) -> tokio::sync::oneshot::Receiver<PermissionDecision> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.push(PendingPermission {
+                tool_use_id: id,
+                created_at: std::time::Instant::now(),
+                resolve_tx: tx,
+            });
+            rx
+        }
+
+        /// Resolve a pending permission by `tool_use_id`, delivering
+        /// `decision` to the waiting receiver.  No-op if the ID is unknown.
+        pub fn resolve_pending(&mut self, id: &str, decision: PermissionDecision) {
+            if let Some(pos) = self.pending.iter().position(|p| p.tool_use_id == id) {
+                let pending = self.pending.remove(pos);
+                let _ = pending.resolve_tx.send(decision);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionRequest (passed to handlers & TUI)
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    pub struct PermissionRequest {
+        pub tool_name: String,
+        pub description: String,
+        pub details: Option<String>,
+        pub is_read_only: bool,
+        /// Context-aware description showing user WHY the tool needs permission.
+        /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: https://example.com"
+        pub context_description: Option<String>,
+    }
+
+    // -----------------------------------------------------------------------
+    // PermissionHandler trait + handlers
+    // -----------------------------------------------------------------------
+
+    /// Trait implemented by anything that can decide whether to allow a tool.
+    pub trait PermissionHandler: Send + Sync {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision;
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision;
+    }
+
+    /// Handler for non-interactive / headless modes.
+    ///
+    /// Uses simple mode-based rules.  For rule-based evaluation backed by a
+    /// `PermissionManager`, use `ManagedAutoPermissionHandler` instead.
+    pub struct AutoPermissionHandler {
+        pub mode: crate::config::PermissionMode,
+    }
+
+    impl PermissionHandler for AutoPermissionHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            use crate::config::PermissionMode;
+            match self.mode {
+                PermissionMode::BypassPermissions => PermissionDecision::Allow,
+                PermissionMode::AcceptEdits => PermissionDecision::Allow,
+                PermissionMode::Plan => {
+                    if request.is_read_only {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
+                    }
+                }
+                PermissionMode::Default => {
+                    if request.is_read_only {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
+                    }
+                }
+            }
+        }
+
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    /// Permission handler for interactive (TUI) mode.
+    ///
+    /// Uses simple mode-based rules.  For rule-based evaluation backed by a
+    /// `PermissionManager`, use `ManagedInteractivePermissionHandler`.
+    pub struct InteractivePermissionHandler {
+        pub mode: crate::config::PermissionMode,
+    }
+
+    impl PermissionHandler for InteractivePermissionHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            use crate::config::PermissionMode;
+            match self.mode {
+                PermissionMode::Plan => {
+                    if request.is_read_only {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
+                    }
+                }
+                // In Default / AcceptEdits / BypassPermissions the user is
+                // watching the TUI so we allow all.
+                _ => PermissionDecision::Allow,
+            }
+        }
+
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    // ---- Manager-backed handlers -----------------------------------------
+
+    /// Non-interactive handler backed by a shared `PermissionManager`.
+    ///
+    /// Delegates to `PermissionManager::evaluate`; converts `Ask` decisions
+    /// into `Deny` (no interactive prompt available in headless mode).
+    pub struct ManagedAutoPermissionHandler {
+        pub manager: Arc<Mutex<PermissionManager>>,
+    }
+
+    impl ManagedAutoPermissionHandler {
+        pub fn new(manager: Arc<Mutex<PermissionManager>>) -> Self {
+            Self { manager }
+        }
+    }
+
+    impl PermissionHandler for ManagedAutoPermissionHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            if let Ok(m) = self.manager.lock() {
+                let decision = m.evaluate(
+                    &request.tool_name,
+                    &request.description,
+                    request.details.as_deref(),
+                );
+                return match decision {
+                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
+                    other => other,
+                };
+            }
+            PermissionDecision::Deny
+        }
+
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    /// Interactive (TUI) handler backed by a shared `PermissionManager`.
+    ///
+    /// Delegates to `PermissionManager::evaluate`; passes `Ask` decisions
+    /// through so the TUI dialog can display them.
+    pub struct ManagedInteractivePermissionHandler {
+        pub manager: Arc<Mutex<PermissionManager>>,
+    }
+
+    impl ManagedInteractivePermissionHandler {
+        pub fn new(manager: Arc<Mutex<PermissionManager>>) -> Self {
+            Self { manager }
+        }
+    }
+
+    impl PermissionHandler for ManagedInteractivePermissionHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            if let Ok(m) = self.manager.lock() {
+                return m.evaluate(
+                    &request.tool_name,
+                    &request.description,
+                    request.details.as_deref(),
+                );
+            }
+            // If the lock is poisoned fall back to allow (user is watching)
+            PermissionDecision::Allow
+        }
+
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    // Convenience constructor aliases used by the spec
+    impl InteractivePermissionHandler {
+        /// Build a manager-backed interactive handler.
+        pub fn with_manager(
+            manager: Arc<Mutex<PermissionManager>>,
+        ) -> ManagedInteractivePermissionHandler {
+            ManagedInteractivePermissionHandler::new(manager)
+        }
+    }
+
+    impl AutoPermissionHandler {
+        /// Build a manager-backed auto handler.
+        pub fn with_manager(
+            manager: Arc<Mutex<PermissionManager>>,
+        ) -> ManagedAutoPermissionHandler {
+            ManagedAutoPermissionHandler::new(manager)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(test)]
+    mod perm_tests {
+        use super::*;
+        use crate::config::{PermissionMode, Settings};
+
+        fn mgr(mode: PermissionMode) -> PermissionManager {
+            PermissionManager::new(mode, &Settings::default())
+        }
+
+        #[test]
+        fn bypass_always_allows() {
+            let m = mgr(PermissionMode::BypassPermissions);
+            assert_eq!(
+                m.evaluate("Bash", "rm -rf /", None),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn default_read_allows() {
+            let m = mgr(PermissionMode::Default);
+            assert_eq!(
+                m.evaluate("Read", "read file", None),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn default_bash_asks() {
+            let m = mgr(PermissionMode::Default);
+            match m.evaluate("Bash", "echo hello", None) {
+                PermissionDecision::Ask { .. } => {}
+                other => panic!("Expected Ask, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn default_network_tools_ask() {
+            let m = mgr(PermissionMode::Default);
+            for tool in [
+                "WebSearch",
+                "WebFetch",
+                "DocSearch",
+                "DocRead",
+                "DeepRead",
+                "RenderedFetch",
+                "RemoteTrigger",
+                "mcp__auth",
+                "ListMcpResources",
+                "ReadMcpResource",
+            ] {
+                match m.evaluate(
+                    tool,
+                    "fetch https://example.com",
+                    Some("https://example.com"),
+                ) {
+                    PermissionDecision::Ask { reason } => {
+                        assert!(reason.contains("HTTP request"), "{tool}: {reason}");
+                    }
+                    other => panic!("Expected Ask for {tool}, got {:?}", other),
+                }
+            }
+        }
+
+        #[test]
+        fn classifier_covers_non_read_tool_names() {
+            for tool in [
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "BatchEdit",
+                "ApplyPatch",
+                "Config",
+                "EnterWorktree",
+                "ExitWorktree",
+                "TeamCreate",
+                "TeamDelete",
+                "CronCreate",
+                "CronDelete",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Write,
+                    "{tool}"
+                );
+            }
+
+            for tool in [
+                "Bash",
+                "PowerShell",
+                "REPL",
+                "TaskStop",
+                "PrWatch",
+                "Browser",
+                "computer",
+                "mcp__github__create_issue",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Execute,
+                    "{tool}"
+                );
+            }
+
+            for tool in [
+                "WebSearch",
+                "WebFetch",
+                "DocSearch",
+                "DocRead",
+                "DeepRead",
+                "RenderedFetch",
+                "RemoteTrigger",
+                "mcp__auth",
+                "ListMcpResources",
+                "ReadMcpResource",
+            ] {
+                assert_eq!(
+                    PermissionLevel::for_tool(tool),
+                    PermissionLevel::Network,
+                    "{tool}"
+                );
+            }
+        }
+
+        #[test]
+        fn session_allow_overrides_default() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow("Bash");
+            assert_eq!(
+                m.evaluate("Bash", "echo hi", None),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn deny_beats_allow() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow("Bash");
+            m.add_rule(PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: None,
+                action: PermissionAction::Deny,
+                scope: PermissionScope::Session,
+            });
+            assert_eq!(
+                m.evaluate("Bash", "echo hi", None),
+                PermissionDecision::Deny
+            );
+        }
+
+        #[test]
+        fn plan_denies_writes() {
+            let m = mgr(PermissionMode::Plan);
+            assert_eq!(
+                m.evaluate("Write", "write file", Some("/tmp/foo")),
+                PermissionDecision::Deny
+            );
+        }
+
+        #[test]
+        fn plan_denies_network() {
+            let m = mgr(PermissionMode::Plan);
+            assert_eq!(
+                m.evaluate("WebSearch", "search web rust", Some("rust")),
+                PermissionDecision::Deny
+            );
+        }
+
+        #[test]
+        fn plan_allows_reads() {
+            let m = mgr(PermissionMode::Plan);
+            assert_eq!(
+                m.evaluate("Read", "read file", Some("/tmp/foo")),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn accept_edits_allows_all() {
+            let m = mgr(PermissionMode::AcceptEdits);
+            assert_eq!(
+                m.evaluate("Bash", "rm -rf /tmp", None),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn glob_path_allow_matches() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(PermissionRule {
+                tool_name: Some("Write".to_string()),
+                path_pattern: Some("/tmp/**".to_string()),
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            });
+            assert_eq!(
+                m.evaluate("Write", "write", Some("/tmp/foo/bar.txt")),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn glob_path_no_match_asks() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(PermissionRule {
+                tool_name: Some("Write".to_string()),
+                path_pattern: Some("/tmp/**".to_string()),
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            });
+            match m.evaluate("Write", "write", Some("/etc/hosts")) {
+                PermissionDecision::Ask { .. } => {}
+                other => panic!("Expected Ask, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn format_reason_bash() {
+            let s = format_permission_reason("Bash", "ls -la", None, PermissionLevel::Execute);
+            assert!(s.contains("Bash wants to run"));
+            assert!(s.contains("ls -la"));
+        }
+
+        #[test]
+        fn format_reason_execute_uses_tool_name() {
+            let s = format_permission_reason(
+                "PowerShell",
+                "Get-ChildItem",
+                None,
+                PermissionLevel::Execute,
+            );
+            assert!(s.contains("PowerShell wants to run"));
+            assert!(!s.contains("Bash wants to run"));
+        }
+
+        #[test]
+        fn format_reason_write_etc() {
+            let s = format_permission_reason(
+                "Write",
+                "write",
+                Some("/etc/hosts"),
+                PermissionLevel::Write,
+            );
+            assert!(s.contains("/etc/hosts"));
+            assert!(s.contains("system files"));
+        }
+
+        #[test]
+        fn format_reason_webfetch() {
+            let s = format_permission_reason(
+                "WebFetch",
+                "fetch",
+                Some("https://example.com"),
+                PermissionLevel::Network,
+            );
+            assert!(s.contains("https://example.com"));
+            assert!(s.contains("HTTP request"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// history module
+// ---------------------------------------------------------------------------
+pub mod history {
+    use crate::config::Config;
+    use crate::provider_id::ProviderId;
+    use crate::types::Message;
+    use serde::{Deserialize, Serialize};
+
+    /// A checkpoint snapshot of conversation messages at a specific point in time.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SessionCheckpoint {
+        /// The message index this checkpoint was taken at (exclusive upper bound).
+        pub message_idx: usize,
+        /// Optional human-readable label.
+        pub label: Option<String>,
+        /// When this checkpoint was created.
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        /// Snapshot of all messages up to (and including) `message_idx - 1`.
+        pub snapshot: Vec<Message>,
+    }
+
+    /// A single persisted conversation session.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConversationSession {
+        pub id: String,
+        pub created_at: chrono::DateTime<chrono::Utc>,
+        pub updated_at: chrono::DateTime<chrono::Utc>,
+        pub messages: Vec<Message>,
+        pub model: String,
+        pub title: Option<String>,
+        pub working_dir: Option<String>,
+        /// Tags for filtering / searching sessions.
+        #[serde(default)]
+        pub tags: Vec<String>,
+        /// ID of the session this was branched from, if any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub branch_from: Option<String>,
+        /// Message index in the parent session at which this branch was created.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub branch_at_message: Option<usize>,
+        /// Remote bridge URL if this session is mirrored to a remote endpoint.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub remote_session_url: Option<String>,
+        /// Accumulated USD cost for this session.
+        #[serde(default)]
+        pub total_cost: f64,
+        /// Accumulated token count for this session.
+        #[serde(default)]
+        pub total_tokens: u64,
+        /// Saved checkpoints (rewind points) within this session.
+        #[serde(default)]
+        pub checkpoints: Vec<SessionCheckpoint>,
+        /// ID of the parent session this was forked from (via /fork).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_session_id: Option<String>,
+        /// Message index in the parent session at which this fork was created.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fork_point_message_index: Option<usize>,
+    }
+
+    impl ConversationSession {
+        pub fn new(model: String) -> Self {
+            let now = chrono::Utc::now();
+            Self {
+                id: uuid::Uuid::new_v4().to_string(),
+                created_at: now,
+                updated_at: now,
+                messages: vec![],
+                model,
+                title: None,
+                working_dir: None,
+                tags: vec![],
+                branch_from: None,
+                branch_at_message: None,
+                remote_session_url: None,
+                total_cost: 0.0,
+                total_tokens: 0,
+                checkpoints: vec![],
+                parent_session_id: None,
+                fork_point_message_index: None,
+            }
+        }
+
+        pub fn add_message(&mut self, message: Message) {
+            self.messages.push(message);
+            self.updated_at = chrono::Utc::now();
+        }
+
+        pub fn message_count(&self) -> usize {
+            self.messages.len()
+        }
+
+        pub fn last_user_message(&self) -> Option<&Message> {
+            self.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::types::Role::User)
+        }
+    }
+
+    /// Persist the effective model in a provider-aware form so resuming a
+    /// session can route gateway models through the same provider.
+    pub fn canonical_session_model(config: &Config, effective_model: &str) -> String {
+        let effective_model = effective_model.trim();
+        if effective_model.is_empty() {
+            return String::new();
+        }
+
+        let Some(provider) = config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty() && *provider != "anthropic")
+        else {
+            return effective_model.to_string();
+        };
+
+        if config.model.as_deref().map(str::trim) == Some(effective_model) {
+            if let Some((model_provider, _)) = ProviderId::split_known_model_prefix(effective_model)
+            {
+                if model_provider != provider {
+                    return effective_model.to_string();
+                }
+            }
+        }
+
+        let provider_prefix = format!("{}/", provider);
+        if effective_model.starts_with(&provider_prefix) {
+            effective_model.to_string()
+        } else {
+            format!("{}/{}", provider, effective_model)
+        }
+    }
+
+    /// Restore a persisted session model into config, including the provider
+    /// encoded by canonical `"provider/model"` session model values.
+    pub fn apply_session_model_to_config(config: &mut Config, session_model: &str) {
+        let session_model = session_model.trim();
+        if session_model.is_empty() {
+            return;
+        }
+
+        if let Some((provider, _)) = ProviderId::split_known_model_prefix(session_model) {
+            config.provider = Some(provider.to_string());
+        }
+        config.model = Some(session_model.to_string());
+    }
+
+    // -------------------------------------------------------------------------
+    // Checkpoint helpers (synchronous, operate on a mutable session in-memory)
+    // -------------------------------------------------------------------------
+
+    /// Create a checkpoint at the current end of the session's message list.
+    /// The checkpoint captures all messages currently in the session.
+    pub fn create_checkpoint(session: &mut ConversationSession, label: Option<&str>) {
+        let idx = session.messages.len();
+        let checkpoint = SessionCheckpoint {
+            message_idx: idx,
+            label: label.map(|s| s.to_string()),
+            created_at: chrono::Utc::now(),
+            snapshot: session.messages.clone(),
+        };
+        session.checkpoints.push(checkpoint);
+        session.updated_at = chrono::Utc::now();
+    }
+
+    /// Restore the session's messages to those saved in checkpoint `idx`.
+    ///
+    /// Returns the messages that were replaced (i.e. the messages discarded by
+    /// the rewind).  The session's `messages` field is replaced with the
+    /// checkpoint snapshot; `updated_at` is refreshed.
+    ///
+    /// # Panics
+    /// Panics if `idx` is out of bounds (i.e. >= `session.checkpoints.len()`).
+    pub fn restore_checkpoint(session: &mut ConversationSession, idx: usize) -> Vec<Message> {
+        let snapshot = session.checkpoints[idx].snapshot.clone();
+        let replaced = std::mem::replace(&mut session.messages, snapshot);
+        session.updated_at = chrono::Utc::now();
+        replaced
+    }
+
+    // -------------------------------------------------------------------------
+    // Persistent storage helpers
+    // -------------------------------------------------------------------------
+
+    /// The on-disk directory for conversation sessions.
+    fn sessions_dir() -> std::path::PathBuf {
+        crate::config::Settings::config_dir().join("sessions")
+    }
+
+    /// Save a session to `~/.mangocode/sessions/<id>.json` and also write
+    /// a JSONL transcript to `~/.claude/projects/` for CloudCLI/Conducctor
+    /// session discovery compatibility.
+    pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
+        // Write the internal JSON session (MangoCode's native format)
+        let dir = sessions_dir();
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(format!("{}.json", session.id));
+        let content = serde_json::to_string_pretty(session)?;
+        tokio::fs::write(&path, content).await?;
+
+        // Also write a JSONL transcript at ~/.claude/projects/ for CC compatibility.
+        // This allows CloudCLI-based UIs to discover MangoCode sessions.
+        let project_root = session
+            .working_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let transcript_path = crate::session_storage::transcript_path(project_root, &session.id);
+        let transcript_parent_ready = if let Some(parent) = transcript_path.parent() {
+            match tokio::fs::create_dir_all(parent).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %parent.display(),
+                        session_id = %session.id,
+                        "failed to create JSONL transcript directory"
+                    );
+                    eprintln!(
+                        "Warning: failed to create JSONL transcript directory {:?}: {}",
+                        parent, e
+                    );
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        // Build JSONL entries from messages with CC-compatible metadata
+        let mut lines = String::new();
+        let cwd_str = session.working_dir.as_deref().unwrap_or(".");
+        let session_id = &session.id;
+
+        for msg in &session.messages {
+            let entry_type = match msg.role {
+                crate::types::Role::User => "user",
+                crate::types::Role::Assistant => "assistant",
+            };
+            let uuid_val = msg
+                .uuid
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let entry = serde_json::json!({
+                "type": entry_type,
+                "message": {
+                    "role": entry_type,
+                    "content": msg.content,
+                },
+                "uuid": uuid_val,
+                "timestamp": session.updated_at.to_rfc3339(),
+                "sessionId": session_id,
+                "cwd": cwd_str,
+            });
+            match serde_json::to_string(&entry) {
+                Ok(serialized) => {
+                    lines.push_str(&serialized);
+                    lines.push('\n');
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %session.id,
+                        "failed to serialize JSONL transcript message entry"
+                    );
+                }
+            }
+        }
+        // Add summary for sidebar display (uses first user message as fallback)
+        let summary = session.title.clone().or_else(|| {
+            session
+                .messages
+                .iter()
+                .find(|m| matches!(m.role, crate::types::Role::User))
+                .and_then(|m| match &m.content {
+                    crate::types::MessageContent::Text(t) => Some(t.chars().take(50).collect()),
+                    crate::types::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| {
+                        if let crate::types::ContentBlock::Text { text } = b {
+                            Some(text.chars().take(50).collect())
+                        } else {
+                            None
+                        }
+                    }),
+                })
+        });
+        if let Some(ref s) = summary {
+            let summary_entry = serde_json::json!({
+                "type": "summary",
+                "summary": s,
+                "sessionId": session_id,
+                "provider": "mangocode",
+            });
+            match serde_json::to_string(&summary_entry) {
+                Ok(serialized) => {
+                    lines.push_str(&serialized);
+                    lines.push('\n');
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %session.id,
+                        "failed to serialize JSONL transcript summary entry"
+                    );
+                }
+            }
+        }
+        if transcript_parent_ready {
+            if let Err(e) = tokio::fs::write(&transcript_path, &lines).await {
+                tracing::warn!(
+                    error = %e,
+                    path = %transcript_path.display(),
+                    session_id = %session.id,
+                    "failed to write JSONL transcript"
+                );
+                eprintln!(
+                    "Warning: failed to write JSONL transcript to {:?}: {}",
+                    transcript_path, e
+                );
+            }
+        } else {
+            tracing::warn!(
+                path = %transcript_path.display(),
+                session_id = %session.id,
+                "skipping JSONL transcript write because parent directory is unavailable"
+            );
+            eprintln!(
+                "Warning: skipped JSONL transcript write because parent directory is unavailable: {:?}",
+                transcript_path
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Load a specific session by ID.
+    pub async fn load_session(id: &str) -> anyhow::Result<ConversationSession> {
+        let path = sessions_dir().join(format!("{}.json", id));
+        let content = tokio::fs::read_to_string(&path).await?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    /// List all sessions, sorted by most-recently-updated first.
+    pub async fn list_sessions() -> Vec<ConversationSession> {
+        let dir = sessions_dir();
+        if !dir.exists() {
+            return vec![];
+        }
+
+        let mut sessions = vec![];
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(session) = serde_json::from_str::<ConversationSession>(&content) {
+                            sessions.push(session);
+                        }
+                    }
+                }
+            }
+        }
+
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions
+    }
+
+    /// Delete a session by ID.
+    pub async fn delete_session(id: &str) -> anyhow::Result<()> {
+        let path = sessions_dir().join(format!("{}.json", id));
+        if path.exists() {
+            tokio::fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// Rename (set the title of) a session.
+    pub async fn rename_session(id: &str, new_title: &str) -> anyhow::Result<()> {
+        let mut session = load_session(id).await?;
+        session.title = Some(new_title.to_string());
+        session.updated_at = chrono::Utc::now();
+        save_session(&session).await
+    }
+
+    /// Add a tag to a session (idempotent — duplicate tags are ignored).
+    pub async fn tag_session(id: &str, tag: &str) -> anyhow::Result<()> {
+        let mut session = load_session(id).await?;
+        let tag_str = tag.to_string();
+        if !session.tags.contains(&tag_str) {
+            session.tags.push(tag_str);
+            session.updated_at = chrono::Utc::now();
+            save_session(&session).await?;
+        }
+        Ok(())
+    }
+
+    /// Remove a tag from a session (no-op if tag is not present).
+    pub async fn untag_session(id: &str, tag: &str) -> anyhow::Result<()> {
+        let mut session = load_session(id).await?;
+        let before_len = session.tags.len();
+        session.tags.retain(|t| t != tag);
+        if session.tags.len() != before_len {
+            session.updated_at = chrono::Utc::now();
+            save_session(&session).await?;
+        }
+        Ok(())
+    }
+
+    /// Create a new session that is a branch of `source_id` at message index
+    /// `at_message_idx`.  The new session starts with messages
+    /// `[0, at_message_idx)` copied from the source.
+    pub async fn branch_session(
+        source_id: &str,
+        at_message_idx: usize,
+        new_title: Option<&str>,
+    ) -> anyhow::Result<ConversationSession> {
+        let source = load_session(source_id).await?;
+        let clamped_idx = at_message_idx.min(source.messages.len());
+        let now = chrono::Utc::now();
+        let branched = ConversationSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            created_at: now,
+            updated_at: now,
+            messages: source.messages[..clamped_idx].to_vec(),
+            model: source.model.clone(),
+            title: new_title
+                .map(|t| t.to_string())
+                .or_else(|| source.title.as_ref().map(|t| format!("{} (branch)", t))),
+            working_dir: source.working_dir.clone(),
+            tags: source.tags.clone(),
+            branch_from: Some(source_id.to_string()),
+            branch_at_message: Some(clamped_idx),
+            remote_session_url: None,
+            total_cost: 0.0,
+            total_tokens: 0,
+            checkpoints: vec![],
+            parent_session_id: None,
+            fork_point_message_index: None,
+        };
+        save_session(&branched).await?;
+        Ok(branched)
+    }
+
+    /// Search sessions whose title or tags contain `query` (case-insensitive
+    /// substring match).  Results are sorted by `updated_at` descending.
+    pub async fn search_sessions(query: &str) -> Vec<ConversationSession> {
+        let lower_query = query.to_lowercase();
+        let all = list_sessions().await;
+        all.into_iter()
+            .filter(|s| {
+                // Check title
+                if let Some(ref title) = s.title {
+                    if title.to_lowercase().contains(&lower_query) {
+                        return true;
+                    }
+                }
+                // Check tags
+                if s.tags
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&lower_query))
+                {
+                    return true;
+                }
+                false
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod session_model_tests {
+        use super::*;
+
+        #[test]
+        fn canonical_session_model_preserves_gateway_provider_identity() {
+            let config = Config {
+                provider: Some("openrouter".to_string()),
+                model: None,
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, "anthropic/claude-sonnet-4"),
+                "openrouter/anthropic/claude-sonnet-4"
+            );
+            assert_eq!(
+                canonical_session_model(&config, "openrouter/meta-llama/Llama-3.3-70B"),
+                "openrouter/meta-llama/Llama-3.3-70B"
+            );
+        }
+
+        #[test]
+        fn canonical_session_model_does_not_wrap_explicit_other_provider_model() {
+            let config = Config {
+                provider: Some("openrouter".to_string()),
+                model: Some("openai/gpt-4o".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, "openai/gpt-4o"),
+                "openai/gpt-4o"
+            );
+        }
+
+        #[test]
+        fn canonical_session_model_trims_and_ignores_blank_model() {
+            let config = Config {
+                provider: Some(" openrouter ".to_string()),
+                model: Some(" openai/gpt-4o ".to_string()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                canonical_session_model(&config, " openai/gpt-4o "),
+                "openai/gpt-4o"
+            );
+            assert_eq!(canonical_session_model(&config, "   "), "");
+        }
+
+        #[test]
+        fn apply_session_model_restores_prefixed_provider() {
+            let mut config = Config {
+                provider: Some("anthropic".to_string()),
+                model: None,
+                ..Default::default()
+            };
+
+            apply_session_model_to_config(&mut config, "openrouter/anthropic/claude-sonnet-4");
+
+            assert_eq!(config.provider.as_deref(), Some("openrouter"));
+            assert_eq!(
+                config.model.as_deref(),
+                Some("openrouter/anthropic/claude-sonnet-4")
+            );
+        }
+
+        #[test]
+        fn apply_session_model_trims_and_ignores_blank_values() {
+            let mut config = Config {
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                ..Default::default()
+            };
+
+            apply_session_model_to_config(&mut config, "   ");
+            assert_eq!(config.provider.as_deref(), Some("anthropic"));
+            assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-5"));
+
+            apply_session_model_to_config(&mut config, " openrouter/openai/gpt-4o ");
+            assert_eq!(config.provider.as_deref(), Some("openrouter"));
+            assert_eq!(config.model.as_deref(), Some("openrouter/openai/gpt-4o"));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cost module
+// ---------------------------------------------------------------------------
+pub mod cost {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// Per-model pricing tiers (USD per million tokens).
+    #[derive(Debug, Clone, Copy)]
+    pub struct ModelPricing {
+        pub input_per_mtk: f64,
+        pub output_per_mtk: f64,
+        pub cache_creation_per_mtk: f64,
+        pub cache_read_per_mtk: f64,
+    }
+
+    impl ModelPricing {
+        /// Pricing for Claude Opus 4 family.
+        pub const OPUS: Self = Self {
+            input_per_mtk: 15.0,
+            output_per_mtk: 75.0,
+            cache_creation_per_mtk: 18.75,
+            cache_read_per_mtk: 1.5,
+        };
+
+        /// Pricing for Claude Sonnet 4 family.
+        pub const SONNET: Self = Self {
+            input_per_mtk: 3.0,
+            output_per_mtk: 15.0,
+            cache_creation_per_mtk: 3.75,
+            cache_read_per_mtk: 0.3,
+        };
+
+        /// Pricing for Claude Haiku family.
+        pub const HAIKU: Self = Self {
+            input_per_mtk: 0.80,
+            output_per_mtk: 4.0,
+            cache_creation_per_mtk: 1.0,
+            cache_read_per_mtk: 0.08,
+        };
+
+        /// Default pricing is Opus (most capable, highest cost).
+        pub fn default_pricing() -> Self {
+            Self::OPUS
+        }
+
+        /// Pick pricing based on model name substring matching.
+        pub fn for_model(model: &str) -> Self {
+            if model.contains("opus") {
+                Self::OPUS
+            } else if model.contains("haiku") {
+                Self::HAIKU
+            } else {
+                // Default to Sonnet pricing for unknown models
+                Self::SONNET
+            }
+        }
+    }
+
+    impl Default for ModelPricing {
+        fn default() -> Self {
+            Self::OPUS
+        }
+    }
+
+    /// Thread-safe, lock-free cost tracker that accumulates token usage.
+    #[derive(Debug, Default)]
+    pub struct CostTracker {
+        input_tokens: AtomicU64,
+        output_tokens: AtomicU64,
+        cache_creation_tokens: AtomicU64,
+        cache_read_tokens: AtomicU64,
+        pricing: parking_lot::RwLock<ModelPricing>,
+    }
+
+    // We need a default for RwLock<ModelPricing> -- use Opus as default.
+    impl CostTracker {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                pricing: parking_lot::RwLock::new(ModelPricing::OPUS),
+                ..Default::default()
+            })
+        }
+
+        pub fn with_model(model: &str) -> Arc<Self> {
+            Arc::new(Self {
+                pricing: parking_lot::RwLock::new(ModelPricing::for_model(model)),
+                ..Default::default()
+            })
+        }
+
+        pub fn set_model(&self, model: &str) {
+            *self.pricing.write() = ModelPricing::for_model(model);
+        }
+
+        pub fn add_usage(&self, input: u64, output: u64, cache_creation: u64, cache_read: u64) {
+            self.input_tokens.fetch_add(input, Ordering::Relaxed);
+            self.output_tokens.fetch_add(output, Ordering::Relaxed);
+            self.cache_creation_tokens
+                .fetch_add(cache_creation, Ordering::Relaxed);
+            self.cache_read_tokens
+                .fetch_add(cache_read, Ordering::Relaxed);
+        }
+
+        pub fn total_cost_usd(&self) -> f64 {
+            let pricing = *self.pricing.read();
+            let input = self.input_tokens.load(Ordering::Relaxed) as f64;
+            let output = self.output_tokens.load(Ordering::Relaxed) as f64;
+            let cache_creation = self.cache_creation_tokens.load(Ordering::Relaxed) as f64;
+            let cache_read = self.cache_read_tokens.load(Ordering::Relaxed) as f64;
+
+            (input * pricing.input_per_mtk
+                + output * pricing.output_per_mtk
+                + cache_creation * pricing.cache_creation_per_mtk
+                + cache_read * pricing.cache_read_per_mtk)
+                / 1_000_000.0
+        }
+
+        pub fn total_tokens(&self) -> u64 {
+            self.input_tokens.load(Ordering::Relaxed)
+                + self.output_tokens.load(Ordering::Relaxed)
+                + self.cache_creation_tokens.load(Ordering::Relaxed)
+                + self.cache_read_tokens.load(Ordering::Relaxed)
+        }
+
+        pub fn input_tokens(&self) -> u64 {
+            self.input_tokens.load(Ordering::Relaxed)
+        }
+
+        pub fn output_tokens(&self) -> u64 {
+            self.output_tokens.load(Ordering::Relaxed)
+        }
+
+        pub fn cache_creation_tokens(&self) -> u64 {
+            self.cache_creation_tokens.load(Ordering::Relaxed)
+        }
+
+        pub fn cache_read_tokens(&self) -> u64 {
+            self.cache_read_tokens.load(Ordering::Relaxed)
+        }
+
+        /// Produce a human-readable summary string, e.g. for display in the TUI.
+        pub fn summary(&self) -> String {
+            let cost = self.total_cost_usd();
+            let total = self.total_tokens();
+            if cost < 0.01 {
+                format!("{} tokens (<$0.01)", total)
+            } else {
+                format!("{} tokens (${:.2})", total, cost)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hooks module
+// ---------------------------------------------------------------------------
+pub mod hooks {
+    use crate::config::{HookEntry, HookEvent};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use tracing::{debug, warn};
+
+    /// Context passed to hook commands via stdin as JSON.
+    #[derive(Debug, serde::Serialize)]
+    pub struct HookContext {
+        pub event: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_input: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tool_output: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub session_id: Option<String>,
+    }
+
+    /// Result of running a hook.
+    #[derive(Debug)]
+    pub enum HookOutcome {
+        /// Hook ran and allowed execution to continue.
+        Allowed,
+        /// Hook ran and blocked execution (blocking hook with non-zero exit).
+        Blocked(String),
+        /// Hook produced modified output (stdout of the hook command).
+        Modified(String),
+    }
+
+    /// Run all hooks registered for the given event. Returns the first blocking
+    /// result if any hook blocks, otherwise `Allowed`.
+    pub async fn run_hooks(
+        hooks: &HashMap<HookEvent, Vec<HookEntry>>,
+        event: HookEvent,
+        ctx: &HookContext,
+        working_dir: &Path,
+    ) -> HookOutcome {
+        let Some(entries) = hooks.get(&event) else {
+            return HookOutcome::Allowed;
+        };
+
+        let ctx_json = match serde_json::to_string(ctx) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize hook context: {}", e);
+                return HookOutcome::Allowed;
+            }
+        };
+
+        for entry in entries {
+            // Apply tool filter if set
+            if let Some(ref filter) = entry.tool_filter {
+                if let Some(ref tool) = ctx.tool_name {
+                    if !filter.is_empty() && filter != tool && filter != "*" {
+                        continue;
+                    }
+                }
+            }
+
+            debug!(command = %entry.command, event = ?event, "Running hook");
+
+            let result = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+                .args(if cfg!(windows) {
+                    ["/C", &entry.command]
+                } else {
+                    ["-c", &entry.command]
+                })
+                .current_dir(working_dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match result {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(command = %entry.command, error = %e, "Failed to spawn hook");
+                    continue;
+                }
+            };
+
+            // Write context JSON to stdin
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = stdin.write_all(ctx_json.as_bytes()).await {
+                    warn!(
+                        command = %entry.command,
+                        error = %e,
+                        "Failed to write hook context to stdin"
+                    );
+                }
+            }
+
+            let output = match child.wait_with_output().await {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!(command = %entry.command, error = %e, "Hook wait failed");
+                    continue;
+                }
+            };
+
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let exit_ok = output.status.success();
+
+            if !exit_ok && entry.blocking {
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let reason = if !stderr.is_empty() { stderr } else { stdout };
+                return HookOutcome::Blocked(format!(
+                    "Hook '{}' blocked execution: {}",
+                    entry.command,
+                    reason.trim()
+                ));
+            }
+
+            if !exit_ok {
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                warn!(
+                    command = %entry.command,
+                    event = ?event,
+                    exit_code = ?output.status.code(),
+                    stderr = %stderr.trim(),
+                    "Non-blocking hook exited unsuccessfully"
+                );
+            }
+
+            if !stdout.trim().is_empty() {
+                return HookOutcome::Modified(stdout.trim().to_string());
+            }
+        }
+
+        HookOutcome::Allowed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// oauth module
+// ---------------------------------------------------------------------------
+
+/// OAuth 2.0 PKCE authentication support.
+///
+/// Supports two login paths:
+/// - **Console** (`org:create_api_key` scope): exchanges access token for an API key.
+/// - **Claude.ai** (`user:inference` scope): uses the access token as a Bearer credential.
+pub mod oauth {
+    use anyhow::Context;
+    use serde::{Deserialize, Serialize};
+    use std::path::Path;
+
+    // ---- Production OAuth endpoints & constants ----
+
+    // NOTE: This OAuth client ID is for the Anthropic CLI OAuth flow.
+    // MangoCode users should use an API key from console.anthropic.com instead.
+    pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+    pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
+    pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+    pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+    pub const API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
+    pub const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
+    pub const CLAUDEAI_SUCCESS_URL: &str =
+        "https://platform.claude.com/oauth/code/success?app=claude-code";
+    pub const CONSOLE_SUCCESS_URL: &str = "https://platform.claude.com/buy_credits\
+        ?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code";
+
+    /// All scopes requested during login (union of Console + Claude.ai scopes).
+    pub const ALL_SCOPES: &[&str] = &[
+        "org:create_api_key",
+        "user:profile",
+        "user:inference",
+        "user:sessions:claude_code",
+        "user:mcp_servers",
+        "user:file_upload",
+    ];
+
+    /// Scope that identifies a Claude.ai subscription token (uses Bearer auth).
+    pub const CLAUDE_AI_INFERENCE_SCOPE: &str = "user:inference";
+
+    // ---- Stored token struct ----
+
+    /// Persisted OAuth tokens (saved to `~/.mangocode/oauth_tokens.json`).
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct OAuthTokens {
+        pub access_token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub refresh_token: Option<String>,
+        /// Unix timestamp in milliseconds when the access token expires.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub expires_at_ms: Option<i64>,
+        pub scopes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub account_uuid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub email: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub organization_uuid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub subscription_type: Option<String>,
+        /// API key created for Console-flow users (exchanged from access token).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub api_key: Option<String>,
+    }
+
+    impl OAuthTokens {
+        /// Returns true if the token requires Bearer-style authorization
+        /// (i.e. Claude.ai subscription with `user:inference` scope).
+        pub fn uses_bearer_auth(&self) -> bool {
+            self.scopes.iter().any(|s| s == CLAUDE_AI_INFERENCE_SCOPE)
+        }
+
+        /// The credential to present to the Anthropic API:
+        /// - Console flow: the stored `api_key` (sk-ant-…)
+        /// - Claude.ai flow: the `access_token` itself (Bearer)
+        pub fn effective_credential(&self) -> Option<&str> {
+            if self.uses_bearer_auth() {
+                if self.access_token.is_empty() {
+                    None
+                } else {
+                    Some(&self.access_token)
+                }
+            } else {
+                self.api_key.as_deref()
+            }
+        }
+
+        /// True if the access token has passed (or is within 5 minutes of) its expiry.
+        pub fn is_expired(&self) -> bool {
+            if let Some(exp) = self.expires_at_ms {
+                let buffer_ms: i64 = 5 * 60 * 1000;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                (now_ms + buffer_ms) >= exp
+            } else {
+                false
+            }
+        }
+
+        /// Returns true if the token is expired or will expire within 5 minutes.
+        pub fn is_expired_or_expiring_soon(&self) -> bool {
+            self.is_expired()
+        }
+
+        pub fn token_file_path() -> std::path::PathBuf {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".mangocode")
+                .join("oauth_tokens.json")
+        }
+
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let path = Self::token_file_path();
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&path, serde_json::to_string_pretty(self)?).await?;
+            Ok(())
+        }
+
+        pub async fn load() -> Option<Self> {
+            let path = Self::token_file_path();
+            match Self::load_from_path(&path).await {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "failed to load OAuth tokens; treating as disconnected"
+                    );
+                    None
+                }
+            }
+        }
+
+        pub(crate) async fn load_from_path(path: &Path) -> anyhow::Result<Option<Self>> {
+            let content = match tokio::fs::read_to_string(path).await {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed to read {}", path.display()));
+                }
+            };
+            serde_json::from_str(&content)
+                .map(Some)
+                .with_context(|| format!("failed to parse {}", path.display()))
+        }
+
+        pub async fn clear() -> anyhow::Result<()> {
+            let path = Self::token_file_path();
+            if path.exists() {
+                tokio::fs::remove_file(path).await?;
+            }
+            Ok(())
+        }
+
+        /// Try to load OAuth tokens from Claude Code's credentials file.
+        ///
+        /// Claude Code stores credentials at `~/.claude/.credentials.json` with the shape:
+        /// ```json
+        /// {
+        ///   "claudeAiOauth": {
+        ///     "accessToken": "...",
+        ///     "refreshToken": "...",
+        ///     "expiresAt": 1234567890000
+        ///   }
+        /// }
+        /// ```
+        /// On macOS, attempts to read OAuth tokens from the system Keychain under
+        /// the service name "Claude Code-credentials", then falls back to the
+        /// `.credentials.json` file. Allows users with existing OAuth tokens to
+        /// use them with MangoCode without re-authenticating.
+        pub async fn load_from_claude_cli() -> Option<Self> {
+            use crate::oauth_config::CLAUDE_AI_SCOPES;
+
+            // Try macOS Keychain first
+            #[cfg(target_os = "macos")]
+            let content = {
+                let keychain_content = get_macos_keychain_credentials().await;
+                if keychain_content.is_some() {
+                    keychain_content
+                } else {
+                    // Fall back to file
+                    let path = dirs::home_dir()?.join(".claude/.credentials.json");
+                    tokio::fs::read_to_string(&path).await.ok()
+                }
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            let content = {
+                let path = dirs::home_dir()?.join(".claude/.credentials.json");
+                tokio::fs::read_to_string(&path).await.ok()
+            };
+
+            let content = content?;
+            let v: serde_json::Value = match serde_json::from_str(&content) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "failed to parse legacy Claude credentials JSON"
+                    );
+                    return None;
+                }
+            };
+            let ca = v.get("claudeAiOauth")?;
+
+            let access_token = ca.get("accessToken")?.as_str()?.to_string();
+            let refresh_token = ca
+                .get("refreshToken")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let expires_at_ms = ca.get("expiresAt").and_then(|v| v.as_i64());
+
+            Some(OAuthTokens {
+                access_token,
+                refresh_token,
+                expires_at_ms,
+                scopes: CLAUDE_AI_SCOPES.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            })
+        }
+
+        #[cfg(target_os = "macos")]
+        async fn get_macos_keychain_credentials() -> Option<String> {
+            // Read OAuth tokens from the Anthropic keychain service
+            let output = tokio::process::Command::new("security")
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                ])
+                .output()
+                .await
+                .ok()?;
+
+            if output.status.success() {
+                let json_str = String::from_utf8(output.stdout).ok()?;
+                Some(json_str.trim().to_string())
+            } else {
+                None
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[allow(dead_code)]
+        async fn get_macos_keychain_credentials() -> Option<String> {
+            None
+        }
+
+        /// Persist `oauth_tokens.json` and sync Claude Max credentials into `auth.json`.
+        ///
+        /// This is used by `mangocode-api` providers that authenticate via Claude.ai OAuth
+        /// and need the refreshed bearer token to be visible in the auth store as well.
+        pub async fn persist_to_disk_with_auth_sync(&self) -> anyhow::Result<()> {
+            self.save().await?;
+            crate::auth_store::AuthStore::sync_anthropic_max_from_oauth_tokens_async(self).await?;
+            Ok(())
+        }
+    }
+
+    /// Refresh an expired OAuth access token using the stored refresh token.
+    ///
+    /// This is the shared helper used by the CLI flow and long-lived provider sessions.
+    pub async fn refresh_oauth_tokens_from_refresh(
+        tokens: &OAuthTokens,
+    ) -> anyhow::Result<OAuthTokens> {
+        use anyhow::{anyhow, bail, Context};
+
+        let refresh = tokens
+            .refresh_token
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("No refresh token available"))?;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("Failed to build HTTP client")?;
+
+        // Use the stored token scopes for refresh, not the hardcoded ALL_SCOPES.
+        // This ensures Claude Max tokens refresh with Claude.ai scopes only.
+        let scope_str = if tokens.scopes.is_empty() {
+            ALL_SCOPES.join(" ")
+        } else {
+            tokens.scopes.join(" ")
+        };
+
+        let body = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": CLIENT_ID,
+            "scope": scope_str,
+        });
+
+        let resp = client
+            .post(TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("OAuth refresh request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+            bail!("OAuth refresh failed ({}): {}", status, text);
+        }
+
+        let data = resp
+            .json::<serde_json::Value>()
+            .await
+            .context("Failed to parse OAuth refresh response")?;
+
+        let access_token = data["access_token"].as_str().unwrap_or("").to_string();
+        if access_token.is_empty() {
+            bail!("OAuth refresh response missing access_token");
+        }
+
+        let refresh_token = data["refresh_token"].as_str().map(|s| s.to_string());
+        let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
+        let expires_at_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
+        let scopes: Vec<String> = data["scope"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
+        let mut updated = tokens.clone();
+        updated.access_token = access_token;
+        if let Some(rt) = refresh_token {
+            if !rt.is_empty() {
+                updated.refresh_token = Some(rt);
+            }
+        }
+        updated.expires_at_ms = Some(expires_at_ms);
+        if !scopes.is_empty() {
+            updated.scopes = scopes;
+        }
+        Ok(updated)
+    }
+
+    // ---- PKCE helpers ----
+
+    /// Generate a 32-byte random code verifier, base64url-encoded (no padding).
+    pub fn generate_code_verifier() -> String {
+        use base64::Engine;
+        let mut bytes = [0u8; 32];
+        let u1 = uuid::Uuid::new_v4();
+        let u2 = uuid::Uuid::new_v4();
+        bytes[..16].copy_from_slice(u1.as_bytes());
+        bytes[16..].copy_from_slice(u2.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// Derive the PKCE code challenge from a verifier: BASE64URL(SHA256(verifier)).
+    pub fn generate_code_challenge(verifier: &str) -> String {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+    }
+
+    /// Generate a random OAuth state parameter for CSRF protection.
+    pub fn generate_state() -> String {
+        use base64::Engine;
+        let mut bytes = [0u8; 32];
+        let u1 = uuid::Uuid::new_v4();
+        let u2 = uuid::Uuid::new_v4();
+        bytes[..16].copy_from_slice(u1.as_bytes());
+        bytes[16..].copy_from_slice(u2.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    // ---- URL builder ----
+
+    /// Build an OAuth authorization URL with all required PKCE parameters.
+    pub fn build_auth_url(
+        authorize_base: &str,
+        code_challenge: &str,
+        state: &str,
+        callback_port: u16,
+        is_manual: bool,
+    ) -> String {
+        let redirect = if is_manual {
+            MANUAL_REDIRECT_URL.to_string()
+        } else {
+            format!("http://localhost:{}/callback", callback_port)
+        };
+        let scope = ALL_SCOPES.join(" ");
+        let Ok(mut u) = url::Url::parse(authorize_base) else {
+            tracing::warn!("invalid OAuth authorize base URL: {authorize_base}");
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query.append_pair("code", "true");
+            query.append_pair("client_id", CLIENT_ID);
+            query.append_pair("response_type", "code");
+            query.append_pair("redirect_uri", &redirect);
+            query.append_pair("scope", &scope);
+            query.append_pair("code_challenge", code_challenge);
+            query.append_pair("code_challenge_method", "S256");
+            query.append_pair("state", state);
+            let separator = if authorize_base.contains('?') {
+                if authorize_base.ends_with('?') || authorize_base.ends_with('&') {
+                    ""
+                } else {
+                    "&"
+                }
+            } else {
+                "?"
+            };
+            return format!("{authorize_base}{separator}{}", query.finish());
+        };
+        {
+            let mut q = u.query_pairs_mut();
+            q.append_pair("code", "true"); // tells the login page to show Claude Max upsell
+            q.append_pair("client_id", CLIENT_ID);
+            q.append_pair("response_type", "code");
+            q.append_pair("redirect_uri", &redirect);
+            q.append_pair("scope", &scope);
+            q.append_pair("code_challenge", code_challenge);
+            q.append_pair("code_challenge_method", "S256");
+            q.append_pair("state", state);
+        }
+        u.to_string()
+    }
+}
+
+// Re-export OAuthTokens at crate root for convenience
+pub use oauth::OAuthTokens;
+
+// ---------------------------------------------------------------------------
+// New modules: keybindings, voice, analytics, lsp, team_memory_sync,
+//              system_prompt, memdir, oauth_config
+// ---------------------------------------------------------------------------
+pub mod analytics;
+pub mod bash_classifier;
+pub mod codex_oauth;
+pub mod context_collapse;
+pub mod effort;
+pub mod feature_gates;
+pub mod keybindings;
+pub mod lsp;
+pub mod memdir;
+pub mod migrations;
+pub mod oauth_config;
+pub mod output_styles;
+pub mod permission_critic;
+pub mod prompt_history;
+pub mod ps_classifier;
+pub mod remote_settings;
+pub mod session_tracing;
+pub mod settings_sync;
+pub mod system_prompt;
+pub mod team_memory_sync;
+pub mod tips;
+pub mod voice;
+
+// ---------------------------------------------------------------------------
+// tasks module — background task registry
+// ---------------------------------------------------------------------------
+pub mod tasks {
+    use chrono::{DateTime, Utc};
+    use dashmap::DashMap;
+    use once_cell::sync::Lazy;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// Current status of a background task.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum TaskStatus {
+        Running,
+        Completed,
+        Failed(String),
+        Cancelled,
+    }
+
+    impl std::fmt::Display for TaskStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TaskStatus::Running => write!(f, "running"),
+                TaskStatus::Completed => write!(f, "completed"),
+                TaskStatus::Failed(reason) => write!(f, "failed: {}", reason),
+                TaskStatus::Cancelled => write!(f, "cancelled"),
+            }
+        }
+    }
+
+    /// A single background task tracked by the registry.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct BackgroundTask {
+        /// Unique identifier for the task.
+        pub id: String,
+        /// Human-readable name / description.
+        pub name: String,
+        /// Current execution status.
+        pub status: TaskStatus,
+        /// When the task was registered.
+        pub started_at: DateTime<Utc>,
+        /// When the task finished (completed, failed, or cancelled).
+        pub completed_at: Option<DateTime<Utc>>,
+        /// Lines of output produced by the task.
+        pub output: Vec<String>,
+        /// OS process ID, if applicable.
+        pub pid: Option<u32>,
+    }
+
+    impl BackgroundTask {
+        /// Create a new running task with the given name.
+        pub fn new(name: impl Into<String>) -> Self {
+            Self {
+                id: Uuid::new_v4().to_string(),
+                name: name.into(),
+                status: TaskStatus::Running,
+                started_at: Utc::now(),
+                completed_at: None,
+                output: Vec::new(),
+                pid: None,
+            }
+        }
+
+        /// Return `true` if the task is still running.
+        pub fn is_running(&self) -> bool {
+            matches!(self.status, TaskStatus::Running)
+        }
+    }
+
+    /// Thread-safe registry of background tasks.
+    pub struct TaskRegistry {
+        tasks: Arc<DashMap<String, BackgroundTask>>,
+    }
+
+    impl TaskRegistry {
+        /// Create a new empty registry.
+        pub fn new() -> Self {
+            Self {
+                tasks: Arc::new(DashMap::new()),
+            }
+        }
+
+        /// Register a new task.  Returns the assigned task ID.
+        pub fn register(&self, task: BackgroundTask) -> String {
+            let id = task.id.clone();
+            self.tasks.insert(id.clone(), task);
+            id
+        }
+
+        /// Update the status of a task.  No-op if the ID is unknown.
+        pub fn update_status(&self, id: &str, status: TaskStatus) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                let is_terminal = !matches!(status, TaskStatus::Running);
+                entry.status = status;
+                if is_terminal && entry.completed_at.is_none() {
+                    entry.completed_at = Some(Utc::now());
+                }
+            }
+        }
+
+        /// Append a line of output to an existing task.  No-op if unknown.
+        pub fn append_output(&self, id: &str, line: &str) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.output.push(line.to_string());
+            }
+        }
+
+        /// Look up a task by ID.
+        pub fn get(&self, id: &str) -> Option<BackgroundTask> {
+            self.tasks.get(id).map(|e| e.clone())
+        }
+
+        /// Return a snapshot of all tasks, ordered by `started_at` ascending.
+        pub fn list(&self) -> Vec<BackgroundTask> {
+            let mut tasks: Vec<BackgroundTask> =
+                self.tasks.iter().map(|e| e.value().clone()).collect();
+            tasks.sort_by_key(|t| t.started_at);
+            tasks
+        }
+
+        /// Mark a task as `Completed`.  No-op if unknown or already terminal.
+        pub fn complete(&self, id: &str) {
+            self.update_status(id, TaskStatus::Completed);
+        }
+
+        /// Mark a task as `Cancelled`.  No-op if unknown or already terminal.
+        pub fn cancel(&self, id: &str) {
+            self.update_status(id, TaskStatus::Cancelled);
+        }
+
+        /// Count tasks that are still running.
+        pub fn active_count(&self) -> usize {
+            self.tasks
+                .iter()
+                .filter(|e| matches!(e.value().status, TaskStatus::Running))
+                .count()
+        }
+
+        /// Set the OS process ID for a task.  No-op if unknown.
+        pub fn set_pid(&self, id: &str, pid: u32) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.pid = Some(pid);
+            }
+        }
+    }
+
+    impl Default for TaskRegistry {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// The process-global task registry singleton.
+    static GLOBAL_REGISTRY: Lazy<TaskRegistry> = Lazy::new(TaskRegistry::new);
+
+    /// Return a reference to the process-global `TaskRegistry`.
+    pub fn global_registry() -> &'static TaskRegistry {
+        &GLOBAL_REGISTRY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn test_message_user() {
+        let msg = Message::user("hello");
+        assert_eq!(msg.role, Role::User);
+        assert_eq!(msg.get_text(), Some("hello"));
+    }
+
+    #[test]
+    fn test_message_assistant_blocks() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "let me think".into(),
+                signature: "sig".into(),
+            },
+            ContentBlock::Text {
+                text: "response".into(),
+            },
+        ]);
+        assert_eq!(msg.get_text(), Some("response"));
+        assert_eq!(msg.get_thinking_blocks().len(), 1);
+    }
+
+    #[test]
+    fn test_hooks_config_default() {
+        let cfg = crate::config::Config::default();
+        assert!(cfg.hooks.is_empty());
+    }
+
+    #[test]
+    fn approvals_reviewer_defaults_to_user() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::User
+        );
+        assert_eq!(cfg.approvals_reviewer.label(), "user");
+    }
+
+    #[test]
+    fn approvals_reviewer_accepts_codex_values_and_serializes_auto_review() {
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals_reviewer": "auto_review"}))
+                .unwrap();
+        assert!(cfg.approvals_reviewer.is_auto_review());
+
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals_reviewer": "guardian_subagent"}))
+                .unwrap();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"approvals-reviewer": "auto_review"}))
+                .unwrap();
+        assert_eq!(
+            cfg.approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+
+        let encoded = serde_json::to_value(crate::config::Config {
+            approvals_reviewer: crate::config::ApprovalsReviewer::AutoReview,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["approvals_reviewer"], "auto_review");
+    }
+
+    #[test]
+    fn settings_merge_allows_project_to_opt_out_of_global_auto_review() {
+        let global = crate::config::Settings::from_json_str(
+            r#"{"config":{"approvals_reviewer":"auto_review"}}"#,
+        )
+        .unwrap();
+        let inherited = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        let explicit_user =
+            crate::config::Settings::from_json_str(r#"{"config":{"approvals_reviewer":"user"}}"#)
+                .unwrap();
+
+        assert_eq!(
+            crate::config::Settings::merge(global.clone(), inherited)
+                .config
+                .approvals_reviewer,
+            crate::config::ApprovalsReviewer::AutoReview
+        );
+        assert_eq!(
+            crate::config::Settings::merge(global, explicit_user)
+                .config
+                .approvals_reviewer,
+            crate::config::ApprovalsReviewer::User
+        );
+    }
+
+    #[test]
+    fn settings_from_json_str_rejects_invalid_approvals_reviewer() {
+        let err = crate::config::Settings::from_json_str(
+            r#"{"config":{"approvals_reviewer":"definitely_not_valid"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("definitely_not_valid"));
+    }
+
+    #[test]
+    fn agent_completion_policy_defaults_to_warn() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.agent_completion_policy,
+            crate::config::AgentCompletionPolicy::Warn
+        );
+        assert_eq!(cfg.agent_completion_policy.label(), "warn");
+        assert!(!cfg.agent_completion_policy.enforces());
+    }
+
+    #[test]
+    fn agent_completion_policy_accepts_hyphen_alias_and_serializes_snake_case() {
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"agent_completion_policy": "warn"})).unwrap();
+        assert_eq!(
+            cfg.agent_completion_policy,
+            crate::config::AgentCompletionPolicy::Warn
+        );
+        assert!(cfg.agent_completion_policy.warns());
+
+        let cfg: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"agent-completion-policy": "off"})).unwrap();
+        assert_eq!(
+            cfg.agent_completion_policy,
+            crate::config::AgentCompletionPolicy::Off
+        );
+        assert!(cfg.agent_completion_policy.is_off());
+
+        let encoded = serde_json::to_value(crate::config::Config {
+            agent_completion_policy: crate::config::AgentCompletionPolicy::Warn,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["agent_completion_policy"], "warn");
+    }
+
+    #[test]
+    fn settings_merge_preserves_inherited_completion_policy_unless_explicit() {
+        let global = crate::config::Settings::from_json_str(
+            r#"{"config":{"agent_completion_policy":"warn"}}"#,
+        )
+        .unwrap();
+        let inherited = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        let explicit_enforce = crate::config::Settings::from_json_str(
+            r#"{"config":{"agent_completion_policy":"enforce"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::config::Settings::merge(global.clone(), inherited)
+                .config
+                .agent_completion_policy,
+            crate::config::AgentCompletionPolicy::Warn
+        );
+        assert_eq!(
+            crate::config::Settings::merge(global, explicit_enforce)
+                .config
+                .agent_completion_policy,
+            crate::config::AgentCompletionPolicy::Enforce
+        );
+    }
+
+    #[test]
+    fn settings_from_json_str_rejects_invalid_completion_policy() {
+        let err = crate::config::Settings::from_json_str(
+            r#"{"config":{"agent_completion_policy":"definitely_not_valid"}}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("definitely_not_valid"));
+    }
+
+    #[test]
+    fn verification_and_reliability_policies_default_and_serialize() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.verification_policy,
+            crate::config::VerificationPolicy::Auto
+        );
+        assert_eq!(
+            cfg.agent_reliability_profile,
+            crate::config::AgentReliabilityProfile::Strict
+        );
+        assert!(cfg.agent_reliability_profile.is_strict());
+
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "verification-policy": "off",
+            "agent-reliability-profile": "strict"
+        }))
+        .unwrap();
+        assert!(cfg.verification_policy.is_off());
+        assert!(cfg.agent_reliability_profile.is_strict());
+
+        let encoded = serde_json::to_value(crate::config::Config {
+            verification_policy: crate::config::VerificationPolicy::Ask,
+            agent_reliability_profile: crate::config::AgentReliabilityProfile::Strict,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["verification_policy"], "ask");
+        assert_eq!(encoded["agent_reliability_profile"], "strict");
+    }
+
+    #[test]
+    fn agent_speed_profile_defaults_to_fast_safe_and_accepts_balanced() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.agent_speed_profile,
+            crate::config::AgentSpeedProfile::FastSafe
+        );
+        assert_eq!(cfg.agent_speed_profile.label(), "fast_safe");
+        assert!(cfg.agent_speed_profile.is_fast_safe());
+
+        let cfg: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "agent-speed-profile": "balanced"
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.agent_speed_profile,
+            crate::config::AgentSpeedProfile::Balanced
+        );
+        assert!(!cfg.agent_speed_profile.is_fast_safe());
+
+        let encoded = serde_json::to_value(crate::config::Config {
+            agent_speed_profile: crate::config::AgentSpeedProfile::FastSafe,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(encoded["agent_speed_profile"], "fast_safe");
+    }
+
+    #[test]
+    fn settings_merge_preserves_inherited_reliability_policies_unless_explicit() {
+        let global = crate::config::Settings::from_json_str(
+            r#"{"config":{"verification_policy":"ask","agent_reliability_profile":"standard"}}"#,
+        )
+        .unwrap();
+        let inherited = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        let explicit_default = crate::config::Settings::from_json_str(
+            r#"{"config":{"verification_policy":"auto","agent_reliability_profile":"strict"}}"#,
+        )
+        .unwrap();
+
+        let merged = crate::config::Settings::merge(global.clone(), inherited);
+        assert_eq!(
+            merged.config.verification_policy,
+            crate::config::VerificationPolicy::Ask
+        );
+        assert_eq!(
+            merged.config.agent_reliability_profile,
+            crate::config::AgentReliabilityProfile::Standard
+        );
+
+        let merged = crate::config::Settings::merge(global, explicit_default);
+        assert_eq!(
+            merged.config.verification_policy,
+            crate::config::VerificationPolicy::Auto
+        );
+        assert_eq!(
+            merged.config.agent_reliability_profile,
+            crate::config::AgentReliabilityProfile::Strict
+        );
+    }
+
+    #[test]
+    fn settings_merge_preserves_inherited_speed_profile_unless_explicit() {
+        let global = crate::config::Settings::from_json_str(
+            r#"{"config":{"agent_speed_profile":"balanced"}}"#,
+        )
+        .unwrap();
+        let inherited = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        let explicit_default = crate::config::Settings::from_json_str(
+            r#"{"config":{"agent_speed_profile":"fast_safe"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate::config::Settings::merge(global.clone(), inherited)
+                .config
+                .agent_speed_profile,
+            crate::config::AgentSpeedProfile::Balanced
+        );
+        assert_eq!(
+            crate::config::Settings::merge(global, explicit_default)
+                .config
+                .agent_speed_profile,
+            crate::config::AgentSpeedProfile::FastSafe
+        );
+    }
+
+    #[test]
+    fn settings_api_key_scrubber_preserves_non_secret_json() {
+        let mut settings = serde_json::json!({
+            "config": {
+                "api_key": "sk-ant",
+                "provider_configs": {
+                    "openai": { "api_key": "sk-openai", "api_base": "https://example.test" },
+                    "google": { "apiKey": "google-key", "enabled": false }
+                },
+                "provider": "openai"
+            },
+            "providers": {
+                "anthropic": { "api_key": "sk-anthropic", "enabled": true }
+            },
+            "custom": { "keep": true }
+        });
+
+        assert!(crate::config::Settings::clear_api_keys_from_settings_json(
+            &mut settings
+        ));
+        assert!(settings["config"].get("api_key").is_none());
+        assert!(settings["config"]["provider_configs"]["openai"]
+            .get("api_key")
+            .is_none());
+        assert!(settings["config"]["provider_configs"]["google"]
+            .get("apiKey")
+            .is_none());
+        assert!(settings["providers"]["anthropic"].get("api_key").is_none());
+        assert_eq!(
+            settings["config"]["provider_configs"]["openai"]["api_base"],
+            "https://example.test"
+        );
+        assert_eq!(settings["custom"]["keep"], true);
+    }
+
+    #[tokio::test]
+    async fn settings_hierarchical_reports_project_parse_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings_dir = temp.path().join(".mangocode");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let settings_path = settings_dir.join("settings.json");
+        std::fs::write(&settings_path, "{bad json").unwrap();
+
+        let (_settings, diagnostics) =
+            crate::config::Settings::load_hierarchical_with_diagnostics(temp.path()).await;
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == settings_path
+                    && diagnostic
+                        .error
+                        .contains("failed to parse project settings")),
+            "expected project settings parse diagnostic, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn default_agent_prompts_do_not_overpromise_hidden_tools() {
+        let agents = crate::config::default_agents();
+        for name in ["build", "plan", "explore"] {
+            let prompt = agents
+                .get(name)
+                .and_then(|agent| agent.prompt.as_deref())
+                .expect("built-in agent should have a prompt");
+            assert!(prompt.contains("runtime-visible"));
+            assert!(!prompt.contains("full access to read, write, and execute"));
+        }
+    }
+
+    #[test]
+    fn test_cost_tracker() {
+        let tracker = CostTracker::new();
+        tracker.add_usage(1000, 500, 200, 100);
+        assert_eq!(tracker.input_tokens(), 1000);
+        assert_eq!(tracker.output_tokens(), 500);
+        assert!(tracker.total_cost_usd() > 0.0);
+    }
+
+    #[test]
+    fn test_error_retryable() {
+        assert!(ClaudeError::RateLimit.is_retryable());
+        assert!(ClaudeError::ApiStatus {
+            status: 429,
+            message: "rate limited".into()
+        }
+        .is_retryable());
+        assert!(!ClaudeError::Auth("bad key".into()).is_retryable());
+    }
+
+    // ---- Config tests -------------------------------------------------------
+
+    #[test]
+    fn test_config_effective_model_default() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.effective_model(), crate::constants::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn test_config_effective_model_override() {
+        let cfg = crate::config::Config {
+            model: Some("claude-haiku-4-5-20251001".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_config_effective_model_trims_and_ignores_blank_override() {
+        let cfg = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some(" gpt-4o ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "gpt-4o");
+
+        let cfg = crate::config::Config {
+            provider: Some("openai".to_string()),
+            model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_config_effective_output_style_trims_and_resolves_prompt() {
+        let cfg = crate::config::Config {
+            output_style: Some(" formal ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_output_style(),
+            crate::system_prompt::OutputStyle::Formal
+        );
+        assert!(cfg
+            .resolve_output_style_prompt()
+            .unwrap()
+            .contains("formal, professional tone"));
+
+        let cfg = crate::config::Config {
+            output_style: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.effective_output_style(),
+            crate::system_prompt::OutputStyle::Default
+        );
+        assert!(cfg.resolve_output_style_prompt().is_none());
+    }
+
+    #[test]
+    fn test_config_resolves_project_output_style_prompt() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let styles_dir = project_dir.path().join(".mangocode").join("output-styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("local.md"),
+            "# Local\nProject-specific style.\n\nUse the project style.",
+        )
+        .unwrap();
+
+        let cfg = crate::config::Config {
+            project_dir: Some(project_dir.path().to_path_buf()),
+            output_style: Some(" LOCAL ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cfg.resolve_output_style_prompt().as_deref(),
+            Some("Use the project style.")
+        );
+    }
+
+    #[test]
+    fn test_config_effective_max_tokens_default() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.effective_max_tokens(),
+            crate::constants::DEFAULT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn test_config_effective_max_tokens_override() {
+        let cfg = crate::config::Config {
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
+        assert_eq!(cfg.effective_max_tokens(), 8192);
+    }
+
+    #[test]
+    fn test_config_resolve_api_key_from_config() {
+        let _guard = env_lock().lock().expect("env test lock");
+        // When config.api_key is set, it should be returned regardless of env var
+        // (Config key takes priority — resolve_api_key returns it first)
+        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let cfg = crate::config::Config {
+            api_key: Some("sk-ant-config-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
+
+        if let Some(k) = orig {
+            std::env::set_var("ANTHROPIC_API_KEY", k);
+        }
+    }
+
+    #[test]
+    fn test_config_resolve_api_key_none() {
+        let _guard = env_lock().lock().expect("env test lock");
+        // Temporarily ensure no env var override
+        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let cfg = crate::config::Config::default();
+        assert!(cfg.resolve_api_key().is_none());
+
+        // Restore
+        if let Some(k) = orig {
+            std::env::set_var("ANTHROPIC_API_KEY", k);
+        }
+    }
+
+    #[test]
+    fn test_config_resolve_api_key_from_env() {
+        let _guard = env_lock().lock().expect("env test lock");
+        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
+
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.resolve_api_key(), Some("sk-ant-env-key".to_string()));
+
+        // Restore
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        if let Some(k) = orig {
+            std::env::set_var("ANTHROPIC_API_KEY", k);
+        }
+    }
+
+    // ---- OAuth token tests --------------------------------------------------
+
+    #[test]
+    fn test_oauth_tokens_not_expired_no_expiry() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            expires_at_ms: None,
+            ..Default::default()
+        };
+        assert!(
+            !tokens.is_expired(),
+            "Token with no expiry should not be considered expired"
+        );
+    }
+
+    #[test]
+    fn test_oauth_tokens_expired_past() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            // Expired 1 hour ago
+            expires_at_ms: Some(chrono::Utc::now().timestamp_millis() - 3_600_000),
+            ..Default::default()
+        };
+        assert!(tokens.is_expired());
+    }
+
+    #[test]
+    fn test_oauth_tokens_not_expired_future() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            // Expires in 1 hour
+            expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+            ..Default::default()
+        };
+        assert!(!tokens.is_expired());
+    }
+
+    #[test]
+    fn test_oauth_tokens_expired_within_buffer() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            // Expires in 3 minutes — within the 5-minute buffer, so treated as expired
+            expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3 * 60 * 1000),
+            ..Default::default()
+        };
+        assert!(
+            tokens.is_expired(),
+            "Token within 5-min buffer should be considered expired"
+        );
+    }
+
+    #[test]
+    fn test_oauth_uses_bearer_auth_with_inference_scope() {
+        let tokens = crate::oauth::OAuthTokens {
+            scopes: vec![crate::oauth::CLAUDE_AI_INFERENCE_SCOPE.to_string()],
+            ..Default::default()
+        };
+        assert!(tokens.uses_bearer_auth());
+    }
+
+    #[test]
+    fn test_oauth_uses_bearer_auth_without_inference_scope() {
+        let tokens = crate::oauth::OAuthTokens {
+            scopes: vec!["org:create_api_key".to_string()],
+            ..Default::default()
+        };
+        assert!(!tokens.uses_bearer_auth());
+    }
+
+    #[test]
+    fn test_oauth_effective_credential_bearer() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "bearer_token_xyz".to_string(),
+            scopes: vec![crate::oauth::CLAUDE_AI_INFERENCE_SCOPE.to_string()],
+            api_key: Some("sk-ant-ignored".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tokens.effective_credential(), Some("bearer_token_xyz"));
+    }
+
+    #[test]
+    fn test_oauth_effective_credential_api_key() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            scopes: vec!["org:create_api_key".to_string()],
+            api_key: Some("sk-ant-real-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(tokens.effective_credential(), Some("sk-ant-real-key"));
+    }
+
+    #[test]
+    fn test_oauth_effective_credential_bearer_empty_access_token() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: String::new(),
+            scopes: vec![crate::oauth::CLAUDE_AI_INFERENCE_SCOPE.to_string()],
+            ..Default::default()
+        };
+        assert_eq!(tokens.effective_credential(), None);
+    }
+
+    #[test]
+    fn test_oauth_effective_credential_no_api_key() {
+        let tokens = crate::oauth::OAuthTokens {
+            access_token: "at".to_string(),
+            scopes: vec!["org:create_api_key".to_string()],
+            api_key: None,
+            ..Default::default()
+        };
+        assert_eq!(tokens.effective_credential(), None);
+    }
+
+    fn temp_oauth_tokens_path() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "mangocode-oauth-token-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("oauth_tokens.json")
+    }
+
+    #[tokio::test]
+    async fn test_oauth_tokens_load_from_path_missing_returns_none() {
+        let path = temp_oauth_tokens_path();
+
+        let tokens = crate::oauth::OAuthTokens::load_from_path(&path)
+            .await
+            .unwrap();
+
+        assert!(tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_oauth_tokens_load_from_path_rejects_malformed_json() {
+        let path = temp_oauth_tokens_path();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "{not-json").await.unwrap();
+
+        let err = crate::oauth::OAuthTokens::load_from_path(&path)
+            .await
+            .unwrap_err();
+        let _ = tokio::fs::remove_dir_all(path.parent().unwrap()).await;
+
+        assert!(err.to_string().contains("failed to parse"));
+    }
+
+    // ---- PKCE tests ---------------------------------------------------------
+
+    #[test]
+    fn test_pkce_code_verifier_length() {
+        let verifier = crate::oauth::generate_code_verifier();
+        // 32 bytes base64url-encoded (no padding) = ceil(32 * 4/3) = 43 chars
+        assert_eq!(
+            verifier.len(),
+            43,
+            "Code verifier should be 43 base64url chars (32 bytes)"
+        );
+        // Must only contain URL-safe base64 chars
+        assert!(verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn test_pkce_code_challenge_format() {
+        let verifier = crate::oauth::generate_code_verifier();
+        let challenge = crate::oauth::generate_code_challenge(&verifier);
+        // SHA256 = 32 bytes → 43 base64url chars
+        assert_eq!(
+            challenge.len(),
+            43,
+            "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)"
+        );
+        assert!(challenge
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn test_pkce_challenge_deterministic() {
+        // Same verifier must produce same challenge
+        let verifier = "test_verifier_fixed_input";
+        let c1 = crate::oauth::generate_code_challenge(verifier);
+        let c2 = crate::oauth::generate_code_challenge(verifier);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_pkce_verifier_unique() {
+        let v1 = crate::oauth::generate_code_verifier();
+        let v2 = crate::oauth::generate_code_verifier();
+        assert_ne!(v1, v2, "Code verifiers should be unique");
+    }
+
+    #[test]
+    fn test_pkce_state_length_and_format() {
+        let state = crate::oauth::generate_state();
+        assert_eq!(state.len(), 43);
+        assert!(state
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    // ---- Auth URL building tests --------------------------------------------
+
+    #[test]
+    fn test_build_auth_url_automatic_has_localhost_redirect() {
+        let challenge = "test_challenge";
+        let state = "test_state";
+        let port: u16 = 12345;
+        let url = crate::oauth::build_auth_url(
+            crate::oauth::CONSOLE_AUTHORIZE_URL,
+            challenge,
+            state,
+            port,
+            false, // automatic
+        );
+        assert!(url.contains("redirect_uri="), "URL must have redirect_uri");
+        assert!(
+            url.contains("localhost%3A12345") || url.contains("localhost:12345"),
+            "Automatic URL should use localhost callback"
+        );
+        assert!(url.contains("code_challenge=test_challenge"));
+        assert!(url.contains("state=test_state"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains(&format!("client_id={}", crate::oauth::CLIENT_ID)));
+    }
+
+    #[test]
+    fn test_build_auth_url_manual_has_manual_redirect() {
+        let url = crate::oauth::build_auth_url(
+            crate::oauth::CLAUDE_AI_AUTHORIZE_URL,
+            "challenge",
+            "state",
+            9999,
+            true, // manual
+        );
+        assert!(url.contains("redirect_uri="), "URL must have redirect_uri");
+        // Manual redirect should NOT be localhost
+        assert!(
+            !url.contains("localhost"),
+            "Manual URL should not use localhost callback"
+        );
+    }
+
+    #[test]
+    fn test_build_auth_url_invalid_base_falls_back_to_encoded_query() {
+        let url = crate::oauth::build_auth_url(
+            "not a url",
+            "challenge value",
+            "state value",
+            12345,
+            false,
+        );
+
+        assert!(url.starts_with("not a url?"));
+        assert!(url.contains("code_challenge=challenge+value"));
+        assert!(url.contains("state=state+value"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback"));
+    }
+
+    // ---- Permission handler tests -------------------------------------------
+
+    fn make_req(tool_name: &str, is_read_only: bool) -> crate::permissions::PermissionRequest {
+        crate::permissions::PermissionRequest {
+            tool_name: tool_name.to_string(),
+            description: format!("{} operation", tool_name),
+            details: None,
+            is_read_only,
+            context_description: None,
+        }
+    }
+
+    #[test]
+    fn test_auto_handler_bypass_allows_all() {
+        let handler = crate::permissions::AutoPermissionHandler {
+            mode: crate::config::PermissionMode::BypassPermissions,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileWrite", false)),
+            crate::permissions::PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_auto_handler_default_allows_reads() {
+        let handler = crate::permissions::AutoPermissionHandler {
+            mode: crate::config::PermissionMode::Default,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileRead", true)),
+            crate::permissions::PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_auto_handler_default_denies_writes() {
+        let handler = crate::permissions::AutoPermissionHandler {
+            mode: crate::config::PermissionMode::Default,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileWrite", false)),
+            crate::permissions::PermissionDecision::Deny
+        );
+    }
+
+    #[test]
+    fn test_auto_handler_accept_edits_allows_writes() {
+        let handler = crate::permissions::AutoPermissionHandler {
+            mode: crate::config::PermissionMode::AcceptEdits,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileWrite", false)),
+            crate::permissions::PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_auto_handler_plan_denies_writes() {
+        let handler = crate::permissions::AutoPermissionHandler {
+            mode: crate::config::PermissionMode::Plan,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("Bash", false)),
+            crate::permissions::PermissionDecision::Deny
+        );
+        assert_eq!(
+            handler.check_permission(&make_req("FileRead", true)),
+            crate::permissions::PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_interactive_handler_default_allows_writes() {
+        // InteractivePermissionHandler allows writes in Default mode
+        // (user is watching the TUI)
+        let handler = crate::permissions::InteractivePermissionHandler {
+            mode: crate::config::PermissionMode::Default,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileWrite", false)),
+            crate::permissions::PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn test_interactive_handler_plan_allows_reads_denies_writes() {
+        let handler = crate::permissions::InteractivePermissionHandler {
+            mode: crate::config::PermissionMode::Plan,
+        };
+        assert_eq!(
+            handler.check_permission(&make_req("FileRead", true)),
+            crate::permissions::PermissionDecision::Allow
+        );
+        assert_eq!(
+            handler.check_permission(&make_req("FileWrite", false)),
+            crate::permissions::PermissionDecision::Deny
+        );
+    }
+
+    // ---- Message content tests ----------------------------------------------
+
+    #[test]
+    fn test_message_get_all_text_multiple_blocks() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "First ".into(),
+            },
+            ContentBlock::Text {
+                text: "Second".into(),
+            },
+        ]);
+        assert_eq!(msg.get_all_text(), "First Second");
+    }
+
+    #[test]
+    fn test_message_get_text_returns_first_text_block() {
+        let msg = Message::assistant_blocks(vec![
+            ContentBlock::Thinking {
+                thinking: "reasoning".into(),
+                signature: "sig".into(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ]);
+        assert_eq!(msg.get_text(), Some("answer"));
+    }
+
+    #[test]
+    fn test_message_has_tool_use_false() {
+        let msg = Message::user("just text");
+        assert!(!msg.has_tool_use());
+    }
+
+    #[test]
+    fn test_cost_tracker_cumulative() {
+        let tracker = CostTracker::new();
+        tracker.add_usage(1000, 500, 100, 50);
+        tracker.add_usage(200, 100, 0, 0);
+        assert_eq!(tracker.input_tokens(), 1200);
+        assert_eq!(tracker.output_tokens(), 600);
+    }
+
+    #[test]
+    fn test_cost_tracker_initial_zero() {
+        let tracker = CostTracker::new();
+        assert_eq!(tracker.input_tokens(), 0);
+        assert_eq!(tracker.output_tokens(), 0);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+}

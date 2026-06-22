@@ -1,0 +1,178 @@
+// FileWrite tool: write/create files.
+
+use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tracing::debug;
+
+pub struct FileWriteTool;
+
+#[derive(Debug, Deserialize)]
+struct FileWriteInput {
+    file_path: String,
+    content: String,
+    #[serde(default)]
+    confirm_conflicts: bool,
+}
+
+#[async_trait]
+impl Tool for FileWriteTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_FILE_WRITE
+    }
+
+    fn description(&self) -> &str {
+        "Writes a file to the local filesystem. This tool will overwrite the existing \
+         file if there is one. Prefer the Edit tool for modifying existing files. \
+         Only use this tool to create new files or for complete rewrites."
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to write"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for this path."
+                }
+            },
+            "required": ["file_path", "content"]
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let params: FileWriteInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+
+        let path = ctx.resolve_path(&params.file_path);
+        if !ctx.is_path_allowed(&path) {
+            return ToolResult::error(format!(
+                "Path {} is outside the allowed working directory",
+                path.display()
+            ));
+        }
+        debug!(path = %path.display(), "Writing file");
+
+        // Permission check
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Write {}", path.display()), false)
+        {
+            return ToolResult::error(e.to_string());
+        }
+
+        let coordination_conflicts = match crate::coordination::preflight_write_conflicts(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(conflicts) => conflicts,
+            Err(result) => return result,
+        };
+        let _coordination_write_claim = match crate::coordination::begin_transient_write_claim(
+            ctx,
+            self.name(),
+            std::slice::from_ref(&path),
+            params.confirm_conflicts,
+        ) {
+            Ok(guard) => guard,
+            Err(result) => return result,
+        };
+
+        // Ensure parent directories exist
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    return ToolResult::error(format!(
+                        "Failed to create directory {}: {}",
+                        parent.display(),
+                        e
+                    ));
+                }
+            }
+        }
+
+        let existed = path.exists();
+        let before_content = if existed {
+            match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return ToolResult::error(format!(
+                        "Failed to read existing file {}: {}",
+                        path.display(),
+                        e
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let is_new = !existed;
+
+        if ctx.config.dry_run {
+            return ToolResult::success(format!(
+                "[DRY RUN] Would {} {}. No changes written.",
+                if is_new { "create" } else { "overwrite" },
+                path.display()
+            ));
+        }
+
+        // Write the file
+        if let Err(e) = crate::fs_atomic::write_atomic(&path, params.content.as_bytes()).await {
+            return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
+        }
+
+        // Run any configured formatter for this file type.
+        crate::try_format_file(&path.to_string_lossy(), ctx).await;
+
+        let (final_content, after_exists) = match tokio::fs::read(&path).await {
+            Ok(bytes) => (bytes, true),
+            Err(_) => (params.content.as_bytes().to_vec(), path.exists()),
+        };
+        ctx.record_file_change_with_existence(
+            path.clone(),
+            &before_content,
+            &final_content,
+            (existed, after_exists),
+            self.name(),
+        );
+
+        let final_text = String::from_utf8_lossy(&final_content);
+        let line_count = final_text.lines().count();
+        let byte_count = final_content.len();
+
+        let action = if is_new { "Created" } else { "Wrote" };
+        let content = crate::coordination::append_confirmed_conflict_note(
+            format!(
+                "{} {} ({} lines, {} bytes)",
+                action,
+                path.display(),
+                line_count,
+                byte_count
+            ),
+            coordination_conflicts.as_deref(),
+        );
+        ToolResult::success(content).with_metadata(json!({
+            "file_path": path.display().to_string(),
+            "is_new": is_new,
+            "lines": line_count,
+            "bytes": byte_count,
+            "coordination_conflicts": coordination_conflicts,
+        }))
+    }
+}

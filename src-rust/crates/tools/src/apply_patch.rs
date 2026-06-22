@@ -1,0 +1,879 @@
+// ApplyPatch tool: apply a unified diff patch to files.
+//
+// Parses standard unified diff format (as produced by `git diff` or `diff -u`).
+// Supports dry_run mode which validates the patch without writing any files.
+
+use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tracing::debug;
+
+pub struct ApplyPatchTool;
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchInput {
+    patch: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    confirm_conflicts: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Internal diff representation
+// ---------------------------------------------------------------------------
+
+/// A single `@@` hunk within a file diff.
+#[derive(Debug)]
+struct Hunk {
+    /// Starting line in the *original* file (0-based index).
+    orig_start: usize,
+    /// Lines in this hunk: `' '` = context, `'-'` = remove, `'+'` = add.
+    lines: Vec<(char, String)>,
+}
+
+/// All hunks for a single file.
+#[derive(Debug)]
+struct FilePatch {
+    /// Target path. For delete patches (`+++ /dev/null`) this is the old path.
+    path: String,
+    /// Whether this patch deletes the target file.
+    is_delete: bool,
+    hunks: Vec<Hunk>,
+}
+
+struct PendingPatchWrite {
+    path: std::path::PathBuf,
+    existed: bool,
+    original_bytes: Vec<u8>,
+    new_content: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Unified diff parser
+// ---------------------------------------------------------------------------
+
+/// Parse a unified diff string into a list of `FilePatch` objects.
+fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
+    let mut file_patches: Vec<FilePatch> = Vec::new();
+    let mut current_file: Option<FilePatch> = None;
+    let mut current_hunk: Option<Hunk> = None;
+    let mut pending_old_path: Option<String> = None;
+
+    for line in patch.lines() {
+        if line.starts_with("--- ") {
+            // Start of a new file section; finalise previous hunk/file.
+            if let Some(h) = current_hunk.take() {
+                if let Some(ref mut f) = current_file {
+                    f.hunks.push(h);
+                }
+            }
+            if let Some(f) = current_file.take() {
+                file_patches.push(f);
+            }
+            pending_old_path = parse_diff_path(line.strip_prefix("--- ").unwrap_or(line));
+        } else if line.starts_with("+++ ") {
+            // Prefer the new path, but use the old path for delete patches.
+            let raw = line.strip_prefix("+++ ").unwrap_or(line);
+            let new_path = parse_diff_path(raw);
+            let is_delete = new_path.is_none();
+            let path = new_path
+                .or_else(|| pending_old_path.clone())
+                .ok_or_else(|| "File diff is missing both old and new paths".to_string())?;
+            current_file = Some(FilePatch {
+                path,
+                is_delete,
+                hunks: Vec::new(),
+            });
+        } else if line.starts_with("@@ ") {
+            // Finalise the previous hunk.
+            if let Some(h) = current_hunk.take() {
+                if let Some(ref mut f) = current_file {
+                    f.hunks.push(h);
+                }
+            }
+            // Parse `@@ -l,s +l,s @@` — we only need the original start line.
+            let orig_start = parse_hunk_header(line)?;
+            current_hunk = Some(Hunk {
+                orig_start,
+                lines: Vec::new(),
+            });
+        } else if let Some(ref mut hunk) = current_hunk {
+            if let Some(stripped) = line.strip_prefix('+') {
+                hunk.lines.push(('+', stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix('-') {
+                hunk.lines.push(('-', stripped.to_string()));
+            } else if let Some(stripped) = line.strip_prefix(' ') {
+                hunk.lines.push((' ', stripped.to_string()));
+            } else if line.starts_with('\\') {
+                // "\ No newline at end of file" — ignore.
+            }
+            // Skip other lines (empty, etc.)
+        }
+    }
+
+    // Flush remaining hunk / file.
+    if let Some(h) = current_hunk.take() {
+        if let Some(ref mut f) = current_file {
+            f.hunks.push(h);
+        }
+    }
+    if let Some(f) = current_file.take() {
+        file_patches.push(f);
+    }
+
+    Ok(file_patches)
+}
+
+fn parse_diff_path(raw: &str) -> Option<String> {
+    let token = raw
+        .trim()
+        .split_once('\t')
+        .map(|(path, _)| path)
+        .unwrap_or_else(|| raw.trim())
+        .trim();
+    let token = unquote_diff_path(token);
+    if token.is_empty() || token == "/dev/null" {
+        return None;
+    }
+    Some(strip_single_diff_prefix(&token).to_string())
+}
+
+fn unquote_diff_path(path: &str) -> String {
+    let Some(stripped) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
+        return path.to_string();
+    };
+
+    let mut out = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some(next) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn strip_single_diff_prefix(path: &str) -> &str {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+}
+
+/// Extract the original-file start line (1-based in the header, converted to
+/// 0-based internally) from a `@@ -l,s +l,s @@` header line.
+fn parse_hunk_header(line: &str) -> Result<usize, String> {
+    // Format: "@@ -orig_start[,orig_count] +new_start[,new_count] @@"
+    let after_at = line
+        .strip_prefix("@@ ")
+        .ok_or_else(|| format!("Invalid hunk header: {}", line))?;
+
+    let minus_part = after_at
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("Malformed hunk header (no -part): {}", line))?;
+
+    // minus_part is like "-12,5" or "-12"
+    let digits = minus_part
+        .trim_start_matches('-')
+        .split(',')
+        .next()
+        .unwrap_or("0");
+
+    let line_num: usize = digits
+        .parse()
+        .map_err(|_| format!("Could not parse line number from: {}", minus_part))?;
+
+    // Header is 1-based; convert to 0-based.
+    Ok(if line_num > 0 { line_num - 1 } else { 0 })
+}
+
+// ---------------------------------------------------------------------------
+// Hunk application
+// ---------------------------------------------------------------------------
+
+/// Apply a single `Hunk` to `lines` (the split lines of the file content).
+///
+/// Returns the modified line vector, or an error describing why the context
+/// did not match.
+fn apply_hunk(lines: Vec<String>, hunk: &Hunk) -> Result<Vec<String>, String> {
+    // Collect the context / removal lines we expect to find.
+    let expected: Vec<&str> = hunk
+        .lines
+        .iter()
+        .filter(|(c, _)| *c == ' ' || *c == '-')
+        .map(|(_, l)| l.as_str())
+        .collect();
+
+    if expected.is_empty() {
+        // Pure insertion — we'll handle it below without a search.
+    }
+
+    // Find the position in `lines` where the context starts.
+    // We start searching from `orig_start` (the hint) but fall back to a
+    // full scan if the hint is off (e.g. after earlier hunks shifted lines).
+    let search_start = hunk.orig_start.min(lines.len());
+    let pos = find_context_position(&lines, &expected, search_start).ok_or_else(|| {
+        format!(
+            "Context not found near line {} (looking for {} lines of context/removes)",
+            hunk.orig_start + 1,
+            expected.len()
+        )
+    })?;
+
+    // Build the replacement: remove '-' and ' ' lines at `pos`, insert '+' and ' '.
+    let mut output_prefix = lines[..pos].to_vec();
+    let mut output_suffix = lines[pos..].to_vec();
+
+    // Skip past the lines that the hunk covers (context + removals).
+    let consume = expected.len();
+    if consume > output_suffix.len() {
+        return Err(format!(
+            "Hunk extends beyond end of file at line {}",
+            pos + 1
+        ));
+    }
+    let remaining = output_suffix.split_off(consume);
+
+    // Build the replacement content from the hunk.
+    let mut replacement: Vec<String> = Vec::new();
+    for (ch, content) in &hunk.lines {
+        match ch {
+            '+' | ' ' => replacement.push(content.clone()),
+            '-' => {} // removed — skip
+            _ => {}
+        }
+    }
+
+    output_prefix.append(&mut replacement);
+    output_prefix.extend(remaining);
+    Ok(output_prefix)
+}
+
+/// Search for `expected` lines starting at `hint` and falling back to a full scan.
+fn find_context_position(lines: &[String], expected: &[&str], hint: usize) -> Option<usize> {
+    if expected.is_empty() {
+        // A pure-insertion hunk always applies at the hint position.
+        return Some(hint.min(lines.len()));
+    }
+
+    let n = lines.len();
+    let max_start = if n >= expected.len() {
+        n - expected.len()
+    } else {
+        return None;
+    };
+
+    // Try hint first, then scan forward and backward.
+    let candidates: Vec<usize> = std::iter::once(hint)
+        .chain((0..=max_start).filter(|&i| i != hint))
+        .collect();
+
+    for &start in &candidates {
+        if start > max_start {
+            continue;
+        }
+        if lines[start..start + expected.len()]
+            .iter()
+            .zip(expected.iter())
+            .all(|(l, e)| l.as_str() == *e)
+        {
+            return Some(start);
+        }
+    }
+    None
+}
+
+async fn rollback_applied_patch_writes(applied: &[&PendingPatchWrite]) {
+    for write in applied.iter().rev() {
+        if write.existed {
+            if let Err(err) =
+                crate::fs_atomic::write_atomic(&write.path, &write.original_bytes).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    path = %write.path.display(),
+                    "failed to restore file while rolling back apply_patch"
+                );
+            }
+        } else if write.path.exists() {
+            if let Err(err) = tokio::fs::remove_file(&write.path).await {
+                tracing::warn!(
+                    error = %err,
+                    path = %write.path.display(),
+                    "failed to remove created file while rolling back apply_patch"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool implementation
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl Tool for ApplyPatchTool {
+    fn name(&self) -> &str {
+        mangocode_core::constants::TOOL_NAME_APPLY_PATCH
+    }
+
+    fn description(&self) -> &str {
+        "Apply a unified diff patch to files. The patch must be in standard unified \
+         diff format (as produced by `git diff` or `diff -u`). Set dry_run=true to \
+         validate the patch without writing any changes."
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff patch content"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "If true, validate the patch without applying it (default: false)"
+                },
+                "confirm_conflicts": {
+                    "type": "boolean",
+                    "description": "Set true only after acknowledging active MangoCode coordination conflicts for patched paths."
+                }
+            },
+            "required": ["patch"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+        let params: ApplyPatchInput = match serde_json::from_value(input) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
+        };
+
+        if params.patch.trim().is_empty() {
+            return ToolResult::error("patch must not be empty".to_string());
+        }
+
+        // Parse the unified diff.
+        let file_patches = match parse_unified_diff(&params.patch) {
+            Ok(fp) => fp,
+            Err(e) => return ToolResult::error(format!("Failed to parse patch: {}", e)),
+        };
+
+        if file_patches.is_empty() {
+            return ToolResult::error(
+                "No file diffs found in patch (expected --- / +++ headers)".to_string(),
+            );
+        }
+
+        // Permission check.
+        if !params.dry_run {
+            if let Err(e) = ctx.check_permission(
+                self.name(),
+                &format!("ApplyPatch to {} file(s)", file_patches.len()),
+                false,
+            ) {
+                return ToolResult::error(e.to_string());
+            }
+        }
+
+        let conflict_paths: Vec<std::path::PathBuf> = file_patches
+            .iter()
+            .map(|fp| ctx.resolve_path(&fp.path))
+            .collect();
+        let coordination_conflicts = if params.dry_run {
+            None
+        } else {
+            match crate::coordination::preflight_write_conflicts(
+                ctx,
+                self.name(),
+                &conflict_paths,
+                params.confirm_conflicts,
+            ) {
+                Ok(conflicts) => conflicts,
+                Err(result) => return result,
+            }
+        };
+        let _coordination_write_claim = if params.dry_run {
+            None
+        } else {
+            match crate::coordination::begin_transient_write_claim(
+                ctx,
+                self.name(),
+                &conflict_paths,
+                params.confirm_conflicts,
+            ) {
+                Ok(guard) => guard,
+                Err(result) => return result,
+            }
+        };
+
+        // ----------------------------------------------------------------
+        // Process each file in the patch
+        // ----------------------------------------------------------------
+
+        let mut total_added: i64 = 0;
+        let mut total_removed: i64 = 0;
+        let mut file_summaries: Vec<Value> = Vec::new();
+        // Built during validation, used for writes after every hunk is known-good.
+        let mut to_write: Vec<PendingPatchWrite> = Vec::new();
+
+        for fp in &file_patches {
+            let path = ctx.resolve_path(&fp.path);
+            debug!(path = %path.display(), "ApplyPatch processing file");
+
+            // Read current content (or empty string for new files).
+            let existed = path.exists();
+            let original_content = if existed {
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolResult::error(format!("Cannot read {}: {}", path.display(), e));
+                    }
+                }
+            } else {
+                String::new()
+            };
+
+            // Split into lines (keep newlines for join later).
+            let mut lines: Vec<String> = original_content.lines().map(|l| l.to_string()).collect();
+
+            let mut file_added: i64 = 0;
+            let mut file_removed: i64 = 0;
+
+            // Apply hunks in order.
+            for (hunk_idx, hunk) in fp.hunks.iter().enumerate() {
+                let added = hunk.lines.iter().filter(|(c, _)| *c == '+').count() as i64;
+                let removed = hunk.lines.iter().filter(|(c, _)| *c == '-').count() as i64;
+
+                lines = match apply_hunk(lines, hunk) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return ToolResult::error(format!(
+                            "Failed to apply hunk {} in {}: {}",
+                            hunk_idx + 1,
+                            fp.path,
+                            e
+                        ));
+                    }
+                };
+
+                file_added += added;
+                file_removed += removed;
+            }
+
+            total_added += file_added;
+            total_removed += file_removed;
+
+            let new_content = if lines.is_empty() {
+                String::new()
+            } else {
+                // Re-join with newlines; preserve trailing newline if original had one.
+                let mut s = lines.join("\n");
+                if original_content.ends_with('\n') || original_content.is_empty() {
+                    s.push('\n');
+                }
+                s
+            };
+
+            if fp.is_delete && !new_content.is_empty() {
+                return ToolResult::error(format!(
+                    "Delete patch for {} did not remove all content",
+                    fp.path
+                ));
+            }
+
+            file_summaries.push(json!({
+                "path": fp.path,
+                "hunks": fp.hunks.len(),
+                "lines_added": file_added,
+                "lines_removed": file_removed,
+                "deleted": fp.is_delete,
+            }));
+
+            to_write.push(PendingPatchWrite {
+                path,
+                existed,
+                original_bytes: original_content.into_bytes(),
+                new_content: if fp.is_delete {
+                    None
+                } else {
+                    Some(new_content)
+                },
+            });
+        }
+
+        // ----------------------------------------------------------------
+        // Dry-run: return summary without writing
+        // ----------------------------------------------------------------
+
+        if params.dry_run || ctx.config.dry_run {
+            return ToolResult::success(format!(
+                "Dry run: patch would modify {} file(s) (+{} -{} lines).",
+                to_write.len(),
+                total_added,
+                total_removed,
+            ))
+            .with_metadata(json!({
+                "dry_run": true,
+                "files": file_summaries,
+                "total_lines_added": total_added,
+                "total_lines_removed": total_removed,
+            }));
+        }
+
+        // ----------------------------------------------------------------
+        // Write all modified files
+        // ----------------------------------------------------------------
+
+        let mut applied: Vec<&PendingPatchWrite> = Vec::new();
+        for write in &to_write {
+            let write_result = if let Some(new_content) = &write.new_content {
+                if let Some(parent) = write.path.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        Err(e)
+                    } else {
+                        crate::fs_atomic::write_atomic(&write.path, new_content.as_bytes()).await
+                    }
+                } else {
+                    crate::fs_atomic::write_atomic(&write.path, new_content.as_bytes()).await
+                }
+            } else if write.path.exists() {
+                tokio::fs::remove_file(&write.path).await
+            } else {
+                Ok(())
+            };
+
+            if let Err(e) = write_result {
+                rollback_applied_patch_writes(&applied).await;
+                return ToolResult::error(format!(
+                    "Failed to write {}: {}",
+                    write.path.display(),
+                    e
+                ));
+            }
+            applied.push(write);
+        }
+
+        for write in &to_write {
+            // Run any configured formatter on each freshly-written file (skip
+            // deletions), then record its on-disk bytes (matches FileEdit).
+            let after_bytes: Vec<u8> = if write.new_content.is_some() {
+                crate::try_format_file(&write.path.to_string_lossy(), ctx).await;
+                tokio::fs::read(&write.path).await.unwrap_or_else(|_| {
+                    write
+                        .new_content
+                        .as_deref()
+                        .unwrap_or("")
+                        .as_bytes()
+                        .to_vec()
+                })
+            } else {
+                Vec::new()
+            };
+            ctx.record_file_change_with_existence(
+                write.path.clone(),
+                &write.original_bytes,
+                &after_bytes,
+                (write.existed, write.new_content.is_some()),
+                self.name(),
+            );
+        }
+
+        let content = crate::coordination::append_confirmed_conflict_note(
+            format!(
+                "Applied patch to {} file(s) (+{} -{} lines).",
+                to_write.len(),
+                total_added,
+                total_removed,
+            ),
+            coordination_conflicts.as_deref(),
+        );
+        ToolResult::success(content).with_metadata(json!({
+            "dry_run": false,
+            "files": file_summaries,
+            "total_lines_added": total_added,
+            "total_lines_removed": total_removed,
+            "coordination_conflicts": coordination_conflicts,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_hunk_header() {
+        assert_eq!(parse_hunk_header("@@ -12,5 +12,6 @@").unwrap(), 11);
+        assert_eq!(parse_hunk_header("@@ -1,3 +1,4 @@ fn foo()").unwrap(), 0);
+        assert_eq!(parse_hunk_header("@@ -0,0 +1 @@").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_apply_hunk_simple() {
+        let lines: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
+        let hunk = Hunk {
+            orig_start: 1,
+            lines: vec![(' ', "b".into()), ('-', "c".into()), ('+', "C".into())],
+        };
+        let result = apply_hunk(lines, &hunk).unwrap();
+        assert_eq!(result, vec!["a", "b", "C"]);
+    }
+
+    #[test]
+    fn test_apply_hunk_context_mismatch() {
+        let lines: Vec<String> = vec!["x".into(), "y".into()];
+        let hunk = Hunk {
+            orig_start: 0,
+            lines: vec![('-', "z".into())],
+        };
+        assert!(apply_hunk(lines, &hunk).is_err());
+    }
+
+    #[test]
+    fn test_parse_unified_diff_basic() {
+        let patch = "\
+--- a/foo.txt
++++ b/foo.txt
+@@ -1,2 +1,2 @@
+ hello
+-world
++rust
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "foo.txt");
+        assert_eq!(fps[0].hunks.len(), 1);
+        let hunk = &fps[0].hunks[0];
+        assert_eq!(hunk.orig_start, 0);
+        assert_eq!(hunk.lines.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_two_files() {
+        let patch = "\
+--- a/a.rs
++++ b/a.rs
+@@ -1 +1 @@
+-old
++new
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-foo
++bar
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 2);
+        assert_eq!(fps[0].path, "a.rs");
+        assert_eq!(fps[1].path, "b.rs");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_delete_uses_old_path() {
+        let patch = "\
+--- a/remove.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "remove.txt");
+        assert!(fps[0].is_delete);
+    }
+
+    #[test]
+    fn test_parse_unified_diff_strips_only_one_diff_prefix() {
+        let patch = "\
+--- a/a/remove.txt
++++ b/a/remove.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "a/remove.txt");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_preserves_paths_with_spaces() {
+        let patch = "\
+--- a/dir/file name.txt
++++ b/dir/file name.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "dir/file name.txt");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_preserves_quoted_paths_with_spaces() {
+        let patch = "\
+--- \"a/dir/file name.txt\"
++++ \"b/dir/file name.txt\"
+@@ -1 +1 @@
+-old
++new
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "dir/file name.txt");
+    }
+
+    #[test]
+    fn test_parse_unified_diff_handles_tab_timestamps() {
+        let patch = "\
+--- a/dir/file name.txt\t2026-05-25 10:00:00
++++ b/dir/file name.txt\t2026-05-25 10:01:00
+@@ -1 +1 @@
+-old
++new
+";
+        let fps = parse_unified_diff(patch).unwrap();
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].path, "dir/file name.txt");
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_deletes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remove.txt");
+        tokio::fs::write(&path, "gone\n").await.unwrap();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            permission_mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            permission_handler: std::sync::Arc::new(
+                mangocode_core::permissions::AutoPermissionHandler {
+                    mode: mangocode_core::config::PermissionMode::BypassPermissions,
+                },
+            ),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "apply-patch-delete-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(9)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+            question_prompt_tx: None,
+            cancel_token: None,
+        };
+
+        let result = ApplyPatchTool
+            .execute(
+                json!({
+                    "patch": "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(!path.exists());
+        let history = ctx.file_history.lock();
+        assert_eq!(history.get_entries_for_turn(9).len(), 1);
+        assert_eq!(
+            history.get_entries_for_turn(9)[0].before_text.as_deref(),
+            Some("gone\n")
+        );
+        assert_eq!(
+            history.get_entries_for_turn(9)[0].after_text.as_deref(),
+            None
+        );
+        assert!(!history.get_entries_for_turn(9)[0].after_exists);
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_rollback_does_not_record_failed_partial_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let blocker = dir.path().join("blocked_parent");
+        tokio::fs::write(&first, "old\n").await.unwrap();
+        tokio::fs::write(&blocker, "not a directory").await.unwrap();
+        let ctx = ToolContext {
+            working_dir: dir.path().to_path_buf(),
+            permission_mode: mangocode_core::config::PermissionMode::BypassPermissions,
+            permission_handler: std::sync::Arc::new(
+                mangocode_core::permissions::AutoPermissionHandler {
+                    mode: mangocode_core::config::PermissionMode::BypassPermissions,
+                },
+            ),
+            cost_tracker: mangocode_core::cost::CostTracker::new(),
+            session_metrics: None,
+            session_id: "apply-patch-partial-failure-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
+            file_history: std::sync::Arc::new(parking_lot::Mutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(12)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: mangocode_core::config::Config::default(),
+            question_prompt_tx: None,
+            cancel_token: None,
+        };
+
+        let result = ApplyPatchTool
+            .execute(
+                json!({
+                    "patch": "\
+--- a/first.txt
++++ b/first.txt
+@@ -1 +1 @@
+-old
++new
+--- /dev/null
++++ b/blocked_parent/child.txt
+@@ -0,0 +1 @@
++child
+"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(tokio::fs::read_to_string(&first).await.unwrap(), "old\n");
+        assert!(ctx.file_history.lock().get_entries_for_turn(12).is_empty());
+    }
+}

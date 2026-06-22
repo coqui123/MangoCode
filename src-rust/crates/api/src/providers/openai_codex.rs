@@ -1,0 +1,978 @@
+// providers/openai_codex.rs — OpenAI Codex via ChatGPT OAuth (Bearer token).
+//
+// Distinct from [`super::openai::OpenAiProvider`] (usage-based API key to api.openai.com).
+
+use async_stream::stream;
+use async_trait::async_trait;
+use futures::Stream;
+use mangocode_core::auth_store::{AuthStore, StoredCredential};
+use mangocode_core::codex_oauth::{
+    extract_chatgpt_account_id, CODEX_API_ENDPOINT, CODEX_CLIENT_ID, CODEX_TOKEN_URL,
+};
+use mangocode_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
+use mangocode_core::provider_id::{ModelId, ProviderId};
+use mangocode_core::types::ContentBlock;
+use serde::Deserialize;
+use serde_json::Value;
+use std::borrow::Cow;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use crate::codex_adapter;
+use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider_error::ProviderError;
+use crate::provider_types::{
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
+    StreamEvent, SystemPromptStyle,
+};
+use crate::providers::anthropic::AnthropicProvider;
+use crate::types::CreateMessageResponse;
+
+const REFRESH_SKEW_SECS: i64 = 120;
+const DISK_CHECK_INTERVAL_MS: i64 = 60_000;
+const CODEX_DEBUG_ENV: &str = "MANGOCODE_CODEX_DEBUG";
+const CODEX_OPENAI_BETA_VALUE: &str = "responses=experimental";
+const CODEX_ORIGINATOR_VALUE: &str = "codex_cli_rs";
+
+#[derive(Debug, Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexModelInfo {
+    slug: String,
+    display_name: String,
+    description: Option<String>,
+    visibility: Option<String>,
+    supported_in_api: Option<bool>,
+    priority: Option<i32>,
+    context_window: Option<u32>,
+    max_context_window: Option<u32>,
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CodexReasoningLevel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexReasoningLevel {
+    effort: String,
+}
+
+/// OpenAI Codex using a ChatGPT-plan OAuth access token against the Codex
+/// HTTP API (`chatgpt.com/backend-api/codex/...`).
+pub struct OpenAiCodexProvider {
+    id: ProviderId,
+    http: reqwest::Client,
+    endpoint: String,
+    /// Test-only: skip disk auth store reads in `ensure_fresh`.
+    skip_disk: bool,
+    /// Latest Bearer access token used for `Authorization` headers.
+    bearer: Arc<Mutex<String>>,
+    cached_expiry_ms: Arc<Mutex<Option<i64>>>,
+    last_disk_check_ms: Arc<Mutex<Option<i64>>>,
+}
+
+impl OpenAiCodexProvider {
+    pub fn new(access_token: String) -> Self {
+        Self {
+            id: ProviderId::new(ProviderId::OPENAI_CODEX),
+            http: mangocode_core::vault::reqwest_client_builder()
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            endpoint: CODEX_API_ENDPOINT.to_string(),
+            skip_disk: false,
+            bearer: Arc::new(Mutex::new(access_token)),
+            cached_expiry_ms: Arc::new(Mutex::new(None)),
+            last_disk_check_ms: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Override the Codex endpoint URL (used for tests / local mocking).
+    pub fn with_endpoint(mut self, endpoint: String) -> Self {
+        self.endpoint = endpoint;
+        self
+    }
+
+    /// Test helper: avoid loading `~/.mangocode/auth.json` during requests.
+    pub fn with_skip_disk(mut self, skip_disk: bool) -> Self {
+        self.skip_disk = skip_disk;
+        self
+    }
+
+    fn debug_enabled() -> bool {
+        std::env::var(CODEX_DEBUG_ENV)
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    }
+
+    fn truncate_debug_payload(value: &Value) -> String {
+        Self::truncate_payload_with_ellipsis(&value.to_string(), 800).into_owned()
+    }
+
+    fn truncate_payload_with_ellipsis(text: &str, max_bytes: usize) -> Cow<'_, str> {
+        if text.len() <= max_bytes {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(format!(
+            "{}...",
+            mangocode_core::truncate::truncate_bytes_prefix(text, max_bytes)
+        ))
+    }
+
+    fn models_endpoint(&self) -> String {
+        if self.endpoint.ends_with("/responses") {
+            format!("{}/models", self.endpoint.trim_end_matches("/responses"))
+        } else {
+            format!("{}/models", self.endpoint.trim_end_matches('/'))
+        }
+    }
+
+    fn static_models(&self) -> Vec<ModelInfo> {
+        let pid = self.id.clone();
+        mangocode_core::codex_oauth::CODEX_MODELS
+            .iter()
+            .map(|(id, name)| ModelInfo {
+                id: ModelId::new(*id),
+                provider_id: pid.clone(),
+                name: (*name).to_string(),
+                context_window: 256_000,
+                max_output_tokens: 32_000,
+                default_reasoning_level: Some("medium".to_string()),
+                supported_reasoning_levels: static_codex_reasoning_levels(id),
+            })
+            .collect()
+    }
+
+    fn model_info_from_codex(&self, model: CodexModelInfo) -> Option<(i32, ModelInfo)> {
+        if model.slug.trim().is_empty() {
+            return None;
+        }
+
+        if model.supported_in_api == Some(false) {
+            return None;
+        }
+
+        if model
+            .visibility
+            .as_deref()
+            .is_some_and(|visibility| !visibility.eq_ignore_ascii_case("list"))
+        {
+            return None;
+        }
+
+        let priority = model
+            .priority
+            .or_else(|| response_priority_hint(&model.slug))
+            .unwrap_or(i32::MAX);
+
+        Some((
+            priority,
+            ModelInfo {
+                id: ModelId::new(model.slug),
+                provider_id: self.id.clone(),
+                name: match model.description {
+                    Some(description) if !description.trim().is_empty() => {
+                        format!("{} - {}", model.display_name, description)
+                    }
+                    _ => model.display_name,
+                },
+                context_window: model
+                    .context_window
+                    .or(model.max_context_window)
+                    .unwrap_or(256_000),
+                max_output_tokens: 32_000,
+                default_reasoning_level: model.default_reasoning_level,
+                supported_reasoning_levels: model
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| level.effort)
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn fetch_live_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        self.ensure_fresh().await;
+        let token = self.bearer.lock().await.clone();
+        if token.is_empty() {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "OpenAI Codex OAuth is not connected. Run /connect and choose OpenAI Codex (OAuth)."
+                    .to_string(),
+            });
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
+                ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Codex auth header build failed: {}", e),
+                    status: None,
+                    body: None,
+                }
+            })?,
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_OPENAI_BETA_VALUE),
+        );
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR_VALUE),
+        );
+
+        let account_id = extract_chatgpt_account_id(&token);
+        if let Some(ref id) = account_id {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(id) {
+                headers.insert("chatgpt-account-id", v);
+            }
+        }
+
+        let client_version = option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.0");
+        let resp = self
+            .http
+            .get(self.models_endpoint())
+            .query(&[("client_version", client_version)])
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex models request failed: {}", e),
+                status: None,
+                body: None,
+            })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: e.to_string(),
+            status: None,
+            body: None,
+        })?;
+
+        if !status.is_success() {
+            return Err(ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex models request failed ({}): {}",
+                    status,
+                    Self::truncate_payload_with_ellipsis(text.trim(), 600)
+                ),
+                status: Some(status.as_u16()),
+                body: Some(text),
+            });
+        }
+
+        let response: CodexModelsResponse =
+            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex models response parse error: {}: {}",
+                    e,
+                    Self::truncate_payload_with_ellipsis(text.trim(), 600)
+                ),
+                status: None,
+                body: Some(text),
+            })?;
+
+        let mut models: Vec<(i32, ModelInfo)> = response
+            .models
+            .into_iter()
+            .filter_map(|model| self.model_info_from_codex(model))
+            .collect();
+        models.sort_by_key(|(priority, _)| *priority);
+        Ok(models.into_iter().map(|(_, model)| model).collect())
+    }
+
+    /// Build from `~/.mangocode/auth.json` OAuth entry for [`ProviderId::OPENAI_CODEX`].
+    ///
+    /// If `auth.json` has no Codex entry but `~/.mangocode/codex_tokens.json` exists from a
+    /// prior MangoCode login, that file is merged into `auth.json` once so refresh metadata
+    /// stays consistent (this is not the separate `~/.codex/auth.json` CLI file).
+    pub fn from_auth_store() -> Option<Self> {
+        let mut store = AuthStore::load();
+        if let Some(StoredCredential::OAuthToken {
+            access,
+            refresh,
+            expires,
+        }) = store.get(ProviderId::OPENAI_CODEX)
+        {
+            let expires_at_secs = if *expires > 0 {
+                Some(*expires / 1000)
+            } else {
+                None
+            };
+            if mangocode_core::oauth_config::codex_auth_is_usable(
+                access,
+                Some(refresh.as_str()),
+                expires_at_secs,
+            ) {
+                return Some(Self::new(access.clone()));
+            }
+        }
+        let tokens = get_codex_tokens()?;
+        if !mangocode_core::oauth_config::codex_auth_is_usable(
+            &tokens.access_token,
+            tokens.refresh_token.as_deref(),
+            tokens.expires_at,
+        ) {
+            return None;
+        }
+        let expires_ms = tokens
+            .expires_at
+            .map(|s| s.saturating_mul(1000))
+            .unwrap_or(0);
+        if let Err(err) = store.set_result(
+            ProviderId::OPENAI_CODEX,
+            StoredCredential::OAuthToken {
+                access: tokens.access_token.clone(),
+                refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                expires: expires_ms,
+            },
+        ) {
+            tracing::warn!(error = %err, "failed to persist legacy Codex OAuth tokens into auth store");
+        }
+        Some(Self::new(tokens.access_token))
+    }
+
+    fn map_stop_reason(s: &str) -> StopReason {
+        match s {
+            "end_turn" => StopReason::EndTurn,
+            "stop_sequence" => StopReason::StopSequence,
+            "max_tokens" => StopReason::MaxTokens,
+            "tool_use" => StopReason::ToolUse,
+            other => StopReason::Other(other.to_string()),
+        }
+    }
+
+    fn cmr_to_provider_response(
+        cmr: CreateMessageResponse,
+        provider_id: &ProviderId,
+    ) -> Result<ProviderResponse, ProviderError> {
+        let mut content: Vec<ContentBlock> = Vec::new();
+        for block in cmr.content {
+            match serde_json::from_value::<ContentBlock>(block) {
+                Ok(b) => content.push(b),
+                Err(e) => {
+                    return Err(ProviderError::Other {
+                        provider: provider_id.clone(),
+                        message: format!("Codex response content parse error: {}", e),
+                        status: None,
+                        body: None,
+                    });
+                }
+            }
+        }
+        let stop_reason = cmr
+            .stop_reason
+            .as_deref()
+            .map(Self::map_stop_reason)
+            .unwrap_or(StopReason::EndTurn);
+        Ok(ProviderResponse {
+            id: cmr.id,
+            content,
+            stop_reason,
+            usage: cmr.usage,
+            model: cmr.model,
+        })
+    }
+
+    fn stream_synthetic_response(
+        response: ProviderResponse,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>> {
+        let s = stream! {
+            yield Ok(StreamEvent::MessageStart {
+                id: response.id.clone(),
+                model: response.model.clone(),
+                usage: response.usage.clone(),
+            });
+
+            for (index, block) in response.content.iter().cloned().enumerate() {
+                match block {
+                    ContentBlock::Text { text } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::Text {
+                                text: String::new(),
+                            },
+                        });
+                        if !text.is_empty() {
+                            yield Ok(StreamEvent::TextDelta { index, text });
+                        }
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        yield Ok(StreamEvent::ContentBlockStart {
+                            index,
+                            content_block: ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input: serde_json::json!({}),
+                            },
+                        });
+                        let partial_json = serde_json::to_string(&input)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        yield Ok(StreamEvent::InputJsonDelta {
+                            index,
+                            partial_json,
+                        });
+                        yield Ok(StreamEvent::ContentBlockStop { index });
+                    }
+                    ContentBlock::Thinking { thinking, .. } => {
+                        yield Ok(StreamEvent::ReasoningDelta { index, reasoning: thinking });
+                    }
+                    _ => {}
+                }
+            }
+
+            yield Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(response.stop_reason.clone()),
+                usage: Some(response.usage.clone()),
+            });
+            yield Ok(StreamEvent::MessageStop);
+        };
+
+        Box::pin(s)
+    }
+
+    async fn persist_oauth(access: &str, refresh: &str, expires_ms: u64) {
+        let mut store = AuthStore::load_async().await;
+        if let Err(err) = store.set_result(
+            ProviderId::OPENAI_CODEX,
+            StoredCredential::OAuthToken {
+                access: access.to_string(),
+                refresh: refresh.to_string(),
+                expires: expires_ms,
+            },
+        ) {
+            tracing::warn!(error = %err, "failed to persist refreshed Codex OAuth tokens");
+        }
+        let tokens = CodexTokens {
+            access_token: access.to_string(),
+            refresh_token: if refresh.is_empty() {
+                None
+            } else {
+                Some(refresh.to_string())
+            },
+            account_id: None,
+            expires_at: if expires_ms > 0 {
+                Some(expires_ms / 1000)
+            } else {
+                None
+            },
+        };
+        if let Err(err) = save_codex_tokens(&tokens) {
+            tracing::warn!(
+                error = %err,
+                "failed to save refreshed legacy Codex token file"
+            );
+        }
+    }
+
+    async fn refresh_tokens(refresh_token: &str) -> anyhow::Result<(String, Option<String>, u64)> {
+        let client = reqwest::Client::new();
+        let params = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CODEX_CLIENT_ID),
+        ];
+        let resp = client.post(CODEX_TOKEN_URL).form(&params).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+            anyhow::bail!("Codex token refresh failed ({}): {}", status, body);
+        }
+        let body: Value = resp.json().await?;
+        if let Some(err) = body.get("error").and_then(|e| e.as_str()) {
+            anyhow::bail!("Codex token refresh error: {}", err);
+        }
+        let access_token = body["access_token"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("refresh: missing access_token"))?
+            .to_string();
+        let new_refresh = body["refresh_token"].as_str().map(|s| s.to_string());
+        let expires_in = body["expires_in"].as_i64().unwrap_or(3600);
+        let now = chrono::Utc::now().timestamp();
+        let expires_ms = (now + expires_in) * 1000;
+        Ok((access_token, new_refresh, expires_ms as u64))
+    }
+
+    /// Refresh the access token when near expiry; updates disk and in-memory bearer.
+    async fn ensure_fresh(&self) {
+        if self.skip_disk {
+            return;
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let should_check_disk = {
+            let last = self.last_disk_check_ms.lock().await;
+            match *last {
+                Some(t) => now_ms - t > DISK_CHECK_INTERVAL_MS,
+                None => true,
+            }
+        };
+
+        if !should_check_disk {
+            let exp = *self.cached_expiry_ms.lock().await;
+            if let Some(expiry) = exp {
+                if now_ms + (REFRESH_SKEW_SECS * 1000) < expiry {
+                    return;
+                }
+            }
+        }
+
+        *self.last_disk_check_ms.lock().await = Some(now_ms);
+
+        let store = AuthStore::load_async().await;
+        let Some(StoredCredential::OAuthToken {
+            access,
+            refresh,
+            expires,
+        }) = store.get(ProviderId::OPENAI_CODEX)
+        else {
+            return;
+        };
+
+        if *expires > 0 {
+            *self.cached_expiry_ms.lock().await = Some(*expires as i64);
+        }
+
+        let exp_ms = *expires as i64;
+        let needs_refresh = exp_ms > 0 && now_ms + (REFRESH_SKEW_SECS * 1000) >= exp_ms;
+        if !needs_refresh {
+            *self.bearer.lock().await = access.clone();
+            return;
+        }
+
+        if refresh.is_empty() {
+            tracing::warn!("OpenAI Codex OAuth: access token expired and no refresh token stored");
+            *self.bearer.lock().await = access.clone();
+            return;
+        }
+
+        match Self::refresh_tokens(refresh).await {
+            Ok((new_access, new_refresh, expires_ms)) => {
+                let rt = new_refresh
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(refresh);
+                Self::persist_oauth(&new_access, rt, expires_ms).await;
+                *self.cached_expiry_ms.lock().await = Some(expires_ms as i64);
+                *self.bearer.lock().await = new_access;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "OpenAI Codex OAuth refresh failed");
+                let mut s = AuthStore::load_async().await;
+                if let Err(err) = s.remove_async_result(ProviderId::OPENAI_CODEX).await {
+                    tracing::warn!(error = %err, "failed to remove stale Codex OAuth credentials");
+                }
+                if let Err(err) = mangocode_core::oauth_config::clear_codex_tokens() {
+                    tracing::warn!(error = %err, "failed to clear stale Codex token file");
+                }
+                *self.bearer.lock().await = String::new();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiCodexProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "OpenAI Codex (OAuth)"
+    }
+
+    async fn create_message(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.ensure_fresh().await;
+        let token = self.bearer.lock().await.clone();
+        if token.is_empty() {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "OpenAI Codex OAuth is not connected. Run /connect and choose OpenAI Codex (OAuth)."
+                    .to_string(),
+            });
+        }
+
+        let anthropic_req = AnthropicProvider::build_request(&request);
+        let body = codex_adapter::anthropic_to_codex_responses_request(
+            &anthropic_req,
+            Some(&request.provider_options),
+        );
+
+        let account_id = extract_chatgpt_account_id(&token);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
+                ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Codex auth header build failed: {}", e),
+                    status: None,
+                    body: None,
+                }
+            })?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        // Codex backend headers required for SSE streaming.
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_OPENAI_BETA_VALUE),
+        );
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR_VALUE),
+        );
+        // Plugin behavior: only send conversation/session headers when a promptCacheKey exists.
+        // We look for common spellings in provider_options.
+        let prompt_cache_key = request
+            .provider_options
+            .get("promptCacheKey")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("prompt_cache_key")
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("conversation_id")
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string());
+
+        if let Some(ref key) = prompt_cache_key {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
+                headers.insert("conversation_id", v);
+            }
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+            {
+                headers.insert("session_id", v);
+            }
+        }
+        if let Some(ref id) = account_id {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(id) {
+                headers.insert("chatgpt-account-id", v);
+            }
+        }
+
+        if Self::debug_enabled() {
+            let header_names = headers
+                .keys()
+                .map(|k| k.as_str().to_string())
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                provider = "openai-codex",
+                url = %self.endpoint,
+                model = %request.model,
+                has_account_id = account_id.is_some(),
+                header_names = ?header_names,
+                top_level_keys = ?body.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                "sending Codex request"
+            );
+        }
+
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex request failed: {}", e),
+                status: None,
+                body: None,
+            })?;
+
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let text = resp.text().await.map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: e.to_string(),
+            status: None,
+            body: None,
+        })?;
+
+        if !status.is_success() {
+            if status.as_u16() == 401 {
+                return Err(ProviderError::AuthFailed {
+                    provider: self.id.clone(),
+                    message: "OpenAI Codex OAuth token was rejected. Run /connect → OpenAI Codex (OAuth) to sign in again.".to_string(),
+                });
+            }
+            if Self::debug_enabled() {
+                tracing::debug!(
+                    provider = "openai-codex",
+                    status = %status,
+                    content_type = %content_type,
+                    body = %text,
+                    "Codex request failed"
+                );
+            }
+            let message = if text.trim().is_empty() {
+                format!("Codex API error ({})", status)
+            } else {
+                let body = Self::truncate_payload_with_ellipsis(text.trim(), 600);
+                format!("Codex API error ({}): {}", status, body)
+            };
+            return Err(ProviderError::Other {
+                provider: self.id.clone(),
+                message,
+                status: Some(status.as_u16()),
+                body: Some(text),
+            });
+        }
+
+        // Codex streams responses, and intermediaries do not always preserve
+        // the exact text/event-stream content type. Detect SSE by body shape too.
+        let looks_like_sse = text
+            .lines()
+            .map(str::trim_start)
+            .any(|line| line.starts_with("data:") || line.starts_with("event:"));
+        let openai_resp: Value = if content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+            || looks_like_sse
+        {
+            codex_adapter::sse_to_last_json_value(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Codex SSE parse error: {}", e),
+                status: None,
+                body: None,
+            })?
+        } else {
+            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: {
+                    let body = Self::truncate_payload_with_ellipsis(text.trim(), 600);
+                    if body.is_empty() {
+                        format!("Codex JSON parse error: {}", e)
+                    } else {
+                        format!("Codex JSON parse error: {}: {}", e, body)
+                    }
+                },
+                status: None,
+                body: Some(text.clone()),
+            })?
+        };
+
+        let (content_blocks, stop_reason, input_tokens, output_tokens) =
+            codex_adapter::parse_codex_response_blocks(&openai_resp);
+        if Self::debug_enabled() {
+            let tool_blocks = content_blocks
+                .iter()
+                .filter(|block| {
+                    block.get("type").and_then(|value| value.as_str()) == Some("tool_use")
+                })
+                .collect::<Vec<_>>();
+            tracing::debug!(
+                provider = "openai-codex",
+                content_block_count = content_blocks.len(),
+                tool_call_count = tool_blocks.len(),
+                stop_reason = %stop_reason,
+                returned_tool_use_blocks = !tool_blocks.is_empty(),
+                "parsed Codex response"
+            );
+        }
+        if content_blocks.is_empty() {
+            return Err(ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!(
+                    "Codex response parsed but did not contain assistant content: {}",
+                    Self::truncate_debug_payload(&openai_resp)
+                ),
+                status: None,
+                body: Some(openai_resp.to_string()),
+            });
+        }
+        let cmr = codex_adapter::build_anthropic_response_from_blocks(
+            content_blocks,
+            &stop_reason,
+            input_tokens,
+            output_tokens,
+            &request.model,
+        );
+        Self::cmr_to_provider_response(cmr, &self.id)
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        // Query loop always uses the streaming path; Codex OAuth is non-streaming over HTTP,
+        // so we synthesize a single-turn event sequence from `create_message`.
+        let resp = self.create_message(request).await?;
+        Ok(Self::stream_synthetic_response(resp))
+    }
+
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        match self.fetch_live_models().await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            Ok(_) => Ok(self.static_models()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
+        self.ensure_fresh().await;
+        if self.bearer.lock().await.is_empty() {
+            return Ok(ProviderStatus::Unavailable {
+                reason: "OpenAI Codex OAuth not configured".to_string(),
+            });
+        }
+        Ok(ProviderStatus::Healthy)
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            // True SSE from Codex is not implemented; the stream is synthesized in
+            // `create_message_stream` so the query engine receives deltas.
+            streaming: true,
+            tool_calling: true,
+            thinking: false,
+            image_input: true,
+            pdf_input: false,
+            audio_input: false,
+            video_input: false,
+            caching: false,
+            structured_output: false,
+            system_prompt_style: SystemPromptStyle::TopLevel,
+        }
+    }
+}
+
+fn response_priority_hint(model_id: &str) -> Option<i32> {
+    mangocode_core::codex_oauth::CODEX_MODELS
+        .iter()
+        .position(|(id, _)| *id == model_id)
+        .map(|idx| idx as i32)
+}
+
+fn static_codex_reasoning_levels(model_id: &str) -> Vec<String> {
+    let mut levels = vec!["low".to_string(), "medium".to_string(), "high".to_string()];
+    if model_id.starts_with("gpt-5.5")
+        || model_id.starts_with("gpt-5.4")
+        || model_id.starts_with("gpt-5.3")
+        || model_id.starts_with("gpt-5.2")
+        || model_id.starts_with("gpt-5.1-codex-max")
+    {
+        levels.push("xhigh".to_string());
+    }
+    levels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use mangocode_core::types::UsageInfo;
+
+    #[test]
+    fn openai_codex_provider_uses_openai_codex_id() {
+        let p = OpenAiCodexProvider::new("test-token".into());
+        assert_eq!(
+            format!("{}", p.id()),
+            mangocode_core::ProviderId::OPENAI_CODEX
+        );
+    }
+
+    #[test]
+    fn truncates_codex_payload_on_utf8_boundary() {
+        let body = format!("{}é{}", "a".repeat(599), "b".repeat(8));
+        let truncated = OpenAiCodexProvider::truncate_payload_with_ellipsis(&body, 600);
+
+        assert_eq!(truncated, format!("{}...", "a".repeat(599)));
+    }
+
+    #[tokio::test]
+    async fn synthetic_stream_outputs_valid_tool_call_events() {
+        let response = ProviderResponse {
+            id: "msg_1".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": "ls" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            usage: UsageInfo {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            model: "gpt-5.2-codex".to_string(),
+        };
+
+        let mut stream = OpenAiCodexProvider::stream_synthetic_response(response);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("stream event"));
+        }
+
+        assert!(matches!(events[0], StreamEvent::MessageStart { .. }));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ToolUse { id, name, input }
+            } if id == "call_1" && name == "Bash" && input == &serde_json::json!({})
+        ));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::InputJsonDelta { index: 0, partial_json }
+                if partial_json == "{\"command\":\"ls\"}"
+        ));
+        assert!(matches!(
+            events[3],
+            StreamEvent::ContentBlockStop { index: 0 }
+        ));
+        assert!(matches!(
+            &events[4],
+            StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                ..
+            }
+        ));
+        assert!(matches!(events[5], StreamEvent::MessageStop));
+    }
+}

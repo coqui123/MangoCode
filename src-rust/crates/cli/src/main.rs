@@ -1,0 +1,7906 @@
+// mangocode CLI entry point
+//
+// This is the main binary for MangoCode. It:
+// 1. Parses CLI arguments with clap
+// 2. Loads configuration from settings.json + env vars
+// 3. Builds system/user context (git status, AGENTS.md)
+// 4. Runs in either:
+//    - Headless (--print / -p) mode: single query, output to stdout
+//    - Interactive REPL mode: full TUI with ratatui
+
+mod codex_oauth_flow;
+mod oauth_flow;
+
+// ---------------------------------------------------------------------------
+// Build-time metadata (embedded via build.rs)
+// ---------------------------------------------------------------------------
+
+/// Build timestamp in RFC 3339 format
+pub const BUILD_TIME: &str = env!("BUILD_TIME");
+
+/// Short git commit hash (or "unknown" if not a git repo)
+pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
+
+/// Full version string: "0.0.7 (abc1234)"
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
+
+/// Package/distribution identifier
+pub const PACKAGE_URL: &str = env!("PACKAGE_URL");
+
+/// Feedback/issue reporting channel
+pub const FEEDBACK_CHANNEL: &str = env!("FEEDBACK_CHANNEL");
+
+/// Explanation of issue routing in this build
+pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
+
+use anyhow::Context;
+use async_trait::async_trait;
+use clap::{ArgAction, Parser, ValueEnum};
+use mangocode_core::history::{apply_session_model_to_config, canonical_session_model};
+use mangocode_core::truncate::{truncate_bytes_prefix, truncate_bytes_with_ellipsis};
+use mangocode_core::types::ToolDefinition;
+use mangocode_core::{
+    config::{
+        AgentCompletionPolicy, AgentReliabilityProfile, AgentSpeedProfile, Config, HookEntry,
+        HookEvent, McpServerConfig, PermissionMode, PipedreamMcpConfig, Settings,
+        SettingsLoadDiagnostic, VerificationPolicy,
+    },
+    context::ContextBuilder,
+    cost::CostTracker,
+    permissions::{AutoPermissionHandler, InteractivePermissionHandler},
+};
+use mangocode_tools::{clear_session_shell_state, PermissionLevel, Tool, ToolContext, ToolResult};
+use parking_lot::Mutex as ParkingMutex;
+use rpassword::prompt_password;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tracing::{debug, info, warn};
+use tracing_subscriber::EnvFilter;
+
+fn tui_effort_to_core(effort: mangocode_tui::EffortLevel) -> mangocode_core::effort::EffortLevel {
+    match effort {
+        mangocode_tui::EffortLevel::Low => mangocode_core::effort::EffortLevel::Low,
+        mangocode_tui::EffortLevel::Normal => mangocode_core::effort::EffortLevel::Medium,
+        mangocode_tui::EffortLevel::High => mangocode_core::effort::EffortLevel::High,
+        mangocode_tui::EffortLevel::Max => mangocode_core::effort::EffortLevel::Max,
+    }
+}
+
+fn core_effort_to_tui(effort: mangocode_core::effort::EffortLevel) -> mangocode_tui::EffortLevel {
+    match effort {
+        mangocode_core::effort::EffortLevel::Low => mangocode_tui::EffortLevel::Low,
+        mangocode_core::effort::EffortLevel::Medium => mangocode_tui::EffortLevel::Normal,
+        mangocode_core::effort::EffortLevel::High => mangocode_tui::EffortLevel::High,
+        mangocode_core::effort::EffortLevel::Max => mangocode_tui::EffortLevel::Max,
+    }
+}
+
+fn parse_effort_level_arg(value: &str) -> Option<mangocode_core::effort::EffortLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normal" => Some(mangocode_core::effort::EffortLevel::Medium),
+        other => mangocode_core::effort::EffortLevel::parse(other),
+    }
+}
+
+fn effort_max_tokens(level: mangocode_core::effort::EffortLevel) -> Option<u32> {
+    match level {
+        mangocode_core::effort::EffortLevel::Low => Some(4096),
+        mangocode_core::effort::EffortLevel::Medium => None,
+        mangocode_core::effort::EffortLevel::High | mangocode_core::effort::EffortLevel::Max => {
+            Some(32768)
+        }
+    }
+}
+
+fn apply_effort_to_config(config: &mut Config, level: mangocode_core::effort::EffortLevel) {
+    config.effort = Some(level.as_str().to_string());
+    config.max_tokens = effort_max_tokens(level);
+}
+
+fn persist_effort_setting(level: mangocode_core::effort::EffortLevel) -> anyhow::Result<()> {
+    let mut settings = Settings::load_sync()?;
+    apply_effort_to_config(&mut settings.config, level);
+    settings.save_sync()
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct PersistedUiSettings {
+    editor_mode: Option<String>,
+    fast_mode: Option<bool>,
+    voice_enabled: Option<bool>,
+}
+
+fn load_persisted_ui_settings() -> anyhow::Result<PersistedUiSettings> {
+    let path = Settings::config_dir().join("ui-settings.json");
+    load_persisted_ui_settings_from_path(&path)
+}
+
+fn load_persisted_ui_settings_from_path(path: &Path) -> anyhow::Result<PersistedUiSettings> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PersistedUiSettings::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn format_persisted_ui_settings_error(err: &anyhow::Error) -> String {
+    format!("Failed to load UI settings; using defaults for this session:\n{err}")
+}
+
+fn slash_command_with_args_skips_tui(cmd_name: &str, cmd_args: &str) -> bool {
+    mangocode_tui::input::slash_command_with_args_skips_tui_intercept(cmd_name, cmd_args)
+}
+
+fn slash_command_lookup_key(cmd_name: &str) -> String {
+    cmd_name.trim().trim_start_matches('/').to_lowercase()
+}
+
+fn slash_command_first_arg_matches(cmd_args: &str, expected: &[&str]) -> bool {
+    let Ok(words) = mangocode_core::split_command_words(cmd_args) else {
+        return false;
+    };
+    words.first().is_some_and(|first| {
+        expected
+            .iter()
+            .any(|value| first.eq_ignore_ascii_case(value))
+    })
+}
+
+fn normalize_prompt_fragment(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn push_system_prompt_append(
+    system_parts: &mut Vec<String>,
+    append: &str,
+    append_if_missing: bool,
+) {
+    let append = append.trim();
+    if append.is_empty() {
+        return;
+    }
+
+    if append_if_missing {
+        let existing = normalize_prompt_fragment(&system_parts.join("\n\n"));
+        let needle = normalize_prompt_fragment(append);
+        if needle.is_empty() || existing.contains(&needle) {
+            return;
+        }
+    }
+
+    system_parts.push(append.to_string());
+}
+
+async fn build_session_system_prompt(
+    working_dir: std::path::PathBuf,
+    config: &Config,
+    append_if_missing: bool,
+) -> String {
+    let instructions_dir = working_dir.display().to_string();
+    let ctx_builder =
+        ContextBuilder::new(working_dir).disable_claude_mds(config.disable_claude_mds);
+    let system_ctx = ctx_builder.build_system_context().await;
+    let user_ctx = ctx_builder.build_user_context().await;
+    if !config.disable_claude_mds {
+        mangocode_query::run_plugin_lifecycle_hooks_with(
+            "InstructionsLoaded",
+            "",
+            None,
+            &instructions_dir,
+        )
+        .await;
+    }
+
+    let mut system_parts = vec![
+        include_str!("system_prompt.txt").to_string(),
+        system_ctx,
+        user_ctx,
+    ];
+    if let Some(ref custom) = config.custom_system_prompt {
+        system_parts[0] = custom.clone();
+    }
+    if let Some(ref append) = config.append_system_prompt {
+        push_system_prompt_append(&mut system_parts, append, append_if_missing);
+    }
+    system_parts.join("\n\n")
+}
+
+fn effective_model_for_query_config(
+    config: &Config,
+    query_config: &mangocode_query::QueryConfig,
+) -> String {
+    if let Some(registry) = query_config.model_registry.as_ref() {
+        mangocode_api::effective_model_for_config(config, registry.as_ref())
+    } else {
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        mangocode_api::effective_model_for_config(config, &registry)
+    }
+}
+
+fn sync_approval_reviewer_runtime(config: &Config) {
+    let critic = mangocode_core::global_critic();
+    let mut critic_config = critic.get_config();
+    critic_config.enabled = config.critic_mode || config.approvals_reviewer.is_auto_review();
+    if let Some(model) = config
+        .critic_model
+        .as_ref()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+    {
+        critic_config.model = model.to_string();
+    }
+    critic.update_config(critic_config);
+}
+
+enum PromptSubmitHookOutcome {
+    Allowed(String),
+    Blocked { reason: String, input: String },
+}
+
+async fn run_user_prompt_submit_hooks(
+    input: String,
+    config: &Config,
+    working_dir: &Path,
+    session_id: &str,
+) -> PromptSubmitHookOutcome {
+    let has_prompt_submit_hooks = !config.hooks.is_empty()
+        || mangocode_plugins::has_global_hooks_for_event(
+            mangocode_plugins::HookEventKind::UserPromptSubmit,
+        );
+    if !has_prompt_submit_hooks {
+        return PromptSubmitHookOutcome::Allowed(input);
+    }
+
+    let mut input = input;
+    let hook_ctx = mangocode_core::hooks::HookContext {
+        event: "UserPromptSubmit".to_string(),
+        tool_name: None,
+        tool_input: None,
+        tool_output: Some(input.clone()),
+        is_error: None,
+        session_id: Some(session_id.to_string()),
+    };
+    let core_outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        mangocode_core::hooks::run_hooks(
+            &config.hooks,
+            mangocode_core::config::HookEvent::UserPromptSubmit,
+            &hook_ctx,
+            working_dir,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        eprintln!("Hooks timed out after 5s, continuing query");
+        mangocode_core::hooks::HookOutcome::Allowed
+    });
+
+    match core_outcome {
+        mangocode_core::hooks::HookOutcome::Blocked(reason) => {
+            return PromptSubmitHookOutcome::Blocked {
+                reason: format!("Prompt blocked by hook: {reason}"),
+                input,
+            };
+        }
+        mangocode_core::hooks::HookOutcome::Modified(modified) if !modified.trim().is_empty() => {
+            input = modified;
+        }
+        _ => {}
+    }
+
+    if mangocode_plugins::has_global_hooks_for_event(
+        mangocode_plugins::HookEventKind::UserPromptSubmit,
+    ) {
+        let prompt_for_plugin_hooks = input.clone();
+        let session_id_for_plugin_hooks = session_id.to_string();
+        let plugin_hook = tokio::task::spawn_blocking(move || {
+            mangocode_plugins::run_global_user_prompt_submit_hook(
+                &prompt_for_plugin_hooks,
+                Some(&session_id_for_plugin_hooks),
+            )
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(5), plugin_hook).await {
+            Ok(Ok(mangocode_plugins::HookOutcome::Deny(reason))) => {
+                return PromptSubmitHookOutcome::Blocked {
+                    reason: format!("Prompt blocked by plugin hook: {reason}"),
+                    input,
+                };
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    error = %err,
+                    "Plugin UserPromptSubmit hook task failed"
+                );
+            }
+            Err(_) => {
+                warn!("Plugin UserPromptSubmit hooks timed out after 5s, continuing query");
+            }
+        }
+    }
+
+    PromptSubmitHookOutcome::Allowed(input)
+}
+
+fn append_system_prompt_configured(config: &Config) -> bool {
+    config
+        .append_system_prompt
+        .as_deref()
+        .is_some_and(|append| !append.trim().is_empty())
+}
+
+fn format_settings_load_diagnostics(diagnostics: &[SettingsLoadDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(SettingsLoadDiagnostic::display)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn flush_stdout_for(context: &'static str) {
+    use std::io::Write;
+
+    if let Err(err) = std::io::stdout().flush() {
+        warn!(error = %err, context, "failed to flush stdout");
+    }
+}
+
+fn apply_cli_model_override(config: &mut Config, model: Option<&str>) -> anyhow::Result<()> {
+    let Some(model) = model else {
+        return Ok(());
+    };
+
+    if mangocode_api::apply_model_selection_to_config(config, model, None) {
+        Ok(())
+    } else {
+        anyhow::bail!("--model requires a non-empty model name")
+    }
+}
+
+fn oauth_provider_for_config_and_model(
+    config: &Config,
+    model: &str,
+) -> mangocode_core::system_prompt::OAuthProvider {
+    if let Some((provider, _)) = mangocode_core::ProviderId::split_known_model_prefix(model) {
+        let model_oauth = mangocode_core::system_prompt::OAuthProvider::from_provider_id(provider);
+        if model_oauth != mangocode_core::system_prompt::OAuthProvider::None {
+            return model_oauth;
+        }
+    }
+
+    mangocode_core::system_prompt::OAuthProvider::from_provider_id(
+        config.provider.as_deref().unwrap_or(""),
+    )
+}
+
+fn sync_query_config_for_runtime(
+    query_config: &mut mangocode_query::QueryConfig,
+    config: &Config,
+    working_dir: &std::path::Path,
+    model_registry: &mangocode_api::ModelRegistry,
+) {
+    query_config.model = mangocode_api::effective_model_for_config(config, model_registry);
+    query_config.max_tokens = config.effective_max_tokens();
+    query_config.output_style = config.effective_output_style();
+    query_config.output_style_prompt = config.resolve_output_style_prompt();
+    query_config.working_directory = Some(working_dir.display().to_string());
+    query_config.oauth_provider = oauth_provider_for_config_and_model(config, &query_config.model);
+    query_config.has_append_system_prompt = append_system_prompt_configured(config);
+    query_config.append_system_prompt = None;
+    query_config.completion_policy = config.agent_completion_policy;
+    query_config.verification_policy = config.verification_policy;
+    query_config.reliability_profile = config.agent_reliability_profile;
+    query_config.speed_profile = config.agent_speed_profile;
+    if let Some(level) = config.effort.as_deref().and_then(parse_effort_level_arg) {
+        query_config.effort_level = Some(level);
+    }
+}
+
+fn tui_output_style_for_config(config: &Config) -> String {
+    config
+        .output_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .filter(|style| !style.eq_ignore_ascii_case("default"))
+        .unwrap_or("auto")
+        .to_string()
+}
+
+fn sync_tui_runtime_state_from_config(
+    app: &mut mangocode_tui::App,
+    query_config: &mut mangocode_query::QueryConfig,
+    working_dir: &std::path::Path,
+    model_registry: &mangocode_api::ModelRegistry,
+) {
+    sync_query_config_for_runtime(query_config, &app.config, working_dir, model_registry);
+    let effective_model = query_config.model.clone();
+    if app.model_name != effective_model {
+        app.cost_tracker.set_model(&effective_model);
+        app.model_name = effective_model;
+    }
+    app.output_style = tui_output_style_for_config(&app.config);
+    if let Some(level) = query_config.effort_level {
+        app.effort_level = core_effort_to_tui(level);
+    }
+}
+
+fn apply_session_model_if_present(config: &mut Config, session_model: &str) -> bool {
+    let session_model = session_model.trim();
+    if session_model.is_empty() {
+        return false;
+    }
+    apply_session_model_to_config(config, session_model);
+    true
+}
+
+fn sync_session_model_to_runtime_config(
+    config: &mut Config,
+    query_config: &mut mangocode_query::QueryConfig,
+    cost_tracker: &Arc<CostTracker>,
+    session_model: &str,
+) {
+    apply_session_model_if_present(config, session_model);
+    query_config.model = effective_model_for_query_config(config, query_config);
+    query_config.oauth_provider = oauth_provider_for_config_and_model(config, &query_config.model);
+    cost_tracker.set_model(&query_config.model);
+}
+
+fn query_error_diagnostic(
+    provider: Option<&str>,
+    model: &str,
+    error: &mangocode_core::error::ClaudeError,
+) -> mangocode_api::ProviderDiagnostic {
+    mangocode_api::diagnostic_from_claude_error(provider.or(Some("anthropic")), Some(model), error)
+}
+
+fn format_query_error_for_output(
+    provider: Option<&str>,
+    model: &str,
+    error: &mangocode_core::error::ClaudeError,
+) -> String {
+    let raw = error.to_string();
+    if raw.contains("Provider diagnostic:") {
+        raw
+    } else {
+        mangocode_api::format_provider_diagnostic(&query_error_diagnostic(provider, model, error))
+    }
+}
+
+fn stream_json_status_event(session_id: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "status",
+        "session_id": session_id,
+        "message": message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tool_context(config: Config) -> ToolContext {
+        ToolContext {
+            working_dir: PathBuf::from("test-workspace"),
+            permission_mode: PermissionMode::Default,
+            permission_handler: Arc::new(AutoPermissionHandler {
+                mode: PermissionMode::Default,
+            }),
+            cost_tracker: CostTracker::new(),
+            session_metrics: None,
+            session_id: "cli-test".to_string(),
+            coordination_actor_id: None,
+            coordination_parent_actor_id: None,
+            inject_coordination_inbox: true,
+            file_history: Arc::new(ParkingMutex::new(
+                mangocode_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            question_prompt_tx: None,
+            cancel_token: None,
+        }
+    }
+
+    #[test]
+    fn prompt_append_in_headless_skips_existing_fragment() {
+        let mut parts = vec!["Base prompt.\n\nUse the repo root carefully.".to_string()];
+        push_system_prompt_append(&mut parts, "Use the repo root carefully.", true);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn prompt_append_in_headless_adds_missing_fragment() {
+        let mut parts = vec!["Base prompt.".to_string()];
+        push_system_prompt_append(&mut parts, "Extra instruction.", true);
+        assert_eq!(parts, vec!["Base prompt.", "Extra instruction."]);
+    }
+
+    #[test]
+    fn prompt_append_in_interactive_keeps_existing_fragment() {
+        let mut parts = vec!["Base prompt. Extra instruction.".to_string()];
+        push_system_prompt_append(&mut parts, "Extra instruction.", false);
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn prompt_append_dedupes_across_whitespace_differences() {
+        let mut parts = vec!["Base prompt.\nUse   the repo root carefully.".to_string()];
+        push_system_prompt_append(&mut parts, "Use the repo root carefully.", true);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn bundled_cli_prompt_preserves_runtime_tools_and_memory_guidance() {
+        let prompt = include_str!("system_prompt.txt");
+        assert!(prompt.contains("current runtime tool list"));
+        assert!(prompt.contains("injected memory/context"));
+        assert!(!prompt.contains("## Available tools"));
+    }
+
+    #[test]
+    fn cli_agent_speed_profile_accepts_printed_label_alias() {
+        let cli = Cli::try_parse_from(["mangocode", "--agent-speed-profile", "fast_safe"])
+            .expect("fast_safe should parse as the printed speed profile label");
+
+        assert_eq!(cli.agent_speed_profile, Some(CliSpeedProfile::FastSafe));
+    }
+
+    #[test]
+    fn cli_runtime_policy_flags_accept_runtime_aliases() {
+        let cli = Cli::try_parse_from([
+            "mangocode",
+            "--completion-policy",
+            "enabled",
+            "--verification-policy",
+            "manual",
+            "--agent-reliability-profile",
+            "reliable-autonomy",
+            "--agent-speed-profile",
+            "default",
+        ])
+        .expect("runtime policy aliases should parse on CLI flags");
+
+        assert_eq!(cli.completion_policy, Some(CliCompletionPolicy::Enforce));
+        assert_eq!(cli.verification_policy, Some(CliVerificationPolicy::Ask));
+        assert_eq!(
+            cli.agent_reliability_profile,
+            Some(CliReliabilityProfile::Strict)
+        );
+        assert_eq!(cli.agent_speed_profile, Some(CliSpeedProfile::FastSafe));
+    }
+
+    #[test]
+    fn cli_runtime_policy_flags_accept_balanced_aliases() {
+        let cli = Cli::try_parse_from([
+            "mangocode",
+            "--agent-reliability-profile",
+            "normal",
+            "--agent-speed-profile",
+            "standard",
+        ])
+        .expect("balanced runtime policy aliases should parse on CLI flags");
+
+        assert_eq!(
+            cli.agent_reliability_profile,
+            Some(CliReliabilityProfile::Standard)
+        );
+        assert_eq!(cli.agent_speed_profile, Some(CliSpeedProfile::Balanced));
+    }
+
+    #[tokio::test]
+    async fn session_system_prompt_builder_includes_bundled_prompt() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mangocode-system-prompt-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let prompt = build_session_system_prompt(temp_dir.clone(), &Config::default(), false).await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+
+        assert!(prompt.contains("## Tool usage"));
+        assert!(prompt.contains("current runtime tool list"));
+        assert!(prompt.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"));
+    }
+
+    #[test]
+    fn arg_bearing_state_commands_skip_tui_intercepts() {
+        for cmd in [
+            "config",
+            "settings",
+            "model",
+            "theme",
+            "output-style",
+            "mcp",
+            "memory",
+            "hooks",
+            "agents",
+            "diff",
+            "review",
+            "search",
+            "find",
+            "feedback",
+            "survey",
+            "bug",
+            "report",
+            "plan",
+            "resume",
+            "session",
+            "rewind",
+            "rename",
+            "export",
+            "help",
+            "cost",
+            "copy",
+            "vim",
+            "vi",
+            "voice",
+            "fast",
+            "speed",
+            "effort",
+        ] {
+            assert!(slash_command_with_args_skips_tui(cmd, "on"));
+        }
+        assert!(slash_command_with_args_skips_tui("/MODEL", "on"));
+        assert!(slash_command_with_args_skips_tui("Find", "needle"));
+        assert!(!slash_command_with_args_skips_tui("effort", ""));
+        assert!(!slash_command_with_args_skips_tui("context", "unexpected"));
+    }
+
+    #[test]
+    fn slash_command_lookup_key_matches_command_executor_casing() {
+        assert_eq!(slash_command_lookup_key("Effort"), "effort");
+        assert_eq!(slash_command_lookup_key("/VOICE"), "voice");
+        assert_eq!(slash_command_lookup_key("  Plugin  "), "plugin");
+    }
+
+    #[test]
+    fn slash_command_first_arg_matches_reload_aliases_case_insensitively() {
+        assert!(slash_command_first_arg_matches(
+            "reload",
+            &["reload", "refresh"]
+        ));
+        assert!(slash_command_first_arg_matches(
+            "  Refresh now",
+            &["reload", "refresh"]
+        ));
+        assert!(slash_command_first_arg_matches(
+            "RELOAD",
+            &["reload", "refresh"]
+        ));
+        assert!(!slash_command_first_arg_matches(
+            "reloadish",
+            &["reload", "refresh"]
+        ));
+        assert!(!slash_command_first_arg_matches(
+            r#"reload "unterminated"#,
+            &["reload", "refresh"]
+        ));
+        assert!(!slash_command_first_arg_matches("", &["reload", "refresh"]));
+    }
+
+    fn temp_ui_settings_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("mangocode-cli-test-{}", uuid::Uuid::new_v4()))
+            .join("ui-settings.json")
+    }
+
+    #[test]
+    fn persisted_ui_settings_loader_defaults_when_missing() {
+        let path = temp_ui_settings_path();
+
+        let settings = load_persisted_ui_settings_from_path(&path).unwrap();
+
+        assert_eq!(settings.editor_mode, None);
+        assert_eq!(settings.fast_mode, None);
+        assert_eq!(settings.voice_enabled, None);
+    }
+
+    #[test]
+    fn persisted_ui_settings_loader_reads_valid_file() {
+        let path = temp_ui_settings_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"editor_mode":"vim","fast_mode":true,"voice_enabled":true}"#,
+        )
+        .unwrap();
+
+        let settings = load_persisted_ui_settings_from_path(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert_eq!(settings.editor_mode.as_deref(), Some("vim"));
+        assert_eq!(settings.fast_mode, Some(true));
+        assert_eq!(settings.voice_enabled, Some(true));
+    }
+
+    #[test]
+    fn persisted_ui_settings_loader_rejects_malformed_file() {
+        let path = temp_ui_settings_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{not-json").unwrap();
+
+        let err = load_persisted_ui_settings_from_path(&path).unwrap_err();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        assert!(err.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn canonical_session_model_preserves_gateway_provider_identity() {
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_session_model(&config, "anthropic/claude-sonnet-4"),
+            "openrouter/anthropic/claude-sonnet-4"
+        );
+        assert_eq!(
+            canonical_session_model(&config, "openrouter/meta-llama/Llama-3.3-70B"),
+            "openrouter/meta-llama/Llama-3.3-70B"
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_does_not_wrap_explicit_other_provider_model() {
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            model: Some("openai/gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            canonical_session_model(&config, "openai/gpt-4o"),
+            "openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn cli_model_override_preserves_configured_model_when_absent() {
+        let mut config = Config {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            ..Default::default()
+        };
+
+        apply_cli_model_override(&mut config, None).unwrap();
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn cli_model_override_trims_and_updates_provider() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        apply_cli_model_override(&mut config, Some(" openai/gpt-4o ")).unwrap();
+
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn cli_model_override_rejects_blank_model() {
+        let mut config = Config {
+            provider: Some("anthropic".to_string()),
+            model: Some("claude-haiku-4-5".to_string()),
+            ..Default::default()
+        };
+
+        let err = apply_cli_model_override(&mut config, Some("   ")).unwrap_err();
+
+        assert!(err.to_string().contains("non-empty model"));
+        assert_eq!(config.provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.model.as_deref(), Some("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn query_error_output_includes_provider_diagnostic() {
+        let err = mangocode_core::error::ClaudeError::ApiStatus {
+            status: 429,
+            message: "rate limited".to_string(),
+        };
+
+        let diagnostic = query_error_diagnostic(Some("openai"), "gpt-5.1", &err);
+        let rendered = format_query_error_for_output(Some("openai"), "gpt-5.1", &err);
+
+        assert_eq!(
+            diagnostic.kind,
+            mangocode_api::ProviderDiagnosticKind::RateLimit
+        );
+        assert_eq!(diagnostic.model.as_deref(), Some("gpt-5.1"));
+        assert!(rendered.contains("provider=openai"), "{rendered}");
+        assert!(rendered.contains("kind=rate_limit"), "{rendered}");
+        assert!(rendered.contains("model=gpt-5.1"), "{rendered}");
+    }
+
+    #[test]
+    fn query_error_output_classifies_quota_diagnostic() {
+        let err = mangocode_core::error::ClaudeError::ApiStatus {
+            status: 402,
+            message: "payment required: billing quota exhausted".to_string(),
+        };
+
+        let diagnostic = query_error_diagnostic(Some("openai"), "gpt-5.1", &err);
+        let rendered = format_query_error_for_output(Some("openai"), "gpt-5.1", &err);
+
+        assert_eq!(
+            diagnostic.kind,
+            mangocode_api::ProviderDiagnosticKind::Quota
+        );
+        assert_eq!(diagnostic.status, Some(402));
+        assert!(rendered.contains("provider=openai"), "{rendered}");
+        assert!(rendered.contains("kind=quota"), "{rendered}");
+        assert!(rendered.contains("Check provider quota"), "{rendered}");
+    }
+
+    #[test]
+    fn stream_json_status_event_preserves_work_run_status() {
+        let event = stream_json_status_event(
+            "session-1",
+            "Work run finished: readiness=needs_verification",
+        );
+
+        assert_eq!(event["type"], "status");
+        assert_eq!(event["session_id"], "session-1");
+        assert_eq!(
+            event["message"],
+            "Work run finished: readiness=needs_verification"
+        );
+    }
+
+    #[test]
+    fn apply_session_model_restores_prefixed_provider() {
+        let mut config = Config::default();
+
+        apply_session_model_to_config(&mut config, "openrouter/anthropic/claude-sonnet-4");
+
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn session_model_sync_updates_runtime_query_model() {
+        let mut config = Config::default();
+        let mut query_config = mangocode_query::QueryConfig::default();
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        query_config.model_registry = Some(Arc::new(registry));
+        query_config.model = "claude-opus-4-1-20250805".to_string();
+        let cost_tracker = CostTracker::new();
+
+        sync_session_model_to_runtime_config(
+            &mut config,
+            &mut query_config,
+            &cost_tracker,
+            "openrouter/anthropic/claude-sonnet-4",
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            config.model.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4")
+        );
+        assert_eq!(query_config.model, "openrouter/anthropic/claude-sonnet-4");
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::None
+        );
+
+        sync_session_model_to_runtime_config(
+            &mut config,
+            &mut query_config,
+            &cost_tracker,
+            "anthropic-max/claude-opus-4-5",
+        );
+
+        assert_eq!(config.provider.as_deref(), Some("anthropic-max"));
+        assert_eq!(query_config.model, "anthropic-max/claude-opus-4-5");
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+    }
+
+    #[test]
+    fn blank_session_model_does_not_poison_runtime_config() {
+        let mut config = Config::default();
+        let mut query_config = mangocode_query::QueryConfig::default();
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        query_config.model_registry = Some(Arc::new(registry));
+        let cost_tracker = CostTracker::new();
+
+        assert!(!apply_session_model_if_present(&mut config, "   "));
+        assert!(config.model.is_none());
+
+        sync_session_model_to_runtime_config(&mut config, &mut query_config, &cost_tracker, "   ");
+
+        assert!(config.model.is_none());
+        assert!(!query_config.model.trim().is_empty());
+    }
+
+    #[test]
+    fn runtime_query_config_sync_refreshes_dispatch_fields() {
+        let config = Config {
+            provider: Some("anthropic-max".to_string()),
+            effort: Some("high".to_string()),
+            max_tokens: Some(1234),
+            append_system_prompt: Some("Extra instructions".to_string()),
+            agent_completion_policy: AgentCompletionPolicy::Warn,
+            verification_policy: VerificationPolicy::Ask,
+            agent_reliability_profile: AgentReliabilityProfile::Strict,
+            agent_speed_profile: AgentSpeedProfile::FastSafe,
+            ..Default::default()
+        };
+        let mut query_config = mangocode_query::QueryConfig {
+            model: "stale-model".to_string(),
+            max_tokens: 1,
+            append_system_prompt: Some("stale append".to_string()),
+            working_directory: None,
+            ..Default::default()
+        };
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let working_dir = PathBuf::from("runtime-workspace");
+
+        sync_query_config_for_runtime(&mut query_config, &config, &working_dir, &registry);
+
+        assert_ne!(query_config.model, "stale-model");
+        assert_eq!(query_config.max_tokens, 1234);
+        assert_eq!(
+            query_config.working_directory.as_deref(),
+            Some("runtime-workspace")
+        );
+        assert_eq!(query_config.append_system_prompt, None);
+        assert!(query_config.has_append_system_prompt);
+        assert_eq!(
+            query_config.effort_level,
+            Some(mangocode_core::effort::EffortLevel::High)
+        );
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::AnthropicMax
+        );
+        assert_eq!(query_config.completion_policy, AgentCompletionPolicy::Warn);
+        assert_eq!(query_config.verification_policy, VerificationPolicy::Ask);
+        assert_eq!(
+            query_config.reliability_profile,
+            AgentReliabilityProfile::Strict
+        );
+        assert_eq!(query_config.speed_profile, AgentSpeedProfile::FastSafe);
+    }
+
+    #[test]
+    fn tui_runtime_sync_refreshes_all_dispatch_fields() {
+        let config = Config {
+            provider: Some("openai".to_string()),
+            effort: Some("max".to_string()),
+            max_tokens: Some(2345),
+            append_system_prompt: Some("Extra runtime context".to_string()),
+            output_style: Some("verbose".to_string()),
+            agent_completion_policy: AgentCompletionPolicy::Warn,
+            verification_policy: VerificationPolicy::Off,
+            agent_reliability_profile: AgentReliabilityProfile::Strict,
+            agent_speed_profile: AgentSpeedProfile::FastSafe,
+            ..Default::default()
+        };
+        let cost_tracker = CostTracker::new();
+        let mut app = mangocode_tui::App::new(config, cost_tracker);
+        let mut query_config = mangocode_query::QueryConfig {
+            model: "stale-model".to_string(),
+            max_tokens: 1,
+            append_system_prompt: Some("stale append".to_string()),
+            has_append_system_prompt: false,
+            working_directory: None,
+            ..Default::default()
+        };
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let working_dir = PathBuf::from("tui-runtime-workspace");
+
+        sync_tui_runtime_state_from_config(&mut app, &mut query_config, &working_dir, &registry);
+
+        assert_ne!(query_config.model, "stale-model");
+        assert_eq!(app.model_name, query_config.model);
+        assert_eq!(query_config.max_tokens, 2345);
+        assert_eq!(
+            query_config.working_directory.as_deref(),
+            Some("tui-runtime-workspace")
+        );
+        assert!(query_config.has_append_system_prompt);
+        assert_eq!(query_config.append_system_prompt, None);
+        assert_eq!(app.output_style, "verbose");
+        assert_eq!(
+            query_config.effort_level,
+            Some(mangocode_core::effort::EffortLevel::Max)
+        );
+        assert_eq!(app.effort_level, mangocode_tui::EffortLevel::Max);
+        assert_eq!(
+            query_config.oauth_provider,
+            mangocode_core::system_prompt::OAuthProvider::None
+        );
+        assert_eq!(query_config.completion_policy, AgentCompletionPolicy::Warn);
+        assert_eq!(query_config.verification_policy, VerificationPolicy::Off);
+        assert_eq!(
+            query_config.reliability_profile,
+            AgentReliabilityProfile::Strict
+        );
+        assert_eq!(query_config.speed_profile, AgentSpeedProfile::FastSafe);
+    }
+
+    #[test]
+    fn tui_output_style_for_config_hides_default_style() {
+        let mut config = Config::default();
+        assert_eq!(tui_output_style_for_config(&config), "auto");
+
+        config.output_style = Some(" default ".to_string());
+        assert_eq!(tui_output_style_for_config(&config), "auto");
+
+        config.output_style = Some("concise".to_string());
+        assert_eq!(tui_output_style_for_config(&config), "concise");
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        feature = "tool-bash"
+    ))]
+    #[test]
+    fn allowed_tool_filter_accepts_runtime_aliases() {
+        let tools = build_tools_with_mcp(None, &["shell_command".to_string()], &[]);
+        assert!(tools.iter().any(|tool| tool.name() == "Bash"));
+        assert!(!tools.iter().any(|tool| tool.name() == "Read"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-apply-patch", feature = "tool-read")
+    ))]
+    #[test]
+    fn disallowed_tool_filter_accepts_runtime_aliases() {
+        let tools = build_tools_with_mcp(None, &[], &["apply_patch".to_string()]);
+        assert!(!tools.iter().any(|tool| tool.name() == "ApplyPatch"));
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+    }
+
+    struct TestDynamicReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for TestDynamicReadOnlyTool {
+        fn name(&self) -> &str {
+            "DynamicReadOnly"
+        }
+
+        fn description(&self) -> &str {
+            "A dynamic read-only test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("dynamic ok")
+        }
+    }
+
+    struct TestMixedActionReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for TestMixedActionReadOnlyTool {
+        fn name(&self) -> &str {
+            "MixedActionReadOnly"
+        }
+
+        fn description(&self) -> &str {
+            "A read-only permission tool with mutating actions"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "default": "write"
+                    }
+                },
+                "additionalProperties": false
+            })
+        }
+
+        fn capabilities(
+            &self,
+            input: &serde_json::Value,
+        ) -> mangocode_tools::runtime::ToolCapabilities {
+            if input.get("action").and_then(serde_json::Value::as_str) == Some("write") {
+                return mangocode_tools::runtime::ToolCapabilities::mutating()
+                    .with_affected_paths(vec!["graphify-out".to_string()]);
+            }
+            mangocode_tools::runtime::ToolCapabilities::read_only()
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("mixed action ok")
+        }
+    }
+
+    struct TestAllMutatingActionReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for TestAllMutatingActionReadOnlyTool {
+        fn name(&self) -> &str {
+            "AllMutatingActionReadOnly"
+        }
+
+        fn description(&self) -> &str {
+            "A read-only permission tool whose actions are all mutating"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["write", "delete"],
+                        "default": "write"
+                    }
+                },
+                "additionalProperties": false
+            })
+        }
+
+        fn capabilities(
+            &self,
+            _input: &serde_json::Value,
+        ) -> mangocode_tools::runtime::ToolCapabilities {
+            mangocode_tools::runtime::ToolCapabilities::mutating()
+                .with_affected_paths(vec!["all-mutating-out".to_string()])
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("all mutating action ok")
+        }
+    }
+
+    struct TestSearchOnlyMixedActionReadOnlyTool;
+
+    #[async_trait]
+    impl Tool for TestSearchOnlyMixedActionReadOnlyTool {
+        fn name(&self) -> &str {
+            "ToolSearch"
+        }
+
+        fn description(&self) -> &str {
+            "A search-only allowed tool with a dynamic mutating action"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::ReadOnly
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "write"]
+                    }
+                },
+                "additionalProperties": false
+            })
+        }
+
+        fn capabilities(
+            &self,
+            input: &serde_json::Value,
+        ) -> mangocode_tools::runtime::ToolCapabilities {
+            if input.get("action").and_then(serde_json::Value::as_str) == Some("write") {
+                return mangocode_tools::runtime::ToolCapabilities::mutating()
+                    .with_affected_paths(vec!["search-index".to_string()]);
+            }
+            mangocode_tools::runtime::ToolCapabilities::read_only()
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("search-only mixed action ok")
+        }
+    }
+
+    struct TestMutatingNoneTool;
+
+    #[async_trait]
+    impl Tool for TestMutatingNoneTool {
+        fn name(&self) -> &str {
+            "MutatingNone"
+        }
+
+        fn description(&self) -> &str {
+            "A mutating None-permission test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::None
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn capabilities(
+            &self,
+            _input: &serde_json::Value,
+        ) -> mangocode_tools::runtime::ToolCapabilities {
+            mangocode_tools::runtime::ToolCapabilities::mutating()
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("mutating ok")
+        }
+    }
+
+    struct TestNetworkTool(&'static str);
+
+    #[async_trait]
+    impl Tool for TestNetworkTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "A network permission test tool"
+        }
+
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Network
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success("network ok")
+        }
+    }
+
+    #[test]
+    fn shared_agent_filter_preserves_live_dynamic_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestDynamicReadOnlyTool)]);
+        let _held_reference = tools.clone();
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "DynamicReadOnly"));
+    }
+
+    #[tokio::test]
+    async fn read_only_agent_filter_blocks_dynamic_mutating_read_only_actions() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestMixedActionReadOnlyTool)]);
+        let _held_reference = tools.clone();
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert_eq!(filtered.len(), 1);
+        let ctx = test_tool_context(Config::default());
+        let definition = filtered[0].to_definition();
+        assert!(definition
+            .description
+            .contains("mutating actions are unavailable"));
+        let actions = definition
+            .input_schema
+            .pointer("/properties/action/enum")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(actions.iter().any(|action| action == "read"));
+        assert!(!actions.iter().any(|action| action == "write"));
+        let action_description = definition
+            .input_schema
+            .pointer("/properties/action/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(action_description.contains("Available action values"));
+        assert!(action_description.contains("read"));
+        assert!(action_description.contains("Mutating action values are omitted"));
+        assert_eq!(
+            definition
+                .input_schema
+                .pointer("/properties/action/default")
+                .and_then(serde_json::Value::as_str),
+            Some("read")
+        );
+
+        let runtime_spec = filtered[0].to_runtime_spec();
+        let runtime_actions = runtime_spec
+            .input_schema
+            .pointer("/properties/action/enum")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(runtime_actions.iter().any(|action| action == "read"));
+        assert!(!runtime_actions.iter().any(|action| action == "write"));
+        assert!(runtime_spec
+            .description
+            .contains("mutating actions are unavailable"));
+
+        let read_result = filtered[0]
+            .execute(serde_json::json!({"action": "read"}), &ctx)
+            .await;
+        assert!(!read_result.is_error);
+
+        let write_result = filtered[0]
+            .execute(serde_json::json!({"action": "write"}), &ctx)
+            .await;
+        assert!(write_result.is_error);
+        assert!(write_result.content.contains("read-only agent access"));
+        assert!(write_result.content.contains("graphify-out"));
+    }
+
+    #[test]
+    fn read_only_agent_filter_drops_tools_with_only_mutating_action_variants() {
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(TestAllMutatingActionReadOnlyTool)]);
+        let _held_reference = tools.clone();
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[cfg(feature = "tool-project-graph")]
+    #[test]
+    fn read_only_agent_filter_prunes_project_graph_mutating_actions_from_schema() {
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(mangocode_tools::ProjectGraphTool)]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let definition = filtered
+            .iter()
+            .find(|tool| tool.name() == "ProjectGraph")
+            .expect("ProjectGraph should remain available for read actions")
+            .to_definition();
+        let actions = definition
+            .input_schema
+            .pointer("/properties/action/enum")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for action in ["report", "stats", "query"] {
+            assert!(
+                actions.iter().any(|value| value == action),
+                "{action} should remain available"
+            );
+        }
+        for action in [
+            "html",
+            "tree",
+            "callflow",
+            "persist",
+            "save_result",
+            "global_add",
+            "global_remove",
+        ] {
+            assert!(
+                !actions.iter().any(|value| value == action),
+                "{action} should be hidden for read-only agents"
+            );
+        }
+        let action_description = definition
+            .input_schema
+            .pointer("/properties/action/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(action_description.contains("Available action values"));
+        assert!(action_description.contains("report"));
+        assert!(!action_description.contains("html writes"));
+        assert!(!action_description.contains("save_result writes"));
+        assert!(action_description.contains("Mutating action values are omitted"));
+    }
+
+    #[test]
+    fn read_only_agent_filter_rejects_mutating_none_permission_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(TestMutatingNoneTool)]);
+
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.is_empty());
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-agent", feature = "tool-bash", feature = "tool-read")
+    ))]
+    #[test]
+    fn read_only_agent_filter_preserves_live_none_permission_tools() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        assert!(filtered
+            .iter()
+            .any(|tool| tool.name() == mangocode_core::constants::TOOL_NAME_AGENT));
+        assert!(filtered.iter().any(|tool| tool.name() == "Read"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-agent", feature = "tool-bash", feature = "tool-read")
+    ))]
+    #[tokio::test]
+    async fn read_only_agent_filter_denies_nested_agent_execution() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let agent_tool = filtered
+            .iter()
+            .find(|tool| tool.name() == mangocode_core::constants::TOOL_NAME_AGENT)
+            .expect("Agent tool should remain discoverable in read-only contexts");
+        let definition = agent_tool.to_definition();
+        assert!(definition
+            .description
+            .contains("mutating actions are unavailable"));
+
+        let ctx = test_tool_context(Config::default());
+        let result = agent_tool
+            .execute(
+                serde_json::json!({
+                    "description": "nested audit",
+                    "prompt": "Inspect the repository"
+                }),
+                &ctx,
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("read-only agent access"));
+    }
+
+    #[test]
+    fn read_only_agent_filter_allows_only_read_oriented_network_tools() {
+        let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![
+            Box::new(TestNetworkTool(
+                mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+            )),
+            Box::new(TestNetworkTool(
+                mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+            )),
+            Box::new(TestNetworkTool("DocSearch")),
+            Box::new(TestNetworkTool("DocRead")),
+            Box::new(TestNetworkTool("DeepRead")),
+            Box::new(TestNetworkTool("RenderedFetch")),
+            Box::new(TestNetworkTool("ListMcpResources")),
+            Box::new(TestNetworkTool("ReadMcpResource")),
+            Box::new(TestNetworkTool("RemoteTrigger")),
+            Box::new(TestNetworkTool("mcp__auth")),
+        ]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let names: std::collections::HashSet<&str> =
+            filtered.iter().map(|tool| tool.name()).collect();
+
+        for tool in [
+            mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+            mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+            "DocSearch",
+            "DocRead",
+            "DeepRead",
+            "RenderedFetch",
+            "ListMcpResources",
+            "ReadMcpResource",
+        ] {
+            assert!(names.contains(tool), "{tool} should remain available");
+        }
+
+        assert!(!names.contains("RemoteTrigger"));
+        assert!(!names.contains("mcp__auth"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-get-goal",
+            feature = "tool-create-goal",
+            feature = "tool-update-goal"
+        )
+    ))]
+    #[test]
+    fn read_only_agent_filter_allows_goal_reads_not_goal_writes() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "get_goal"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "create_goal"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "update_goal"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-grep",
+            feature = "tool-tool-search",
+            feature = "tool-write"
+        )
+    ))]
+    #[test]
+    fn search_only_agent_filter_keeps_tool_search() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "search-only");
+
+        assert!(filtered.iter().any(|tool| tool.name() == "ToolSearch"));
+        #[cfg(feature = "tool-grep")]
+        assert!(filtered.iter().any(|tool| tool.name() == "CodeSearch"));
+        assert!(filtered.iter().any(|tool| tool.name() == "Grep"));
+        assert!(!filtered.iter().any(|tool| tool.name() == "Write"));
+    }
+
+    #[tokio::test]
+    async fn search_only_agent_filter_reports_search_only_dynamic_denials() {
+        let tools: Arc<Vec<Box<dyn Tool>>> =
+            Arc::new(vec![Box::new(TestSearchOnlyMixedActionReadOnlyTool)]);
+        let filtered = filter_tools_for_agent(tools, "search-only");
+
+        assert_eq!(filtered.len(), 1);
+        let ctx = test_tool_context(Config::default());
+        let result = filtered[0]
+            .execute(serde_json::json!({"action": "write"}), &ctx)
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("search-only agent access"));
+        assert!(!result.content.contains("read-only agent access"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-bash",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
+    #[test]
+    fn agent_filter_visibility_config_matches_filtered_runtime_tools() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+        let mut config = Config::default();
+
+        mangocode_tools::restrict_config_to_available_tools(&mut config, filtered.as_ref());
+
+        assert!(config.allowed_tools.iter().any(|name| name == "ToolSearch"));
+        assert!(config.allowed_tools.iter().any(|name| name == "Read"));
+        assert!(!config.allowed_tools.iter().any(|name| name == "Bash"));
+        assert!(config.disallowed_tools.is_empty());
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-bash",
+            feature = "tool-powershell",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
+    #[test]
+    fn read_only_agent_filter_blocks_hidden_tool_aliases() {
+        let tools = build_tools_with_mcp(None, &[], &[]);
+        let filtered = filter_tools_for_agent(tools, "read-only");
+
+        assert!(mangocode_tools::resolve_tool(&filtered, "Read").is_some());
+        for hidden_alias in ["Bash", "shell_command", "container.exec", "PowerShell"] {
+            assert!(
+                mangocode_tools::resolve_tool(&filtered, hidden_alias).is_none(),
+                "{hidden_alias} must not resolve in read-only agent access"
+            );
+        }
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(
+            feature = "tool-agent",
+            feature = "tool-bash",
+            feature = "tool-read",
+            feature = "tool-tool-search"
+        )
+    ))]
+    #[test]
+    fn dynamic_tool_rebuild_preserves_named_agent_filter() {
+        let query_config = mangocode_query::QueryConfig {
+            agent_definition: Some(mangocode_core::config::AgentDefinition {
+                access: "read-only".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let tools = build_tools_for_query_config(None, &Config::default(), &query_config);
+
+        assert!(tools.iter().any(|tool| tool.name() == "ToolSearch"));
+        assert!(tools.iter().any(|tool| tool.name() == "Read"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name() == mangocode_core::constants::TOOL_NAME_AGENT));
+        assert!(!tools.iter().any(|tool| tool.name() == "Bash"));
+    }
+
+    #[cfg(any(
+        feature = "default-tools",
+        feature = "default-tools-no-web-research",
+        feature = "full-tools",
+        all(feature = "tool-bash", feature = "tool-tool-search")
+    ))]
+    #[test]
+    fn interactive_visibility_resync_survives_base_config_overwrite() {
+        let query_config = mangocode_query::QueryConfig {
+            agent_definition: Some(mangocode_core::config::AgentDefinition {
+                access: "read-only".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let tools = build_tools_for_query_config(None, &Config::default(), &query_config);
+        let mut tool_ctx = test_tool_context(Config::default());
+
+        sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
+        assert!(!tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "Bash"));
+
+        tool_ctx.config = Config::default();
+        assert!(tool_ctx.config.allowed_tools.is_empty());
+
+        sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
+        assert!(tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "ToolSearch"));
+        assert!(!tool_ctx
+            .config
+            .allowed_tools
+            .iter()
+            .any(|name| name == "Bash"));
+    }
+
+    #[test]
+    fn mcp_config_override_accepts_pipedream_aliases() {
+        let mut config = Config::default();
+
+        apply_mcp_config_override(
+            &mut config,
+            r#"{
+                "mcpServers": {
+                    "pd": {
+                        "command": "node",
+                        "pipedream": {
+                            "clientId": "client-1",
+                            "projectId": "project-1"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("valid pipedream config should parse");
+
+        let server = config.mcp_servers.iter().find(|server| server.name == "pd");
+        let pipedream = server
+            .and_then(|server| server.pipedream.as_ref())
+            .expect("pipedream config should be preserved");
+        assert_eq!(pipedream.client_id.as_deref(), Some("client-1"));
+        assert_eq!(pipedream.project_id.as_deref(), Some("project-1"));
+    }
+
+    #[test]
+    fn mcp_config_override_rejects_malformed_pipedream_config() {
+        let mut config = Config::default();
+
+        let err = apply_mcp_config_override(
+            &mut config,
+            r#"{
+                "mcpServers": {
+                    "pd": {
+                        "command": "node",
+                        "pipedream": 42
+                    }
+                }
+            }"#,
+        )
+        .expect_err("malformed pipedream config should fail");
+
+        assert!(err
+            .to_string()
+            .contains("Invalid pipedream config for MCP server 'pd'"));
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_config_override_rejects_invalid_array_entries_without_partial_merge() {
+        let mut config = Config::default();
+
+        let err =
+            apply_mcp_config_override(&mut config, r#"[{"name":"valid","command":"node"},42]"#)
+                .expect_err("invalid array entry should fail");
+
+        assert!(err
+            .to_string()
+            .contains("Invalid MCP server at index 1 in --mcp-config"));
+        assert!(config.mcp_servers.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP tool wrapper: makes MCP server tools look like native mangocode-tools.
+// ---------------------------------------------------------------------------
+
+struct SharedToolRef {
+    tools: Arc<Vec<Box<dyn Tool>>>,
+    index: usize,
+}
+
+impl SharedToolRef {
+    fn inner(&self) -> &dyn Tool {
+        self.tools[self.index].as_ref()
+    }
+}
+
+#[async_trait]
+impl Tool for SharedToolRef {
+    fn name(&self) -> &str {
+        self.inner().name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner().description()
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        self.inner().permission_level()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.inner().input_schema()
+    }
+
+    fn aliases(&self) -> Vec<String> {
+        self.inner().aliases()
+    }
+
+    fn capabilities(
+        &self,
+        input: &serde_json::Value,
+    ) -> mangocode_tools::runtime::ToolCapabilities {
+        self.inner().capabilities(input)
+    }
+
+    fn to_definition(&self) -> ToolDefinition {
+        self.inner().to_definition()
+    }
+
+    fn to_runtime_spec(&self) -> mangocode_tools::runtime::ToolSpec {
+        self.inner().to_runtime_spec()
+    }
+
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        self.inner().execute(input, ctx).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AgentToolRestriction {
+    ReadOnly,
+    SearchOnly,
+}
+
+impl AgentToolRestriction {
+    fn label(self) -> &'static str {
+        match self {
+            AgentToolRestriction::ReadOnly => "read-only",
+            AgentToolRestriction::SearchOnly => "search-only",
+        }
+    }
+
+    fn denied_capabilities(
+        self,
+        tool: &dyn Tool,
+        input: &serde_json::Value,
+    ) -> Option<mangocode_tools::runtime::ToolCapabilities> {
+        let capabilities = tool.capabilities(input);
+        match self {
+            AgentToolRestriction::ReadOnly | AgentToolRestriction::SearchOnly
+                if capabilities.mutating =>
+            {
+                Some(capabilities)
+            }
+            _ => None,
+        }
+    }
+
+    fn definition_note(self) -> &'static str {
+        match self {
+            AgentToolRestriction::ReadOnly | AgentToolRestriction::SearchOnly => {
+                " In this restricted agent context, mutating actions are unavailable and will be denied."
+            }
+        }
+    }
+
+    fn input_schema(self, tool: &dyn Tool) -> serde_json::Value {
+        let mut schema = tool.input_schema();
+        match self {
+            AgentToolRestriction::ReadOnly | AgentToolRestriction::SearchOnly => {
+                self.remove_mutating_action_variants(tool, &mut schema);
+            }
+        }
+        schema
+    }
+
+    fn has_allowed_action_variants(self, tool: &dyn Tool) -> bool {
+        let schema = tool.input_schema();
+        let Some(action_enum) = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|properties| properties.get("action"))
+            .and_then(|action| action.get("enum"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return true;
+        };
+
+        let actions = action_enum
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+        if actions.is_empty() {
+            return true;
+        }
+
+        actions.iter().any(|action| {
+            self.denied_capabilities(tool, &serde_json::json!({ "action": action }))
+                .is_none()
+        })
+    }
+
+    fn remove_mutating_action_variants(self, tool: &dyn Tool, schema: &mut serde_json::Value) {
+        let Some(action_schema) = schema
+            .get_mut("properties")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("action"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        let Some(action_enum) = action_schema
+            .get_mut("enum")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+
+        let original_actions: Vec<String> = action_enum
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect();
+        action_enum.retain(|value| {
+            let Some(action) = value.as_str() else {
+                return true;
+            };
+            self.denied_capabilities(tool, &serde_json::json!({ "action": action }))
+                .is_none()
+        });
+
+        let available_actions: Vec<String> = action_enum
+            .iter()
+            .filter_map(|value| value.as_str().map(ToString::to_string))
+            .collect();
+        if available_actions.len() != original_actions.len() {
+            let default_removed = action_schema
+                .get("default")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|default| !available_actions.iter().any(|action| action == default));
+            if default_removed {
+                if let Some(first_action) = available_actions.first() {
+                    action_schema.insert(
+                        "default".to_string(),
+                        serde_json::Value::String(first_action.clone()),
+                    );
+                } else {
+                    action_schema.remove("default");
+                }
+            }
+
+            let available = if available_actions.is_empty() {
+                "none".to_string()
+            } else {
+                available_actions.join(", ")
+            };
+            *action_schema
+                .entry("description")
+                .or_insert_with(|| serde_json::Value::String(String::new())) =
+                serde_json::Value::String(format!(
+                    "Available action values in this restricted agent context: {available}. Mutating action values are omitted and will be denied."
+                ));
+        }
+    }
+}
+
+enum AgentRestrictedToolInner {
+    Owned(Box<dyn Tool>),
+    Shared {
+        tools: Arc<Vec<Box<dyn Tool>>>,
+        index: usize,
+    },
+}
+
+struct AgentRestrictedTool {
+    inner: AgentRestrictedToolInner,
+    restriction: AgentToolRestriction,
+}
+
+impl AgentRestrictedTool {
+    fn owned(tool: Box<dyn Tool>, restriction: AgentToolRestriction) -> Self {
+        Self {
+            inner: AgentRestrictedToolInner::Owned(tool),
+            restriction,
+        }
+    }
+
+    fn shared(
+        tools: Arc<Vec<Box<dyn Tool>>>,
+        index: usize,
+        restriction: AgentToolRestriction,
+    ) -> Self {
+        Self {
+            inner: AgentRestrictedToolInner::Shared { tools, index },
+            restriction,
+        }
+    }
+
+    fn inner(&self) -> &dyn Tool {
+        match &self.inner {
+            AgentRestrictedToolInner::Owned(tool) => tool.as_ref(),
+            AgentRestrictedToolInner::Shared { tools, index } => tools[*index].as_ref(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AgentRestrictedTool {
+    fn name(&self) -> &str {
+        self.inner().name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner().description()
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        self.inner().permission_level()
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        self.restriction.input_schema(self.inner())
+    }
+
+    fn aliases(&self) -> Vec<String> {
+        self.inner().aliases()
+    }
+
+    fn capabilities(
+        &self,
+        input: &serde_json::Value,
+    ) -> mangocode_tools::runtime::ToolCapabilities {
+        self.inner().capabilities(input)
+    }
+
+    fn to_definition(&self) -> ToolDefinition {
+        let mut definition = self.inner().to_definition();
+        definition.input_schema = self.input_schema();
+        definition
+            .description
+            .push_str(self.restriction.definition_note());
+        definition
+    }
+
+    fn to_runtime_spec(&self) -> mangocode_tools::runtime::ToolSpec {
+        let mut spec = self.inner().to_runtime_spec();
+        spec.input_schema = self.input_schema();
+        spec.description
+            .push_str(self.restriction.definition_note());
+        spec
+    }
+
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        if let Some(capabilities) = self.restriction.denied_capabilities(self.inner(), &input) {
+            let mut message = format!(
+                "Tool '{}' denied by {} agent access because this action is mutating.",
+                self.name(),
+                self.restriction.label()
+            );
+            if !capabilities.affected_paths.is_empty() {
+                message.push_str(&format!(
+                    " Affected paths: {}",
+                    capabilities.affected_paths.join(", ")
+                ));
+            }
+            return ToolResult::error(message);
+        }
+        self.inner().execute(input, ctx).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI argument definition
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "mangocode",
+    version = VERSION,
+    about = "MangoCode - AI-powered coding assistant",
+    long_about = None,
+)]
+struct Cli {
+    /// Initial prompt to send (enables headless/print mode)
+    prompt: Option<String>,
+
+    /// Print mode: send prompt and exit (non-interactive)
+    #[arg(short = 'p', long = "print", action = ArgAction::SetTrue)]
+    print: bool,
+
+    /// Vault passphrase to unlock the local vault (enables loading provider keys from vault).
+    ///
+    /// NOTE: Passing secrets on the command line can leak via shell history and process lists.
+    /// Prefer `--vault-prompt` when possible.
+    #[arg(long = "vault-passphrase", value_name = "PASSPHRASE")]
+    vault_passphrase: Option<String>,
+
+    /// Prompt for vault passphrase even in headless/print mode.
+    #[arg(long = "vault-prompt", action = ArgAction::SetTrue)]
+    vault_prompt: bool,
+
+    /// Model to use (defaults to provider-appropriate model if not set)
+    #[arg(short = 'm', long = "model")]
+    model: Option<String>,
+
+    /// Permission mode
+    #[arg(long = "permission-mode", value_enum, default_value_t = CliPermissionMode::Default)]
+    permission_mode: CliPermissionMode,
+
+    /// Agent completion enforcement policy
+    #[arg(long = "completion-policy", value_enum)]
+    completion_policy: Option<CliCompletionPolicy>,
+
+    /// Verification policy for coding runs that modify files
+    #[arg(long = "verification-policy", value_enum)]
+    verification_policy: Option<CliVerificationPolicy>,
+
+    /// Reliability profile for source-grounded coding runs
+    #[arg(long = "agent-reliability-profile", value_enum)]
+    agent_reliability_profile: Option<CliReliabilityProfile>,
+
+    /// Speed/safety profile for agent tool dispatch
+    #[arg(long = "agent-speed-profile", value_enum)]
+    agent_speed_profile: Option<CliSpeedProfile>,
+
+    /// Resume a previous session by ID
+    #[arg(long = "resume")]
+    resume: Option<String>,
+
+    /// Maximum number of agentic turns; 0 disables the limit
+    #[arg(long = "max-turns", default_value_t = mangocode_core::constants::MAX_TURNS_DEFAULT)]
+    max_turns: u32,
+
+    /// Custom system prompt
+    #[arg(long = "system-prompt", short = 's')]
+    system_prompt: Option<String>,
+
+    /// Append to system prompt
+    #[arg(long = "append-system-prompt")]
+    append_system_prompt: Option<String>,
+
+    /// Disable AGENTS.md memory files
+    #[arg(long = "no-claude-md", action = ArgAction::SetTrue)]
+    no_claude_md: bool,
+
+    /// Output format
+    #[arg(long = "output-format", value_enum, default_value_t = CliOutputFormat::Text)]
+    output_format: CliOutputFormat,
+
+    /// Enable verbose logging
+    #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
+    verbose: bool,
+
+    /// API key (overrides ANTHROPIC_API_KEY env var)
+    #[arg(long = "api-key")]
+    api_key: Option<String>,
+
+    /// Maximum tokens per response
+    #[arg(long = "max-tokens")]
+    max_tokens: Option<u32>,
+
+    /// Working directory
+    #[arg(long = "cwd")]
+    cwd: Option<PathBuf>,
+
+    /// Bypass all permission checks (danger!)
+    #[arg(long = "dangerously-skip-permissions", action = ArgAction::SetTrue)]
+    dangerously_skip_permissions: bool,
+
+    /// Preview write operations without modifying files
+    #[arg(long = "dry-run", action = ArgAction::SetTrue)]
+    dry_run: bool,
+
+    /// Dump the system prompt to stdout and exit
+    #[arg(long = "dump-system-prompt", action = ArgAction::SetTrue, hide = true)]
+    dump_system_prompt: bool,
+
+    /// List available models and exit
+    #[arg(long = "list-models", action = ArgAction::SetTrue)]
+    list_models: bool,
+
+    /// MCP config JSON string (inline server definitions)
+    #[arg(long = "mcp-config")]
+    mcp_config: Option<String>,
+
+    /// Claude-compatible settings override (JSON string or path to JSON file)
+    #[arg(long = "settings")]
+    settings_override: Option<String>,
+
+    /// Disable auto-compaction
+    #[arg(long = "no-auto-compact", action = ArgAction::SetTrue)]
+    no_auto_compact: bool,
+
+    /// Grant MangoCode access to an additional directory (can be repeated)
+    #[arg(long = "add-dir", value_name = "DIR", action = ArgAction::Append)]
+    add_dir: Vec<PathBuf>,
+
+    /// Input format for --print mode (text or stream-json)
+    #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
+    input_format: CliInputFormat,
+
+    /// Session ID to tag this headless run (for tracking in logs/hooks)
+    #[arg(long = "session-id")]
+    session_id_flag: Option<String>,
+
+    /// Prefill the first assistant turn with this text
+    #[arg(long = "prefill")]
+    prefill: Option<String>,
+
+    /// Effort level for extended thinking (low, medium, high, max)
+    #[arg(long = "effort", value_name = "LEVEL")]
+    effort: Option<String>,
+
+    /// Extended thinking budget in tokens (enables extended thinking)
+    #[arg(long = "thinking", value_name = "TOKENS")]
+    thinking: Option<u32>,
+
+    /// Qwen/DashScope: request reasoning persistence across turns when supported by the model.
+    /// Only applied to supported Qwen 3.6 Plus model IDs.
+    #[arg(long = "qwen-preserve-thinking", action = ArgAction::SetTrue)]
+    qwen_preserve_thinking: bool,
+
+    /// Continue the most recent conversation
+    #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
+    continue_session: bool,
+
+    /// Override system prompt from a file
+    #[arg(long = "system-prompt-file")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Tools to allow (comma- or space-separated, default: all)
+    #[arg(
+        long = "allowed-tools",
+        alias = "allowedTools",
+        value_name = "TOOLS",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    allowed_tools: Vec<String>,
+
+    /// Tools to disallow (comma- or space-separated)
+    #[arg(
+        long = "disallowed-tools",
+        alias = "disallowedTools",
+        value_name = "TOOLS",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    disallowed_tools: Vec<String>,
+
+    /// Extra beta feature headers to send (comma-separated)
+    #[arg(long = "betas", value_name = "HEADERS")]
+    betas: Option<String>,
+
+    /// Disable all slash commands
+    #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
+    disable_slash_commands: bool,
+
+    /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
+    #[arg(long = "bare", action = ArgAction::SetTrue)]
+    bare: bool,
+
+    /// Billing workload tag
+    #[arg(long = "workload", value_name = "TAG")]
+    workload: Option<String>,
+
+    /// Maximum spend in USD before aborting the query loop
+    #[arg(long = "max-budget-usd", value_name = "USD")]
+    max_budget_usd: Option<f64>,
+
+    /// Fallback model to use if the primary model is overloaded or unavailable
+    #[arg(long = "fallback-model")]
+    fallback_model: Option<String>,
+
+    /// LLM provider to use (default: lmstudio). Examples: openai, openai-codex, google, ollama
+    #[arg(long, env = "MANGOCODE_PROVIDER")]
+    provider: Option<String>,
+
+    /// Override the API base URL for the selected provider
+    #[arg(long, env = "MANGOCODE_API_BASE")]
+    api_base: Option<String>,
+
+    /// Named agent to use (e.g., build, plan, explore, review, test, docs, debug, refactor)
+    #[arg(long, short = 'A')]
+    agent: Option<String>,
+
+    /// Run a one-shot self-review (critic) turn before finishing a file-changing
+    /// run. Equivalent to setting MANGOCODE_FLAG_SELF_REVIEW=1 for this invocation.
+    #[arg(long = "self-review", action = ArgAction::SetTrue)]
+    self_review: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliPermissionMode {
+    Default,
+    AcceptEdits,
+    BypassPermissions,
+    Plan,
+}
+
+impl From<CliPermissionMode> for PermissionMode {
+    fn from(m: CliPermissionMode) -> Self {
+        match m {
+            CliPermissionMode::Default => PermissionMode::Default,
+            CliPermissionMode::AcceptEdits => PermissionMode::AcceptEdits,
+            CliPermissionMode::BypassPermissions => PermissionMode::BypassPermissions,
+            CliPermissionMode::Plan => PermissionMode::Plan,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliCompletionPolicy {
+    #[value(alias = "enforced")]
+    #[value(alias = "on")]
+    #[value(alias = "enable")]
+    #[value(alias = "enabled")]
+    #[value(alias = "true")]
+    #[value(alias = "1")]
+    Enforce,
+    #[value(alias = "warning")]
+    #[value(alias = "advisory")]
+    Warn,
+    #[value(alias = "disable")]
+    #[value(alias = "disabled")]
+    #[value(alias = "false")]
+    #[value(alias = "0")]
+    #[value(alias = "none")]
+    Off,
+}
+
+impl From<CliCompletionPolicy> for AgentCompletionPolicy {
+    fn from(policy: CliCompletionPolicy) -> Self {
+        match policy {
+            CliCompletionPolicy::Enforce => AgentCompletionPolicy::Enforce,
+            CliCompletionPolicy::Warn => AgentCompletionPolicy::Warn,
+            CliCompletionPolicy::Off => AgentCompletionPolicy::Off,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliVerificationPolicy {
+    #[value(alias = "on")]
+    #[value(alias = "enable")]
+    #[value(alias = "enabled")]
+    #[value(alias = "true")]
+    #[value(alias = "1")]
+    Auto,
+    #[value(alias = "prompt")]
+    #[value(alias = "manual")]
+    Ask,
+    #[value(alias = "disable")]
+    #[value(alias = "disabled")]
+    #[value(alias = "false")]
+    #[value(alias = "0")]
+    #[value(alias = "none")]
+    Off,
+}
+
+impl From<CliVerificationPolicy> for VerificationPolicy {
+    fn from(policy: CliVerificationPolicy) -> Self {
+        match policy {
+            CliVerificationPolicy::Auto => VerificationPolicy::Auto,
+            CliVerificationPolicy::Ask => VerificationPolicy::Ask,
+            CliVerificationPolicy::Off => VerificationPolicy::Off,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliReliabilityProfile {
+    #[value(alias = "balanced")]
+    #[value(alias = "normal")]
+    Standard,
+    #[value(alias = "reliable")]
+    #[value(alias = "reliable_autonomy")]
+    #[value(alias = "reliable-autonomy")]
+    #[value(alias = "default")]
+    Strict,
+}
+
+impl From<CliReliabilityProfile> for AgentReliabilityProfile {
+    fn from(profile: CliReliabilityProfile) -> Self {
+        match profile {
+            CliReliabilityProfile::Standard => AgentReliabilityProfile::Standard,
+            CliReliabilityProfile::Strict => AgentReliabilityProfile::Strict,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliSpeedProfile {
+    #[value(alias = "balance")]
+    #[value(alias = "standard")]
+    Balanced,
+    #[value(alias = "fast_safe")]
+    #[value(alias = "fast")]
+    #[value(alias = "safe_fast")]
+    #[value(alias = "safe-fast")]
+    #[value(alias = "default")]
+    FastSafe,
+}
+
+impl From<CliSpeedProfile> for AgentSpeedProfile {
+    fn from(profile: CliSpeedProfile) -> Self {
+        match profile {
+            CliSpeedProfile::Balanced => AgentSpeedProfile::Balanced,
+            CliSpeedProfile::FastSafe => AgentSpeedProfile::FastSafe,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliOutputFormat {
+    Text,
+    Json,
+    #[value(name = "stream-json")]
+    StreamJson,
+}
+
+impl From<CliOutputFormat> for mangocode_core::config::OutputFormat {
+    fn from(f: CliOutputFormat) -> Self {
+        match f {
+            CliOutputFormat::Text => mangocode_core::config::OutputFormat::Text,
+            CliOutputFormat::Json => mangocode_core::config::OutputFormat::Json,
+            CliOutputFormat::StreamJson => mangocode_core::config::OutputFormat::StreamJson,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum CliInputFormat {
+    /// Plain text prompt (default)
+    Text,
+    /// Newline-delimited JSON messages — each line is {"role":"user"|"assistant","content":"..."}
+    #[value(name = "stream-json")]
+    StreamJson,
+}
+
+fn resolve_bridge_config(
+    settings: &Settings,
+    auth_credential: &str,
+    use_bearer_auth: bool,
+    is_headless: bool,
+) -> Option<mangocode_bridge::BridgeConfig> {
+    if is_headless {
+        return None;
+    }
+
+    let mut bridge_config = mangocode_bridge::BridgeConfig::from_env();
+
+    if settings.remote_control_at_startup {
+        bridge_config.enabled = true;
+    }
+
+    if bridge_config.session_token.is_none() && use_bearer_auth && !auth_credential.is_empty() {
+        bridge_config.session_token = Some(auth_credential.to_string());
+    }
+
+    bridge_config.is_active().then_some(bridge_config)
+}
+
+fn normalize_tool_list(raw_values: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in raw_values {
+        for token in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+            let t = token.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+fn parse_hook_event(name: &str) -> Option<HookEvent> {
+    let normalized = name.replace(['-', '_'], "").to_ascii_lowercase();
+    match normalized.as_str() {
+        "sessionstart" => Some(HookEvent::SessionStart),
+        "pretooluse" => Some(HookEvent::PreToolUse),
+        "posttooluse" => Some(HookEvent::PostToolUse),
+        "precompact" => Some(HookEvent::PreCompact),
+        "postcompact" => Some(HookEvent::PostCompact),
+        "postmodelturn" => Some(HookEvent::PostModelTurn),
+        "userpromptsubmit" => Some(HookEvent::UserPromptSubmit),
+        "sessionend" => Some(HookEvent::SessionEnd),
+        "notification" => Some(HookEvent::Notification),
+        "stop" => Some(HookEvent::Stop),
+        _ => None,
+    }
+}
+
+fn parse_hook_entries(value: &serde_json::Value) -> Vec<HookEntry> {
+    let mut entries = Vec::new();
+
+    match value {
+        serde_json::Value::String(command) => {
+            if !command.trim().is_empty() {
+                entries.push(HookEntry {
+                    command: command.trim().to_string(),
+                    tool_filter: None,
+                    blocking: true,
+                });
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                entries.extend(parse_hook_entries(item));
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(nested) = obj.get("hooks") {
+                entries.extend(parse_hook_entries(nested));
+            }
+
+            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                let command = cmd.trim();
+                if !command.is_empty() {
+                    entries.push(HookEntry {
+                        command: command.to_string(),
+                        tool_filter: obj
+                            .get("tool_filter")
+                            .or_else(|| obj.get("toolFilter"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        blocking: obj
+                            .get("blocking")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+
+    entries
+}
+
+fn parse_mcp_server_from_value(
+    name: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<McpServerConfig> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("MCP server '{name}' must be an object"))?;
+    let command = obj
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let args = obj
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let env = obj
+        .get("env")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let url = obj
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let headers = obj
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let pipedream = obj
+        .get("pipedream")
+        .map(|v| {
+            serde_json::from_value::<PipedreamMcpConfig>(v.clone()).map_err(|err| {
+                anyhow::anyhow!("Invalid pipedream config for MCP server '{name}': {err}")
+            })
+        })
+        .transpose()?;
+    let server_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if url.is_some() {
+                "sse".to_string()
+            } else {
+                "stdio".to_string()
+            }
+        });
+
+    Ok(McpServerConfig {
+        name: name.to_string(),
+        command,
+        args,
+        env,
+        url,
+        headers,
+        pipedream,
+        server_type,
+    })
+}
+
+fn merge_mcp_servers(config: &mut Config, servers: Vec<McpServerConfig>) {
+    for server in servers {
+        if let Some(existing) = config
+            .mcp_servers
+            .iter_mut()
+            .find(|s| s.name == server.name)
+        {
+            *existing = server;
+        } else {
+            config.mcp_servers.push(server);
+        }
+    }
+}
+
+fn mcp_server_configs_equal(left: &[McpServerConfig], right: &[McpServerConfig]) -> bool {
+    serde_json::to_value(left).ok() == serde_json::to_value(right).ok()
+}
+
+fn make_permission_handler(
+    is_headless: bool,
+    mode: &PermissionMode,
+) -> Arc<dyn mangocode_core::PermissionHandler> {
+    if is_headless {
+        Arc::new(AutoPermissionHandler { mode: mode.clone() })
+    } else {
+        Arc::new(InteractivePermissionHandler { mode: mode.clone() })
+    }
+}
+
+fn apply_settings_override(config: &mut Config, raw: &str) -> anyhow::Result<()> {
+    let trimmed = raw.trim();
+    let value: serde_json::Value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("Invalid --settings JSON: {e}"))?
+    } else {
+        let content = std::fs::read_to_string(trimmed)
+            .map_err(|e| anyhow::anyhow!("Failed to read --settings file '{trimmed}': {e}"))?;
+        let content = content.trim_start_matches('\u{feff}');
+        serde_json::from_str(content)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON in --settings file '{trimmed}': {e}"))?
+    };
+
+    let hooks_value = value
+        .get("hooks")
+        .or_else(|| value.get("config").and_then(|cfg| cfg.get("hooks")));
+    if let Some(hooks_obj) = hooks_value.and_then(|v| v.as_object()) {
+        for (event_name, entries_value) in hooks_obj {
+            if let Some(event) = parse_hook_event(event_name) {
+                let entries = parse_hook_entries(entries_value);
+                if !entries.is_empty() {
+                    config.hooks.insert(event, entries);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_mcp_config_override(config: &mut Config, raw: &str) -> anyhow::Result<()> {
+    let trimmed = raw.trim();
+    let value: serde_json::Value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("Invalid --mcp-config JSON: {e}"))?
+    } else {
+        let content = std::fs::read_to_string(trimmed)
+            .map_err(|e| anyhow::anyhow!("Failed to read --mcp-config file '{trimmed}': {e}"))?;
+        let content = content.trim_start_matches('\u{feff}');
+        serde_json::from_str(content)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON in --mcp-config file '{trimmed}': {e}"))?
+    };
+
+    let mut parsed = Vec::new();
+
+    if let Some(obj) = value.get("mcpServers").and_then(|v| v.as_object()) {
+        for (name, server_value) in obj {
+            parsed.push(parse_mcp_server_from_value(name, server_value)?);
+        }
+    } else if let Some(arr) = value.as_array() {
+        for (index, item) in arr.iter().enumerate() {
+            let server =
+                serde_json::from_value::<McpServerConfig>(item.clone()).map_err(|err| {
+                    anyhow::anyhow!("Invalid MCP server at index {index} in --mcp-config: {err}")
+                })?;
+            parsed.push(server);
+        }
+    }
+
+    if parsed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--mcp-config did not contain any valid MCP servers"
+        ));
+    }
+
+    merge_mcp_servers(config, parsed);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Fast-path: handle --version before parsing everything
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("MangoCode v{}", VERSION);
+        return Ok(());
+    }
+
+    // Fast-path: `claude auth <login|logout|status>`
+    if raw_args.get(1).map(|s| s.as_str()) == Some("auth") {
+        return handle_auth_command(&raw_args[2..]).await;
+    }
+
+    // Fast-path: `claude acp` — start the Agent Client Protocol stdio server.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("acp") {
+        return mangocode_acp::run_acp_server().await;
+    }
+
+    // Fast-path: `claude models` — list all available providers and models.
+    if raw_args.get(1).map(|s| s.as_str()) == Some("models") {
+        let mut registry = mangocode_api::ModelRegistry::new();
+        // Load cached models.dev data if available so the list is comprehensive.
+        registry.load_standard_cache();
+        let mut entries = registry.list_all();
+        // Sort by provider then model id for stable output.
+        entries.sort_by(|a, b| {
+            (*a.info.provider_id)
+                .cmp(&*b.info.provider_id)
+                .then_with(|| (*a.info.id).cmp(&*b.info.id))
+        });
+        for entry in entries {
+            println!(
+                "{}/{} — {} (ctx: {}K, in: ${:.2}/M, out: ${:.2}/M)",
+                entry.info.provider_id,
+                entry.info.id,
+                entry.info.name,
+                entry.info.context_window / 1000,
+                entry.cost_input.unwrap_or(0.0),
+                entry.cost_output.unwrap_or(0.0),
+            );
+        }
+        return Ok(());
+    }
+
+    // Fast-path: named commands (`claude agents`, `claude ide`, `claude branch`, …)
+    // Check before Cli::parse() so these names don't conflict with positional prompt arg.
+    if let Some(cmd_name) = raw_args.get(1).map(|s| s.as_str()) {
+        // Only intercept if it looks like a subcommand (no leading `-` or `/`)
+        if !cmd_name.starts_with('-') && !cmd_name.starts_with('/') {
+            if let Some(named_cmd) =
+                mangocode_commands::named_commands::find_named_command(cmd_name)
+            {
+                // Build a minimal CommandContext (named commands are pre-session)
+                let settings = match Settings::load().await {
+                    Ok(settings) => settings,
+                    Err(e) => {
+                        eprintln!("Error: failed to load settings: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let config = settings.effective_config();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let cmd_ctx = mangocode_commands::CommandContext {
+                    config,
+                    cost_tracker: CostTracker::new(),
+                    session_metrics: None,
+                    messages: vec![],
+                    effort_level: None,
+                    working_dir: cwd,
+                    session_id: "pre-session".to_string(),
+                    session_title: None,
+                    remote_session_url: None,
+                    mcp_manager: None,
+                    model_registry: None,
+                };
+                // Collect remaining args after the command name
+                let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
+                let result = named_cmd.execute_named(&rest, &cmd_ctx);
+                match result {
+                    mangocode_commands::CommandResult::Message(msg)
+                    | mangocode_commands::CommandResult::UserMessage(msg) => {
+                        println!("{}", msg);
+                        std::process::exit(0);
+                    }
+                    mangocode_commands::CommandResult::ReloadAuthStore(msg) => {
+                        println!("{}", msg);
+                        std::process::exit(0);
+                    }
+                    mangocode_commands::CommandResult::Error(e) => {
+                        eprintln!("Error: {}", e);
+                        eprintln!("Usage: {}", named_cmd.usage());
+                        std::process::exit(1);
+                    }
+                    _ => {
+                        // For any other result variant, fall through to normal startup
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    let mut cli = Cli::parse();
+
+    // Promote --self-review to the feature-flag env override before any flag is
+    // read (FeatureFlags merges MANGOCODE_FLAG_* env vars at init). Non-persisting:
+    // affects only this process, not flags.json.
+    if cli.self_review {
+        std::env::set_var("MANGOCODE_FLAG_SELF_REVIEW", "1");
+    }
+
+    // Setup logging
+    let log_level = if cli.verbose { "debug" } else { "warn" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
+        )
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .init();
+
+    // Determine working directory
+    let cwd = cli
+        .cwd
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let is_headless = cli.print || cli.prompt.is_some() || cli.dump_system_prompt;
+
+    debug!(cwd = %cwd.display(), "Starting MangoCode");
+
+    // Load settings from disk (hierarchical: global < project)
+    let (settings, settings_diagnostics) = Settings::load_hierarchical_with_diagnostics(&cwd).await;
+    if is_headless && !settings_diagnostics.is_empty() {
+        anyhow::bail!(
+            "failed to load settings:\n{}",
+            format_settings_load_diagnostics(&settings_diagnostics)
+        );
+    }
+
+    // Build effective config (CLI args override settings)
+    let mut config = settings.effective_config();
+    if let Some(ref key) = cli.api_key {
+        config.api_key = Some(key.clone());
+    }
+    apply_cli_model_override(&mut config, cli.model.as_deref())?;
+    if let Some(mt) = cli.max_tokens {
+        config.max_tokens = Some(mt);
+    }
+    config.verbose = cli.verbose;
+    if cli.qwen_preserve_thinking {
+        config.preserve_thinking = true;
+    }
+    config.output_format = cli.output_format.into();
+    config.disable_claude_mds = cli.no_claude_md || cli.bare;
+    if cli.bare {
+        // --bare promises "no hooks, no plugins, no AGENTS.md": plugins are
+        // skipped at load time below; hooks are cleared here.
+        config.hooks.clear();
+    }
+    if let Some(sp) = cli.system_prompt.clone() {
+        config.custom_system_prompt = Some(sp);
+    } else if let Some(ref path) = cli.system_prompt_file {
+        let contents = std::fs::read_to_string(path).with_context(|| {
+            format!("Failed to read --system-prompt-file {}", path.display())
+        })?;
+        config.custom_system_prompt = Some(contents);
+    }
+    if let Some(asp) = cli.append_system_prompt.clone() {
+        config.append_system_prompt = Some(asp);
+    }
+    if cli.dangerously_skip_permissions {
+        // Block bypass mode when running as root/sudo.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons"
+            );
+        }
+        config.permission_mode = PermissionMode::BypassPermissions;
+    } else {
+        config.permission_mode = cli.permission_mode.into();
+    }
+    if cli.dry_run {
+        config.dry_run = true;
+    }
+    if let Some(policy) = cli.completion_policy {
+        config.agent_completion_policy = policy.into();
+    }
+    if let Some(policy) = cli.verification_policy {
+        config.verification_policy = policy.into();
+    }
+    if let Some(profile) = cli.agent_reliability_profile {
+        config.agent_reliability_profile = profile.into();
+    }
+    if let Some(profile) = cli.agent_speed_profile {
+        config.agent_speed_profile = profile.into();
+    }
+    config.additional_dirs = cli.add_dir.clone();
+    if cli.no_auto_compact {
+        config.auto_compact = false;
+    }
+    config.project_dir = Some(cwd.clone());
+    if let Some(p) = &cli.provider {
+        config.provider = Some(p.clone());
+    } else if config.provider.is_none() {
+        config.provider = Some("lmstudio".to_string());
+    }
+    if let Some(base) = &cli.api_base {
+        // Store in the provider's config entry
+        let provider_id = config
+            .provider
+            .clone()
+            .unwrap_or_else(|| "lmstudio".to_string());
+        config
+            .provider_configs
+            .entry(provider_id)
+            .or_default()
+            .api_base = Some(base.clone());
+    }
+    if !cli.allowed_tools.is_empty() {
+        config.allowed_tools = normalize_tool_list(&cli.allowed_tools);
+    }
+    if !cli.disallowed_tools.is_empty() {
+        config.disallowed_tools = normalize_tool_list(&cli.disallowed_tools);
+    }
+    if let Some(ref settings_override) = cli.settings_override {
+        apply_settings_override(&mut config, settings_override)?;
+    }
+    if let Some(ref mcp_config) = cli.mcp_config {
+        apply_mcp_config_override(&mut config, mcp_config)?;
+    }
+    sync_approval_reviewer_runtime(&config);
+
+    // --list-models fast path
+    if cli.list_models {
+        let mut registry = mangocode_api::ModelRegistry::new();
+        registry.load_standard_cache();
+        let mut entries = registry.list_all();
+        entries.sort_by(|a, b| {
+            (*a.info.provider_id)
+                .cmp(&*b.info.provider_id)
+                .then_with(|| (*a.info.id).cmp(&*b.info.id))
+        });
+
+        match cli.output_format {
+            CliOutputFormat::Json | CliOutputFormat::StreamJson => {
+                let mut grouped: serde_json::Map<String, serde_json::Value> =
+                    serde_json::Map::new();
+                for entry in &entries {
+                    let provider = entry.info.provider_id.to_string();
+                    let model_obj = serde_json::json!({
+                        "id": &*entry.info.id,
+                        "name": &entry.info.name,
+                        "provider": &provider,
+                        "context_window": entry.info.context_window,
+                        "max_output_tokens": entry.info.max_output_tokens,
+                        "cost_per_million_input_tokens": entry.cost_input,
+                        "cost_per_million_output_tokens": entry.cost_output,
+                    });
+                    let provider_models = grouped
+                        .entry(provider)
+                        .or_insert_with(|| serde_json::json!([]));
+                    if let Some(models) = provider_models.as_array_mut() {
+                        models.push(model_obj);
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&grouped)?);
+            }
+            CliOutputFormat::Text => {
+                let mut current_provider = String::new();
+                for entry in &entries {
+                    let provider = entry.info.provider_id.to_string();
+                    if provider != current_provider {
+                        if !current_provider.is_empty() {
+                            println!();
+                        }
+                        println!("{}:", provider);
+                        current_provider = provider;
+                    }
+                    print!(
+                        "  {:<40} {:>6}K ctx  {:>6} max out",
+                        &*entry.info.id,
+                        entry.info.context_window / 1000,
+                        entry.info.max_output_tokens,
+                    );
+                    if let (Some(ci), Some(co)) = (entry.cost_input, entry.cost_output) {
+                        print!("  ${:.2}/${:.2} per 1M tok", ci, co);
+                    }
+                    println!();
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // --dump-system-prompt fast path
+    if cli.dump_system_prompt {
+        let system_prompt = build_session_system_prompt(cwd.clone(), &config, is_headless).await;
+        println!("{system_prompt}");
+        return Ok(());
+    }
+
+    let system_prompt = build_session_system_prompt(cwd.clone(), &config, is_headless).await;
+
+    // Initialize API client.
+    // Try config/env first; fall back to saved OAuth tokens.
+    // If no Anthropic credentials are found, check whether any other provider is
+    // configured (OpenAI, Google, Ollama, Groq, etc.) — if so, proceed without
+    // requiring Anthropic auth. Only launch the OAuth flow when Anthropic is
+    // explicitly the intended provider and no key exists at all.
+    let other_provider_configured = {
+        let active_provider = config.provider.as_deref().unwrap_or("lmstudio");
+        let has_non_anthropic_env = std::env::var("OPENAI_API_KEY").is_ok()
+            || std::env::var("GOOGLE_API_KEY").is_ok()
+            || std::env::var("GOOGLE_GENERATIVE_AI_API_KEY").is_ok()
+            || std::env::var("GROQ_API_KEY").is_ok()
+            || std::env::var("XAI_API_KEY").is_ok()
+            || std::env::var("MISTRAL_API_KEY").is_ok()
+            || std::env::var("OPENROUTER_API_KEY").is_ok()
+            || std::env::var("DEEPSEEK_API_KEY").is_ok()
+            || std::env::var("COHERE_API_KEY").is_ok()
+            || std::env::var("TOGETHER_API_KEY").is_ok()
+            || std::env::var("PERPLEXITY_API_KEY").is_ok()
+            || std::env::var("CEREBRAS_API_KEY").is_ok()
+            || std::env::var("DEEPINFRA_API_KEY").is_ok()
+            || std::env::var("VENICE_API_KEY").is_ok()
+            || std::env::var("DASHSCOPE_API_KEY").is_ok()
+            || std::env::var("AZURE_API_KEY").is_ok()
+            || std::env::var("GITHUB_TOKEN").is_ok()
+            || std::env::var("MINIMAX_API_KEY").is_ok()
+            || std::env::var("SAMBANOVA_API_KEY").is_ok()
+            || std::env::var("HF_TOKEN").is_ok()
+            || std::env::var("HUGGINGFACE_HUB_TOKEN").is_ok()
+            || std::env::var("HUGGINGFACE_API_KEY").is_ok()
+            || std::env::var("NVIDIA_API_KEY").is_ok()
+            || std::env::var("SILICONFLOW_API_KEY").is_ok()
+            || std::env::var("MOONSHOT_API_KEY").is_ok()
+            || std::env::var("ZHIPU_API_KEY").is_ok()
+            || std::env::var("NEBIUS_API_KEY").is_ok()
+            || std::env::var("NOVITA_API_KEY").is_ok()
+            || std::env::var("OVHCLOUD_API_KEY").is_ok()
+            || std::env::var("SCALEWAY_API_KEY").is_ok()
+            || std::env::var("VULTR_API_KEY").is_ok()
+            || std::env::var("BASETEN_API_KEY").is_ok()
+            || std::env::var("FRIENDLI_TOKEN").is_ok()
+            || std::env::var("UPSTAGE_API_KEY").is_ok()
+            || std::env::var("STEPFUN_API_KEY").is_ok()
+            || std::env::var("FIREWORKS_API_KEY").is_ok()
+            || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
+            || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+            || std::env::var("AWS_SECRET_ACCESS_KEY").is_ok()
+            || std::env::var("AWS_SESSION_TOKEN").is_ok()
+            || std::env::var("AWS_REGION").is_ok()
+            || std::env::var("AWS_DEFAULT_REGION").is_ok()
+            || std::env::var("VERTEX_PROJECT_ID").is_ok()
+            || std::env::var("VERTEX_ACCESS_TOKEN").is_ok()
+            // Forward-looking / gateway-style credentials (may be used by optional providers)
+            || std::env::var("CLOUDFLARE_API_TOKEN").is_ok()
+            || std::env::var("AICORE_SERVICE_KEY").is_ok()
+            || std::env::var("GITLAB_TOKEN").is_ok()
+            // Local providers are always available
+            || true; // Ollama/LM Studio don't require keys
+        active_provider != "anthropic" || has_non_anthropic_env
+    };
+
+    let vault = mangocode_core::Vault::new();
+    // If a vault exists, offer a one-time optional unlock so keys for *any*
+    // provider can be resolved from the vault (not just Anthropic).
+    if vault.exists() && mangocode_core::get_vault_passphrase().is_none() {
+        // 1) Non-interactive unlock via CLI flag (works in headless).
+        if let Some(passphrase) = cli.vault_passphrase.clone().filter(|p| !p.is_empty()) {
+            match vault.load(&passphrase) {
+                Ok(_) => {
+                    mangocode_core::set_vault_passphrase(passphrase);
+                    info!("Vault unlocked");
+                }
+                Err(e) => {
+                    warn!(error = %e, "Vault unlock failed: {} — using env vars", e);
+                }
+            }
+        } else if !is_headless || cli.vault_prompt {
+            // 2) Interactive prompt (default only when not headless; can be forced in headless).
+            match prompt_password("Vault passphrase (or Enter to skip): ") {
+                Ok(passphrase) if !passphrase.is_empty() => match vault.load(&passphrase) {
+                    Ok(_) => {
+                        mangocode_core::set_vault_passphrase(passphrase);
+                        info!("Vault unlocked");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Vault unlock failed: {} — using env vars", e);
+                    }
+                },
+                _ => info!("Vault skipped — using env vars only"),
+            }
+        }
+    } else if !vault.exists() && !is_headless {
+        // No vault exists and we're in interactive mode - offer to initialize
+        eprintln!(
+            "No vault found. The vault securely stores API keys encrypted with a passphrase."
+        );
+        eprint!("Would you like to create a vault? [Y/n]: ");
+        flush_stdout_for("vault initialization prompt");
+
+        let mut response = String::new();
+        if std::io::stdin().read_line(&mut response).is_ok() {
+            let response = response.trim().to_lowercase();
+            if response.is_empty() || response == "y" || response == "yes" {
+                // Prompt for passphrase
+                match prompt_password("Enter vault passphrase: ") {
+                    Ok(pass1) if !pass1.is_empty() => {
+                        match prompt_password("Confirm vault passphrase: ") {
+                            Ok(pass2) if pass1 == pass2 => {
+                                let data = mangocode_core::vault::VaultData::default();
+                                match vault.save(&data, &pass1) {
+                                    Ok(_) => {
+                                        mangocode_core::set_vault_passphrase(pass1);
+                                        eprintln!("Vault created and unlocked successfully.");
+                                        info!("Vault initialized");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to initialize vault: {}", e);
+                                        warn!(error = %e, "Vault initialization failed: {}", e);
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                eprintln!("Passphrases do not match. Vault creation cancelled.");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to read confirmation: {}", e);
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("No passphrase entered. Vault creation cancelled.");
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read passphrase: {}", e);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "Vault creation skipped. You can create one later with: mangocode vault init"
+                );
+            }
+        }
+    }
+
+    let mut cached_tokens = mangocode_core::oauth::OAuthTokens::load().await;
+    if let Some(ref tokens) = cached_tokens {
+        if tokens.is_expired_or_expiring_soon() {
+            match crate::oauth_flow::refresh_oauth_token(tokens).await {
+                Ok(refreshed) => {
+                    tracing::info!("OAuth token refreshed");
+                    cached_tokens = Some(refreshed);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Token refresh failed - will re-login if needed");
+                }
+            }
+        }
+    }
+
+    // Keep `auth.json` aligned with `oauth_tokens.json` for Claude Max so the
+    // provider registry's AnthropicMaxProvider is not stuck on a stale access token.
+    if let Some(ref t) = cached_tokens {
+        if t.uses_bearer_auth() {
+            if let Err(err) = mangocode_core::AuthStore::sync_anthropic_max_from_oauth_tokens(t) {
+                tracing::warn!(
+                    error = %err,
+                    "failed to sync Claude Max OAuth credentials into auth store"
+                );
+            }
+        }
+    }
+
+    let stored_anthropic_key = if config.provider.as_deref().unwrap_or("lmstudio") == "anthropic" {
+        mangocode_core::AuthStore::load().api_key_for("anthropic")
+    } else {
+        None
+    };
+    let has_stored_anthropic_key = stored_anthropic_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+
+    let resolved_auth = config
+        .resolve_auth_async()
+        .await
+        .or_else(|| {
+            cached_tokens.as_ref().and_then(|tokens| {
+                tokens
+                    .effective_credential()
+                    .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+            })
+        })
+        .or_else(|| stored_anthropic_key.clone().map(|key| (key, false)));
+
+    let (api_key, use_bearer_auth) = match resolved_auth {
+        Some(auth) => auth,
+        None if other_provider_configured
+            && config.provider.as_deref().unwrap_or("lmstudio") != "anthropic" =>
+        {
+            // Non-Anthropic provider selected — no Anthropic key needed.
+            (String::new(), false)
+        }
+        None => {
+            // No Anthropic credential found.
+            let active_provider = config.provider.as_deref().unwrap_or("lmstudio");
+
+            // Root-cause fix for a stale settings.json that still pins
+            // `provider: "anthropic"` from before the default became lmstudio:
+            // if the user did NOT explicitly choose anthropic on the CLI and no
+            // Anthropic credential exists, anthropic is simply unusable here, so
+            // fall back to the local default rather than hard-failing the run.
+            // An explicit `--provider anthropic` still gets the clear error.
+            if is_headless && active_provider == "anthropic" && cli.provider.is_none() {
+                tracing::warn!(
+                    "settings.json selects provider=\"anthropic\" but no Anthropic \
+                     credential was found; falling back to the local `lmstudio` \
+                     provider. Pass --provider or set ANTHROPIC_API_KEY to override."
+                );
+                config.provider = Some("lmstudio".to_string());
+                // A stale Anthropic-specific model (e.g. `claude-opus-4-6`) would
+                // still route to Anthropic auth under the local provider; drop it
+                // unless the user explicitly chose a model on the CLI, so the
+                // provider's own default model (`effective_model`) applies.
+                if cli.model.is_none() {
+                    let anthropic_model = config.model.as_deref().is_some_and(|m| {
+                        let m = m.trim().to_ascii_lowercase();
+                        m.starts_with("claude") || m.starts_with("anthropic/")
+                    });
+                    if anthropic_model {
+                        config.model = None;
+                    }
+                }
+                (String::new(), false)
+            } else if is_headless {
+                anyhow::bail!(
+                    "No API key found for the active provider `{active_provider}`.\n\
+                     (The provider is read from --provider, else ~/.mangocode/settings.json, \
+                     else the built-in default `lmstudio`. If settings.json pins \
+                     `provider: \"anthropic\"` from an older version, pass --provider or update it.)\n\
+                     Options:\n\
+                     - Run `mangocode --provider lmstudio` / `--provider ollama` for local models (no key needed)\n\
+                     - Set ANTHROPIC_API_KEY for Anthropic\n\
+                     - Set OPENAI_API_KEY for OpenAI (usage-based API; not ChatGPT-plan Codex)\n\
+                     - For OpenAI Codex (ChatGPT plan): run MangoCode interactively once, `/connect` → OpenAI Codex (OAuth), then use `--provider openai-codex` headless with `~/.mangocode/auth.json` populated\n\
+                     - Set GOOGLE_API_KEY for Google Gemini\n\
+                     - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
+                     - Run `mangocode auth login` for Anthropic OAuth"
+                );
+            } else {
+                // Interactive mode: start the TUI anyway — the provider setup
+                // dialog will be shown inside the TUI, just like OpenCode does.
+                (String::new(), false)
+            }
+        }
+    };
+
+    let mut client_config = mangocode_api::client::ClientConfig {
+        api_key: api_key.clone(),
+        api_base: config.resolve_api_base(),
+        use_bearer_auth,
+        ..Default::default()
+    };
+    if let Some(betas) = cli.betas.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if client_config.beta_features.is_empty() {
+            client_config.beta_features = betas.to_string();
+        } else {
+            client_config.beta_features = format!("{},{}", client_config.beta_features, betas);
+        }
+    }
+    if let Some(workload) = cli
+        .workload
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Sanitize to a safe billing-tag token: drop any character outside
+        // [A-Za-z0-9_.-] so a crafted value cannot inject ';'/'=' and forge
+        // extra key=value pairs in the x-anthropic-billing-header.
+        let sanitized: String = workload
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+            .collect();
+        if !sanitized.is_empty() {
+            client_config.workload = sanitized.clone();
+            // Also publish it process-wide so provider-built configs pick it up.
+            mangocode_api::set_workload_override(sanitized);
+        }
+    }
+    let client_config = client_config;
+    let client = Arc::new(
+        mangocode_api::AnthropicClient::new(client_config.clone())
+            .context("Failed to create API client")?,
+    );
+
+    // Build provider registry: auto-registers all env-configured providers
+    // AND providers with keys stored in ~/.mangocode/auth.json (from /connect).
+    // Anthropic is always the default; additional providers (OpenAI, Google,
+    // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
+    // their respective environment variables or auth store entries are found.
+    //
+    // Clone the config so the original is available later for rebuilding the
+    // registry when `/connect` adds a new provider at runtime.
+    let provider_registry =
+        mangocode_api::ProviderRegistry::from_environment_with_auth_store(client_config.clone());
+
+    let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
+    if let Some(cfg) = bridge_config.as_ref() {
+        info!(
+            server_url = %cfg.server_url,
+            startup_enabled = settings.remote_control_at_startup,
+            "Remote control bridge configured for interactive startup"
+        );
+    }
+
+    // Build tools
+    // Interactive mode uses InteractivePermissionHandler which allows writes in Default mode
+    // (the user is watching the TUI so they can intervene). Headless/print mode uses
+    // AutoPermissionHandler which denies writes in Default mode for safety.
+    let permission_handler = make_permission_handler(is_headless, &config.permission_mode);
+    let cost_tracker = CostTracker::new();
+    let session_metrics = mangocode_core::analytics::SessionMetrics::new();
+    // -c/--continue resumes the most recently updated session, preferring
+    // sessions recorded for the current project directory; falls back to the
+    // global most-recent session when this project has none.
+    if cli.continue_session && cli.resume.is_none() {
+        let sessions = mangocode_core::history::list_sessions().await;
+        let cwd_str = cwd.display().to_string();
+        let latest = sessions
+            .iter()
+            .find(|s| s.working_dir.as_deref() == Some(cwd_str.as_str()))
+            .or_else(|| sessions.first());
+        match latest {
+            Some(latest) => {
+                info!(session_id = %latest.id, "--continue: resuming most recent session");
+                cli.resume = Some(latest.id.clone());
+            }
+            None => {
+                warn!("--continue requested but no prior sessions found; starting fresh");
+            }
+        }
+    }
+
+    // Use --session-id if provided, otherwise generate a fresh UUID.
+    let session_id = cli
+        .session_id_flag
+        .clone()
+        .or_else(|| cli.resume.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let file_history = Arc::new(ParkingMutex::new(
+        mangocode_core::file_history::FileHistory::new(),
+    ));
+    let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Load plugins before MCP startup so plugin-provided MCP servers are
+    // present in the in-memory config when the manager and tool wrappers are
+    // constructed.
+    let plugin_registry = if cli.bare {
+        info!("Plugins skipped because --bare was requested");
+        mangocode_plugins::PluginRegistry::new()
+    } else {
+        mangocode_plugins::load_plugins(&cwd, &[]).await
+    };
+    {
+        let plugin_cmd_count = plugin_registry.all_command_defs().len();
+        let plugin_hook_count = plugin_registry
+            .build_hook_registry()
+            .values()
+            .map(|v| v.len())
+            .sum::<usize>();
+        info!(
+            plugins = plugin_registry.enabled_count(),
+            commands = plugin_cmd_count,
+            hooks = plugin_hook_count,
+            "Plugins loaded"
+        );
+        mangocode_plugins::set_global_hooks(plugin_registry.build_hook_registry());
+        mangocode_plugins::set_global_registry(plugin_registry.clone());
+
+        let mut existing_names: std::collections::HashSet<String> =
+            config.mcp_servers.iter().map(|s| s.name.clone()).collect();
+        for mcp_server in plugin_registry.all_mcp_servers() {
+            if existing_names.insert(mcp_server.name.clone()) {
+                config.mcp_servers.push(mcp_server);
+            }
+        }
+    }
+
+    // Initialize MCP servers first (needed for ToolContext.mcp_manager).
+    let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
+
+    let mut tool_ctx = ToolContext {
+        working_dir: cwd.clone(),
+        permission_mode: config.permission_mode.clone(),
+        permission_handler: permission_handler.clone(),
+        cost_tracker: cost_tracker.clone(),
+        session_metrics: Some(session_metrics.clone()),
+        session_id: session_id.clone(),
+        coordination_actor_id: None,
+        coordination_parent_actor_id: None,
+        inject_coordination_inbox: true,
+        file_history: file_history.clone(),
+        current_turn: current_turn.clone(),
+        non_interactive: cli.print || cli.prompt.is_some(),
+        mcp_manager: mcp_manager_arc.clone(),
+        config: config.clone(),
+        question_prompt_tx: None,
+        cancel_token: None,
+    };
+
+    // Register the mangocode-query-backed agent runner so TeamCreateTool can spawn real
+    // sub-agents.  Must be called before any tool execution begins.
+    // The function keeps the first registered runner; this guard avoids rebuilding
+    // the closure across repeated init paths.
+    #[cfg(any(feature = "tool-team-create", feature = "tool-team-delete"))]
+    {
+        static SWARM_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        SWARM_INIT.get_or_init(mangocode_query::init_team_swarm_runner);
+        static PLAN_SEARCH_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        PLAN_SEARCH_INIT.get_or_init(mangocode_query::init_plan_search_realizer);
+    }
+
+    // Build the full tool list: built-ins from mangocode-tools plus AgentTool from mangocode-query
+    // (AgentTool lives in mangocode-query to avoid a circular mangocode-tools ↔ mangocode-query dependency).
+    // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
+    let tools = build_tools_with_mcp(
+        mcp_manager_arc.clone(),
+        &config.allowed_tools,
+        &config.disallowed_tools,
+    );
+
+    // Build model registry for dynamic model/provider resolution.
+    // The registry is pre-populated with a hardcoded snapshot and enriched
+    // from the models.dev cache if available.
+    let model_registry = {
+        let mut reg = mangocode_api::ModelRegistry::new();
+        reg.load_standard_cache();
+        Arc::new(reg)
+    };
+
+    // Build query config
+    let mut query_config =
+        mangocode_query::QueryConfig::from_config_with_registry(&config, &model_registry);
+    query_config.model_registry = Some(model_registry.clone());
+    query_config.is_non_interactive = is_headless;
+    query_config.has_append_system_prompt = append_system_prompt_configured(&config);
+    cost_tracker.set_model(&query_config.model);
+    query_config.max_turns = cli.max_turns;
+
+    let coordination_heartbeat = mangocode_core::coordination::spawn_presence_heartbeat(
+        mangocode_core::coordination::process_session_id(&session_id),
+        cwd.clone(),
+        query_config.model.clone(),
+        None,
+    );
+    query_config.system_prompt = Some(system_prompt);
+    query_config.append_system_prompt = None;
+    query_config.working_directory = Some(cwd.display().to_string());
+    if let Some(tokens) = cli.thinking {
+        query_config.thinking_budget = Some(tokens);
+    }
+    if let Some(level) = config.effort.as_deref().and_then(parse_effort_level_arg) {
+        query_config.effort_level = Some(level);
+    }
+    if let Some(ref level_str) = cli.effort {
+        if let Some(level) = parse_effort_level_arg(level_str) {
+            query_config.effort_level = Some(level);
+        } else {
+            eprintln!(
+                "Warning: unknown effort level '{}' — expected low/medium/high/max",
+                level_str
+            );
+        }
+    }
+    if let Some(usd) = cli.max_budget_usd {
+        query_config.max_budget_usd = Some(usd);
+    }
+    if let Some(ref fb) = cli.fallback_model {
+        let Some(fallback_model) = mangocode_api::normalize_model_id(fb) else {
+            anyhow::bail!("--fallback-model requires a non-empty model name");
+        };
+        query_config.fallback_model = Some(fallback_model);
+    }
+    // Wire in the provider registry so non-Anthropic providers can be dispatched.
+    let provider_registry = std::sync::Arc::new(provider_registry);
+    query_config.provider_registry = Some(provider_registry.clone());
+
+    // Background skill index for `Skill` tool / prefetch listing (parallel to full discovery).
+    let skill_index = std::sync::Arc::new(tokio::sync::RwLock::new(
+        mangocode_query::SkillIndex::default(),
+    ));
+    let prefetch_root = config.project_dir.clone().unwrap_or_else(|| cwd.clone());
+    let prefetch_skills_config = config.skills.clone();
+    let skill_index_bg = skill_index.clone();
+    tokio::spawn(async move {
+        mangocode_query::prefetch_skills(&prefetch_root, &prefetch_skills_config, skill_index_bg)
+            .await;
+    });
+    query_config.skill_index = Some(skill_index);
+
+    // Wire in the named agent (--agent flag).
+    // Merge built-in default agents with user-defined agents (user wins on collision).
+    let tools = if let Some(ref agent_name) = cli.agent {
+        query_config.agent_name = Some(agent_name.clone());
+        let mut all_agents = mangocode_core::default_agents();
+        all_agents.extend(config.agents.clone());
+        if let Some(def) = all_agents.get(agent_name) {
+            let access = def.access.clone();
+            query_config.agent_definition = Some(def.clone());
+            // Override max_turns from agent definition when specified.
+            if let Some(turns) = def.max_turns {
+                query_config.max_turns = turns;
+            }
+            filter_tools_for_agent(tools, &access)
+        } else {
+            eprintln!(
+                "Warning: unknown agent '{}'. Run /agent to see available agents.",
+                agent_name
+            );
+            tools
+        }
+    } else {
+        tools
+    };
+
+    sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools, &query_config);
+
+    // Spawn the background cron scheduler (fires cron tasks at scheduled times).
+    // Cancelled automatically when the process exits since we use a shared token.
+    let cron_cancel = tokio_util::sync::CancellationToken::new();
+    mangocode_query::start_cron_scheduler(
+        client.clone(),
+        tools.clone(),
+        tool_ctx.clone(),
+        query_config.clone(),
+        cron_cancel.clone(),
+    );
+
+    // Spawn proactive monitor loop (feature-gated + opt-in via /proactive on).
+    let proactive_cancel = tokio_util::sync::CancellationToken::new();
+    let _proactive_handle =
+        mangocode_query::ProactiveAgent::new(cwd.clone(), tool_ctx.session_id.clone()).start(
+            client.clone(),
+            tools.clone(),
+            tool_ctx.clone(),
+            query_config.clone(),
+            proactive_cancel.clone(),
+        );
+
+    // Spawn background remote settings poller.
+    let remote_settings_cancel = tokio_util::sync::CancellationToken::new();
+    let remote_config = mangocode_core::remote_settings::RemoteSettingsConfig::from_env();
+    if mangocode_core::remote_settings::RemoteSettingsManager::is_eligible(
+        remote_config.api_key.as_deref(),
+    ) {
+        let manager = std::sync::Arc::new(
+            mangocode_core::remote_settings::RemoteSettingsManager::new(remote_config),
+        );
+        let poll_cancel = remote_settings_cancel.child_token();
+        tokio::spawn(async move {
+            manager.start_polling(poll_cancel).await;
+        });
+    }
+
+    // --print mode (headless)
+    let result = if is_headless {
+        run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
+    } else {
+        // Capture provider before `config` is moved into run_interactive.
+        let is_non_anthropic_provider =
+            config.provider.as_deref().unwrap_or("lmstudio") != "anthropic";
+        run_interactive(InteractiveRunArgs {
+            config,
+            settings,
+            settings_diagnostics,
+            client,
+            tools,
+            tool_ctx,
+            query_config,
+            cost_tracker,
+            resume_id: cli.resume,
+            bridge_config,
+            coordination_heartbeat,
+            // has_credentials: true if we have an Anthropic key, OR if a
+            // non-Anthropic provider is selected (its own auth is checked at
+            // request time - we don't want to block TUI startup here).
+            has_credentials: !api_key.is_empty()
+                || is_non_anthropic_provider
+                || has_stored_anthropic_key,
+            model_registry,
+            client_config,
+            disable_slash_commands: cli.disable_slash_commands,
+        })
+        .await
+    };
+
+    cron_cancel.cancel();
+    proactive_cancel.cancel();
+    remote_settings_cancel.cancel();
+    result
+}
+
+async fn connect_mcp_manager_arc(config: &Config) -> Option<Arc<mangocode_mcp::McpManager>> {
+    if config.mcp_servers.is_empty() {
+        return None;
+    }
+
+    info!(
+        count = config.mcp_servers.len(),
+        "Connecting to MCP servers"
+    );
+    let mcp_manager = mangocode_mcp::McpManager::connect_all(&config.mcp_servers).await;
+    let mcp_manager = Arc::new(mcp_manager);
+    mcp_manager.clone().spawn_notification_poll_loop();
+    Some(mcp_manager)
+}
+
+fn build_tools_with_mcp(
+    mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    allowed_tools: &[String],
+    disallowed_tools: &[String],
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    let mut v: Vec<Box<dyn mangocode_tools::Tool>> = mangocode_tools::all_tools();
+    #[cfg(feature = "tool-agent")]
+    v.push(Box::new(mangocode_query::AgentTool));
+
+    if let Some(ref manager_arc) = mcp_manager {
+        mangocode_tools::extend_with_mcp_tools(&mut v, manager_arc.clone());
+        debug!(total_tools = v.len(), "MCP tools registered");
+    }
+
+    Arc::new(mangocode_tools::filter_tools_by_name_config(
+        v,
+        allowed_tools,
+        disallowed_tools,
+    ))
+}
+
+/// Filter the tool list based on the agent's access level.
+/// - "full"        -> runtime-visible tools allowed (no extra agent filtering)
+/// - "read-only"   -> ReadOnly tools, read-oriented Network tools, non-mutating None tools, and safe interactive helpers
+/// - "search-only" -> only code/file/web search, Read, and ToolSearch tools
+fn filter_tools_for_agent(
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    access: &str,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    match access {
+        "read-only" => filter_live_tools_for_agent(
+            tools,
+            tool_allowed_for_read_only_agent,
+            Some(AgentToolRestriction::ReadOnly),
+        ),
+        "search-only" => filter_live_tools_for_agent(
+            tools,
+            tool_allowed_for_search_only_agent,
+            Some(AgentToolRestriction::SearchOnly),
+        ),
+        _ => tools, // "full" — keep the runtime-visible tools unchanged
+    }
+}
+
+fn agent_access_filters_tools(access: &str) -> bool {
+    matches!(access, "read-only" | "search-only")
+}
+
+fn query_agent_restricted_access(query_config: &mangocode_query::QueryConfig) -> Option<&str> {
+    query_config
+        .agent_definition
+        .as_ref()
+        .map(|definition| definition.access.as_str())
+        .filter(|access| agent_access_filters_tools(access))
+}
+
+fn apply_query_agent_tool_filter(
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    query_config: &mangocode_query::QueryConfig,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    if let Some(access) = query_agent_restricted_access(query_config) {
+        filter_tools_for_agent(tools, access)
+    } else {
+        tools
+    }
+}
+
+fn build_tools_for_query_config(
+    mcp_manager: Option<Arc<mangocode_mcp::McpManager>>,
+    config: &Config,
+    query_config: &mangocode_query::QueryConfig,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager, &config.allowed_tools, &config.disallowed_tools);
+    apply_query_agent_tool_filter(tools, query_config)
+}
+
+fn sync_tool_context_visibility_for_query_agent(
+    tool_ctx: &mut ToolContext,
+    tools: &Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    query_config: &mangocode_query::QueryConfig,
+) {
+    if query_agent_restricted_access(query_config).is_some() {
+        mangocode_tools::sync_tool_context_to_available_tools(tool_ctx, tools.as_ref());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headless mode: read prompt from arg/stdin, run, print response
+// ---------------------------------------------------------------------------
+
+fn filter_live_tools_for_agent(
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    predicate: fn(&dyn mangocode_tools::Tool) -> bool,
+    restriction: Option<AgentToolRestriction>,
+) -> Arc<Vec<Box<dyn mangocode_tools::Tool>>> {
+    match Arc::try_unwrap(tools) {
+        Ok(live_tools) => Arc::new(
+            live_tools
+                .into_iter()
+                .filter(|tool| {
+                    predicate(tool.as_ref())
+                        && restriction
+                            .map(|restriction| {
+                                restriction.has_allowed_action_variants(tool.as_ref())
+                            })
+                            .unwrap_or(true)
+                })
+                .map(|tool| wrap_owned_tool_for_agent(tool, restriction))
+                .collect(),
+        ),
+        Err(shared_tools) => {
+            let filtered = shared_tools
+                .iter()
+                .enumerate()
+                .filter(|(_, tool)| {
+                    predicate(tool.as_ref())
+                        && restriction
+                            .map(|restriction| {
+                                restriction.has_allowed_action_variants(tool.as_ref())
+                            })
+                            .unwrap_or(true)
+                })
+                .map(|(index, _)| {
+                    wrap_shared_tool_for_agent(shared_tools.clone(), index, restriction)
+                })
+                .collect();
+            Arc::new(filtered)
+        }
+    }
+}
+
+fn wrap_owned_tool_for_agent(
+    tool: Box<dyn Tool>,
+    restriction: Option<AgentToolRestriction>,
+) -> Box<dyn Tool> {
+    match restriction {
+        Some(restriction) => Box::new(AgentRestrictedTool::owned(tool, restriction)),
+        None => tool,
+    }
+}
+
+fn wrap_shared_tool_for_agent(
+    tools: Arc<Vec<Box<dyn Tool>>>,
+    index: usize,
+    restriction: Option<AgentToolRestriction>,
+) -> Box<dyn Tool> {
+    match restriction {
+        Some(restriction) => Box::new(AgentRestrictedTool::shared(tools, index, restriction)),
+        None => Box::new(SharedToolRef { tools, index }),
+    }
+}
+
+fn tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    use mangocode_tools::PermissionLevel as PL;
+    match tool.permission_level() {
+        PL::ReadOnly => true,
+        PL::Network => network_tool_allowed_for_read_only_agent(tool),
+        PL::None => {
+            let name = tool.name();
+            name == mangocode_core::constants::TOOL_NAME_ASK_USER
+                || name == mangocode_core::constants::TOOL_NAME_AGENT
+                || !tool.capabilities(&serde_json::Value::Null).mutating
+        }
+        _ => false,
+    }
+}
+
+fn network_tool_allowed_for_read_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    const READ_ONLY_NETWORK_TOOLS: &[&str] = &[
+        mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+        mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+        "DocSearch",
+        "DocRead",
+        "DeepRead",
+        "RenderedFetch",
+        "ListMcpResources",
+        "ReadMcpResource",
+    ];
+    READ_ONLY_NETWORK_TOOLS
+        .iter()
+        .any(|allowed| mangocode_tools::tool_name_matches(tool, allowed))
+}
+
+fn tool_allowed_for_search_only_agent(tool: &dyn mangocode_tools::Tool) -> bool {
+    const SEARCH_TOOLS: &[&str] = &[
+        mangocode_core::constants::TOOL_NAME_CODE_SEARCH,
+        mangocode_core::constants::TOOL_NAME_GREP,
+        mangocode_core::constants::TOOL_NAME_GLOB,
+        mangocode_core::constants::TOOL_NAME_FILE_READ,
+        mangocode_core::constants::TOOL_NAME_WEB_SEARCH,
+        mangocode_core::constants::TOOL_NAME_WEB_FETCH,
+        "ToolSearch",
+    ];
+    SEARCH_TOOLS
+        .iter()
+        .any(|allowed| mangocode_tools::tool_name_matches(tool, allowed))
+}
+
+async fn run_headless(
+    cli: &Cli,
+    client: Arc<mangocode_api::AnthropicClient>,
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    tool_ctx: ToolContext,
+    query_config: mangocode_query::QueryConfig,
+    cost_tracker: Arc<CostTracker>,
+) -> anyhow::Result<()> {
+    use mangocode_query::{QueryEvent, QueryOutcome};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    fn permission_mode_name(mode: &PermissionMode) -> &'static str {
+        match mode {
+            PermissionMode::Default => "default",
+            PermissionMode::AcceptEdits => "acceptEdits",
+            PermissionMode::BypassPermissions => "bypassPermissions",
+            PermissionMode::Plan => "plan",
+        }
+    }
+
+    fn emit_ndjson(value: serde_json::Value) {
+        println!("{}", value);
+        flush_stdout_for("headless ndjson output");
+    }
+
+    fn model_usage_json(
+        model: &str,
+        usage: &mangocode_core::types::UsageInfo,
+        cost_usd: f64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            model: {
+                "inputTokens": usage.input_tokens,
+                "outputTokens": usage.output_tokens,
+                "costUSD": cost_usd,
+            }
+        })
+    }
+
+    let mut tool_ctx = tool_ctx;
+    let mut query_config = query_config;
+    let start_time = std::time::Instant::now();
+
+    // Load prior conversation when --resume is provided; headless mode keeps
+    // using the active tool-context session ID for event/session linkage.
+    let mut session = if let Some(ref id) = cli.resume {
+        match mangocode_core::history::load_session(id).await {
+            Ok(mut s) => {
+                if !s.model.is_empty() {
+                    sync_session_model_to_runtime_config(
+                        &mut tool_ctx.config,
+                        &mut query_config,
+                        &cost_tracker,
+                        &s.model,
+                    );
+                }
+                if let Some(saved_dir) = s.working_dir.as_ref() {
+                    let saved_path = PathBuf::from(saved_dir);
+                    if saved_path.exists() {
+                        tool_ctx.working_dir = saved_path;
+                        tool_ctx.config.project_dir = Some(tool_ctx.working_dir.clone());
+                        query_config.working_directory =
+                            Some(tool_ctx.working_dir.display().to_string());
+                        query_config.system_prompt = Some(
+                            build_session_system_prompt(
+                                tool_ctx.working_dir.clone(),
+                                &tool_ctx.config,
+                                true,
+                            )
+                            .await,
+                        );
+                        let skill_index = Arc::new(tokio::sync::RwLock::new(
+                            mangocode_query::SkillIndex::default(),
+                        ));
+                        let skill_index_bg = skill_index.clone();
+                        let prefetch_root = tool_ctx.working_dir.clone();
+                        let prefetch_skills_config = tool_ctx.config.skills.clone();
+                        tokio::spawn(async move {
+                            mangocode_query::prefetch_skills(
+                                &prefetch_root,
+                                &prefetch_skills_config,
+                                skill_index_bg,
+                            )
+                            .await;
+                        });
+                        query_config.skill_index = Some(skill_index);
+                    }
+                }
+                if s.id != tool_ctx.session_id {
+                    s.id = tool_ctx.session_id.clone();
+                }
+                s
+            }
+            Err(e) => {
+                eprintln!("Warning: could not load session {}: {}", id, e);
+                let mut fresh = mangocode_core::history::ConversationSession::new(
+                    canonical_session_model(&tool_ctx.config, &query_config.model),
+                );
+                fresh.id = tool_ctx.session_id.clone();
+                fresh
+            }
+        }
+    } else {
+        let mut fresh = mangocode_core::history::ConversationSession::new(canonical_session_model(
+            &tool_ctx.config,
+            &query_config.model,
+        ));
+        fresh.id = tool_ctx.session_id.clone();
+        fresh
+    };
+
+    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    if session.model.trim().is_empty() {
+        session.model = canonical_session_model(&tool_ctx.config, &query_config.model);
+    }
+
+    // Build new input messages for this invocation.
+    // --input-format stream-json: stdin is newline-delimited JSON, each line is
+    // {"role":"user"|"assistant","content":"..."}.
+    // --input-format text (default): read prompt from positional arg or entire stdin as text.
+    let mut incoming_messages: Vec<mangocode_core::types::Message> =
+        if cli.input_format == CliInputFormat::StreamJson {
+            use tokio::io::{self, AsyncBufReadExt, BufReader};
+            let stdin = io::stdin();
+            let mut reader = BufReader::new(stdin);
+            let mut line = String::new();
+            let mut parsed: Vec<mangocode_core::types::Message> = Vec::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v) => {
+                        let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                        let content = match v.get("content").and_then(|c| c.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => {
+                                eprintln!(
+                                    "Warning: skipping line with missing/invalid content: {}",
+                                    trimmed
+                                );
+                                continue;
+                            }
+                        };
+                        if role == "assistant" {
+                            parsed.push(mangocode_core::types::Message::assistant(content));
+                        } else {
+                            parsed.push(mangocode_core::types::Message::user(content));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: skipping malformed JSON line: {} ({:?})",
+                            trimmed, e
+                        );
+                    }
+                }
+            }
+            if parsed.is_empty() {
+                // Also check positional arg as fallback
+                if let Some(ref p) = cli.prompt {
+                    parsed.push(mangocode_core::types::Message::user(p.clone()));
+                }
+            }
+            parsed
+        } else {
+            // Plain text mode
+            let prompt = if let Some(ref p) = cli.prompt {
+                p.clone()
+            } else {
+                use tokio::io::{self, AsyncReadExt};
+                let mut stdin = io::stdin();
+                let mut buf = String::new();
+                stdin.read_to_string(&mut buf).await.context("Failed to read prompt from stdin")?;
+                buf.trim().to_string()
+            };
+
+            if prompt.is_empty() {
+                eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
+                std::process::exit(1);
+            }
+
+            vec![mangocode_core::types::Message::user(prompt)]
+        };
+
+    // --prefill: inject a partial assistant turn before the query so the model
+    // --prefill: partial assistant message before the first user turn
+    if let Some(ref prefill_text) = cli.prefill {
+        incoming_messages.push(mangocode_core::types::Message::assistant(
+            prefill_text.clone(),
+        ));
+    }
+
+    let mut messages = session.messages.clone();
+    messages.extend(incoming_messages);
+
+    if messages.is_empty() {
+        eprintln!("Error: No messages provided.");
+        std::process::exit(1);
+    }
+
+    let is_json_output = matches!(
+        cli.output_format,
+        CliOutputFormat::Json | CliOutputFormat::StreamJson
+    );
+    let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
+
+    if is_stream_json {
+        let mut tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        tool_names.sort();
+
+        let mut mcp_servers = Vec::new();
+        if let Some(ref manager) = tool_ctx.mcp_manager {
+            let mut statuses: Vec<(String, mangocode_mcp::McpServerStatus)> =
+                manager.all_statuses().into_iter().collect();
+            statuses.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, status) in statuses {
+                let status_name = match status {
+                    mangocode_mcp::McpServerStatus::Connected { .. } => "connected",
+                    mangocode_mcp::McpServerStatus::Connecting => "connecting",
+                    mangocode_mcp::McpServerStatus::Disconnected { .. } => "disconnected",
+                    mangocode_mcp::McpServerStatus::Failed { .. } => "failed",
+                };
+                mcp_servers.push(serde_json::json!({
+                    "name": name,
+                    "status": status_name,
+                }));
+            }
+        }
+
+        emit_ndjson(serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": tool_ctx.session_id,
+            "cwd": tool_ctx.working_dir.display().to_string(),
+            "model": query_config.model,
+            "tools": tool_names,
+            "mcp_servers": mcp_servers,
+            "permissionMode": permission_mode_name(&tool_ctx.permission_mode),
+        }));
+    }
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    let cancel = CancellationToken::new();
+    tool_ctx.cancel_token = Some(cancel.clone());
+    let stream_session_id = tool_ctx.session_id.clone();
+    let mut brief_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let event_task = tokio::spawn(async move {
+        let mut full_text = String::new();
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                    ..
+                }) => {
+                    full_text.push_str(&text);
+                    if !is_json_output {
+                        print!("{}", text);
+                        flush_stdout_for("headless text stream");
+                    } else if is_stream_json {
+                        // Emit CC-compatible content_block_delta + content_block_stop
+                        // instead of wrapping in an assistant message, so orchestration
+                        // UIs can use the standard Claude streaming adapter.
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_delta",
+                            "delta": { "text": text },
+                            "session_id": stream_session_id,
+                        }));
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_stop",
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    full_text.push_str(&text);
+                    if !is_json_output {
+                        print!("{}", text);
+                        flush_stdout_for("headless text stream");
+                    } else if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_delta",
+                            "delta": { "text": text },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                        emit_ndjson(serde_json::json!({
+                            "type": "content_block_stop",
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::ThinkingDelta { thinking },
+                    ..
+                }) => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": thinking }]
+                            },
+                            "parent_tool_use_id": serde_json::Value::Null,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta:
+                                mangocode_api::streaming::ContentDelta::ThinkingDelta { thinking },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": thinking }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Stream(mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                    delta: mangocode_api::streaming::ContentDelta::SignatureDelta { signature },
+                    ..
+                }) => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": "", "signature": signature }]
+                            },
+                            "parent_tool_use_id": serde_json::Value::Null,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::StreamWithParent {
+                    event:
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta:
+                                mangocode_api::streaming::ContentDelta::SignatureDelta { signature },
+                            ..
+                        },
+                    parent_tool_use_id,
+                } => {
+                    if is_stream_json {
+                        emit_ndjson(serde_json::json!({
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{ "type": "thinking", "thinking": "", "signature": signature }]
+                            },
+                            "parent_tool_use_id": parent_tool_use_id,
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::ToolStart {
+                    tool_name,
+                    tool_id,
+                    input_json,
+                    parent_tool_use_id,
+                } => {
+                    if !is_json_output {
+                        eprintln!("\n[{}...]", tool_name);
+                    } else if is_stream_json {
+                        let parsed_input = serde_json::from_str::<serde_json::Value>(&input_json)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": input_json }));
+                        // In stream-json mode, suppress Brief tool_use events entirely.
+                        // Brief is an internal display wrapper — the model also emits
+                        // a separate assistant text event with the same content, so
+                        // emitting Brief as tool_use would cause duplicate messages
+                        // in orchestration UIs like Conducctor.
+                        if tool_name == "Brief" {
+                            brief_tool_ids.insert(tool_id.clone());
+                        } else {
+                            emit_ndjson(serde_json::json!({
+                                "type": "assistant",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [{
+                                        "type": "tool_use",
+                                        "id": tool_id,
+                                        "name": tool_name,
+                                        "input": parsed_input,
+                                    }]
+                                },
+                                "parent_tool_use_id": parent_tool_use_id
+                                    .map(serde_json::Value::String)
+                                    .unwrap_or(serde_json::Value::Null),
+                                "session_id": stream_session_id,
+                            }));
+                        }
+                    } else {
+                        emit_ndjson(serde_json::json!({ "type": "tool_start", "tool": tool_name }));
+                    }
+                }
+                QueryEvent::ToolEnd {
+                    tool_id,
+                    result,
+                    is_error,
+                    ..
+                } => {
+                    if is_stream_json {
+                        // Skip tool_result for Brief (already emitted as text)
+                        if brief_tool_ids.remove(&tool_id) {
+                            continue;
+                        }
+                        emit_ndjson(serde_json::json!({
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": result,
+                                    "is_error": is_error,
+                                }]
+                            },
+                            "session_id": stream_session_id,
+                        }));
+                    }
+                }
+                QueryEvent::Status(msg) => {
+                    if is_stream_json {
+                        emit_ndjson(stream_json_status_event(&stream_session_id, &msg));
+                    } else if is_json_output {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({ "type": "status", "message": msg })
+                        );
+                    }
+                }
+                QueryEvent::Error(msg) => {
+                    if is_stream_json {
+                        let lower = msg.to_ascii_lowercase();
+                        if lower.contains("rate limit") || lower.contains("ratelimit") {
+                            emit_ndjson(serde_json::json!({
+                                "type": "rate_limit_event",
+                                "session_id": stream_session_id,
+                                "rate_limit_info": {
+                                    "message": msg,
+                                }
+                            }));
+                        }
+                        // Stream-json compatibility mode reserves terminal errors
+                        // for the final `result/subtype=error` event.
+                    } else if is_json_output {
+                        eprintln!("{}", serde_json::json!({ "type": "error", "error": msg }));
+                    } else {
+                        eprintln!("\nError: {}", msg);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        full_text
+    });
+
+    let outcome = mangocode_query::run_query_loop(
+        client.as_ref(),
+        &mut messages,
+        tools.as_slice(),
+        &tool_ctx,
+        &query_config,
+        cost_tracker.clone(),
+        Some(event_tx.clone()),
+        cancel,
+        None,
+        None, // no HITL permission prompts in this context
+    )
+    .await;
+
+    drop(event_tx);
+    let full_text = match event_task.await {
+        Ok(full_text) => full_text,
+        Err(err) => {
+            eprintln!("Warning: failed to collect streamed output: {}", err);
+            String::new()
+        }
+    };
+
+    session.messages = messages;
+    session.model = canonical_session_model(&tool_ctx.config, &query_config.model);
+    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+    session.total_cost = cost_tracker.total_cost_usd();
+    session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
+    session.updated_at = chrono::Utc::now();
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+
+    if let Err(e) = mangocode_core::history::save_session(&session).await {
+        eprintln!("Warning: failed to save session {}: {}", session.id, e);
+    }
+
+    persist_session_usage(&cost_tracker, &session, duration_ms);
+    mangocode_query::finish_session_lifecycle(
+        &tool_ctx,
+        format!(
+            "Session ended in {} after {} turns and {:.4} USD of tracked cost.",
+            tool_ctx.working_dir.display(),
+            tool_ctx
+                .current_turn
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cost_tracker.total_cost_usd()
+        ),
+    )
+    .await;
+
+    // Final output
+    match cli.output_format {
+        CliOutputFormat::Json => match outcome {
+            QueryOutcome::EndTurn { message, usage } => {
+                let result_text = if full_text.is_empty() {
+                    message.get_all_text()
+                } else {
+                    full_text
+                };
+                let out = serde_json::json!({
+                    "type": "result",
+                    "result": result_text,
+                    "session_id": tool_ctx.session_id,
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                    "cost_usd": cost_tracker.total_cost_usd(),
+                });
+                println!("{}", out);
+            }
+            QueryOutcome::MaxTokens {
+                partial_message,
+                usage,
+            } => {
+                let result_text = if full_text.is_empty() {
+                    partial_message.get_all_text()
+                } else {
+                    full_text
+                };
+                let out = serde_json::json!({
+                    "type": "result",
+                    "result": result_text,
+                    "session_id": tool_ctx.session_id,
+                    "stop_reason": "max_tokens",
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                    "cost_usd": cost_tracker.total_cost_usd(),
+                });
+                println!("{}", out);
+            }
+            QueryOutcome::Error(e) => {
+                let diagnostic = query_error_diagnostic(
+                    tool_ctx.config.provider.as_deref(),
+                    &query_config.model,
+                    &e,
+                );
+                let out = serde_json::json!({
+                    "type": "error",
+                    "error": format_query_error_for_output(
+                        tool_ctx.config.provider.as_deref(),
+                        &query_config.model,
+                        &e,
+                    ),
+                    "diagnostic": diagnostic,
+                });
+                eprintln!("{}", out);
+                std::process::exit(1);
+            }
+            QueryOutcome::BudgetExceeded {
+                cost_usd,
+                limit_usd,
+            } => {
+                let out = serde_json::json!({
+                    "type": "error",
+                    "error": format!("Budget limit ${:.4} reached (spent ${:.4})", limit_usd, cost_usd),
+                });
+                eprintln!("{}", out);
+                std::process::exit(2);
+            }
+            QueryOutcome::Cancelled => {
+                let out = serde_json::json!({ "type": "error", "error": "Cancelled" });
+                eprintln!("{}", out);
+                std::process::exit(1);
+            }
+        },
+        CliOutputFormat::StreamJson => {
+            // Already streamed above; emit final Claude-compatible result event.
+            match outcome {
+                QueryOutcome::EndTurn { usage, .. } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": false,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "end_turn",
+                        "duration_ms": duration_ms,
+                        "cost_usd": cost_tracker.total_cost_usd(),
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        },
+                        "modelUsage": model_usage_json(
+                            &query_config.model,
+                            &usage,
+                            cost_tracker.total_cost_usd(),
+                        ),
+                    }));
+                }
+                QueryOutcome::MaxTokens { usage, .. } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": false,
+                        "session_id": tool_ctx.session_id,
+                        "stop_reason": "max_tokens",
+                        "duration_ms": duration_ms,
+                        "cost_usd": cost_tracker.total_cost_usd(),
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        },
+                        "modelUsage": model_usage_json(
+                            &query_config.model,
+                            &usage,
+                            cost_tracker.total_cost_usd(),
+                        ),
+                    }));
+                }
+                QueryOutcome::Error(e) => {
+                    let diagnostic = query_error_diagnostic(
+                        tool_ctx.config.provider.as_deref(),
+                        &query_config.model,
+                        &e,
+                    );
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": diagnostic.kind.as_str(),
+                            "message": format_query_error_for_output(
+                                tool_ctx.config.provider.as_deref(),
+                                &query_config.model,
+                                &e,
+                            ),
+                        },
+                        "diagnostic": diagnostic,
+                    }));
+                    std::process::exit(1);
+                }
+                QueryOutcome::BudgetExceeded {
+                    cost_usd,
+                    limit_usd,
+                } => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": "BudgetExceeded",
+                            "message": format!("Budget limit ${:.4} reached (spent ${:.4})", limit_usd, cost_usd),
+                        }
+                    }));
+                    std::process::exit(2);
+                }
+                QueryOutcome::Cancelled => {
+                    emit_ndjson(serde_json::json!({
+                        "type": "result",
+                        "subtype": "error",
+                        "is_error": true,
+                        "session_id": tool_ctx.session_id,
+                        "error": {
+                            "type": "Cancelled",
+                            "message": "Cancelled",
+                        }
+                    }));
+                    std::process::exit(1);
+                }
+            }
+        }
+        CliOutputFormat::Text => {
+            // Streaming text was already printed; add newline
+            println!();
+            if cli.verbose {
+                eprintln!(
+                    "\nTokens: {} in / {} out | Cost: ${:.4}",
+                    cost_tracker.input_tokens(),
+                    cost_tracker.output_tokens(),
+                    cost_tracker.total_cost_usd(),
+                );
+            }
+            match outcome {
+                QueryOutcome::Error(e) => {
+                    eprintln!(
+                        "Error: {}",
+                        format_query_error_for_output(
+                            tool_ctx.config.provider.as_deref(),
+                            &query_config.model,
+                            &e,
+                        )
+                    );
+                    std::process::exit(1);
+                }
+                QueryOutcome::BudgetExceeded {
+                    cost_usd,
+                    limit_usd,
+                } => {
+                    eprintln!(
+                        "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
+                        limit_usd, cost_usd
+                    );
+                    std::process::exit(2);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Interactive REPL mode
+// ---------------------------------------------------------------------------
+
+struct InteractiveRunArgs {
+    config: Config,
+    settings: mangocode_core::config::Settings,
+    settings_diagnostics: Vec<SettingsLoadDiagnostic>,
+    client: Arc<mangocode_api::AnthropicClient>,
+    tools: Arc<Vec<Box<dyn mangocode_tools::Tool>>>,
+    tool_ctx: ToolContext,
+    query_config: mangocode_query::QueryConfig,
+    cost_tracker: Arc<CostTracker>,
+    resume_id: Option<String>,
+    bridge_config: Option<mangocode_bridge::BridgeConfig>,
+    coordination_heartbeat: mangocode_core::coordination::PresenceHeartbeat,
+    has_credentials: bool,
+    model_registry: Arc<mangocode_api::ModelRegistry>,
+    /// Base client config used to build the Anthropic default provider. Kept
+    /// around so the main loop can rebuild the provider registry after a
+    /// runtime `/connect` flow (see `App::provider_registry_stale`).
+    client_config: mangocode_api::client::ClientConfig,
+    /// When true (--disable-slash-commands), `/`-prefixed input is sent to the
+    /// model verbatim instead of being dispatched as a slash command.
+    disable_slash_commands: bool,
+}
+
+fn persist_session_usage(
+    cost_tracker: &Arc<CostTracker>,
+    session: &mangocode_core::history::ConversationSession,
+    duration_ms: u64,
+) {
+    let mut ledger = mangocode_core::usage_ledger::UsageLedger::load();
+    ledger.record_session(mangocode_core::usage_ledger::SessionCostRecord {
+        session_id: session.id.clone(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        model: session.model.clone(),
+        cost_usd: cost_tracker.total_cost_usd(),
+        input_tokens: cost_tracker.input_tokens(),
+        output_tokens: cost_tracker.output_tokens(),
+        cache_creation_tokens: cost_tracker.cache_creation_tokens(),
+        cache_read_tokens: cost_tracker.cache_read_tokens(),
+        duration_ms,
+        working_dir: session.working_dir.clone().unwrap_or_default(),
+    });
+}
+
+async fn save_session_warning(
+    session: &mangocode_core::history::ConversationSession,
+    action: &str,
+) -> Option<String> {
+    match mangocode_core::history::save_session(session).await {
+        Ok(()) => None,
+        Err(err) => {
+            warn!(
+                error = %err,
+                session_id = %session.id,
+                action = %action,
+                "failed to save session"
+            );
+            Some(format!(
+                "Warning: failed to save session {} after {}: {}",
+                truncate_bytes_prefix(&session.id, 8),
+                action,
+                err
+            ))
+        }
+    }
+}
+
+fn notify_tui_warning(app: &mut mangocode_tui::App, message: String) {
+    app.status_message = Some(message.clone());
+    app.notifications
+        .push(mangocode_tui::NotificationKind::Warning, message, Some(6));
+}
+
+async fn save_session_and_notify(
+    app: &mut mangocode_tui::App,
+    session: &mangocode_core::history::ConversationSession,
+    action: &str,
+) -> bool {
+    if let Some(warning) = save_session_warning(session, action).await {
+        notify_tui_warning(app, warning);
+        false
+    } else {
+        true
+    }
+}
+
+fn set_process_working_dir_or_notify(app: &mut mangocode_tui::App, path: &Path) {
+    if let Err(err) = std::env::set_current_dir(path) {
+        let message = format!(
+            "Warning: failed to switch process directory to {}: {}",
+            path.display(),
+            err
+        );
+        warn!(
+            error = %err,
+            path = %path.display(),
+            "failed to switch process working directory"
+        );
+        notify_tui_warning(app, message);
+    }
+}
+
+/// Detached plugin lifecycle hook dispatch for UI-driven events
+/// (PermissionRequest/Denied, Elicitation, CwdChanged, ConfigChange).
+/// Best-effort: never blocks the UI loop.
+fn spawn_plugin_lifecycle_hooks(
+    event_name: &'static str,
+    session_id: String,
+    tool_name: Option<String>,
+    message: String,
+) {
+    tokio::spawn(async move {
+        mangocode_query::run_plugin_lifecycle_hooks_with(
+            event_name,
+            &session_id,
+            tool_name.as_deref(),
+            &message,
+        )
+        .await;
+    });
+}
+
+/// Fire `Notification` hooks (settings + plugin) when MangoCode needs the
+/// user's attention (permission prompt, HITL question). Detached and
+/// best-effort: never blocks the UI loop.
+fn spawn_notification_hooks(
+    hooks: std::collections::HashMap<HookEvent, Vec<HookEntry>>,
+    working_dir: PathBuf,
+    session_id: String,
+    tool_name: Option<String>,
+    message: String,
+) {
+    let has_core = hooks.contains_key(&HookEvent::Notification);
+    let has_plugin = mangocode_plugins::has_global_hooks_for_event(
+        mangocode_plugins::HookEventKind::Notification,
+    );
+    if !has_core && !has_plugin {
+        return;
+    }
+    tokio::spawn(async move {
+        if has_core {
+            let ctx = mangocode_core::hooks::HookContext {
+                event: "Notification".to_string(),
+                tool_name: tool_name.clone(),
+                tool_input: None,
+                tool_output: Some(message.clone()),
+                is_error: None,
+                session_id: Some(session_id.clone()),
+            };
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                mangocode_core::hooks::run_hooks(
+                    &hooks,
+                    HookEvent::Notification,
+                    &ctx,
+                    &working_dir,
+                ),
+            )
+            .await
+            .is_err()
+            {
+                warn!("Notification hooks timed out after 5s");
+            }
+        }
+        if has_plugin {
+            let payload = serde_json::json!({
+                "event": "Notification",
+                "tool_name": tool_name,
+                "tool_input": null,
+                "tool_output": message,
+                "is_error": null,
+                "session_id": session_id,
+            });
+            if let Err(err) = tokio::task::spawn_blocking(move || {
+                mangocode_plugins::run_global_lifecycle_hook(
+                    mangocode_plugins::HookEventKind::Notification,
+                    payload,
+                )
+            })
+            .await
+            {
+                warn!(error = %err, "Plugin Notification hook task failed");
+            }
+        }
+    });
+}
+
+fn escape_attachment_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn escape_attachment_body(markdown: &str) -> String {
+    markdown.replace("</attachment>", "</ attachment>")
+}
+
+async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
+    let InteractiveRunArgs {
+        config,
+        settings,
+        settings_diagnostics,
+        client,
+        tools,
+        tool_ctx,
+        query_config,
+        cost_tracker,
+        resume_id,
+        bridge_config,
+        coordination_heartbeat,
+        has_credentials,
+        model_registry,
+        client_config,
+        disable_slash_commands,
+    } = args;
+
+    use crossterm::event::{self, Event, KeyCode};
+    use mangocode_bridge::{BridgeOutbound, TuiBridgeEvent};
+    use mangocode_commands::{execute_command, CommandContext, CommandResult};
+    use mangocode_query::{QueryEvent, QueryOutcome};
+    use mangocode_tui::{
+        bridge_state::BridgeConnectionState, device_auth_dialog::DeviceAuthEvent,
+        hybrid::HybridTerminal, init_mascot, notifications::NotificationKind, App,
+    };
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
+    let mut tool_ctx = tool_ctx;
+    let session_start = std::time::Instant::now();
+    let mut session = if let Some(ref id) = resume_id {
+        match mangocode_core::history::load_session(id).await {
+            Ok(session) => {
+                println!("Resumed session: {}", id);
+                if let Some(saved_dir) = session.working_dir.as_ref() {
+                    let saved_path = std::path::PathBuf::from(saved_dir);
+                    if saved_path.exists() {
+                        tool_ctx.working_dir = saved_path;
+                    }
+                }
+                tool_ctx.session_id = session.id.clone();
+                session
+            }
+            Err(e) => {
+                eprintln!("Warning: could not load session {}: {}", id, e);
+                let effective_model =
+                    mangocode_api::effective_model_for_config(&config, &model_registry);
+                let mut session = mangocode_core::history::ConversationSession::new(
+                    canonical_session_model(&config, &effective_model),
+                );
+                session.id = tool_ctx.session_id.clone();
+                session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+                session
+            }
+        }
+    } else {
+        let effective_model = mangocode_api::effective_model_for_config(&config, &model_registry);
+        let mut session = mangocode_core::history::ConversationSession::new(
+            canonical_session_model(&config, &effective_model),
+        );
+        session.id = tool_ctx.session_id.clone();
+        session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+        session
+    };
+    let initial_messages = session.messages.clone();
+    // `base_query_config` must be mutable so we can swap in a fresh
+    // provider registry after a runtime `/connect` flow (see the
+    // `provider_registry_stale` check inside the main loop below).
+    let mut base_query_config = query_config;
+    let (persisted_ui_settings, ui_settings_load_warning) = match load_persisted_ui_settings() {
+        Ok(settings) => (settings, None),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load persisted UI settings; using defaults"
+            );
+            (
+                PersistedUiSettings::default(),
+                Some(format_persisted_ui_settings_error(&err)),
+            )
+        }
+    };
+    let mut live_config = config.clone();
+    if !session.model.trim().is_empty() {
+        apply_session_model_if_present(&mut live_config, &session.model);
+    }
+    if persisted_ui_settings.fast_mode.unwrap_or(false) {
+        live_config.model = Some(mangocode_tui::model_picker::FAST_MODE_MODEL.to_string());
+    }
+    live_config.project_dir = Some(tool_ctx.working_dir.clone());
+    tool_ctx.config = live_config.clone();
+    base_query_config.model =
+        mangocode_api::effective_model_for_config(&live_config, &model_registry);
+    base_query_config.working_directory = Some(tool_ctx.working_dir.display().to_string());
+    base_query_config.system_prompt = Some(
+        build_session_system_prompt(tool_ctx.working_dir.clone(), &tool_ctx.config, false).await,
+    );
+    base_query_config.has_append_system_prompt = append_system_prompt_configured(&live_config);
+    base_query_config.append_system_prompt = None;
+    base_query_config.completion_policy = live_config.agent_completion_policy;
+    base_query_config.verification_policy = live_config.verification_policy;
+    base_query_config.reliability_profile = live_config.agent_reliability_profile;
+    base_query_config.speed_profile = live_config.agent_speed_profile;
+    coordination_heartbeat.update(
+        mangocode_core::coordination::process_session_id(&session.id),
+        tool_ctx.working_dir.clone(),
+        base_query_config.model.clone(),
+        session.title.clone(),
+    );
+
+    let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if disable_slash_commands {
+        // No slash dispatch in this session, so suppress `/` autocomplete too.
+        app.prompt_slash_commands.clear();
+    }
+    let mut startup_settings_warnings = Vec::new();
+    if !settings_diagnostics.is_empty() {
+        startup_settings_warnings.push(format_settings_load_diagnostics(&settings_diagnostics));
+    }
+    if let Some(warning) = ui_settings_load_warning.clone() {
+        startup_settings_warnings.push(warning);
+    }
+    if !startup_settings_warnings.is_empty() {
+        app.invalid_config_dialog = mangocode_tui::InvalidConfigDialogState::show_settings_error(
+            &startup_settings_warnings.join("\n\n"),
+        );
+    }
+    if let Some(warning) = ui_settings_load_warning {
+        notify_tui_warning(&mut app, warning);
+    }
+    app.model_name = base_query_config.model.clone();
+    app.cost_tracker.set_model(&base_query_config.model);
+    app.output_style = tui_output_style_for_config(&live_config);
+    init_mascot(&mut app);
+    // Sync initial effort level (from --effort flag or /effort command) to TUI indicator.
+    if let Some(level) = base_query_config.effort_level {
+        app.effort_level = core_effort_to_tui(level);
+    }
+    app.fast_mode = persisted_ui_settings
+        .fast_mode
+        .unwrap_or_else(|| app.model_name.contains("haiku"));
+    app.prompt_input.vim_enabled =
+        matches!(persisted_ui_settings.editor_mode.as_deref(), Some("vim"));
+    if persisted_ui_settings.voice_enabled.unwrap_or(false) && app.voice_recorder.is_none() {
+        app.enable_voice_from_startup();
+    }
+    app.refresh_prompt_input();
+    app.provider_registry = base_query_config.provider_registry.clone();
+
+    // Background: refresh the model registry from models.dev.
+    // The fetched JSON is saved as a cache file; the App will reload it from
+    // disk whenever the /model picker opens.
+    {
+        let cache_path = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("mangocode")
+            .join("models.json");
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let url = std::env::var("MODELS_DEV_URL")
+                .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
+            if let Ok(resp) = client
+                .get(&url)
+                .header("User-Agent", "MangoCode/0.0.7")
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if let Some(parent) = cache_path.parent() {
+                            if let Err(err) = std::fs::create_dir_all(parent) {
+                                tracing::warn!(
+                                    error = %err,
+                                    path = %parent.display(),
+                                    "failed to create models cache directory"
+                                );
+                                return;
+                            }
+                        }
+                        match std::fs::write(&cache_path, &text) {
+                            Ok(()) => tracing::info!("Models cache refreshed from models.dev"),
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                path = %cache_path.display(),
+                                "failed to write models cache"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    app.session_id = Some(session.id.clone());
+    app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
+    if let Some(manager) = tool_ctx.mcp_manager.clone() {
+        app.attach_mcp_manager(manager);
+    }
+    app.replace_messages(initial_messages.clone());
+
+    let home_dir = dirs::home_dir();
+    if home_dir.as_deref() == Some(tool_ctx.working_dir.as_path()) {
+        app.home_dir_warning = true;
+    }
+
+    // Bypass permissions confirmation dialog: must be accepted before any work
+    // Mark whether valid credentials exist so the TUI can show a provider
+    // setup dialog instead of failing silently on the first message.
+    app.has_credentials = has_credentials;
+
+    // Set agent mode from the --agent flag (carried on query_config).
+    if let Some(ref agent_name) = base_query_config.agent_name {
+        app.agent_mode = Some(agent_name.clone());
+    }
+
+    // Show onboarding: status hint if no credentials, welcome tour if first run.
+    if !has_credentials {
+        app.status_message =
+            Some("No provider configured. Run /connect to set one up.".to_string());
+    } else if !settings.has_completed_onboarding {
+        app.onboarding_dialog.show();
+    }
+
+    use mangocode_core::config::PermissionMode;
+    if live_config.permission_mode == PermissionMode::BypassPermissions {
+        app.bypass_permissions_dialog.show();
+    }
+
+    // Version-upgrade notice: record the current version for future comparisons.
+    // (Actual upgrade notice UI is handled by the release-notes slash command.)
+    {
+        let current_version = mangocode_core::constants::APP_VERSION.to_string();
+        if settings.last_seen_version.as_deref() != Some(&current_version) {
+            // Persist asynchronously to avoid blocking startup.
+            let version_clone = current_version.clone();
+            tokio::spawn(async move {
+                if let Ok(mut s) = mangocode_core::config::Settings::load().await {
+                    s.last_seen_version = Some(version_clone);
+                    if let Err(err) = s.save().await {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to persist last seen version"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    // CLAUDE_STATUS_COMMAND: optional external command whose stdout replaces the
+    // left-side status bar text. Polled every 500ms (debounced) in the main loop.
+    // The command is run in a background task; results flow through a channel.
+    let status_cmd_str = std::env::var("CLAUDE_STATUS_COMMAND").ok();
+    let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
+    if let Some(ref cmd_str) = status_cmd_str {
+        let cmd_str = cmd_str.clone();
+        let tx = status_cmd_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Run via shell so pipes/redirects in the command string work.
+                let output = if cfg!(target_os = "windows") {
+                    tokio::process::Command::new("cmd")
+                        .args(["/C", &cmd_str])
+                        .output()
+                        .await
+                } else {
+                    tokio::process::Command::new("sh")
+                        .args(["-c", &cmd_str])
+                        .output()
+                        .await
+                };
+                if let Ok(out) = output {
+                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let _ = tx.try_send(text);
+                }
+            }
+        });
+    }
+
+    // Bridge runtime channels — Some when bridge is configured and started.
+    //
+    // tui_rx:       TUI-facing events from the bridge worker (connect/disconnect/prompts)
+    // outbound_tx:  Forward query events to the bridge worker for upload to server
+    // bridge_cancel: CancellationToken to stop the bridge worker task
+    struct BridgeRuntime {
+        tui_rx: mpsc::Receiver<TuiBridgeEvent>,
+        outbound_tx: mpsc::Sender<BridgeOutbound>,
+        cancel: CancellationToken,
+    }
+
+    // Preserve the bridge token before consuming bridge_config so we can reconstruct
+    // a BridgeSessionInfo once the bridge worker reports it has connected.
+    let bridge_token: Option<String> = bridge_config.as_ref().and_then(|c| c.session_token.clone());
+
+    let mut bridge_runtime: Option<BridgeRuntime> = if let Some(cfg) = bridge_config {
+        let bridge_cancel = CancellationToken::new();
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiBridgeEvent>(64);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<BridgeOutbound>(256);
+
+        // Update TUI state to "connecting" before the task starts.
+        app.bridge_state = BridgeConnectionState::Connecting;
+
+        let cancel_clone = bridge_cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                mangocode_bridge::run_bridge_loop(cfg, tui_tx, outbound_rx, cancel_clone).await
+            {
+                warn!("Bridge loop exited with error: {}", e);
+            }
+        });
+
+        Some(BridgeRuntime {
+            tui_rx,
+            outbound_tx,
+            cancel: bridge_cancel,
+        })
+    } else {
+        None
+    };
+
+    // Relay channels for the BridgeSessionInfo-based event path.
+    //
+    // relay_ev_tx:    receives serialised JSON event payloads from the query-event
+    //                 drain loop; a background task consumes them and calls
+    //                 post_bridge_event so the web UI sees live streaming events.
+    // relay_ev_rx_opt: Option wrapper so we can move the Receiver into the relay
+    //                 task exactly once when the bridge session comes online.
+    // remote_prompt_tx/rx: inbound user messages polled from poll_bridge_messages
+    //                 are delivered here; the main loop injects them as query turns.
+    let (relay_ev_tx, relay_ev_rx) = mpsc::channel::<String>(256);
+    let mut relay_ev_rx_opt: Option<mpsc::Receiver<String>> = Some(relay_ev_rx);
+    let (remote_prompt_tx, mut remote_prompt_rx) = mpsc::channel::<String>(32);
+
+    // Once the bridge worker reports Connected we build this from the session
+    // credentials so both relay tasks can POST/poll the /api/bridge/sessions API.
+    let mut bridge_session_info: Option<std::sync::Arc<mangocode_bridge::BridgeSessionInfo>> = None;
+
+    let mut messages = initial_messages;
+    let mut cmd_ctx = CommandContext {
+        config: live_config,
+        cost_tracker: cost_tracker.clone(),
+        session_metrics: tool_ctx.session_metrics.clone(),
+        messages: messages.clone(),
+        effort_level: base_query_config.effort_level,
+        working_dir: tool_ctx.working_dir.clone(),
+        session_id: session.id.clone(),
+        session_title: session.title.clone(),
+        remote_session_url: session.remote_session_url.clone(),
+        mcp_manager: tool_ctx.mcp_manager.clone(),
+        model_registry: Some(model_registry.clone()),
+    };
+
+    // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
+    let mut tools_arc = tools;
+    sync_tool_context_visibility_for_query_agent(&mut tool_ctx, &tools_arc, &base_query_config);
+
+    // Current cancel token (replaced each turn)
+    let mut cancel: Option<CancellationToken> = None;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    // HITL clarification channel: AskUserQuestion tool posts a QuestionPrompt
+    // here; the main loop drains the receiver, sets `app.question_dialog`,
+    // and dispatches the response back over the prompt's oneshot when the
+    // user finishes (or cancels).
+    let (question_tx, mut question_rx) =
+        mpsc::unbounded_channel::<mangocode_tools::QuestionPrompt>();
+    tool_ctx.question_prompt_tx = Some(question_tx.clone());
+    // Pending response sender, taken from the active QuestionPrompt while
+    // its dialog is on-screen. Stored separately so the dialog state in
+    // `app.question_dialog` stays serializable / Clone.
+    let mut pending_question_response: Option<(
+        String,
+        tokio::sync::oneshot::Sender<mangocode_tools::QuestionResponse>,
+    )> = None;
+
+    // HITL permission channel: the critic-bypass path (`approvals_reviewer =
+    // User`, the default) posts a PermissionPrompt here when a risky tool
+    // needs Allow/Deny. The main loop honors session allowlists, surfaces
+    // `app.permission_request`, and routes the user's key choice back as a
+    // HitlDecision over the prompt's oneshot.
+    let (perm_tx, mut perm_rx) =
+        mpsc::unbounded_channel::<mangocode_query::PermissionPrompt>();
+    struct PendingHitl {
+        tx: tokio::sync::oneshot::Sender<mangocode_query::HitlDecision>,
+        tool_name: String,
+        suggested_prefix: Option<String>,
+        description: String,
+    }
+    let mut pending_hitl: Option<PendingHitl> = None;
+    // Session-scoped allowlist of non-Bash tool names. Bash uses
+    // `app.bash_prefix_allowlist` so an allow on `ls` doesn't approve
+    // `rm -rf` later.
+    let mut hitl_session_allowlist: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    type MessagesArc = Arc<tokio::sync::Mutex<Vec<mangocode_core::types::Message>>>;
+    let mut current_query: Option<(tokio::task::JoinHandle<QueryOutcome>, MessagesArc)> = None;
+    // Active effort level (None = use model default / High).
+    // Tracks the user's /effort selection; flows into qcfg each turn.
+    let mut current_effort: Option<mangocode_core::effort::EffortLevel> =
+        base_query_config.effort_level;
+
+    // Background update check: spawned once at startup; result delivered via channel.
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    tokio::spawn(async move {
+        let info = mangocode_core::check_for_updates().await;
+        let version = info.map(|i| i.latest_version);
+        let _ = update_tx.send(version).await;
+    });
+
+    // Device code / OAuth auth channel — background tasks send events here
+    // so the main loop can update the device_auth_dialog state.
+    let (device_auth_tx, mut device_auth_rx) = mpsc::channel::<DeviceAuthEvent>(8);
+
+    let mut terminal = HybridTerminal::setup(&app)?;
+    terminal.print_initial_messages(&app, &messages)?;
+
+    'main: loop {
+        app.frame_count = app.frame_count.wrapping_add(1);
+        app.notifications.tick();
+
+        // If the user completed a `/connect` flow (OAuth or API key) during this
+        // session, `auth.json` on disk has new credentials but the in-memory
+        // registry was built at startup and is stale. Rebuild it so the next
+        // dispatched query can actually find providers like `anthropic-max` or
+        // `openai-codex` (otherwise the query dispatcher may fall back to the
+        // generic OpenAI-compatible client and mis-route credentials).
+        if app.provider_registry_stale {
+            app.provider_registry_stale = false;
+            let refreshed = std::sync::Arc::new(
+                mangocode_api::ProviderRegistry::from_environment_with_auth_store(
+                    client_config.clone(),
+                ),
+            );
+            base_query_config.provider_registry = Some(refreshed.clone());
+            app.provider_registry = Some(refreshed);
+        }
+
+        terminal.render_live(&app)?;
+
+        // Poll for crossterm events (keyboard/mouse) with short timeout
+        if crossterm::event::poll(Duration::from_millis(16))? {
+            let evt = event::read()?;
+            match evt {
+                Event::Key(key) => {
+                    // On Windows crossterm emits Press + Release for a single key.
+                    // Only process Press to avoid double-registering input.
+                    if key.kind != crossterm::event::KeyEventKind::Press {
+                        continue;
+                    }
+
+                    // Ctrl+C: copy selected text if there's a selection, otherwise cancel/quit
+                    if key.code == KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                    {
+                        // Check if there's an active text selection - copy instead of cancel/quit
+                        let has_selection = app.selection_anchor.is_some()
+                            && !app.selection_text.borrow().is_empty();
+                        if has_selection {
+                            // Let the app handle the copy via its normal key handler
+                            app.handle_key_event(key);
+                            continue;
+                        }
+
+                        // No selection - handle as cancel (if streaming) or quit
+                        if app.is_streaming {
+                            if let Some(ref ct) = cancel {
+                                ct.cancel();
+                            }
+                            app.is_streaming = false;
+                            app.restore_queued_input_for_editing();
+                            app.status_message = Some("Cancelled.".to_string());
+                            continue;
+                        } else {
+                            break 'main;
+                        }
+                    }
+
+                    // Ctrl+D on empty input => quit
+                    if key.code == KeyCode::Char('d')
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && app.prompt_input.is_empty()
+                    {
+                        break 'main;
+                    }
+
+                    // Enter => submit input (but NOT when ANY dialog/overlay is open —
+                    // dialogs handle their own Enter in handle_key_event).
+                    let any_dialog_open = app.connect_dialog.visible
+                        || app.codex_account_dialog.visible
+                        || app.key_input_dialog.visible
+                        || app.device_auth_dialog.visible
+                        || app.command_palette.visible
+                        || app.model_picker.visible
+                        || app.onboarding_dialog.visible
+                        || app.bypass_permissions_dialog.visible
+                        || app.settings_screen.visible
+                        || app.export_dialog.visible
+                        || app.theme_screen.visible
+                        || app.privacy_screen.visible
+                        || app.stats_dialog.open
+                        || app.invalid_config_dialog.visible
+                        || app.context_viz.visible
+                        || app.mcp_approval.visible
+                        || app.session_browser.visible
+                        || app.session_branching.visible
+                        || app.tasks_overlay.visible
+                        || app.mcp_view.open
+                        || app.agents_menu.open
+                        || app.diff_viewer.open
+                        || app.help_overlay.visible
+                        || app.history_search_overlay.visible
+                        || app.rewind_flow.visible
+                        || app.show_help
+                        || app.context_menu_state.is_some()
+                        || app.permission_request.is_some()
+                        || app.global_search.open;
+                    // Esc during streaming cancels the active query turn.
+                    if key.code == KeyCode::Esc && app.is_streaming {
+                        if let Some(ref ct) = cancel {
+                            ct.cancel();
+                        }
+                        app.is_streaming = false;
+                        app.restore_queued_input_for_editing();
+                        app.status_message = Some("Cancelled.".to_string());
+                        continue;
+                    }
+                    if key.code == KeyCode::Enter && !app.is_streaming && !any_dialog_open {
+                        // If a slash-command suggestion is active, accept and execute immediately.
+                        if !app.prompt_input.suggestions.is_empty()
+                            && app.prompt_input.suggestion_index.is_some()
+                            && app.prompt_input.text.starts_with('/')
+                        {
+                            app.prompt_input.accept_suggestion();
+                            // Fall through to submit — no second Enter needed
+                        }
+
+                        let has_pending_attachments = !app.prompt_input.pending_images.is_empty()
+                            || !app.prompt_input.pending_documents.is_empty();
+                        let mut input = app.take_input();
+                        if input.is_empty() && !has_pending_attachments {
+                            continue;
+                        }
+
+                        // Check for slash command
+                        if input.starts_with('/') && !disable_slash_commands {
+                            let (cmd_name, cmd_args) =
+                                mangocode_tui::input::parse_slash_command(&input);
+                            let cmd_name = cmd_name.to_string();
+                            let cmd_args = cmd_args.to_string();
+                            let cmd_key = slash_command_lookup_key(&cmd_name);
+
+                            // ── Step 1: TUI-layer intercept (overlays, toggles) ────────
+                            // Run first so we know whether a UI overlay opened, which
+                            // lets us suppress redundant CLI text output below.
+                            //
+                            // Skip TUI overlay for arg-bearing commands where the user
+                            // wants to SET state, not browse a picker:
+                            //   /model claude-haiku  → set model, don't open picker
+                            //   /theme dark          → set theme, don't open picker
+                            //   /resume <id>         → load session, don't open browser
+                            // Also skip TUI for state toggles with explicit
+                            // on|off/value args so blind toggles do not misfire.
+                            let skip_tui_for_args =
+                                slash_command_with_args_skips_tui(&cmd_key, &cmd_args);
+                            let handled_by_tui = if skip_tui_for_args {
+                                false
+                            } else {
+                                app.intercept_slash_command_with_args(&cmd_key, &cmd_args)
+                            };
+                            if handled_by_tui {
+                                terminal.render_live(&app)?;
+                            }
+
+                            // Sync effort level when TUI cycled the visual indicator
+                            // (no-args /effort → cycle Low→Med→High→Max→Low).
+                            if handled_by_tui && cmd_key == "effort" && cmd_args.is_empty() {
+                                let level = tui_effort_to_core(app.effort_level);
+                                current_effort = Some(level);
+                                base_query_config.effort_level = Some(level);
+                                apply_effort_to_config(&mut app.config, level);
+                                apply_effort_to_config(&mut cmd_ctx.config, level);
+                                apply_effort_to_config(&mut tool_ctx.config, level);
+                                if let Err(err) = persist_effort_setting(level) {
+                                    app.status_message =
+                                        Some(format!("Failed to save effort setting: {}", err));
+                                }
+                            }
+
+                            // Honour exit/quit triggered by TUI intercept immediately.
+                            if app.should_quit {
+                                break 'main;
+                            }
+
+                            // ── Step 2: CLI-layer (real side effects) ──────────────────
+                            // Handles: config changes, session ops, file I/O, OAuth, etc.
+                            // Always runs — some commands need BOTH (e.g. /clear clears
+                            // app state via TUI AND the messages vec via CLI).
+                            cmd_ctx.messages = messages.clone();
+                            cmd_ctx.effort_level = current_effort;
+                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // Start optimistically true; set false for Silent/None below.
+                            let mut handled_by_cli = cli_result.is_some();
+                            let cli_succeeded = !matches!(
+                                &cli_result,
+                                Some(CommandResult::Error(_)) | Some(CommandResult::Silent) | None
+                            );
+
+                            // Whether we need to fall through and submit a user message.
+                            let mut submit_user_msg: Option<String> = None;
+
+                            match cli_result {
+                                Some(CommandResult::Exit) => break 'main,
+                                Some(CommandResult::ClearConversation) => {
+                                    messages.clear();
+                                    app.replace_messages(Vec::new());
+                                    session.messages.clear();
+                                    session.updated_at = chrono::Utc::now();
+                                    app.status_message = Some("Conversation cleared.".to_string());
+                                    save_session_and_notify(
+                                        &mut app,
+                                        &session,
+                                        "clearing conversation",
+                                    )
+                                    .await;
+                                    terminal.reset_transcript(&app, &messages)?;
+                                }
+                                Some(CommandResult::SetMessages(new_msgs)) => {
+                                    let removed = messages.len().saturating_sub(new_msgs.len());
+                                    messages = new_msgs.clone();
+                                    app.replace_messages(new_msgs);
+                                    session.messages = messages.clone();
+                                    session.updated_at = chrono::Utc::now();
+                                    app.status_message = Some(format!(
+                                        "Rewound {} message{}.",
+                                        removed,
+                                        if removed == 1 { "" } else { "s" }
+                                    ));
+                                    save_session_and_notify(
+                                        &mut app,
+                                        &session,
+                                        "rewinding session",
+                                    )
+                                    .await;
+                                    terminal.reset_transcript(&app, &messages)?;
+                                }
+                                Some(CommandResult::ImportSessionState {
+                                    config,
+                                    messages: imported_msgs,
+                                    effort: imported_effort,
+                                    working_dir: imported_dir,
+                                    message: msg,
+                                }) => {
+                                    let mut new_cfg = config;
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
+
+                                    if let Some(ref new_dir) = imported_dir {
+                                        new_cfg.project_dir = Some(new_dir.clone());
+                                    }
+
+                                    messages = imported_msgs.clone();
+                                    app.replace_messages(imported_msgs);
+                                    session.messages = messages.clone();
+
+                                    if let Some(new_dir) = imported_dir {
+                                        tool_ctx.working_dir = new_dir.clone();
+                                        cmd_ctx.working_dir = new_dir.clone();
+                                        base_query_config.working_directory =
+                                            Some(new_dir.display().to_string());
+                                        session.working_dir = Some(new_dir.display().to_string());
+                                        clear_session_shell_state(&tool_ctx.session_id);
+                                        set_process_working_dir_or_notify(&mut app, &new_dir);
+                                    } else {
+                                        base_query_config.working_directory =
+                                            Some(tool_ctx.working_dir.display().to_string());
+                                    }
+
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
+                                    base_query_config.completion_policy =
+                                        new_cfg.agent_completion_policy;
+                                    base_query_config.verification_policy =
+                                        new_cfg.verification_policy;
+                                    base_query_config.reliability_profile =
+                                        new_cfg.agent_reliability_profile;
+                                    base_query_config.speed_profile = new_cfg.agent_speed_profile;
+                                    if let Some(level) = imported_effort {
+                                        current_effort = Some(level);
+                                        base_query_config.effort_level = Some(level);
+                                        app.effort_level = core_effort_to_tui(level);
+                                    }
+                                    sync_approval_reviewer_runtime(&new_cfg);
+                                    cmd_ctx.config = new_cfg.clone();
+                                    cmd_ctx.effort_level = current_effort;
+                                    tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
+                                    app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
+                                    app.fast_mode = new_cfg
+                                        .model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        mangocode_core::config::PermissionMode::Plan
+                                    );
+                                    session.updated_at = chrono::Utc::now();
+                                    if save_session_and_notify(
+                                        &mut app,
+                                        &session,
+                                        "importing session state",
+                                    )
+                                    .await
+                                    {
+                                        app.status_message = Some(msg.clone());
+                                    }
+                                    terminal.reset_transcript(&app, &messages)?;
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
+                                Some(CommandResult::OpenRewindOverlay) => {
+                                    app.replace_messages(messages.clone());
+                                    app.open_rewind_flow();
+                                    app.status_message =
+                                        Some("Select a message to rewind to.".to_string());
+                                }
+                                Some(CommandResult::OpenHooksOverlay) => {
+                                    app.hooks_config_menu.open();
+                                    app.status_message =
+                                        Some("Hooks configuration browser".to_string());
+                                }
+                                Some(CommandResult::ResumeSession(resumed_session)) => {
+                                    session = resumed_session;
+                                    messages = session.messages.clone();
+                                    app.replace_messages(messages.clone());
+                                    if !session.model.trim().is_empty() {
+                                        apply_session_model_if_present(
+                                            &mut cmd_ctx.config,
+                                            &session.model,
+                                        );
+                                        apply_session_model_if_present(
+                                            &mut app.config,
+                                            &session.model,
+                                        );
+                                        apply_session_model_if_present(
+                                            &mut tool_ctx.config,
+                                            &session.model,
+                                        );
+                                    }
+                                    base_query_config.model =
+                                        mangocode_api::effective_model_for_config(
+                                            &cmd_ctx.config,
+                                            &model_registry,
+                                        );
+                                    app.model_name = base_query_config.model.clone();
+                                    app.cost_tracker.set_model(&base_query_config.model);
+                                    if session.model.trim().is_empty() {
+                                        session.model = canonical_session_model(
+                                            &cmd_ctx.config,
+                                            &base_query_config.model,
+                                        );
+                                    }
+                                    tool_ctx.session_id = session.id.clone();
+                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
+                                        mangocode_core::file_history::FileHistory::new(),
+                                    ));
+                                    tool_ctx.current_turn =
+                                        Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                                    cmd_ctx.session_id = session.id.clone();
+                                    cmd_ctx.session_title = session.title.clone();
+                                    if let Some(saved_dir) = session.working_dir.as_ref() {
+                                        let saved_path = std::path::PathBuf::from(saved_dir);
+                                        if saved_path.exists() {
+                                            tool_ctx.working_dir = saved_path.clone();
+                                            cmd_ctx.working_dir = saved_path;
+                                        }
+                                    }
+                                    tool_ctx.config.project_dir =
+                                        Some(tool_ctx.working_dir.clone());
+                                    cmd_ctx.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &cmd_ctx.config,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&cmd_ctx.config);
+                                    base_query_config.append_system_prompt = None;
+                                    base_query_config.completion_policy =
+                                        cmd_ctx.config.agent_completion_policy;
+                                    base_query_config.verification_policy =
+                                        cmd_ctx.config.verification_policy;
+                                    base_query_config.reliability_profile =
+                                        cmd_ctx.config.agent_reliability_profile;
+                                    base_query_config.speed_profile =
+                                        cmd_ctx.config.agent_speed_profile;
+                                    app.attach_turn_diff_state(
+                                        tool_ctx.file_history.clone(),
+                                        tool_ctx.current_turn.clone(),
+                                    );
+                                    app.session_id = Some(session.id.clone());
+                                    app.session_title = session.title.clone();
+                                    app.remote_session_url = session.remote_session_url.clone();
+                                    coordination_heartbeat.update(
+                                        mangocode_core::coordination::process_session_id(
+                                            &session.id,
+                                        ),
+                                        tool_ctx.working_dir.clone(),
+                                        base_query_config.model.clone(),
+                                        session.title.clone(),
+                                    );
+                                    app.status_message = Some(format!(
+                                        "Resumed session {}.",
+                                        truncate_bytes_prefix(&session.id, 8)
+                                    ));
+                                    terminal.reset_transcript(&app, &messages)?;
+                                }
+                                Some(CommandResult::SetWorkingDir(new_dir, msg)) => {
+                                    tool_ctx.working_dir = new_dir.clone();
+                                    cmd_ctx.working_dir = new_dir.clone();
+                                    tool_ctx.config.project_dir = Some(new_dir.clone());
+                                    cmd_ctx.config.project_dir = Some(new_dir.clone());
+                                    app.config.project_dir = Some(new_dir.clone());
+                                    app.refresh_prompt_slash_commands();
+                                    base_query_config.working_directory =
+                                        Some(new_dir.display().to_string());
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            new_dir.clone(),
+                                            &cmd_ctx.config,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&cmd_ctx.config);
+                                    base_query_config.append_system_prompt = None;
+                                    base_query_config.completion_policy =
+                                        cmd_ctx.config.agent_completion_policy;
+                                    base_query_config.verification_policy =
+                                        cmd_ctx.config.verification_policy;
+                                    base_query_config.reliability_profile =
+                                        cmd_ctx.config.agent_reliability_profile;
+                                    base_query_config.speed_profile =
+                                        cmd_ctx.config.agent_speed_profile;
+                                    coordination_heartbeat.update(
+                                        mangocode_core::coordination::process_session_id(
+                                            &tool_ctx.session_id,
+                                        ),
+                                        tool_ctx.working_dir.clone(),
+                                        base_query_config.model.clone(),
+                                        session.title.clone(),
+                                    );
+                                    session.working_dir = Some(new_dir.display().to_string());
+                                    session.updated_at = chrono::Utc::now();
+                                    clear_session_shell_state(&tool_ctx.session_id);
+                                    set_process_working_dir_or_notify(&mut app, &new_dir);
+                                    spawn_plugin_lifecycle_hooks(
+                                        "CwdChanged",
+                                        tool_ctx.session_id.clone(),
+                                        None,
+                                        new_dir.display().to_string(),
+                                    );
+                                    if save_session_and_notify(
+                                        &mut app,
+                                        &session,
+                                        "changing workspace",
+                                    )
+                                    .await
+                                    {
+                                        app.status_message = Some(msg.clone());
+                                    }
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
+                                Some(CommandResult::RenameSession(title)) => {
+                                    session.title = Some(title.clone());
+                                    session.updated_at = chrono::Utc::now();
+                                    cmd_ctx.session_title = session.title.clone();
+                                    if save_session_and_notify(
+                                        &mut app,
+                                        &session,
+                                        "renaming session",
+                                    )
+                                    .await
+                                    {
+                                        app.status_message =
+                                            Some(format!("Session renamed to \"{}\".", title));
+                                    }
+                                }
+                                Some(CommandResult::Message(msg)) => {
+                                    // Suppress text output when TUI already opened an
+                                    // overlay for this command (e.g. /stats opens dialog
+                                    // AND would push a text message — drop the text).
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
+                                Some(CommandResult::ReloadAuthStore(msg)) => {
+                                    app.auth_store = mangocode_core::AuthStore::load();
+                                    app.provider_registry_stale = true;
+                                    app.status_message = Some(msg.clone());
+                                    if !handled_by_tui {
+                                        terminal.print_assistant_text(&app, &msg)?;
+                                        app.push_message(
+                                            mangocode_core::types::Message::assistant(msg),
+                                        );
+                                    }
+                                }
+                                Some(CommandResult::ConfigChange(new_cfg)) => {
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
+                                    base_query_config.completion_policy =
+                                        new_cfg.agent_completion_policy;
+                                    base_query_config.verification_policy =
+                                        new_cfg.verification_policy;
+                                    base_query_config.reliability_profile =
+                                        new_cfg.agent_reliability_profile;
+                                    base_query_config.speed_profile = new_cfg.agent_speed_profile;
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
+                                    sync_approval_reviewer_runtime(&new_cfg);
+                                    cmd_ctx.config = new_cfg.clone();
+                                    tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
+                                    app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
+                                    // Sync the model actually used for dispatch,
+                                    // including provider defaults after model reset.
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
+                                    // Sync fast_mode visual indicator.
+                                    app.fast_mode = new_cfg
+                                        .model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
+                                    // Sync plan_mode visual indicator.
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        mangocode_core::config::PermissionMode::Plan
+                                    );
+                                    app.sleep_inhibitor.set_enabled(new_cfg.prevent_idle_sleep);
+                                    spawn_plugin_lifecycle_hooks(
+                                        "ConfigChange",
+                                        tool_ctx.session_id.clone(),
+                                        None,
+                                        "Configuration updated".to_string(),
+                                    );
+                                    app.status_message = Some("Configuration updated.".to_string());
+                                }
+                                Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
+                                    let reconnect_mcp = !mcp_server_configs_equal(
+                                        &cmd_ctx.config.mcp_servers,
+                                        &new_cfg.mcp_servers,
+                                    );
+                                    let rebuild_tools = cmd_ctx.config.allowed_tools
+                                        != new_cfg.allowed_tools
+                                        || cmd_ctx.config.disallowed_tools
+                                            != new_cfg.disallowed_tools;
+                                    base_query_config.system_prompt = Some(
+                                        build_session_system_prompt(
+                                            tool_ctx.working_dir.clone(),
+                                            &new_cfg,
+                                            false,
+                                        )
+                                        .await,
+                                    );
+                                    base_query_config.has_append_system_prompt =
+                                        append_system_prompt_configured(&new_cfg);
+                                    base_query_config.append_system_prompt = None;
+                                    base_query_config.completion_policy =
+                                        new_cfg.agent_completion_policy;
+                                    base_query_config.verification_policy =
+                                        new_cfg.verification_policy;
+                                    base_query_config.reliability_profile =
+                                        new_cfg.agent_reliability_profile;
+                                    base_query_config.speed_profile = new_cfg.agent_speed_profile;
+                                    base_query_config.working_directory =
+                                        Some(tool_ctx.working_dir.display().to_string());
+                                    sync_approval_reviewer_runtime(&new_cfg);
+                                    cmd_ctx.config = new_cfg.clone();
+                                    tool_ctx.config = new_cfg.clone();
+                                    tool_ctx.permission_mode = new_cfg.permission_mode.clone();
+                                    tool_ctx.permission_handler =
+                                        make_permission_handler(false, &new_cfg.permission_mode);
+                                    // Sync the model actually used for dispatch,
+                                    // including provider defaults after model reset.
+                                    let effective_model = mangocode_api::effective_model_for_config(
+                                        &new_cfg,
+                                        &model_registry,
+                                    );
+                                    base_query_config.model = effective_model.clone();
+                                    app.cost_tracker.set_model(&effective_model);
+                                    app.model_name = effective_model.clone();
+                                    session.model =
+                                        canonical_session_model(&new_cfg, &effective_model);
+                                    // Sync fast_mode visual indicator.
+                                    app.fast_mode = new_cfg
+                                        .model
+                                        .as_deref()
+                                        .map(|m| m.contains("haiku"))
+                                        .unwrap_or(false);
+                                    app.plan_mode = matches!(
+                                        new_cfg.permission_mode,
+                                        mangocode_core::config::PermissionMode::Plan
+                                    );
+                                    app.sleep_inhibitor.set_enabled(new_cfg.prevent_idle_sleep);
+                                    app.config = new_cfg.clone();
+                                    app.output_style = tui_output_style_for_config(&new_cfg);
+                                    if reconnect_mcp {
+                                        app.pending_mcp_reconnect = true;
+                                    } else if rebuild_tools {
+                                        tools_arc = build_tools_for_query_config(
+                                            tool_ctx.mcp_manager.clone(),
+                                            &new_cfg,
+                                            &base_query_config,
+                                        );
+                                    }
+                                    sync_tool_context_visibility_for_query_agent(
+                                        &mut tool_ctx,
+                                        &tools_arc,
+                                        &base_query_config,
+                                    );
+                                    app.refresh_prompt_slash_commands();
+                                    spawn_plugin_lifecycle_hooks(
+                                        "ConfigChange",
+                                        tool_ctx.session_id.clone(),
+                                        None,
+                                        msg.clone(),
+                                    );
+                                    app.status_message = Some(msg);
+                                }
+                                Some(CommandResult::UserMessage(msg)) => {
+                                    if cmd_key == "plan" {
+                                        let mode = if cmd_args.trim().eq_ignore_ascii_case("exit") {
+                                            mangocode_core::config::PermissionMode::Default
+                                        } else {
+                                            mangocode_core::config::PermissionMode::Plan
+                                        };
+                                        app.plan_mode = matches!(
+                                            mode,
+                                            mangocode_core::config::PermissionMode::Plan
+                                        );
+                                        app.config.permission_mode = mode.clone();
+                                        cmd_ctx.config.permission_mode = mode.clone();
+                                        tool_ctx.config.permission_mode = mode.clone();
+                                        tool_ctx.permission_mode = mode.clone();
+                                        tool_ctx.permission_handler =
+                                            make_permission_handler(false, &mode);
+                                    }
+                                    // Queue a user-visible turn for the model.
+                                    submit_user_msg = Some(msg);
+                                }
+                                Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
+                                    terminal.suspend().ok();
+                                    match oauth_flow::run_oauth_login_flow(with_claude_ai).await {
+                                        Ok(result) => {
+                                            debug!(
+                                                credential_len = result.credential.len(),
+                                                bearer = result.use_bearer_auth,
+                                                "OAuth login complete"
+                                            );
+                                            app.status_message =
+                                                Some("Login successful!".to_string());
+                                            eprintln!(
+                                                "\nLogin successful! Please restart \
+                                                 claude to use the new credentials."
+                                            );
+                                            break 'main;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("\nLogin failed: {}", e);
+                                        }
+                                    }
+                                    terminal = HybridTerminal::resume(&app, &messages)?;
+                                }
+                                Some(CommandResult::Error(e)) => {
+                                    app.status_message = Some(format!("Error: {}", e));
+                                }
+                                Some(CommandResult::Silent) | None => {
+                                    handled_by_cli = false;
+                                }
+                            }
+
+                            // Sync effort visual + API level when CLI handled
+                            // /effort with explicit args (/effort high).
+                            if handled_by_cli && cmd_key == "effort" && !cmd_args.is_empty() {
+                                if let Some(level) = parse_effort_level_arg(&cmd_args) {
+                                    current_effort = Some(level);
+                                    base_query_config.effort_level = Some(level);
+                                    cmd_ctx.effort_level = Some(level);
+                                    app.effort_level = core_effort_to_tui(level);
+                                    app.status_message = Some(format!(
+                                        "Effort: {} {}",
+                                        app.effort_level.symbol(),
+                                        app.effort_level.label(),
+                                    ));
+                                }
+                            }
+
+                            // Sync vim mode from the setting the CLI command just wrote.
+                            if cli_succeeded
+                                && handled_by_cli
+                                && matches!(cmd_key.as_str(), "vim" | "vi")
+                            {
+                                match load_persisted_ui_settings() {
+                                    Ok(latest_ui_settings) => {
+                                        if let Some(editor_mode) = latest_ui_settings.editor_mode {
+                                            app.prompt_input.vim_enabled = editor_mode == "vim";
+                                            app.refresh_prompt_input();
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            "failed to reload persisted UI settings after /vim"
+                                        );
+                                        notify_tui_warning(
+                                            &mut app,
+                                            format_persisted_ui_settings_error(&err),
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Sync voice mode from the setting the CLI command just wrote.
+                            if cli_succeeded && handled_by_cli && cmd_key == "voice" {
+                                match load_persisted_ui_settings() {
+                                    Ok(latest_ui_settings) => {
+                                        if let Some(enabled) = latest_ui_settings.voice_enabled {
+                                            app.set_voice_enabled(enabled);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            error = %err,
+                                            "failed to reload persisted UI settings after /voice"
+                                        );
+                                        notify_tui_warning(
+                                            &mut app,
+                                            format_persisted_ui_settings_error(&err),
+                                        );
+                                    }
+                                }
+                            }
+
+                            if handled_by_cli
+                                && (cmd_key == "reload-plugins"
+                                    || (matches!(cmd_key.as_str(), "plugin" | "plugins")
+                                        && slash_command_first_arg_matches(
+                                            &cmd_args,
+                                            &["reload", "refresh"],
+                                        )))
+                            {
+                                app.refresh_prompt_slash_commands();
+                            }
+
+                            if !handled_by_cli && !handled_by_tui {
+                                app.status_message =
+                                    Some(format!("Unknown command: /{}", cmd_name));
+                            }
+
+                            // If a UserMessage was queued (e.g. /compact), submit it.
+                            if let Some(msg) = submit_user_msg {
+                                // Fall through to the normal send path using
+                                // the generated prompt, not the original slash
+                                // command. Printing/pushing here would duplicate
+                                // the chat turn below.
+                                input = msg;
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        match run_user_prompt_submit_hooks(
+                            input,
+                            &cmd_ctx.config,
+                            &tool_ctx.working_dir,
+                            &tool_ctx.session_id,
+                        )
+                        .await
+                        {
+                            PromptSubmitHookOutcome::Allowed(updated_input) => {
+                                input = updated_input;
+                            }
+                            PromptSubmitHookOutcome::Blocked {
+                                reason,
+                                input: blocked_input,
+                            } => {
+                                app.set_prompt_text(blocked_input);
+                                app.status_message = Some(reason);
+                                continue;
+                            }
+                        }
+
+                        // Regular user message (with optional image/document attachments)
+                        let pending_imgs = app.prompt_input.clear_images();
+                        let pending_docs = app.prompt_input.clear_documents();
+                        let user_msg = if pending_imgs.is_empty() && pending_docs.is_empty() {
+                            mangocode_core::types::Message::user(input.clone())
+                        } else {
+                            let attachment_caps =
+                                mangocode_core::smart_attachments::model_attachment_capabilities(
+                                    app.config.provider.as_deref(),
+                                    &app.model_name,
+                                );
+                            let mut blocks: Vec<mangocode_core::types::ContentBlock> = Vec::new();
+                            for img in &pending_imgs {
+                                if attachment_caps.image_input {
+                                    if let Some(b64) =
+                                        mangocode_tui::image_paste::encode_image_base64(&img.path)
+                                    {
+                                        blocks.push(mangocode_core::types::ContentBlock::Image {
+                                            source: mangocode_core::types::ImageSource {
+                                                source_type: "base64".to_string(),
+                                                media_type: Some("image/png".to_string()),
+                                                data: Some(b64),
+                                                url: None,
+                                            },
+                                        });
+                                    } else {
+                                        blocks.push(mangocode_core::types::ContentBlock::Text {
+                                            text: format!(
+                                                "[Attachment warning: image '{}' could not be read from {}.]",
+                                                img.label,
+                                                img.path.display()
+                                            ),
+                                        });
+                                    }
+                                } else {
+                                    let fallback = mangocode_core::smart_attachments::image_markdown_with_ocr_fallback(
+                                        &img.path,
+                                        Some(&img.label),
+                                        Some(&app.config.attachments),
+                                    )
+                                    .unwrap_or_else(|e| {
+                                            format!(
+                                                "# Image Attachment: {}\n\n\
+                                                 > The selected provider/model does not support raw image input, and MangoCode could not build the Markdown image fallback: {}\n\n\
+                                                 - Source path: `{}`\n",
+                                                img.label,
+                                                e,
+                                                img.path.display()
+                                            )
+                                    });
+                                    blocks.push(mangocode_core::types::ContentBlock::Text {
+                                        text: fallback,
+                                    });
+                                }
+                            }
+                            for doc in pending_docs {
+                                let name = escape_attachment_attr(&doc.label);
+                                let media_type = escape_attachment_attr(
+                                    doc.media_type.as_deref().unwrap_or("text/markdown"),
+                                );
+                                let source =
+                                    escape_attachment_attr(&doc.path.display().to_string());
+                                let cache =
+                                    escape_attachment_attr(&doc.cache_path.display().to_string());
+                                let markdown = escape_attachment_body(&doc.markdown);
+                                blocks.push(mangocode_core::types::ContentBlock::Text {
+                                    text: format!(
+                                        "<attachment name=\"{}\" media_type=\"{}\" source=\"{}\" cache=\"{}\">\n{}\n</attachment>",
+                                        name, media_type, source, cache, markdown
+                                    ),
+                                });
+                            }
+                            blocks.push(mangocode_core::types::ContentBlock::Text {
+                                text: input.clone(),
+                            });
+                            mangocode_core::types::Message::user_blocks(blocks)
+                        };
+                        terminal.print_user_input(&app, &input)?;
+                        messages.push(user_msg.clone());
+                        app.push_message(user_msg);
+                        session.messages = messages.clone();
+                        session.updated_at = chrono::Utc::now();
+
+                        // Start async query
+                        app.is_streaming = true;
+                        app.streaming_text.clear();
+
+                        let ct = CancellationToken::new();
+                        cancel = Some(ct.clone());
+
+                        // Use Arc<Mutex> so the task can write updated messages back
+                        let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                        let msgs_arc_clone = msgs_arc.clone();
+
+                        // Share the already-filtered runtime tool set, including visible MCP tools.
+                        let tools_arc_clone = tools_arc.clone();
+                        let ctx_clone = tool_ctx.clone();
+                        let mut qcfg = base_query_config.clone();
+                        sync_query_config_for_runtime(
+                            &mut qcfg,
+                            &cmd_ctx.config,
+                            &tool_ctx.working_dir,
+                            &model_registry,
+                        );
+                        qcfg.system_prompt = base_query_config.system_prompt.clone();
+                        // Apply active effort level (set via /effort command).
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                        }
+                        let tracker = cost_tracker.clone();
+                        let tx = event_tx.clone();
+                        let client_clone = client.clone();
+
+                        let perm_tx_for_spawn = perm_tx.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut msgs = msgs_arc_clone.lock().await.clone();
+                            let outcome = mangocode_query::run_query_loop(
+                                client_clone.as_ref(),
+                                &mut msgs,
+                                tools_arc_clone.as_slice(),
+                                &ctx_clone,
+                                &qcfg,
+                                tracker,
+                                Some(tx),
+                                ct,
+                                None,
+                                Some(perm_tx_for_spawn.clone()), // route HITL prompts to the TUI main loop
+                            )
+                            .await;
+                            // Write updated messages (with tool calls + assistant response) back
+                            *msgs_arc_clone.lock().await = msgs;
+                            outcome
+                        });
+
+                        // Store the Arc so we can read messages after task completes
+                        current_query = Some((handle, msgs_arc));
+                        continue;
+                    }
+
+                    let expanded_before = app.expanded_tool_outputs.clone();
+                    let model_picker_was_visible = app.model_picker.visible;
+                    let config_before_key = cmd_ctx.config.clone();
+                    app.handle_key_event(key);
+                    if model_picker_was_visible
+                        && !app.model_picker.visible
+                        && key.code == KeyCode::Enter
+                    {
+                        let level = tui_effort_to_core(app.effort_level);
+                        current_effort = Some(level);
+                        base_query_config.effort_level = Some(level);
+                        apply_effort_to_config(&mut app.config, level);
+                        if let Err(err) = persist_effort_setting(level) {
+                            app.status_message =
+                                Some(format!("Failed to save effort setting: {}", err));
+                        }
+                    }
+                    if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
+                        terminal.reset_transcript(&app, &messages)?;
+                    }
+                    let app_config = app.config.clone();
+                    let reconnect_mcp = !mcp_server_configs_equal(
+                        &config_before_key.mcp_servers,
+                        &app_config.mcp_servers,
+                    );
+                    let rebuild_tools = config_before_key.allowed_tools != app_config.allowed_tools
+                        || config_before_key.disallowed_tools != app_config.disallowed_tools;
+                    cmd_ctx.config = app_config.clone();
+                    tool_ctx.config = app_config.clone();
+                    tool_ctx.permission_mode = app_config.permission_mode.clone();
+                    tool_ctx.permission_handler =
+                        make_permission_handler(false, &app_config.permission_mode);
+                    sync_tui_runtime_state_from_config(
+                        &mut app,
+                        &mut base_query_config,
+                        &tool_ctx.working_dir,
+                        &model_registry,
+                    );
+                    if reconnect_mcp {
+                        app.pending_mcp_reconnect = true;
+                    } else if rebuild_tools {
+                        tools_arc = build_tools_for_query_config(
+                            tool_ctx.mcp_manager.clone(),
+                            &app_config,
+                            &base_query_config,
+                        );
+                    }
+                    sync_approval_reviewer_runtime(&app_config);
+                    sync_tool_context_visibility_for_query_agent(
+                        &mut tool_ctx,
+                        &tools_arc,
+                        &base_query_config,
+                    );
+                    if !app.model_name.is_empty() {
+                        session.model = canonical_session_model(&app.config, &app.model_name);
+                    }
+                    if !app.is_streaming && app.messages.len() < messages.len() {
+                        messages = app.messages.clone();
+                        session.messages = messages.clone();
+                        session.updated_at = chrono::Utc::now();
+                    }
+                }
+                Event::Paste(data) => {
+                    app.handle_terminal_paste(&data);
+                }
+                Event::Mouse(mouse) => {
+                    let expanded_before = app.expanded_tool_outputs.clone();
+                    app.handle_mouse_event(mouse);
+                    if app.expanded_tool_outputs != expanded_before && !app.is_streaming {
+                        terminal.reset_transcript(&app, &messages)?;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    init_mascot(&mut app);
+                    terminal.render_live(&app)?;
+                }
+                _ => {}
+            }
+            terminal.render_live(&app)?;
+        }
+
+        // --- HITL clarification dialog (AskUserQuestion tool) ---------------
+        // 1) If the active dialog has finished (completed or cancelled by the
+        //    user), send the response back over its oneshot and clear it.
+        if let Some(dialog) = app.question_dialog.as_ref() {
+            if dialog.completed || dialog.cancelled {
+                let response = dialog.build_response();
+                let dialog_id = dialog.tool_use_id.clone();
+                let was_cancelled = dialog.cancelled;
+                app.question_dialog = None;
+                if let Some((pending_id, tx)) = pending_question_response.take() {
+                    if pending_id == dialog_id {
+                        let _ = tx.send(response);
+                        spawn_plugin_lifecycle_hooks(
+                            "ElicitationResult",
+                            tool_ctx.session_id.clone(),
+                            Some("AskUserQuestion".to_string()),
+                            if was_cancelled {
+                                "cancelled".to_string()
+                            } else {
+                                "answered".to_string()
+                            },
+                        );
+                    } else {
+                        // Mismatched id: keep the sender so the right prompt
+                        // still gets its answer, and drop the stale response.
+                        pending_question_response = Some((pending_id, tx));
+                    }
+                }
+            }
+        }
+        // 2) When no dialog is on-screen, accept the next pending prompt.
+        if app.question_dialog.is_none() && pending_question_response.is_none() {
+            if let Ok(prompt) = question_rx.try_recv() {
+                spawn_notification_hooks(
+                    tool_ctx.config.hooks.clone(),
+                    tool_ctx.working_dir.clone(),
+                    tool_ctx.session_id.clone(),
+                    Some("AskUserQuestion".to_string()),
+                    "MangoCode is waiting for your answer to a question".to_string(),
+                );
+                spawn_plugin_lifecycle_hooks(
+                    "Elicitation",
+                    tool_ctx.session_id.clone(),
+                    Some("AskUserQuestion".to_string()),
+                    format!("{} question(s) awaiting user input", prompt.questions.len()),
+                );
+                let dialog = mangocode_tui::dialogs::QuestionDialog::new(
+                    prompt.tool_use_id.clone(),
+                    prompt.questions,
+                );
+                app.question_dialog = Some(dialog);
+                pending_question_response = Some((prompt.tool_use_id, prompt.response_tx));
+            }
+        }
+
+        // --- HITL permission prompt handling --------------------------------
+        // a) If the user just dismissed a permission dialog, translate the
+        //    chosen key into a HitlDecision and send it back over the
+        //    pending oneshot. '\x00' means Esc / dismiss → Deny.
+        if let Some((_tool_use_id, _resp_tool_name, key)) =
+            app.last_permission_response.take()
+        {
+            if let Some(pending) = pending_hitl.take() {
+                use mangocode_query::HitlDecision;
+                let is_bash = pending.tool_name
+                    == mangocode_core::constants::TOOL_NAME_BASH
+                    || pending.tool_name == "PowerShell";
+                let decision = match key {
+                    'y' => HitlDecision::AllowOnce,
+                    'Y' => {
+                        if is_bash {
+                            if let Some(prefix) = pending
+                                .suggested_prefix
+                                .clone()
+                                .or_else(|| {
+                                    pending
+                                        .description
+                                        .split_whitespace()
+                                        .next()
+                                        .map(|s| s.to_string())
+                                })
+                            {
+                                app.bash_prefix_allowlist.insert(prefix);
+                            }
+                        } else {
+                            hitl_session_allowlist.insert(pending.tool_name.clone());
+                        }
+                        HitlDecision::AllowSession
+                    }
+                    'p' => {
+                        // Persistent allow: in-session + write to user
+                        // settings so it survives a restart.
+                        if is_bash {
+                            if let Some(prefix) = pending
+                                .suggested_prefix
+                                .clone()
+                                .or_else(|| {
+                                    pending
+                                        .description
+                                        .split_whitespace()
+                                        .next()
+                                        .map(|s| s.to_string())
+                                })
+                            {
+                                app.bash_prefix_allowlist.insert(prefix);
+                            }
+                        } else {
+                            hitl_session_allowlist.insert(pending.tool_name.clone());
+                        }
+                        let tool_name_for_persist = pending.tool_name.clone();
+                        tokio::spawn(async move {
+                            if let Ok(mut s) =
+                                mangocode_core::config::Settings::load().await
+                            {
+                                let rule = mangocode_core::PermissionRule {
+                                    tool_name: Some(tool_name_for_persist),
+                                    path_pattern: None,
+                                    action: mangocode_core::PermissionAction::Allow,
+                                    scope: mangocode_core::PermissionScope::Persistent,
+                                };
+                                s.permission_rules.push(
+                                    mangocode_core::SerializedPermissionRule::from(&rule),
+                                );
+                                let _ = s.save().await;
+                            }
+                        });
+                        HitlDecision::AllowPersistent
+                    }
+                    'P' => {
+                        let prefix = pending
+                            .suggested_prefix
+                            .clone()
+                            .or_else(|| {
+                                pending
+                                    .description
+                                    .split_whitespace()
+                                    .next()
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if !prefix.is_empty() {
+                            app.bash_prefix_allowlist.insert(prefix.clone());
+                        }
+                        HitlDecision::AllowPrefix(prefix)
+                    }
+                    _ => HitlDecision::Deny,
+                };
+                if matches!(decision, HitlDecision::Deny) {
+                    spawn_plugin_lifecycle_hooks(
+                        "PermissionDenied",
+                        tool_ctx.session_id.clone(),
+                        Some(pending.tool_name.clone()),
+                        pending.description.clone(),
+                    );
+                }
+                let _ = pending.tx.send(decision);
+            }
+        }
+        // b) Drain new permission prompts. Auto-approve from session
+        //    allowlists; otherwise surface a dialog and stash the response
+        //    sender.
+        if app.permission_request.is_none() {
+            if let Ok(prompt) = perm_rx.try_recv() {
+                let is_bash =
+                    prompt.tool_name == mangocode_core::constants::TOOL_NAME_BASH;
+                let is_shell = is_bash || prompt.tool_name == "PowerShell";
+                let auto_approve = if is_shell {
+                    app.bash_command_allowed_by_prefix(&prompt.description)
+                } else {
+                    hitl_session_allowlist.contains(&prompt.tool_name)
+                };
+                if auto_approve {
+                    let _ = prompt
+                        .response_tx
+                        .send(mangocode_query::HitlDecision::AllowOnce);
+                } else {
+                    spawn_notification_hooks(
+                        tool_ctx.config.hooks.clone(),
+                        tool_ctx.working_dir.clone(),
+                        tool_ctx.session_id.clone(),
+                        Some(prompt.tool_name.clone()),
+                        format!(
+                            "MangoCode is waiting for permission to run {}: {}",
+                            prompt.tool_name, prompt.description
+                        ),
+                    );
+                    spawn_plugin_lifecycle_hooks(
+                        "PermissionRequest",
+                        tool_ctx.session_id.clone(),
+                        Some(prompt.tool_name.clone()),
+                        prompt.description.clone(),
+                    );
+                    let pr = if is_shell {
+                        mangocode_tui::dialogs::PermissionRequest::bash(
+                            prompt.tool_use_id.clone(),
+                            prompt.tool_name.clone(),
+                            prompt.description.clone(),
+                            prompt.details.clone().unwrap_or_default(),
+                            prompt.suggested_prefix.clone(),
+                        )
+                    } else {
+                        mangocode_tui::dialogs::PermissionRequest::standard(
+                            prompt.tool_use_id.clone(),
+                            prompt.tool_name.clone(),
+                            prompt.description.clone(),
+                        )
+                    };
+                    app.permission_request = Some(pr);
+                    pending_hitl = Some(PendingHitl {
+                        tx: prompt.response_tx,
+                        tool_name: prompt.tool_name,
+                        suggested_prefix: prompt.suggested_prefix,
+                        description: prompt.description,
+                    });
+                }
+            }
+        }
+
+        // Drain query events in bounded batches so a misbehaving provider
+        // cannot starve input/render by flooding the queue.
+        const MAX_QUERY_EVENTS_PER_FRAME: usize = 512;
+        let mut drained_query_events = 0usize;
+        while drained_query_events < MAX_QUERY_EVENTS_PER_FRAME {
+            let Ok(evt) = event_rx.try_recv() else { break };
+            drained_query_events += 1;
+
+            // Forward to bridge before consuming (clone only what we need).
+            if let Some(ref runtime) = bridge_runtime {
+                let outbound: Option<BridgeOutbound> = match &evt {
+                    QueryEvent::Stream(
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            index,
+                            ..
+                        },
+                    ) => Some(BridgeOutbound::TextDelta {
+                        delta: text.clone(),
+                        message_id: format!("msg-{}", index),
+                    }),
+                    QueryEvent::StreamWithParent {
+                        event:
+                            mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                                delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                                index,
+                                ..
+                            },
+                        ..
+                    } => Some(BridgeOutbound::TextDelta {
+                        delta: text.clone(),
+                        message_id: format!("msg-{}", index),
+                    }),
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                        ..
+                    } => Some(BridgeOutbound::ToolStart {
+                        id: tool_id.clone(),
+                        name: tool_name.clone(),
+                        input_preview: Some(input_json.clone()),
+                    }),
+                    QueryEvent::ToolEnd {
+                        tool_id,
+                        result,
+                        is_error,
+                        ..
+                    } => Some(BridgeOutbound::ToolEnd {
+                        id: tool_id.clone(),
+                        output: result.clone(),
+                        is_error: *is_error,
+                    }),
+                    QueryEvent::TurnComplete {
+                        stop_reason, turn, ..
+                    } => Some(BridgeOutbound::TurnComplete {
+                        message_id: format!("turn-{}", turn),
+                        stop_reason: stop_reason.clone(),
+                    }),
+                    QueryEvent::Error(msg) => Some(BridgeOutbound::Error {
+                        message: msg.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(ob) = outbound {
+                    let _ = runtime.outbound_tx.try_send(ob);
+                }
+            }
+            // Also forward to the BridgeSessionInfo relay channel (best-effort).
+            // This drives the post_bridge_event relay task spawned on Connected.
+            if bridge_session_info.is_some() {
+                let relay_payload: Option<String> = match &evt {
+                    QueryEvent::Stream(
+                        mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                            delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                            ..
+                        },
+                    ) => Some(
+                        serde_json::json!({
+                            "type": "text_chunk",
+                            "text": text,
+                        })
+                        .to_string(),
+                    ),
+                    QueryEvent::StreamWithParent {
+                        event:
+                            mangocode_api::AnthropicStreamEvent::ContentBlockDelta {
+                                delta: mangocode_api::streaming::ContentDelta::TextDelta { text },
+                                ..
+                            },
+                        ..
+                    } => Some(
+                        serde_json::json!({
+                            "type": "text_chunk",
+                            "text": text,
+                        })
+                        .to_string(),
+                    ),
+                    QueryEvent::ToolStart {
+                        tool_name,
+                        tool_id,
+                        input_json,
+                        ..
+                    } => Some(
+                        serde_json::json!({
+                            "type": "tool_start",
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "input": input_json,
+                        })
+                        .to_string(),
+                    ),
+                    QueryEvent::ToolEnd {
+                        tool_name,
+                        tool_id,
+                        result,
+                        is_error,
+                        ..
+                    } => Some(
+                        serde_json::json!({
+                            "type": "tool_end",
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                            "result": result,
+                            "is_error": is_error,
+                        })
+                        .to_string(),
+                    ),
+                    _ => None,
+                };
+                if let Some(payload) = relay_payload {
+                    let _ = relay_ev_tx.try_send(payload);
+                }
+            }
+            app.handle_query_event(evt.clone());
+            terminal.handle_query_event(&app, &evt)?;
+        }
+        if drained_query_events == MAX_QUERY_EVENTS_PER_FRAME {
+            // Keep responsive and continue draining on the next frame.
+            tracing::debug!(
+                limit = MAX_QUERY_EVENTS_PER_FRAME,
+                "Query event drain reached per-frame cap"
+            );
+        }
+
+        // Drain TUI-facing bridge events.
+        let mut disconnect_bridge = false;
+        if let Some(runtime) = bridge_runtime.as_mut() {
+            loop {
+                match runtime.tui_rx.try_recv() {
+                    Ok(TuiBridgeEvent::Connected {
+                        session_url,
+                        session_id: conn_sid,
+                    }) => {
+                        let short = truncate_bytes_with_ellipsis(&session_url, 60);
+                        app.bridge_state = BridgeConnectionState::Connected {
+                            session_url: session_url.clone(),
+                            peer_count: 0,
+                        };
+                        app.remote_session_url = Some(session_url.clone());
+                        cmd_ctx.remote_session_url = Some(session_url.clone());
+                        app.notifications.push(
+                            NotificationKind::Success,
+                            format!("Remote control active: {}", short),
+                            Some(5),
+                        );
+                        // Persist the session URL into the saved session record.
+                        session.remote_session_url = Some(session_url.clone());
+                        session.updated_at = chrono::Utc::now();
+                        save_session_and_notify(&mut app, &session, "saving remote session URL")
+                            .await;
+
+                        // Wire the BridgeSessionInfo relay so live tool/text events reach
+                        // the web UI via /api/bridge/sessions. This runs alongside
+                        // run_bridge_loop as a best-effort supplementary delivery path.
+                        if let Some(ref token) = bridge_token {
+                            let info = std::sync::Arc::new(mangocode_bridge::BridgeSessionInfo {
+                                session_id: conn_sid.clone(),
+                                session_url: session_url.clone(),
+                                token: token.clone(),
+                            });
+                            bridge_session_info = Some(info.clone());
+
+                            // Relay consumer: moves relay_ev_rx (taken from the Option)
+                            // into a background task that calls post_bridge_event per item.
+                            if let Some(rx) = relay_ev_rx_opt.take() {
+                                let info_relay = info.clone();
+                                tokio::spawn(async move {
+                                    let mut rx = rx;
+                                    while let Some(payload) = rx.recv().await {
+                                        let _ = mangocode_bridge::post_bridge_event(
+                                            &info_relay,
+                                            payload,
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+
+                            // Poll task: periodically calls poll_bridge_messages and
+                            // forwards inbound user messages to remote_prompt_tx.
+                            let info_poll = info.clone();
+                            let poll_tx = remote_prompt_tx.clone();
+                            tokio::spawn(async move {
+                                let mut since_id: Option<String> = None;
+                                loop {
+                                    match mangocode_bridge::poll_bridge_messages(
+                                        &info_poll,
+                                        since_id.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(msgs) if !msgs.is_empty() => {
+                                            for msg in &msgs {
+                                                since_id = Some(msg.id.clone());
+                                                if msg.role == "user"
+                                                    && poll_tx
+                                                        .send(msg.content.clone())
+                                                        .await
+                                                        .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                }
+                            });
+                        }
+                    }
+                    Ok(TuiBridgeEvent::Disconnected { reason }) => {
+                        app.bridge_state = BridgeConnectionState::Disconnected;
+                        app.remote_session_url = None;
+                        cmd_ctx.remote_session_url = None;
+                        if let Some(r) = reason {
+                            app.notifications.push(
+                                NotificationKind::Warning,
+                                format!("Bridge disconnected: {}", r),
+                                Some(5),
+                            );
+                        }
+                        disconnect_bridge = true;
+                        break;
+                    }
+                    Ok(TuiBridgeEvent::Reconnecting { attempt }) => {
+                        app.bridge_state = BridgeConnectionState::Reconnecting { attempt };
+                    }
+                    Ok(TuiBridgeEvent::InboundPrompt { content, .. }) => {
+                        // Inject the remote prompt as if the user typed it, then
+                        // trigger submission automatically.
+                        app.set_prompt_text(content.clone());
+                        // Push as a user message and fire a query immediately.
+                        terminal.print_user_input(&app, &content)?;
+                        messages.push(mangocode_core::types::Message::user(content.clone()));
+                        app.push_message(mangocode_core::types::Message::user(content.clone()));
+                        session.messages = messages.clone();
+                        session.updated_at = chrono::Utc::now();
+                        app.is_streaming = true;
+                        app.streaming_text.clear();
+                        let ct = CancellationToken::new();
+                        cancel = Some(ct.clone());
+                        let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                        let msgs_arc_clone = msgs_arc.clone();
+                        let tools_arc_clone = tools_arc.clone();
+                        let ctx_clone = tool_ctx.clone();
+                        let mut qcfg = base_query_config.clone();
+                        sync_query_config_for_runtime(
+                            &mut qcfg,
+                            &cmd_ctx.config,
+                            &tool_ctx.working_dir,
+                            &model_registry,
+                        );
+                        qcfg.system_prompt = base_query_config.system_prompt.clone();
+                        if let Some(level) = current_effort {
+                            qcfg.effort_level = Some(level);
+                        }
+                        let tracker = cost_tracker.clone();
+                        let tx = event_tx.clone();
+                        let client_clone = client.clone();
+                        let perm_tx_for_spawn = perm_tx.clone();
+                        let handle = tokio::spawn(async move {
+                            let mut msgs = msgs_arc_clone.lock().await.clone();
+                            let outcome = mangocode_query::run_query_loop(
+                                client_clone.as_ref(),
+                                &mut msgs,
+                                tools_arc_clone.as_slice(),
+                                &ctx_clone,
+                                &qcfg,
+                                tracker,
+                                Some(tx),
+                                ct,
+                                None,
+                                Some(perm_tx_for_spawn.clone()), // route HITL prompts to the TUI main loop
+                            )
+                            .await;
+                            *msgs_arc_clone.lock().await = msgs;
+                            outcome
+                        });
+                        current_query = Some((handle, msgs_arc));
+                    }
+                    Ok(TuiBridgeEvent::Cancelled) => {
+                        if app.is_streaming {
+                            if let Some(ref ct) = cancel {
+                                ct.cancel();
+                            }
+                            app.is_streaming = false;
+                            app.restore_queued_input_for_editing();
+                            app.status_message = Some("Cancelled by remote control.".to_string());
+                        }
+                    }
+                    Ok(TuiBridgeEvent::PermissionResponse {
+                        tool_use_id,
+                        response,
+                    }) => {
+                        // Resolve a pending permission dialog if IDs match.
+                        if let Some(ref pr) = app.permission_request {
+                            if pr.tool_use_id == tool_use_id {
+                                use mangocode_bridge::PermissionResponseKind;
+                                let _allow = matches!(
+                                    response,
+                                    PermissionResponseKind::Allow
+                                        | PermissionResponseKind::AllowSession
+                                );
+                                app.permission_request = None;
+                            }
+                        }
+                    }
+                    Ok(TuiBridgeEvent::SessionNameUpdate { title }) => {
+                        session.title = Some(title.clone());
+                        session.updated_at = chrono::Utc::now();
+                        cmd_ctx.session_title = Some(title.clone());
+                        app.session_title = Some(title);
+                        save_session_and_notify(&mut app, &session, "saving session title").await;
+                    }
+                    Ok(TuiBridgeEvent::Error(msg)) => {
+                        app.bridge_state = BridgeConnectionState::Failed {
+                            reason: msg.clone(),
+                        };
+                        app.notifications.push(
+                            NotificationKind::Warning,
+                            format!("Bridge error: {}", msg),
+                            Some(5),
+                        );
+                        disconnect_bridge = true;
+                        break;
+                    }
+                    Ok(TuiBridgeEvent::Ping) => {
+                        // No TUI action needed; pong is handled inside run_bridge_loop.
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.bridge_state = BridgeConnectionState::Disconnected;
+                        app.remote_session_url = None;
+                        cmd_ctx.remote_session_url = None;
+                        app.notifications.push(
+                            NotificationKind::Warning,
+                            "Remote control connection lost.".to_string(),
+                            Some(5),
+                        );
+                        disconnect_bridge = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if disconnect_bridge {
+            bridge_runtime = None;
+        }
+
+        // Drain inbound prompts from the BridgeSessionInfo poll task.
+        // These are user messages received from the web UI via poll_bridge_messages
+        // and injected here just like TuiBridgeEvent::InboundPrompt.
+        while let Ok(content) = remote_prompt_rx.try_recv() {
+            if !app.is_streaming {
+                app.set_prompt_text(content.clone());
+                terminal.print_user_input(&app, &content)?;
+                messages.push(mangocode_core::types::Message::user(content.clone()));
+                app.push_message(mangocode_core::types::Message::user(content.clone()));
+                session.messages = messages.clone();
+                session.updated_at = chrono::Utc::now();
+                app.is_streaming = true;
+                app.streaming_text.clear();
+                let ct = CancellationToken::new();
+                cancel = Some(ct.clone());
+                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                let msgs_arc_clone = msgs_arc.clone();
+                let tools_arc_clone = tools_arc.clone();
+                let ctx_clone = tool_ctx.clone();
+                let mut qcfg = base_query_config.clone();
+                sync_query_config_for_runtime(
+                    &mut qcfg,
+                    &cmd_ctx.config,
+                    &tool_ctx.working_dir,
+                    &model_registry,
+                );
+                qcfg.system_prompt = base_query_config.system_prompt.clone();
+                if let Some(level) = current_effort {
+                    qcfg.effort_level = Some(level);
+                }
+                let tracker = cost_tracker.clone();
+                let tx = event_tx.clone();
+                let client_clone = client.clone();
+                let perm_tx_for_spawn = perm_tx.clone();
+                let handle = tokio::spawn(async move {
+                    let mut msgs = msgs_arc_clone.lock().await.clone();
+                    let outcome = mangocode_query::run_query_loop(
+                        client_clone.as_ref(),
+                        &mut msgs,
+                        tools_arc_clone.as_slice(),
+                        &ctx_clone,
+                        &qcfg,
+                        tracker,
+                        Some(tx),
+                        ct,
+                        None,
+                        Some(perm_tx_for_spawn.clone()), // route HITL prompts to the TUI main loop
+                    )
+                    .await;
+                    *msgs_arc_clone.lock().await = msgs;
+                    outcome
+                });
+                current_query = Some((handle, msgs_arc));
+                break; // process one prompt per frame
+            }
+        }
+
+        // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
+        if status_cmd_str.is_some() {
+            while let Ok(text) = status_cmd_rx.try_recv() {
+                app.status_line_override = if text.is_empty() { None } else { Some(text) };
+            }
+        }
+
+        // Check if the background update task has reported a result.
+        if app.update_available.is_none() {
+            if let Ok(Some(version)) = update_rx.try_recv() {
+                app.update_available = Some(version);
+            }
+        }
+
+        // ---- Device code / OAuth auth: spawn background task when pending ----
+        if let Some(provider_id) = app.device_auth_pending.take() {
+            let _tx = device_auth_tx.clone();
+            match provider_id.as_str() {
+                "github-copilot" => {
+                    let tx2 = device_auth_tx.clone();
+                    // Use MangoCode's GitHub Copilot device flow app so the returned
+                    // token stays bound to MangoCode's own OAuth registration.
+                    const COPILOT_CLIENT_ID: &str = "Iv23li4E44oPZR1huPU9";
+                    tokio::spawn(async move {
+                        // Step 1: Request device code
+                        match mangocode_core::device_code::request_device_code(
+                            COPILOT_CLIENT_ID,
+                            "read:user",
+                            "https://github.com/login/device/code",
+                        )
+                        .await
+                        {
+                            Ok(resp) => {
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::GotCode {
+                                        user_code: resp.user_code,
+                                        verification_uri: resp.verification_uri,
+                                        device_code: resp.device_code.clone(),
+                                        interval: resp.interval,
+                                    })
+                                    .await;
+                                // Step 2: Poll for access token
+                                match mangocode_core::device_code::poll_for_token(
+                                    COPILOT_CLIENT_ID,
+                                    &resp.device_code,
+                                    "https://github.com/login/oauth/access_token",
+                                    resp.interval,
+                                    300,
+                                )
+                                .await
+                                {
+                                    Ok(token) => {
+                                        let _ =
+                                            tx2.send(DeviceAuthEvent::TokenReceived(token)).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx2.send(DeviceAuthEvent::Error(e)).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e)).await;
+                            }
+                        }
+                    });
+                }
+                "openai-codex" => {
+                    let tx2 = device_auth_tx.clone();
+                    tokio::spawn(async move {
+                        if mangocode_core::codex_oauth::likely_headless_or_remote() {
+                            let _ = tx2
+                                .send(DeviceAuthEvent::Error(
+                                    mangocode_core::codex_oauth::HEADLESS_CODEX_OAUTH_HINT
+                                        .to_string(),
+                                ))
+                                .await;
+                            return;
+                        }
+
+                        match crate::codex_oauth_flow::run_oauth_flow(tx2.clone()).await {
+                            Ok(tokens) => {
+                                let expires_ms = tokens
+                                    .expires_at
+                                    .map(|sec| sec.saturating_mul(1000))
+                                    .unwrap_or(0);
+                                let mut store = mangocode_core::AuthStore::load();
+                                if let Err(e) = store.set_result(
+                                    mangocode_core::ProviderId::OPENAI_CODEX,
+                                    mangocode_core::auth_store::StoredCredential::OAuthToken {
+                                        access: tokens.access_token.clone(),
+                                        refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                                        expires: expires_ms,
+                                    },
+                                ) {
+                                    let _ = tx2
+                                        .send(DeviceAuthEvent::Error(format!(
+                                            "Failed to save OpenAI Codex credentials: {}",
+                                            e
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                if let Err(err) =
+                                    mangocode_core::oauth_config::save_codex_tokens(&tokens)
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to save legacy OpenAI Codex token file after OAuth login"
+                                    );
+                                }
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(
+                                        "OpenAI Codex (OAuth)".to_string(),
+                                    ))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e.to_string())).await;
+                            }
+                        }
+                    });
+                }
+                "anthropic-max" => {
+                    let tx2 = device_auth_tx.clone();
+                    // Claude Max (OAuth) — PKCE flow using the upstream registered client ID.                    // run_oauth_login_flow(true) → claude.ai Bearer-token path (Max subscription).
+                    tokio::spawn(async move {
+                        // Signal the dialog to enter browser-waiting state
+                        let placeholder_url =
+                            "Opening browser for Claude authentication…".to_string();
+                        let _ = tx2
+                            .send(DeviceAuthEvent::GotBrowserUrl {
+                                url: placeholder_url,
+                            })
+                            .await;
+
+                        match crate::oauth_flow::run_oauth_login_flow(true).await {
+                            Ok(result) => {
+                                // Persist into AuthStore under "anthropic-max"
+                                let mut store = mangocode_core::AuthStore::load();
+                                // Unwrap tokens: we need refresh + expiry for full storage.
+                                // access_token is in result.credential when use_bearer_auth=true.
+                                let (refresh_tok, expires_u64) = (
+                                    result.tokens.refresh_token.clone().unwrap_or_default(),
+                                    result.tokens.expires_at_ms.map(|ms| ms as u64).unwrap_or(0),
+                                );
+                                if let Err(e) = store.set_result(
+                                    mangocode_core::ProviderId::ANTHROPIC_MAX,
+                                    mangocode_core::auth_store::StoredCredential::OAuthToken {
+                                        access: result.credential.clone(),
+                                        refresh: refresh_tok,
+                                        expires: expires_u64,
+                                    },
+                                ) {
+                                    let _ = tx2
+                                        .send(DeviceAuthEvent::Error(format!(
+                                            "Failed to save Claude Max credentials: {}",
+                                            e
+                                        )))
+                                        .await;
+                                    return;
+                                }
+                                let _ = tx2
+                                    .send(DeviceAuthEvent::TokenReceived(result.credential))
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(DeviceAuthEvent::Error(e.to_string())).await;
+                            }
+                        }
+                    });
+                }
+                "anthropic" => {
+                    let tx2 = device_auth_tx.clone();
+                    // OAuth device flow is not supported for this provider.
+                    // Use an API key from console.anthropic.com instead.
+                    tokio::spawn(async move {
+                        let _ = tx2
+                            .send(DeviceAuthEvent::Error(
+                                "Anthropic OAuth requires a registered application.\n\
+                             Use an API key instead: console.anthropic.com/settings/keys"
+                                    .to_string(),
+                            ))
+                            .await;
+                    });
+                }
+                _ => {
+                    // Unknown provider for device auth — should not happen
+                    app.device_auth_dialog
+                        .set_error(format!("Unsupported auth flow for {}", provider_id));
+                }
+            }
+        }
+
+        // ---- Drain device auth events from the background task ----
+        while let Ok(evt) = device_auth_rx.try_recv() {
+            match evt {
+                DeviceAuthEvent::GotCode {
+                    user_code,
+                    verification_uri,
+                    device_code,
+                    interval,
+                } => {
+                    // Auto-copy the user code to clipboard
+                    let copied = mangocode_tui::try_copy_to_clipboard(&user_code);
+
+                    // Auto-open the verification URL in the browser
+                    let opened = match open::that(&verification_uri) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                verification_uri = %verification_uri,
+                                "failed to open device auth verification URL"
+                            );
+                            false
+                        }
+                    };
+
+                    app.device_auth_dialog.set_code(
+                        user_code,
+                        verification_uri,
+                        device_code,
+                        interval,
+                    );
+
+                    let (kind, message) = match (copied, opened) {
+                        (true, true) => (
+                            mangocode_tui::NotificationKind::Info,
+                            "Code copied to clipboard & browser opened.",
+                        ),
+                        (true, false) => (
+                            mangocode_tui::NotificationKind::Warning,
+                            "Code copied. Open the verification URL manually.",
+                        ),
+                        (false, true) => (
+                            mangocode_tui::NotificationKind::Warning,
+                            "Browser opened. Copy the code manually.",
+                        ),
+                        (false, false) => (
+                            mangocode_tui::NotificationKind::Warning,
+                            "Open the verification URL and copy the code manually.",
+                        ),
+                    };
+                    app.notifications.push(kind, message.to_string(), Some(4));
+                }
+                DeviceAuthEvent::GotBrowserUrl { url } => {
+                    let copied = mangocode_tui::try_copy_to_clipboard(&url);
+                    app.device_auth_dialog.set_browser_url(url);
+                    let (kind, message) = if copied {
+                        (
+                            mangocode_tui::NotificationKind::Info,
+                            "Login URL copied to clipboard.",
+                        )
+                    } else {
+                        (
+                            mangocode_tui::NotificationKind::Warning,
+                            "Login URL available in dialog. Copy it manually.",
+                        )
+                    };
+                    app.notifications.push(kind, message.to_string(), Some(5));
+                }
+                DeviceAuthEvent::BrowserOpenFailed { url, error } => {
+                    warn!(
+                        error = %error,
+                        url = %url,
+                        "Codex OAuth browser auto-open failed"
+                    );
+                    app.device_auth_dialog.set_browser_url(url);
+                    app.notifications.push(
+                        mangocode_tui::NotificationKind::Warning,
+                        "Could not open the login URL automatically. Open it manually from the dialog."
+                            .to_string(),
+                        Some(6),
+                    );
+                }
+                DeviceAuthEvent::TokenReceived(token) => {
+                    app.device_auth_dialog.set_success(token);
+                }
+                DeviceAuthEvent::Error(msg) => {
+                    app.device_auth_dialog.set_error(msg);
+                }
+            }
+        }
+
+        // Check if query task is done; sync messages from the task
+        let task_finished = current_query
+            .as_ref()
+            .map(|(h, _)| h.is_finished())
+            .unwrap_or(false);
+
+        if task_finished {
+            let synced_messages = current_query.as_ref().and_then(|(_, msgs_arc)| {
+                if let Ok(msgs) = msgs_arc.try_lock() {
+                    Some(msgs.clone())
+                } else {
+                    None
+                }
+            });
+
+            if let Some(synced_messages) = synced_messages {
+                if let Some((handle, _msgs_arc)) = current_query.take() {
+                    let mut query_join_failed = false;
+                    if let Err(err) = handle.await {
+                        warn!(error = %err, "query task failed before completion state was synced");
+                        app.status_message = Some(format!("Query task failed: {err}"));
+                        query_join_failed = true;
+                    }
+                    // Sync the updated conversation back to our local vector
+                    messages = synced_messages;
+                    session.messages = messages.clone();
+                    session.updated_at = chrono::Utc::now();
+                    let effective_model =
+                        mangocode_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                    session.model = canonical_session_model(&cmd_ctx.config, &effective_model);
+                    session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+                    app.is_streaming = false;
+                    // Sync the authoritative message list (with ToolUse / ToolResult
+                    // content blocks) from the query task into the TUI so they render
+                    // inline in chronological order. The transient `tool_use_blocks`
+                    // staging area is cleared since the canonical history now owns them.
+                    app.replace_messages(messages.clone());
+                    app.tool_use_blocks.clear();
+                    if !query_join_failed {
+                        app.status_message = None;
+                    }
+                    terminal.print_new_messages(&app)?;
+
+                    if let Some(mut input) = app.take_next_queued_input() {
+                        if !input.is_empty() {
+                            match run_user_prompt_submit_hooks(
+                                input,
+                                &cmd_ctx.config,
+                                &tool_ctx.working_dir,
+                                &tool_ctx.session_id,
+                            )
+                            .await
+                            {
+                                PromptSubmitHookOutcome::Allowed(updated_input) => {
+                                    input = updated_input;
+                                }
+                                PromptSubmitHookOutcome::Blocked {
+                                    reason,
+                                    input: blocked_input,
+                                } => {
+                                    app.restore_input_and_queued_for_editing(blocked_input);
+                                    app.status_message = Some(reason);
+                                    input = String::new();
+                                }
+                            }
+
+                            if input.is_empty() {
+                                // The queued prompt was restored to the composer by a hook gate.
+                                // Fall through so the completed turn is still persisted.
+                            } else {
+                                terminal.print_user_input(&app, &input)?;
+                                let user_msg = mangocode_core::types::Message::user(input.clone());
+                                messages.push(user_msg.clone());
+                                app.push_message(user_msg);
+                                session.messages = messages.clone();
+                                session.updated_at = chrono::Utc::now();
+
+                                app.is_streaming = true;
+                                app.streaming_text.clear();
+
+                                let ct = CancellationToken::new();
+                                cancel = Some(ct.clone());
+
+                                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+                                let msgs_arc_clone = msgs_arc.clone();
+
+                                let tools_arc_clone = tools_arc.clone();
+                                let ctx_clone = tool_ctx.clone();
+                                let mut qcfg = base_query_config.clone();
+                                sync_query_config_for_runtime(
+                                    &mut qcfg,
+                                    &cmd_ctx.config,
+                                    &tool_ctx.working_dir,
+                                    &model_registry,
+                                );
+                                qcfg.system_prompt = base_query_config.system_prompt.clone();
+                                if let Some(level) = current_effort {
+                                    qcfg.effort_level = Some(level);
+                                }
+                                let tracker = cost_tracker.clone();
+                                let tx = event_tx.clone();
+                                let client_clone = client.clone();
+
+                                let perm_tx_for_spawn = perm_tx.clone();
+                                let handle = tokio::spawn(async move {
+                                    let mut msgs = msgs_arc_clone.lock().await.clone();
+                                    let outcome = mangocode_query::run_query_loop(
+                                        client_clone.as_ref(),
+                                        &mut msgs,
+                                        tools_arc_clone.as_slice(),
+                                        &ctx_clone,
+                                        &qcfg,
+                                        tracker,
+                                        Some(tx),
+                                        ct,
+                                        None,
+                                        Some(perm_tx_for_spawn.clone()), // route HITL prompts to the TUI main loop
+                                    )
+                                    .await;
+                                    *msgs_arc_clone.lock().await = msgs;
+                                    outcome
+                                });
+
+                                current_query = Some((handle, msgs_arc));
+                            }
+                        }
+                    }
+
+                    // Persist session and search index in background so UI loop stays responsive.
+                    let session_clone = session.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = mangocode_core::history::save_session(&session_clone).await
+                        {
+                            eprintln!("Session save failed: {e}");
+                        }
+
+                        if let Err(e) = tokio::task::spawn_blocking(move || {
+                            let db_path =
+                                mangocode_core::config::Settings::config_dir().join("sessions.db");
+                            match mangocode_core::SqliteSessionStore::open(&db_path) {
+                                Ok(store) => {
+                                    if let Err(e) = store.save_session(
+                                        &session_clone.id,
+                                        session_clone.title.as_deref(),
+                                        &session_clone.model,
+                                    ) {
+                                        eprintln!("SQLite session index failed: {e}");
+                                    }
+
+                                    for msg in &session_clone.messages {
+                                        let content_str = match &msg.content {
+                                            mangocode_core::types::MessageContent::Text(t) => t.clone(),
+                                            mangocode_core::types::MessageContent::Blocks(blocks) => {
+                                                blocks
+                                                    .iter()
+                                                    .filter_map(|b| {
+                                                        if let mangocode_core::types::ContentBlock::Text {
+                                                            text,
+                                                        } = b
+                                                        {
+                                                            Some(text.as_str())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ")
+                                            }
+                                        };
+                                        let role = match msg.role {
+                                            mangocode_core::types::Role::User => "user",
+                                            mangocode_core::types::Role::Assistant => "assistant",
+                                        };
+                                        let msg_id = msg.uuid.as_deref().unwrap_or("unknown");
+                                        if let Err(e) = store.save_message(
+                                            &session_clone.id,
+                                            msg_id,
+                                            role,
+                                            &content_str,
+                                            None,
+                                        ) {
+                                            eprintln!("SQLite message index failed: {e}");
+                                        }
+                                    }
+                                }
+                                Err(e) => eprintln!("SQLite open failed: {e}"),
+                            }
+                        })
+                        .await
+                        {
+                            eprintln!("SQLite indexing task join failed: {e}");
+                        }
+                    });
+                }
+            }
+        }
+
+        if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
+            let new_mcp_manager = connect_mcp_manager_arc(&cmd_ctx.config).await;
+            tool_ctx.mcp_manager = new_mcp_manager.clone();
+            app.mcp_manager = new_mcp_manager.clone();
+            tools_arc = build_tools_for_query_config(
+                new_mcp_manager.clone(),
+                &cmd_ctx.config,
+                &base_query_config,
+            );
+            sync_tool_context_visibility_for_query_agent(
+                &mut tool_ctx,
+                &tools_arc,
+                &base_query_config,
+            );
+            if app.mcp_view.open {
+                app.refresh_mcp_view();
+            }
+
+            let connected = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
+            app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
+                "No MCP servers configured.".to_string()
+            } else {
+                format!(
+                    "Reconnected MCP runtime ({} connected server{}).",
+                    connected,
+                    if connected == 1 { "" } else { "s" }
+                )
+            });
+        }
+
+        if app.should_quit {
+            break 'main;
+        }
+    }
+
+    if let Some(runtime) = bridge_runtime.take() {
+        runtime.cancel.cancel();
+    }
+
+    session.total_cost = cost_tracker.total_cost_usd();
+    session.total_tokens = cost_tracker.input_tokens() + cost_tracker.output_tokens();
+    session.updated_at = chrono::Utc::now();
+    if let Some(warning) = save_session_warning(&session, "interactive shutdown").await {
+        eprintln!("{}", warning);
+    }
+    let duration_ms = session_start.elapsed().as_millis() as u64;
+    persist_session_usage(&cost_tracker, &session, duration_ms);
+    mangocode_query::finish_session_lifecycle(
+        &tool_ctx,
+        format!(
+            "Session ended in {} after {} turns and {:.4} USD of tracked cost.",
+            tool_ctx.working_dir.display(),
+            tool_ctx
+                .current_turn
+                .load(std::sync::atomic::Ordering::Relaxed),
+            cost_tracker.total_cost_usd()
+        ),
+    )
+    .await;
+
+    terminal.restore()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `claude auth` subcommand handler
+// ---------------------------------------------------------------------------
+// Runs before `Cli::parse()` so it does not consume the positional `prompt`.
+//
+// Usage:
+//   claude auth login [--console]   — OAuth PKCE login (claude.ai by default)
+//   claude auth logout              — Clear stored credentials
+//   claude auth status [--json]     — Show authentication status
+
+async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
+    match args.first().map(|s| s.as_str()) {
+        Some("codex") => match args.get(1).map(|s| s.as_str()) {
+            Some("login") => {
+                auth_codex_login().await;
+            }
+            Some(unknown) => {
+                eprintln!("Unknown auth codex subcommand: '{}'", unknown);
+                eprintln!("Usage: mangocode auth codex login");
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Usage: mangocode auth codex login");
+                std::process::exit(1);
+            }
+        },
+
+        Some("login") => {
+            // --console flag selects the Console OAuth flow (creates an API key)
+            // Default (no flag) uses the Claude.ai flow (Bearer token)
+            let login_with_claude_ai = !args.iter().any(|a| a == "--console");
+            println!("Starting authentication...");
+            match oauth_flow::run_oauth_login_flow(login_with_claude_ai).await {
+                Ok(result) => {
+                    debug!(
+                        credential_len = result.credential.len(),
+                        bearer = result.use_bearer_auth,
+                        "OAuth login complete"
+                    );
+                    println!("Successfully logged in!");
+                    if let Some(email) = &result.tokens.email {
+                        println!("  Account: {}", email);
+                    }
+                    if result.use_bearer_auth {
+                        println!("  Auth method: claude.ai");
+                    } else {
+                        println!("  Auth method: console (API key)");
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Some("logout") => {
+            auth_logout().await;
+        }
+
+        Some("status") => {
+            let json_output = args.iter().any(|a| a == "--json");
+            auth_status(json_output).await;
+        }
+
+        Some(unknown) => {
+            eprintln!("Unknown auth subcommand: '{}'", unknown);
+            eprintln!();
+            eprintln!("Usage: mangocode auth <subcommand>");
+            eprintln!(
+                "  login [--console]   Authenticate (claude.ai by default; --console for API key)"
+            );
+            eprintln!("  codex login         Authenticate OpenAI Codex OAuth for headless use");
+            eprintln!("  logout              Remove stored credentials");
+            eprintln!("  status [--json]     Show authentication status");
+            std::process::exit(1);
+        }
+
+        None => {
+            eprintln!("Usage: mangocode auth <login|codex|logout|status>");
+            eprintln!("  login [--console]   Authenticate with Anthropic");
+            eprintln!("  codex login         Authenticate OpenAI Codex OAuth for headless use");
+            eprintln!("  logout              Remove stored credentials");
+            eprintln!("  status [--json]     Show authentication status");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+async fn auth_codex_login() {
+    println!("Starting OpenAI Codex OAuth login...");
+    if mangocode_core::codex_oauth::likely_headless_or_remote() {
+        println!();
+        println!("{}", mangocode_core::codex_oauth::HEADLESS_CODEX_OAUTH_HINT);
+        println!();
+    }
+
+    match codex_oauth_flow::run_terminal_oauth_flow().await {
+        Ok(tokens) => {
+            if let Err(e) = mangocode_core::oauth_config::save_codex_tokens(&tokens) {
+                eprintln!("Warning: failed to save legacy Codex token file: {}", e);
+            }
+
+            let expires_ms = tokens
+                .expires_at
+                .map(|secs| secs.saturating_mul(1000))
+                .unwrap_or(0);
+            let mut store = mangocode_core::AuthStore::load();
+            if let Err(e) = store.set_result(
+                mangocode_core::ProviderId::OPENAI_CODEX,
+                mangocode_core::StoredCredential::OAuthToken {
+                    access: tokens.access_token.clone(),
+                    refresh: tokens.refresh_token.clone().unwrap_or_default(),
+                    expires: expires_ms,
+                },
+            ) {
+                eprintln!(
+                    "Error: failed to save OpenAI Codex OAuth credentials: {}",
+                    e
+                );
+                std::process::exit(1);
+            }
+
+            println!("Successfully logged in to OpenAI Codex OAuth.");
+            if let Some(account_id) = tokens.account_id.as_deref() {
+                println!("  ChatGPT account id: {}", account_id);
+            }
+            println!("  Provider: openai-codex");
+            println!("Use headless mode with `--provider openai-codex`.");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("OpenAI Codex OAuth login failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print current auth status, then exit with code 0 (logged in) or 1 (not logged in).
+async fn auth_status(json_output: bool) {
+    // Gather auth state
+    let env_api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+    let (settings, settings_error) = match Settings::load().await {
+        Ok(settings) => (settings, None),
+        Err(e) => (Settings::default(), Some(e.to_string())),
+    };
+    let settings_api_key = settings.config.api_key.clone().filter(|k| !k.is_empty());
+    let oauth_tokens = mangocode_core::oauth::OAuthTokens::load().await;
+    let api_provider = "Anthropic";
+    let api_key_source = if env_api_key.is_some() {
+        Some("ANTHROPIC_API_KEY".to_string())
+    } else if settings_api_key.is_some() {
+        Some("settings".to_string())
+    } else if oauth_tokens
+        .as_ref()
+        .is_some_and(|tokens| !tokens.uses_bearer_auth() && tokens.api_key.is_some())
+    {
+        Some("/login managed key".to_string())
+    } else {
+        None
+    };
+    let token_source = oauth_tokens.as_ref().map(|tokens| {
+        if tokens.uses_bearer_auth() {
+            "claude.ai".to_string()
+        } else {
+            "console_oauth".to_string()
+        }
+    });
+    let login_method = oauth_tokens
+        .as_ref()
+        .and_then(|tokens| subscription_label(tokens.subscription_type.as_deref()))
+        .or_else(|| {
+            oauth_tokens.as_ref().map(|tokens| {
+                if tokens.uses_bearer_auth() {
+                    "MangoCode Account".to_string()
+                } else {
+                    "Console Account".to_string()
+                }
+            })
+        })
+        .or_else(|| api_key_source.as_ref().map(|_| "API Key".to_string()));
+    let billing_mode = oauth_tokens.as_ref().map_or_else(
+        || {
+            if api_key_source.is_some() {
+                "API".to_string()
+            } else {
+                "None".to_string()
+            }
+        },
+        |tokens| {
+            if tokens.uses_bearer_auth() {
+                "Subscription".to_string()
+            } else {
+                "API".to_string()
+            }
+        },
+    );
+
+    let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
+        let uses_bearer = tokens.uses_bearer_auth();
+        let method = if uses_bearer {
+            "claude.ai"
+        } else {
+            "oauth_token"
+        };
+        (method.to_string(), true)
+    } else if env_api_key.is_some() || settings_api_key.is_some() {
+        ("api_key".to_string(), true)
+    } else {
+        ("none".to_string(), false)
+    };
+
+    if json_output {
+        // JSON output (used by SDK + scripts)
+        let mut obj = serde_json::json!({
+            "loggedIn": logged_in,
+            "authMethod": auth_method,
+            "apiProvider": api_provider,
+            "billing": billing_mode,
+        });
+
+        // Include API key source if known
+        if let Some(ref source) = api_key_source {
+            obj["apiKeySource"] = serde_json::Value::String(source.clone());
+        }
+        if let Some(ref source) = token_source {
+            obj["tokenSource"] = serde_json::Value::String(source.clone());
+        }
+        if let Some(ref method) = login_method {
+            obj["loginMethod"] = serde_json::Value::String(method.clone());
+        }
+        if let Some(ref error) = settings_error {
+            obj["settingsError"] = serde_json::Value::String(error.clone());
+        }
+
+        if let Some(ref tokens) = oauth_tokens {
+            obj["email"] = json_null_or_string(&tokens.email);
+            obj["orgId"] = json_null_or_string(&tokens.organization_uuid);
+            obj["subscriptionType"] = json_null_or_string(&tokens.subscription_type);
+        }
+
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+    } else {
+        // Human-readable text output
+        if !logged_in {
+            println!("Not logged in. Run `claude auth login` to authenticate.");
+        } else {
+            println!("Logged in.");
+            println!("  API provider: {}", api_provider);
+            println!("  Billing: {}", billing_mode);
+            if let Some(ref method) = login_method {
+                println!("  Login method: {}", method);
+            }
+            if let Some(ref source) = token_source {
+                println!("  Auth token: {}", source);
+            }
+            if let Some(ref source) = api_key_source {
+                println!("  API key: {}", source);
+            }
+            match auth_method.as_str() {
+                "claude.ai" | "oauth_token" => {
+                    if let Some(ref tokens) = oauth_tokens {
+                        if let Some(ref email) = tokens.email {
+                            println!("  Email: {}", email);
+                        }
+                        if let Some(ref org) = tokens.organization_uuid {
+                            println!("  Organization ID: {}", org);
+                        } else {
+                            println!("  Organization ID: unavailable");
+                        }
+                        if let Some(ref sub) = tokens.subscription_type {
+                            println!("  Subscription: {}", sub);
+                        }
+                    }
+                }
+                "api_key" => {
+                    println!("  Organization ID: unavailable for direct API key auth");
+                }
+                _ => {}
+            }
+        }
+        if let Some(ref error) = settings_error {
+            eprintln!("Warning: failed to load settings: {}", error);
+        }
+    }
+
+    std::process::exit(if logged_in { 0 } else { 1 });
+}
+
+/// Clear all stored credentials and exit.
+async fn auth_logout() {
+    let mut had_error = false;
+
+    if let Err(e) = mangocode_core::oauth::OAuthTokens::clear().await {
+        eprintln!("Warning: failed to clear OAuth tokens: {}", e);
+        had_error = true;
+    }
+
+    if let Err(e) = mangocode_core::oauth_config::clear_codex_tokens() {
+        eprintln!("Warning: failed to clear Codex token file: {}", e);
+        had_error = true;
+    }
+
+    let mut auth_store = mangocode_core::AuthStore::load_async().await;
+    match auth_store.clear_all_credentials_async().await {
+        Ok(report) => {
+            if report.vault_locked {
+                eprintln!(
+                    "Warning: encrypted vault is locked; vault-stored provider credentials may remain until you unlock the vault and run logout again."
+                );
+                had_error = true;
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to clear auth store: {}", e);
+            had_error = true;
+        }
+    }
+
+    if let Err(e) = Settings::clear_global_api_keys_preserving_json().await {
+        eprintln!("Warning: failed to update settings.json: {}", e);
+        had_error = true;
+    }
+
+    mangocode_core::clear_vault_passphrase();
+
+    if had_error {
+        eprintln!("Logout completed with warnings.");
+        std::process::exit(1);
+    } else {
+        println!("Successfully logged out. Stored credentials cleared.");
+        std::process::exit(0);
+    }
+}
+
+/// Helper: convert `Option<String>` to a JSON string or null.
+fn subscription_label(subscription_type: Option<&str>) -> Option<String> {
+    match subscription_type? {
+        "enterprise" => Some("MangoCode Enterprise Account".to_string()),
+        "team" => Some("MangoCode Team Account".to_string()),
+        "max" => Some("MangoCode Max Account".to_string()),
+        "pro" => Some("MangoCode Pro Account".to_string()),
+        other if !other.is_empty() => Some(format!("{} Account", other)),
+        _ => None,
+    }
+}
+
+/// Helper: convert `Option<String>` to a JSON string or null.
+fn json_null_or_string(opt: &Option<String>) -> serde_json::Value {
+    match opt {
+        Some(s) => serde_json::Value::String(s.clone()),
+        None => serde_json::Value::Null,
+    }
+}
