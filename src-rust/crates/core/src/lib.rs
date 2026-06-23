@@ -105,12 +105,6 @@ pub mod mcp_templates;
 pub mod ide;
 pub use ide::{detect_ide, is_ide_terminal, IdeKind};
 
-// Background update checker — compares running version against GitHub releases.
-pub mod update_check;
-pub use update_check::{
-    check_for_updates, is_newer, UpdateInfo, GITHUB_RELEASES_API_LATEST_URL,
-    GITHUB_RELEASES_API_URL, GITHUB_RELEASES_PAGE, GITHUB_REPO_URL,
-};
 
 // Re-export commonly used types at the crate root
 pub use config::{
@@ -1208,9 +1202,6 @@ pub mod config {
         /// Serialised as `hasCompletedOnboarding` for settings file compatibility.
         #[serde(default, rename = "hasCompletedOnboarding")]
         pub has_completed_onboarding: bool,
-        /// App version at last launch — used to detect upgrades and show release notes.
-        #[serde(default, rename = "lastSeenVersion")]
-        pub last_seen_version: Option<String>,
         /// Active provider ID at the settings level (e.g. "lmstudio", "openai").
         #[serde(default = "default_provider")]
         pub provider: Option<String>,
@@ -2079,7 +2070,6 @@ pub mod config {
                 },
                 has_completed_onboarding: over.has_completed_onboarding
                     || base.has_completed_onboarding,
-                last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
                 commands: merge_map(base.commands, over.commands),
@@ -2189,8 +2179,6 @@ pub mod config {
 // ---------------------------------------------------------------------------
 pub mod constants {
     pub const APP_NAME: &str = "claude";
-    pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-
     // Models
     pub const DEFAULT_MODEL: &str = "default";
     pub const SONNET_MODEL: &str = "claude-sonnet-4-6";

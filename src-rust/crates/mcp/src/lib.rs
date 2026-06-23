@@ -1520,7 +1520,7 @@ pub mod client {
                 },
                 client_info: ClientInfo {
                     name: mangocode_core::constants::APP_NAME.to_string(),
-                    version: mangocode_core::constants::APP_VERSION.to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             };
 

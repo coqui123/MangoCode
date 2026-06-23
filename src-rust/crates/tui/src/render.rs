@@ -44,7 +44,6 @@ use crate::theme_screen::render_theme_screen;
 use crate::virtual_list::{VirtualItem, VirtualList};
 use crate::voice_mode_notice::render_voice_mode_notice;
 use chrono;
-use mangocode_core::constants::APP_VERSION;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1662,18 +1661,12 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
     let box_height = area.height;
     if box_height < MIN_WELCOME_BOX_HEIGHT || box_width < 30 {
         // Too small: fall back to a single line
-        let line = Line::from(vec![
-            Span::styled(
-                "MangoCode ",
-                Style::default()
-                    .fg(CLAUDE_ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{}", APP_VERSION),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
+        let line = Line::from(vec![Span::styled(
+            "MangoCode",
+            Style::default()
+                .fg(CLAUDE_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )]);
         frame.render_widget(Paragraph::new(vec![line]), area);
         return;
     }
@@ -1684,23 +1677,17 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         height: box_height,
     };
 
-    // Outer border with title "MangoCode vX.Y"
+    // Outer border with title "MangoCode"
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(CLAUDE_ORANGE))
-        .title(Line::from(vec![
-            Span::styled(
-                " MangoCode ",
-                Style::default()
-                    .fg(CLAUDE_ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{} ", APP_VERSION),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+        .title(Line::from(Span::styled(
+            " MangoCode ",
+            Style::default()
+                .fg(CLAUDE_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )));
     frame.render_widget(outer_block, box_area);
 
     // Inner area (inside the border)
@@ -1930,18 +1917,12 @@ pub fn greeting_header_lines(app: &App) -> Vec<Line<'static>> {
         None => "Welcome back!".to_string(),
     };
     vec![
-        Line::from(vec![
-            Span::styled(
-                "MangoCode ",
-                Style::default()
-                    .fg(CLAUDE_ORANGE)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{}", APP_VERSION),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
+        Line::from(Span::styled(
+            "MangoCode",
+            Style::default()
+                .fg(CLAUDE_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(Span::styled(
             welcome_msg,
             Style::default()

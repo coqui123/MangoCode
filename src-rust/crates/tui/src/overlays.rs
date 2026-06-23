@@ -182,7 +182,6 @@ impl HelpOverlay {
 
 /// Render the help overlay into the frame.
 pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect) {
-    use mangocode_core::constants::APP_VERSION;
     use ratatui::layout::{Constraint, Direction, Layout};
     use ratatui::widgets::Wrap;
 
@@ -458,10 +457,10 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         col_chunks[2],
     );
 
-    // ─── Version / hint bar ────────────────────────────────────────────────
+    // ─── Hint bar ───────────────────────────────────────────────────────────
     let version_line = Line::from(vec![
         Span::styled(
-            format!(" v{}  \u{00b7}  Type to filter  \u{00b7}  \u{2191}\u{2193} scroll commands  \u{00b7}  Esc to close", APP_VERSION),
+            " Type to filter  \u{00b7}  \u{2191}\u{2193} scroll commands  \u{00b7}  Esc to close".to_string(),
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         ),
     ]);

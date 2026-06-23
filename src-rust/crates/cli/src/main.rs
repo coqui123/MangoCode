@@ -11,27 +11,6 @@
 mod codex_oauth_flow;
 mod oauth_flow;
 
-// ---------------------------------------------------------------------------
-// Build-time metadata (embedded via build.rs)
-// ---------------------------------------------------------------------------
-
-/// Build timestamp in RFC 3339 format
-pub const BUILD_TIME: &str = env!("BUILD_TIME");
-
-/// Short git commit hash (or "unknown" if not a git repo)
-pub const GIT_COMMIT: &str = env!("GIT_COMMIT");
-
-/// Full version string: "0.0.7 (abc1234)"
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")");
-
-/// Package/distribution identifier
-pub const PACKAGE_URL: &str = env!("PACKAGE_URL");
-
-/// Feedback/issue reporting channel
-pub const FEEDBACK_CHANNEL: &str = env!("FEEDBACK_CHANNEL");
-
-/// Explanation of issue routing in this build
-pub const ISSUES_EXPLAINER: &str = env!("ISSUES_EXPLAINER");
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -2099,7 +2078,6 @@ impl Tool for AgentRestrictedTool {
 #[derive(Parser, Debug)]
 #[command(
     name = "mangocode",
-    version = VERSION,
     about = "MangoCode - AI-powered coding assistant",
     long_about = None,
 )]
@@ -2745,14 +2723,8 @@ fn apply_mcp_config_override(config: &mut Config, raw: &str) -> anyhow::Result<(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Fast-path: handle --version before parsing everything
-    let raw_args: Vec<String> = std::env::args().collect();
-    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("MangoCode v{}", VERSION);
-        return Ok(());
-    }
-
     // Fast-path: `claude auth <login|logout|status>`
+    let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.get(1).map(|s| s.as_str()) == Some("auth") {
         return handle_auth_command(&raw_args[2..]).await;
     }
@@ -5059,27 +5031,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         app.bypass_permissions_dialog.show();
     }
 
-    // Version-upgrade notice: record the current version for future comparisons.
-    // (Actual upgrade notice UI is handled by the release-notes slash command.)
-    {
-        let current_version = mangocode_core::constants::APP_VERSION.to_string();
-        if settings.last_seen_version.as_deref() != Some(&current_version) {
-            // Persist asynchronously to avoid blocking startup.
-            let version_clone = current_version.clone();
-            tokio::spawn(async move {
-                if let Ok(mut s) = mangocode_core::config::Settings::load().await {
-                    s.last_seen_version = Some(version_clone);
-                    if let Err(err) = s.save().await {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to persist last seen version"
-                        );
-                    }
-                }
-            });
-        }
-    }
-
     // CLAUDE_STATUS_COMMAND: optional external command whose stdout replaces the
     // left-side status bar text. Polled every 500ms (debounced) in the main loop.
     // The command is run in a background task; results flow through a channel.
@@ -5231,14 +5182,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     // Tracks the user's /effort selection; flows into qcfg each turn.
     let mut current_effort: Option<mangocode_core::effort::EffortLevel> =
         base_query_config.effort_level;
-
-    // Background update check: spawned once at startup; result delivered via channel.
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    tokio::spawn(async move {
-        let info = mangocode_core::check_for_updates().await;
-        let version = info.map(|i| i.latest_version);
-        let _ = update_tx.send(version).await;
-    });
 
     // Device code / OAuth auth channel — background tasks send events here
     // so the main loop can update the device_auth_dialog state.
@@ -7001,13 +6944,6 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
         if status_cmd_str.is_some() {
             while let Ok(text) = status_cmd_rx.try_recv() {
                 app.status_line_override = if text.is_empty() { None } else { Some(text) };
-            }
-        }
-
-        // Check if the background update task has reported a result.
-        if app.update_available.is_none() {
-            if let Ok(Some(version)) = update_rx.try_recv() {
-                app.update_available = Some(version);
             }
         }
 

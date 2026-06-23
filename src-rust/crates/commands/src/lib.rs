@@ -255,7 +255,6 @@ pub struct ModelCommand;
 pub struct ConfigCommand;
 pub struct FlagsCommand;
 pub struct ColorCommand;
-pub struct VersionCommand;
 pub struct ResumeCommand;
 pub struct WorkspaceCommand;
 pub struct StatusCommand;
@@ -310,8 +309,6 @@ pub struct CopyCommand;
 pub struct ChromeCommand;
 pub struct VimCommand;
 pub struct VoiceCommand;
-pub struct UpgradeCommand;
-pub struct ReleaseNotesCommand;
 pub struct RateLimitOptionsCommand;
 pub struct StatuslineCommand;
 pub struct SecurityReviewCommand;
@@ -913,8 +910,7 @@ fn command_category(name: &str) -> &'static str {
         "cost" | "analytics" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => {
             "Usage & Cost"
         }
-        "status" | "run" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
-        | "release-notes" => "System",
+        "status" | "run" | "doctor" | "terminal-setup" => "System",
         "login" | "logout" | "permissions" => "Auth & Permissions",
         "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review"
         | "workspace" | "cwd" | "cd" | "project" => "Project",
@@ -2020,28 +2016,6 @@ impl SlashCommand for PrivacySettingsCommand {
             Ok(_) => CommandResult::Message(format!("Opened privacy settings: {}", url)),
             Err(_) => CommandResult::Message(fallback),
         }
-    }
-}
-
-// ---- /version ------------------------------------------------------------
-
-#[async_trait]
-impl SlashCommand for VersionCommand {
-    fn name(&self) -> &str {
-        "version"
-    }
-    fn aliases(&self) -> Vec<&str> {
-        vec!["v"]
-    }
-    fn description(&self) -> &str {
-        "Show version information"
-    }
-
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        CommandResult::Message(format!(
-            "MangoCode v{}",
-            mangocode_core::constants::APP_VERSION
-        ))
     }
 }
 
@@ -11314,261 +11288,6 @@ impl SlashCommand for VoiceCommand {
     }
 }
 
-// ---- /update -------------------------------------------------------------
-
-#[async_trait]
-impl SlashCommand for UpgradeCommand {
-    fn name(&self) -> &str {
-        "update"
-    }
-    fn aliases(&self) -> Vec<&str> {
-        vec!["upgrade"]
-    }
-    fn description(&self) -> &str {
-        "Check for updates and show download options"
-    }
-    fn help(&self) -> &str {
-        "Usage: /update\n\n\
-         Checks GitHub releases for the latest version of MangoCode.\n\
-         If a newer version is available, shows where to download it."
-    }
-
-    async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = mangocode_core::constants::APP_VERSION;
-
-        // Check GitHub releases API for latest version
-        let client = reqwest::Client::builder()
-            .user_agent(format!("mangocode/{}", current))
-            .timeout(std::time::Duration::from_secs(8))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => {
-                return CommandResult::Message(format!(
-                    "Current version: {current}\n\
-                     Could not check for updates (HTTP client error: {e})\n\
-                     Visit {} for updates.",
-                    mangocode_core::GITHUB_RELEASES_PAGE
-                ));
-            }
-        };
-
-        let resp = client
-            .get(mangocode_core::GITHUB_RELEASES_API_LATEST_URL)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let text = match r.text().await {
-                    Ok(text) => text,
-                    Err(err) => {
-                        return CommandResult::Message(format!(
-                            "Current version: v{current}\n\
-                             Could not read latest release response: {err}\n\
-                             Visit {} for updates.",
-                            mangocode_core::GITHUB_RELEASES_PAGE
-                        ));
-                    }
-                };
-                let json: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(json) => json,
-                    Err(err) => {
-                        return CommandResult::Message(format!(
-                            "Current version: v{current}\n\
-                             Could not parse latest release response: {err}\n\
-                             Response: {}\n\
-                             Visit {} for updates.",
-                            truncate_bytes_with_ellipsis(&text, 500),
-                            mangocode_core::GITHUB_RELEASES_PAGE
-                        ));
-                    }
-                };
-
-                let tag = json
-                    .get("tag_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .trim_start_matches('v');
-
-                let url = json
-                    .get("html_url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(mangocode_core::GITHUB_RELEASES_PAGE);
-
-                let newer = mangocode_core::is_newer(tag, current);
-
-                if tag == "unknown" || newer.is_none() {
-                    CommandResult::Message(format!(
-                        "Current version: v{current}\n\
-                         Could not determine the latest release version.\n\
-                         Release page: {url}"
-                    ))
-                } else if newer == Some(false) {
-                    CommandResult::Message(format!(
-                        "MangoCode v{current} — you are up to date.\n\
-                         Release page: {url}"
-                    ))
-                } else {
-                    CommandResult::Message(format!(
-                        "Update available!\n\
-                         Current version:  v{current}\n\
-                         Latest version:   v{tag}\n\
-                         Release page:     {url}\n\n\
-                         To upgrade from source:\n\
-                           git clone {}.git\n\
-                           cd MangoCode/src-rust\n\
-                           cargo install --path crates/cli --locked --force --bin mangocode",
-                        mangocode_core::GITHUB_REPO_URL
-                    ))
-                }
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = response_error_body(r, "GitHub latest release").await;
-                let detail = if body.trim().is_empty() {
-                    format!("HTTP {status}")
-                } else {
-                    format!("HTTP {status}: {}", body.trim())
-                };
-                CommandResult::Message(format!(
-                    "Current version: v{current}\n\
-                     Could not check for updates ({detail}).\n\
-                     Visit {} for updates.",
-                    mangocode_core::GITHUB_RELEASES_PAGE
-                ))
-            }
-            Err(e) => CommandResult::Message(format!(
-                "Current version: v{current}\n\
-                 Could not check for updates: {e}\n\
-                 Visit {} for updates.",
-                mangocode_core::GITHUB_RELEASES_PAGE
-            )),
-        }
-    }
-}
-
-// ---- /release-notes ------------------------------------------------------
-
-#[async_trait]
-impl SlashCommand for ReleaseNotesCommand {
-    fn name(&self) -> &str {
-        "release-notes"
-    }
-    fn description(&self) -> &str {
-        "Show release notes for the current version"
-    }
-    fn help(&self) -> &str {
-        "Usage: /release-notes [version]\n\n\
-         Fetches and displays release notes from GitHub.\n\
-         Without an argument, shows notes for the current version."
-    }
-
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let current = mangocode_core::constants::APP_VERSION;
-        let version = args.trim();
-
-        let tag = if version.is_empty() {
-            format!("v{}", current)
-        } else if version.starts_with('v') {
-            version.to_string()
-        } else {
-            format!("v{}", version)
-        };
-
-        let client = reqwest::Client::builder()
-            .user_agent(format!("mangocode/{}", current))
-            .timeout(std::time::Duration::from_secs(8))
-            .build();
-
-        let client = match client {
-            Ok(c) => c,
-            Err(_) => {
-                return CommandResult::Message(format!(
-                    "MangoCode {tag} release notes:\n\
-                     Visit {}/tag/{tag}",
-                    mangocode_core::GITHUB_RELEASES_PAGE
-                ));
-            }
-        };
-
-        let url = format!("{}/tags/{}", mangocode_core::GITHUB_RELEASES_API_URL, tag);
-
-        match client.get(&url).send().await {
-            Ok(r) if r.status().is_success() => {
-                let text = match r.text().await {
-                    Ok(text) => text,
-                    Err(err) => {
-                        return CommandResult::Message(format!(
-                            "Could not read release notes response: {err}\n\
-                             View at: {}/tag/{tag}",
-                            mangocode_core::GITHUB_RELEASES_PAGE
-                        ));
-                    }
-                };
-                let json: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(json) => json,
-                    Err(err) => {
-                        return CommandResult::Message(format!(
-                            "Could not parse release notes response: {err}\n\
-                             Response: {}\n\
-                             View at: {}/tag/{tag}",
-                            truncate_bytes_with_ellipsis(&text, 500),
-                            mangocode_core::GITHUB_RELEASES_PAGE
-                        ));
-                    }
-                };
-
-                let body = json
-                    .get("body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("No release notes found.");
-
-                let published = json
-                    .get("published_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown date");
-
-                let html_url = json.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
-
-                CommandResult::Message(format!(
-                    "Release Notes: MangoCode {tag}\n\
-                     Published: {published}\n\
-                     URL: {html_url}\n\
-                     ─────────────────────────────────\n\
-                     {body}"
-                ))
-            }
-            Ok(r) if r.status().as_u16() == 404 => CommandResult::Message(format!(
-                "No release found for {tag}.\n\
-                 View all releases: {}",
-                mangocode_core::GITHUB_RELEASES_PAGE
-            )),
-            Ok(r) => {
-                let status = r.status();
-                let body = response_error_body(r, "GitHub release notes").await;
-                let detail = if body.trim().is_empty() {
-                    format!("HTTP {status}")
-                } else {
-                    format!("HTTP {status}: {}", body.trim())
-                };
-                CommandResult::Message(format!(
-                    "Could not fetch release notes ({detail}).\n\
-                     View at: {}/tag/{}",
-                    mangocode_core::GITHUB_RELEASES_PAGE,
-                    tag
-                ))
-            }
-            Err(e) => CommandResult::Message(format!(
-                "Could not fetch release notes: {e}\n\
-                 View at: {}/tag/{tag}",
-                mangocode_core::GITHUB_RELEASES_PAGE
-            )),
-        }
-    }
-}
-
 // ---- /rate-limit-options -------------------------------------------------
 
 #[async_trait]
@@ -14055,7 +13774,6 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(FlagsCommand),
         Box::new(ColorCommand),
         Box::new(PluginCommand),
-        Box::new(VersionCommand),
         Box::new(ResumeCommand),
         Box::new(WorkspaceCommand),
         Box::new(ReloadPluginsCommand),
@@ -14196,8 +13914,6 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ChromeCommand),
         Box::new(VimCommand),
         Box::new(VoiceCommand),
-        Box::new(UpgradeCommand),
-        Box::new(ReleaseNotesCommand),
         Box::new(RateLimitOptionsCommand),
         Box::new(StatuslineCommand),
         Box::new(SecurityReviewCommand),

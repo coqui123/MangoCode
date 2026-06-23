@@ -41,9 +41,6 @@ sha2 = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
-[build-dependencies]
-chrono = { workspace = true }
-
 # Windows-only: embed the mango mascot as the executable icon. The icon is
 # rasterized from mangoMan.svg into a multi-resolution .ico at build time.
 [target.'cfg(windows)'.build-dependencies]
