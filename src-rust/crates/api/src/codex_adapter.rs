@@ -667,7 +667,29 @@ pub fn anthropic_to_codex_responses_request(
         merge_codex_provider_options(&mut body, options);
     }
 
+    // Optionally request reasoning summaries so the model's thinking can be
+    // surfaced to the user. Gated (default off) because the ChatGPT Codex
+    // backend is known to reject some public Responses fields, so this request
+    // shape should be confirmed against a live session before defaulting on.
+    // An explicit provider-option summary always wins.
+    if codex_reasoning_summary_enabled()
+        && body
+            .get("reasoning")
+            .and_then(|r| r.get("summary"))
+            .is_none()
+    {
+        body["reasoning"]["summary"] = json!("auto");
+    }
+
     strip_sdk_only_fields(body)
+}
+
+/// True when reasoning-summary requests are enabled for Codex via
+/// `MANGOCODE_CODEX_REASONING_SUMMARY` (default off — see call site).
+fn codex_reasoning_summary_enabled() -> bool {
+    std::env::var("MANGOCODE_CODEX_REASONING_SUMMARY")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on" | "ON"))
+        .unwrap_or(false)
 }
 
 fn collect_content_text(part: &Value) -> Option<String> {
@@ -709,6 +731,30 @@ fn collect_output_item_text(item: &Value) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+/// Extract reasoning-summary text from a Responses `output` item of type
+/// "reasoning". Returns `None` unless the item carries non-empty summary text,
+/// so encrypted-only reasoning items (when no summary was requested) are ignored
+/// and never produce an empty thinking block.
+fn collect_output_item_reasoning(item: &Value) -> Option<String> {
+    if item.get("type").and_then(|v| v.as_str()) != Some("reasoning") {
+        return None;
+    }
+    let mut text = String::new();
+    if let Some(summary) = item.get("summary").and_then(|v| v.as_array()) {
+        for part in summary {
+            if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                if !t.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 fn collect_output_item_tool_use(item: &Value) -> Option<Value> {
@@ -754,7 +800,22 @@ fn parse_tool_arguments_value(raw: &str) -> Value {
     if raw.trim().is_empty() {
         return json!({});
     }
-    serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!({ "raw": raw }))
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => value,
+        Err(_) => {
+            // Salvage truncated/malformed argument JSON (e.g. a tool call cut
+            // off at max_tokens, or wrapped in a ```json fence) the same way the
+            // OpenAI provider does, instead of handing `{"raw": ...}` to the
+            // tool and wasting the turn.
+            if let Some(repaired) =
+                crate::providers::openai::repair_tool_call_arguments(raw)
+            {
+                tracing::warn!("repaired truncated/malformed Codex tool call arguments JSON");
+                return repaired;
+            }
+            json!({ "raw": raw })
+        }
+    }
 }
 
 fn response_text_from_value(resp: &Value) -> Option<String> {
@@ -767,7 +828,13 @@ fn response_content_blocks_from_value(resp: &Value) -> Vec<Value> {
 
     if let Some(out) = resp.get("output").and_then(|v| v.as_array()) {
         for item in out {
-            if let Some(tool_use) = collect_output_item_tool_use(item) {
+            if let Some(reasoning) = collect_output_item_reasoning(item) {
+                blocks.push(json!({
+                    "type": "thinking",
+                    "thinking": reasoning,
+                    "signature": "",
+                }));
+            } else if let Some(tool_use) = collect_output_item_tool_use(item) {
                 blocks.push(tool_use);
             } else if let Some(text) = collect_output_item_text(item) {
                 if !text.is_empty() {
@@ -975,6 +1042,72 @@ pub fn build_anthropic_response_from_blocks(
 mod tests {
     use super::*;
     use crate::types::{ApiMessage, SystemPrompt};
+
+    #[test]
+    fn parse_tool_arguments_repairs_truncated_json() {
+        // Valid JSON passes through untouched.
+        assert_eq!(
+            parse_tool_arguments_value(r#"{"path":"a.rs","content":"x"}"#),
+            json!({ "path": "a.rs", "content": "x" })
+        );
+        // Empty / whitespace -> empty object.
+        assert_eq!(parse_tool_arguments_value("   "), json!({}));
+        // A tool call cut off at max_tokens (unterminated string + missing
+        // closing brace) is salvaged into a usable object instead of being
+        // handed to the tool as `{"raw": ...}`.
+        let truncated = r#"{"path":"src/main.rs","content":"fn main() {"#;
+        let repaired = parse_tool_arguments_value(truncated);
+        assert_eq!(repaired["path"], "src/main.rs");
+        assert!(
+            repaired.get("raw").is_none(),
+            "repairable JSON should not fall back to raw"
+        );
+        // Genuinely unsalvageable text still falls back to raw, never panics.
+        assert_eq!(
+            parse_tool_arguments_value("not json at all")["raw"],
+            "not json at all"
+        );
+    }
+
+    #[test]
+    fn parses_reasoning_summary_into_thinking_block() {
+        let resp = json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "First I check the file." }],
+                    "encrypted_content": "enc",
+                },
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "Answer." }],
+                },
+            ]
+        });
+        let blocks = response_content_blocks_from_value(&resp);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[0]["thinking"], "First I check the file.");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "Answer.");
+    }
+
+    #[test]
+    fn reasoning_item_without_summary_is_ignored() {
+        // Encrypted-only reasoning (no summary requested) must not produce an
+        // empty thinking block.
+        let resp = json!({
+            "output": [
+                { "type": "reasoning", "encrypted_content": "enc" },
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "Answer." }],
+                },
+            ]
+        });
+        let blocks = response_content_blocks_from_value(&resp);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+    }
 
     #[test]
     fn test_anthropic_to_codex_request_basic() {

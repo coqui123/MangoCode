@@ -2010,6 +2010,159 @@ fn copilot_recovery_fully_exhausted(
         )
 }
 
+/// Maximum native (non-Copilot) "described a tool action but called no tool"
+/// recovery nudges per turn. Kept at 1: a model that ignores one explicit nudge
+/// will not improve with more, and a tight cap bounds the blast radius if the
+/// heuristic ever fires on a borderline reply.
+const NATIVE_TOOL_INTENT_RECOVERY_LIMIT: u32 = 1;
+
+const NATIVE_TOOL_INTENT_RECOVERY_MSG: &str =
+    "Your previous reply described a tool action you were about to take but did not call any \
+     tool. If the next step needs a tool, call it now. If the task is already complete, say so \
+     explicitly instead.";
+
+/// High-precision detector for an "unfulfilled tool intent": the model announced
+/// it was about to read/edit/run something but ended the turn without calling a
+/// tool. Deliberately conservative — it must never fire on a legitimate final
+/// answer (a false positive wastes a turn and nags a well-behaved model), so it
+/// requires an explicit forward-looking lead-in ("I'll", "let me", …) followed
+/// in the same sentence by a concrete tool verb AND a tool object / path, and it
+/// bails out on any completion / answer / refusal marker.
+///
+/// Unlike the Copilot-pirate detector (coupled to the `<mango_tool_call>` text
+/// protocol), this works structurally for any native tool-calling provider — it
+/// is only consulted when the assistant emitted no tool_use block.
+fn looks_like_unfulfilled_tool_intent(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    // Empty, or a long-form essay/answer rather than a quick stall.
+    if t.is_empty() || t.chars().count() > 4000 {
+        return false;
+    }
+    // Code was provided, or the model is asking the user something → not a stall.
+    if t.contains("```") || t.trim_end().ends_with('?') {
+        return false;
+    }
+    // Past-tense completion, summaries, recommendations, and refusals all mean
+    // the turn is legitimately over.
+    const COMPLETION_MARKERS: &[&str] = &[
+        "i've ", "i have ", "i did ", "i implemented", "i added", "i created",
+        "i updated", "i fixed", "i changed", "i wrote", "i ran ", "done",
+        "completed", "finished", "here's", "here is", "in summary",
+        "to summarize", "in conclusion", "the answer", "as you can see",
+        "successfully", "let me know", "feel free", "anything else",
+        "hope this helps", "tests pass", "i recommend", "i suggest",
+        "i cannot", "i can't", "i'm unable", "unable to",
+    ];
+    if COMPLETION_MARKERS.iter().any(|m| t.contains(m)) {
+        return false;
+    }
+    const LEAD_INS: &[&str] = &[
+        "i'll ", "i will ", "let me ", "i'm going to ", "i am going to ",
+        "i need to ", "i'm gonna ", "i plan to ", "let's ", "now i'll",
+        "next i'll", "i'll go ahead",
+    ];
+    // Single-word verbs are matched on word boundaries (so "view" does not match
+    // "review"/"preview"); multi-word verbs are matched as substrings below.
+    const TOOL_VERBS: &[&str] = &[
+        "read", "open", "view", "inspect", "examine", "check", "scan", "search",
+        "grep", "find", "list", "locate", "run", "execute", "edit", "modify",
+        "update", "patch", "rewrite", "create", "write", "delete", "remove",
+        "explore",
+    ];
+    const TOOL_OBJECTS: &[&str] = &[
+        "file", "files", "code", "directory", "dir", "folder", "repo",
+        "repository", "function", "method", "class", "module", "test", "tests",
+        "command", "script", "line", "lines", "content", "contents", "config",
+        "source", "codebase", "project", "package", "readme",
+    ];
+
+    for lead in LEAD_INS {
+        let mut from = 0usize;
+        while let Some(rel) = t[from..].find(lead) {
+            let start = from + rel + lead.len();
+            // Window = rest of the current sentence, capped to ~120 chars.
+            let window: String = t[start..]
+                .chars()
+                .take_while(|c| !matches!(c, '.' | '\n' | ';' | '!'))
+                .take(120)
+                .collect();
+            let words: Vec<&str> = window
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let has_verb = words.iter().any(|w| TOOL_VERBS.contains(w))
+                || window.contains("look at")
+                || window.contains("look in")
+                || window.contains("add to");
+            let has_object = words.iter().any(|w| TOOL_OBJECTS.contains(w))
+                || window_has_pathlike(&window);
+            if has_verb && has_object {
+                return true;
+            }
+            from = start;
+        }
+    }
+    false
+}
+
+/// True when `window` contains a path-like or backtick-quoted token — a strong
+/// signal the sentence references a concrete file/location.
+fn window_has_pathlike(window: &str) -> bool {
+    if window.contains('/') || window.contains('`') {
+        return true;
+    }
+    const EXTS: &[&str] = &[
+        ".rs", ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".toml", ".md",
+        ".txt", ".go", ".java", ".rb", ".c", ".cpp", ".h", ".yaml", ".yml",
+        ".sh", ".sql", ".html", ".css",
+    ];
+    EXTS.iter().any(|e| window.contains(e))
+}
+
+/// Inject a one-shot recovery nudge when a native (non-Copilot) provider ended
+/// the turn describing a tool action without actually calling a tool. Returns
+/// `None` when not applicable or the (small) retry budget is spent.
+///
+/// Copilot-pirate has its own richer text-protocol recovery; this path is
+/// skipped while that bridge is active so the two never double-fire.
+#[allow(clippy::too_many_arguments)]
+fn try_native_tool_intent_recovery(
+    assistant_msg: &Message,
+    config: &mangocode_core::Config,
+    provider_id: &str,
+    tools: &[Box<dyn mangocode_tools::Tool>],
+    is_non_interactive: bool,
+    recovery_count: &mut u32,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) -> Option<String> {
+    if tools.is_empty() || *recovery_count >= NATIVE_TOOL_INTENT_RECOVERY_LIMIT {
+        return None;
+    }
+    // Copilot-pirate runs its own text-protocol recovery; don't double-handle.
+    if copilot_pirate_active(config, provider_id, is_non_interactive) {
+        return None;
+    }
+    if !assistant_msg.get_tool_use_blocks().is_empty() {
+        return None;
+    }
+    if !looks_like_unfulfilled_tool_intent(&assistant_msg.get_all_text()) {
+        return None;
+    }
+    *recovery_count += 1;
+    warn!(
+        attempt = *recovery_count,
+        limit = NATIVE_TOOL_INTENT_RECOVERY_LIMIT,
+        provider = provider_id,
+        "model described a tool action but called no tool — recovery nudge"
+    );
+    if let Some(tx) = event_tx {
+        let _ = tx.send(QueryEvent::Status(
+            "Model described a tool action but didn't call it — nudging".to_string(),
+        ));
+    }
+    Some(NATIVE_TOOL_INTENT_RECOVERY_MSG.to_string())
+}
+
 /// Maximum completion-gate continuations before enforce mode fails closed.
 const COMPLETION_GATE_CONTINUATION_LIMIT: u32 = 3;
 
@@ -2927,6 +3080,7 @@ async fn run_query_loop_inner(
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
     let mut copilot_agent_recovery_count: u32 = 0;
+    let mut native_tool_intent_recovery_count: u32 = 0;
     // Execution scratchpad: per-turn state tracking for all models.
     // Provides deterministic scaffolding (plan / last tool / next step) to
     // reduce goal-drift in long agentic sessions.
@@ -4171,6 +4325,7 @@ async fn run_query_loop_inner(
                     // even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
                         copilot_agent_recovery_count = 0;
+                        native_tool_intent_recovery_count = 0;
                         let tool_results = execute_model_tool_calls(
                             tool_use_blocks,
                             client,
@@ -4229,6 +4384,19 @@ async fn run_query_loop_inner(
                                  agent recovery attempts."
                                     .to_string(),
                             ));
+                        }
+                        if let Some(recovery_msg) = try_native_tool_intent_recovery(
+                            &assistant_msg,
+                            &tool_ctx.config,
+                            &provider_id_str,
+                            tools,
+                            config.is_non_interactive,
+                            &mut native_tool_intent_recovery_count,
+                            event_tx.as_ref(),
+                        ) {
+                            messages.push(Message::user(recovery_msg));
+                            end_interaction_span(interaction_span);
+                            continue;
                         }
                     }
 
@@ -4896,6 +5064,18 @@ async fn run_query_loop_inner(
                             .to_string(),
                     ));
                 }
+                if let Some(recovery_msg) = try_native_tool_intent_recovery(
+                    &assistant_msg,
+                    &tool_ctx.config,
+                    active_provider_id,
+                    tools,
+                    config.is_non_interactive,
+                    &mut native_tool_intent_recovery_count,
+                    event_tx.as_ref(),
+                ) {
+                    messages.push(Message::user(recovery_msg));
+                    continue;
+                }
                 match apply_completion_gate(
                     work_run,
                     config,
@@ -5071,6 +5251,7 @@ async fn run_query_loop_inner(
                 // boundary; reset the max_tokens retry counter.
                 max_tokens_recovery_count = 0;
                 copilot_agent_recovery_count = 0;
+                native_tool_intent_recovery_count = 0;
                 // Extract tool calls and execute them
                 let tool_calls = assistant_msg
                     .get_tool_use_blocks()
@@ -7423,6 +7604,45 @@ pub async fn run_single_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unfulfilled_tool_intent_fires_on_clear_deferrals() {
+        for s in [
+            "I'll now read the config file.",
+            "Let me open src/main.rs to check the imports.",
+            "I need to search the codebase for usages.",
+            "Next, I'll run the tests.",
+            "I'm going to edit the file to fix this.",
+            "Let me look at the `Cargo.toml` first.",
+            "I will inspect the module to understand the flow.",
+        ] {
+            assert!(looks_like_unfulfilled_tool_intent(s), "should fire: {s:?}");
+        }
+    }
+
+    #[test]
+    fn unfulfilled_tool_intent_ignores_legit_completions() {
+        for s in [
+            "I've read the file and fixed the bug.",
+            "Here's the summary of the changes I made.",
+            "Let me know if you need anything else.",
+            "I'll explain how the parser works: it tokenizes input.",
+            "The answer is 42.",
+            "Done — all tests pass.",
+            "I'll recommend using approach B for performance.",
+            "I'm going to update my profile picture.",
+            "```rust\nfn main() {}\n```",
+            "Could you clarify which file you mean?",
+            "I cannot access that resource for safety reasons.",
+            "I suggest reviewing the design before we continue.",
+            "",
+        ] {
+            assert!(
+                !looks_like_unfulfilled_tool_intent(s),
+                "should NOT fire: {s:?}"
+            );
+        }
+    }
 
     #[test]
     fn lmstudio_defaults_to_copilot_proxy_in_interactive_only() {

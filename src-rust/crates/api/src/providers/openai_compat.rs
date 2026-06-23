@@ -109,6 +109,10 @@ fn env_flag_truthy(v: &str) -> bool {
     matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
 }
 
+fn env_flag_falsy(v: &str) -> bool {
+    matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
+}
+
 /// True when an OpenAI-compat base URL targets the Copilot-pirate local proxy
 /// (M365 Copilot over WebSocket). That server accepts chat completions but does
 /// not return native OpenAI `tool_calls`; Copilot answers in plain text only.
@@ -123,12 +127,18 @@ pub fn is_copilot_pirate_backend(base_url: &str) -> bool {
         return false;
     }
 
-    // Explicit override forces the bridge on for the local backend.
-    if std::env::var("MANGOCODE_COPILOT_PIRATE")
-        .map(|v| env_flag_truthy(v.trim()))
-        .unwrap_or(false)
-    {
-        return true;
+    // Explicit override forces the bridge on or off for the local backend.
+    // `=1/true/on` forces it on; `=0/false/off` forces it off so a user who
+    // runs a *real* local server (LM Studio, vLLM, llama.cpp) on the Copilot
+    // port can escape the text-tool-protocol bridge entirely.
+    if let Ok(raw) = std::env::var("MANGOCODE_COPILOT_PIRATE") {
+        let v = raw.trim();
+        if env_flag_truthy(v) {
+            return true;
+        }
+        if env_flag_falsy(v) {
+            return false;
+        }
     }
 
     let port = std::env::var("COPILOT_API_PORT").unwrap_or_else(|_| "8765".into());

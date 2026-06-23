@@ -402,6 +402,11 @@ pub fn lm_studio() -> OpenAiCompatProvider {
             // Request a final usage chunk so token counts (and the usage ledger
             // / "Recent activity") populate instead of recording zero.
             include_usage_in_stream: true,
+            // Local reasoning models (Qwen3, DeepSeek-R1 distills, gpt-oss) loaded
+            // in LM Studio stream chain-of-thought inline as `<think>...</think>`
+            // in delta content. Strip it to reasoning events (parity with Ollama)
+            // instead of dumping raw think tags into the visible answer.
+            inline_think_tags: true,
             ..Default::default()
         },
     )
@@ -419,6 +424,9 @@ pub fn llama_cpp() -> OpenAiCompatProvider {
             // Request a final usage chunk so token counts (and the usage ledger
             // / "Recent activity") populate instead of recording zero.
             include_usage_in_stream: true,
+            // Strip inline `<think>...</think>` chain-of-thought to reasoning
+            // events for local reasoning models (parity with Ollama / LM Studio).
+            inline_think_tags: true,
             ..Default::default()
         },
     )

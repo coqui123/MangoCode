@@ -5,13 +5,14 @@
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::Stream;
+use futures::StreamExt as _;
 use mangocode_core::auth_store::{AuthStore, StoredCredential};
 use mangocode_core::codex_oauth::{
     extract_chatgpt_account_id, CODEX_API_ENDPOINT, CODEX_CLIENT_ID, CODEX_TOKEN_URL,
 };
 use mangocode_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use mangocode_core::provider_id::{ModelId, ProviderId};
-use mangocode_core::types::ContentBlock;
+use mangocode_core::types::{ContentBlock, UsageInfo};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -449,6 +450,153 @@ impl OpenAiCodexProvider {
         Box::pin(s)
     }
 
+    /// Build the request headers + serialized body for a Codex call. Mirrors the
+    /// inline construction in `create_message` so the live-streaming path sends
+    /// an identical request; `create_message` itself is intentionally left
+    /// untouched (it is the proven fallback path).
+    fn build_codex_request_parts(
+        &self,
+        request: &ProviderRequest,
+        token: &str,
+    ) -> Result<(reqwest::header::HeaderMap, String), ProviderError> {
+        let anthropic_req = AnthropicProvider::build_request(request);
+        let body = codex_adapter::anthropic_to_codex_responses_request(
+            &anthropic_req,
+            Some(&request.provider_options),
+        );
+        let account_id = extract_chatgpt_account_id(token);
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).map_err(|e| {
+                ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Codex auth header build failed: {}", e),
+                    status: None,
+                    body: None,
+                }
+            })?,
+        );
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_OPENAI_BETA_VALUE),
+        );
+        headers.insert(
+            "originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR_VALUE),
+        );
+        let prompt_cache_key = request
+            .provider_options
+            .get("promptCacheKey")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("prompt_cache_key")
+                    .and_then(|v| v.as_str())
+            })
+            .or_else(|| {
+                request
+                    .provider_options
+                    .get("conversation_id")
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.to_string());
+        if let Some(ref key) = prompt_cache_key {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(key) {
+                headers.insert("conversation_id", v);
+            }
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+            {
+                headers.insert("session_id", v);
+            }
+        }
+        if let Some(ref id) = account_id {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(id) {
+                headers.insert("chatgpt-account-id", v);
+            }
+        }
+
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Codex request serialize failed: {}", e),
+            status: None,
+            body: None,
+        })?;
+        Ok((headers, body_str))
+    }
+
+    /// Experimental true-streaming path (gated by `MANGOCODE_CODEX_LIVE_STREAM`).
+    /// Streams text/reasoning deltas as SSE frames arrive, then finalizes tool
+    /// calls / stop / usage from the complete buffer using the same authoritative
+    /// parse as `create_message`. Any setup error is surfaced to the caller,
+    /// which falls back to the buffered synthetic stream.
+    async fn create_message_stream_live(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        self.ensure_fresh().await;
+        let token = self.bearer.lock().await.clone();
+        if token.is_empty() {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "OpenAI Codex OAuth is not connected. Run /connect and choose OpenAI Codex (OAuth).".to_string(),
+            });
+        }
+        let (headers, body_str) = self.build_codex_request_parts(&request, &token)?;
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            "openai-codex",
+            |_attempt| {
+                let builder = self.http.post(&self.endpoint).headers(headers.clone());
+                let b = body_str.clone();
+                async move { builder.body(b).send().await }
+            },
+            |msg| eprintln!("{}", msg),
+        )
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Codex request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            if status.as_u16() == 401 {
+                return Err(ProviderError::AuthFailed {
+                    provider: self.id.clone(),
+                    message: "OpenAI Codex OAuth token was rejected. Run /connect → OpenAI Codex (OAuth) to sign in again.".to_string(),
+                });
+            }
+            let text = resp.text().await.unwrap_or_default();
+            return Err(crate::error_handling::parse_error_response(
+                status.as_u16(),
+                &text,
+                &self.id,
+            ));
+        }
+
+        let model = request.model.clone();
+        let provider_id = self.id.clone();
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map(|b| b.to_vec()).map_err(|_| ()));
+        Ok(codex_live_event_stream(byte_stream, model, provider_id))
+    }
+
     async fn persist_oauth(access: &str, refresh: &str, expires_ms: u64) {
         let mut store = AuthStore::load_async().await;
         if let Err(err) = store.set_result(
@@ -703,19 +851,33 @@ impl LlmProvider for OpenAiCodexProvider {
             );
         }
 
-        let resp = self
-            .http
-            .post(&self.endpoint)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Codex request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+        let body_str = serde_json::to_string(&body).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Codex request serialize failed: {}", e),
+            status: None,
+            body: None,
+        })?;
+        // Wrap the POST in the shared retry middleware so transient 429/529
+        // responses back off and retry instead of aborting the turn on the
+        // first rate-limit (parity with the openai_compat providers).
+        let retry_cfg = crate::error_handling::RetryConfig::default();
+        let resp = crate::retry::retry_request(
+            &retry_cfg,
+            "openai-codex",
+            |_attempt| {
+                let builder = self.http.post(&self.endpoint).headers(headers.clone());
+                let b = body_str.clone();
+                async move { builder.body(b).send().await }
+            },
+            |msg| eprintln!("{}", msg),
+        )
+        .await
+        .map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Codex request failed: {}", e),
+            status: None,
+            body: None,
+        })?;
 
         let status = resp.status();
         let content_type = resp
@@ -748,18 +910,16 @@ impl LlmProvider for OpenAiCodexProvider {
                     "Codex request failed"
                 );
             }
-            let message = if text.trim().is_empty() {
-                format!("Codex API error ({})", status)
-            } else {
-                let body = Self::truncate_payload_with_ellipsis(text.trim(), 600);
-                format!("Codex API error ({}): {}", status, body)
-            };
-            return Err(ProviderError::Other {
-                provider: self.id.clone(),
-                message,
-                status: Some(status.as_u16()),
-                body: Some(text),
-            });
+            // Route through the shared classifier so context-overflow (400/413),
+            // quota (402 / insufficient_quota), rate-limit (429), and server
+            // (5xx) errors map to typed ProviderError variants the query loop
+            // can act on (reactive compaction, retry, failover) instead of an
+            // opaque `Other` that simply aborts the turn.
+            return Err(crate::error_handling::parse_error_response(
+                status.as_u16(),
+                &text,
+                &self.id,
+            ));
         }
 
         // Codex streams responses, and intermediaries do not always preserve
@@ -839,8 +999,22 @@ impl LlmProvider for OpenAiCodexProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        // Query loop always uses the streaming path; Codex OAuth is non-streaming over HTTP,
-        // so we synthesize a single-turn event sequence from `create_message`.
+        // Experimental: stream live when explicitly enabled, falling back to the
+        // proven buffered synthetic path on any setup error (zero regression when
+        // the flag is off, which is the default).
+        if codex_live_stream_enabled() {
+            match self.create_message_stream_live(request.clone()).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Codex live stream failed to start; falling back to buffered synthetic stream"
+                    );
+                }
+            }
+        }
+        // Default: Codex OAuth is non-streaming over HTTP, so we synthesize a
+        // single-turn event sequence from `create_message`.
         let resp = self.create_message(request).await?;
         Ok(Self::stream_synthetic_response(resp))
     }
@@ -901,6 +1075,189 @@ fn static_codex_reasoning_levels(model_id: &str) -> Vec<String> {
     levels
 }
 
+/// True when experimental Codex live streaming is enabled via
+/// `MANGOCODE_CODEX_LIVE_STREAM` (default off — see `create_message_stream`).
+fn codex_live_stream_enabled() -> bool {
+    std::env::var("MANGOCODE_CODEX_LIVE_STREAM")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on" | "ON"))
+        .unwrap_or(false)
+}
+
+/// Convert a raw Codex SSE byte stream into MangoCode stream events. Text and
+/// reasoning deltas are emitted live as frames arrive; tool calls, stop reason
+/// and usage are finalized from the complete buffer via the same authoritative
+/// parse (`sse_to_last_json_value` + `parse_codex_response_blocks`) the
+/// non-streaming path uses, so tool-call correctness is unchanged by framing.
+///
+/// The input item type is `Result<Vec<u8>, ()>` (transport errors collapsed to
+/// `()`) so the converter is decoupled from `reqwest` and unit-testable with a
+/// synthetic byte stream.
+fn codex_live_event_stream<S>(
+    byte_stream: S,
+    model: String,
+    provider_id: ProviderId,
+) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>
+where
+    S: Stream<Item = Result<Vec<u8>, ()>> + Send + 'static,
+{
+    let s = stream! {
+        let mut byte_stream = Box::pin(byte_stream);
+        yield Ok(StreamEvent::MessageStart {
+            id: format!("codex_live_{}", model),
+            model: model.clone(),
+            usage: UsageInfo {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        });
+
+        let mut raw = String::new();
+        let mut pending = String::new();
+        let mut text_open = false;
+        let mut streamed_any_text = false;
+
+        while let Some(item) = byte_stream.next().await {
+            let bytes = match item {
+                Ok(b) => b,
+                // Transport error mid-stream: stop reading and finalize from the
+                // buffer accumulated so far.
+                Err(()) => break,
+            };
+            let chunk = String::from_utf8_lossy(&bytes);
+            raw.push_str(&chunk);
+            pending.push_str(&chunk);
+            while let Some(nl) = pending.find('\n') {
+                let line: String = pending.drain(..=nl).collect();
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = rest.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                            if !d.is_empty() {
+                                if !text_open {
+                                    text_open = true;
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: 0,
+                                        content_block: ContentBlock::Text {
+                                            text: String::new(),
+                                        },
+                                    });
+                                }
+                                streamed_any_text = true;
+                                yield Ok(StreamEvent::TextDelta {
+                                    index: 0,
+                                    text: d.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    "response.reasoning_summary_text.delta"
+                    | "response.reasoning_text.delta" => {
+                        if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                            if !d.is_empty() {
+                                yield Ok(StreamEvent::ReasoningDelta {
+                                    index: 0,
+                                    reasoning: d.to_string(),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if text_open {
+            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
+        }
+
+        // Authoritative finalize from the complete buffer.
+        let parsed = codex_adapter::sse_to_last_json_value(&raw).ok();
+        if parsed.is_none() && !streamed_any_text {
+            yield Err(ProviderError::Other {
+                provider: provider_id,
+                message: "Codex live stream produced no parseable content".to_string(),
+                status: None,
+                body: None,
+            });
+            return;
+        }
+        let (content_blocks, stop_reason, in_tok, out_tok) = match parsed.as_ref() {
+            Some(v) => codex_adapter::parse_codex_response_blocks(v),
+            None => (Vec::new(), "end_turn".to_string(), 0u64, 0u64),
+        };
+
+        let mut index = if text_open { 1 } else { 0 };
+        // Only emit authoritative text if nothing streamed live (e.g. the backend
+        // delivered the message via output_text.done rather than deltas).
+        if !streamed_any_text {
+            for b in &content_blocks {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !t.is_empty() {
+                            yield Ok(StreamEvent::ContentBlockStart {
+                                index,
+                                content_block: ContentBlock::Text { text: String::new() },
+                            });
+                            yield Ok(StreamEvent::TextDelta {
+                                index,
+                                text: t.to_string(),
+                            });
+                            yield Ok(StreamEvent::ContentBlockStop { index });
+                            index += 1;
+                        }
+                    }
+                }
+            }
+        }
+        for b in &content_blocks {
+            if b.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let input = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                yield Ok(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: serde_json::json!({}),
+                    },
+                });
+                let partial_json =
+                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+                yield Ok(StreamEvent::InputJsonDelta { index, partial_json });
+                yield Ok(StreamEvent::ContentBlockStop { index });
+                index += 1;
+            }
+        }
+
+        let stop = OpenAiCodexProvider::map_stop_reason(&stop_reason);
+        let usage = UsageInfo {
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        yield Ok(StreamEvent::MessageDelta {
+            stop_reason: Some(stop),
+            usage: Some(usage),
+        });
+        yield Ok(StreamEvent::MessageStop);
+    };
+    Box::pin(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +1279,44 @@ mod tests {
         let truncated = OpenAiCodexProvider::truncate_payload_with_ellipsis(&body, 600);
 
         assert_eq!(truncated, format!("{}...", "a".repeat(599)));
+    }
+
+    #[tokio::test]
+    async fn live_stream_emits_text_live_then_finalizes_tool_use() {
+        // Two text deltas, a tool-call item, then the authoritative completed
+        // event carrying the full message + function call.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]},{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}],\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n",
+            "data: [DONE]\n",
+        );
+        let byte_stream = futures::stream::iter(vec![Ok::<Vec<u8>, ()>(sse.as_bytes().to_vec())]);
+        let stream =
+            codex_live_event_stream(byte_stream, "gpt-5.2-codex".to_string(), "openai-codex".into());
+        let events: Vec<StreamEvent> = stream.map(|e| e.expect("event")).collect().await;
+
+        assert!(matches!(events.first(), Some(StreamEvent::MessageStart { .. })));
+        // Text was streamed incrementally (not buffered into one delta).
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "Hel")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "lo")));
+        // Tool call finalized from the authoritative parse of the full buffer.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ContentBlockStart {
+                content_block: ContentBlock::ToolUse { name, .. },
+                ..
+            } if name == "Bash"
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::InputJsonDelta { partial_json, .. } if partial_json.contains("ls"))));
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
     }
 
     #[tokio::test]
