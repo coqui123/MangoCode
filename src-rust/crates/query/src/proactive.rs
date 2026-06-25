@@ -600,7 +600,7 @@ fn gather_last_error(session_id: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Send a desktop notification. Best-effort — silently ignores failures.
-fn send_notification(title: &str, body: &str) {
+pub fn send_notification(title: &str, body: &str) {
     // Truncate body for notification readability.
     let body_truncated = mangocode_core::truncate::truncate_bytes_with_ellipsis(body, 200);
 

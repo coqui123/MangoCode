@@ -2,10 +2,16 @@
 //! checkout) when MangoCode's `lmstudio` slot is pointed at it but it isn't
 //! running yet.
 //!
-//! The proxy directory is located via `COPILOT_SERVER_DIR` (must contain
-//! `server.py`). The server is spawned detached so it persists across MangoCode
-//! sessions — no re-spawn on every launch. No-op when the port is already open,
-//! the directory isn't configured, or a spawn was already attempted this run.
+//! The proxy location is resolved from (highest priority first):
+//! - `COPILOT_SERVER_SCRIPT` — full path to `server.py`
+//! - `COPILOT_SERVER_DIR` — directory containing `server.py`
+//! - `config.env` entries for the keys above
+//! - `provider_configs.lmstudio.options.copilot_server_script` /
+//!   `copilot_server_dir`
+//!
+//! The server is spawned detached so it persists across MangoCode sessions — no
+//! re-spawn on every launch. No-op when the port is already open, the path isn't
+//! configured, or a spawn was already attempted this run.
 //!
 //! Also handles automatic token refresh on startup and periodic refresh every
 //! 45 minutes via the proxy's `/v1/token/refresh` endpoint.
@@ -16,8 +22,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+use mangocode_core::Config;
 
 static SPAWN_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static TOKEN_REFRESH_STARTED: AtomicBool = AtomicBool::new(false);
@@ -37,11 +46,111 @@ fn port_is_open(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-/// Resolve the Copilot-pirate checkout dir from `COPILOT_SERVER_DIR`. Returns
-/// `None` unless the dir exists and contains `server.py`.
-fn server_dir() -> Option<PathBuf> {
-    let dir = PathBuf::from(env::var_os("COPILOT_SERVER_DIR")?);
-    dir.join("server.py").exists().then_some(dir)
+struct ServerLocation {
+    dir: PathBuf,
+    script: PathBuf,
+}
+
+static RESOLVED_LOCATION: OnceLock<ServerLocation> = OnceLock::new();
+
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn env_value(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .and_then(|v| non_empty(&v).map(str::to_string))
+}
+
+fn config_env_value(config: &Config, key: &str) -> Option<String> {
+    config
+        .env
+        .get(key)
+        .and_then(|v| non_empty(v).map(str::to_string))
+}
+
+fn provider_option_string(config: &Config, key: &str) -> Option<String> {
+    for provider_id in ["lmstudio", "lm-studio"] {
+        let Some(pc) = config.lookup_provider_config(provider_id) else {
+            continue;
+        };
+        let Some(raw) = pc.options.get(key) else {
+            continue;
+        };
+        if let Some(value) = raw.as_str().and_then(non_empty) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn location_from_script_path(script: PathBuf) -> Option<ServerLocation> {
+    if !script.is_file() {
+        return None;
+    }
+    let dir = script.parent()?.to_path_buf();
+    Some(ServerLocation { dir, script })
+}
+
+fn location_from_dir(dir: PathBuf) -> Option<ServerLocation> {
+    let script = dir.join("server.py");
+    script.is_file().then_some(ServerLocation { dir, script })
+}
+
+fn resolve_server_location_from_sources(
+    script: Option<String>,
+    dir: Option<String>,
+) -> Option<ServerLocation> {
+    if let Some(path) = script {
+        if let Some(loc) = location_from_script_path(PathBuf::from(path)) {
+            return Some(loc);
+        }
+    }
+    dir.and_then(|path| location_from_dir(PathBuf::from(path)))
+}
+
+fn resolve_server_location(config: Option<&Config>) -> Option<ServerLocation> {
+    if let Some(loc) = RESOLVED_LOCATION.get() {
+        return Some(ServerLocation {
+            dir: loc.dir.clone(),
+            script: loc.script.clone(),
+        });
+    }
+
+    let script = env_value("COPILOT_SERVER_SCRIPT").or_else(|| {
+        config.and_then(|cfg| {
+            config_env_value(cfg, "COPILOT_SERVER_SCRIPT")
+                .or_else(|| provider_option_string(cfg, "copilot_server_script"))
+        })
+    });
+    let dir = env_value("COPILOT_SERVER_DIR").or_else(|| {
+        config.and_then(|cfg| {
+            config_env_value(cfg, "COPILOT_SERVER_DIR")
+                .or_else(|| provider_option_string(cfg, "copilot_server_dir"))
+        })
+    });
+
+    let loc = resolve_server_location_from_sources(script, dir)?;
+
+    // Persist for background refresh threads and later calls in this process.
+    if env::var("COPILOT_SERVER_DIR").is_err() {
+        env::set_var("COPILOT_SERVER_DIR", &loc.dir);
+    }
+    if env::var("COPILOT_SERVER_SCRIPT").is_err() {
+        env::set_var("COPILOT_SERVER_SCRIPT", &loc.script);
+    }
+    let _ = RESOLVED_LOCATION.set(ServerLocation {
+        dir: loc.dir.clone(),
+        script: loc.script.clone(),
+    });
+    Some(loc)
+}
+
+/// Resolve the Copilot-pirate checkout dir. Returns `None` unless configured.
+fn server_dir(config: Option<&Config>) -> Option<PathBuf> {
+    resolve_server_location(config).map(|loc| loc.dir)
 }
 
 fn venv_python(dir: &Path) -> PathBuf {
@@ -109,8 +218,8 @@ fn cdp_session_alive() -> bool {
 /// 9225 if one is already running, avoiding redundant browser launches.
 /// Returns `true` if the extraction succeeded.
 pub fn refresh_browser_token() -> bool {
-    let Some(dir) = server_dir() else {
-        debug!("COPILOT_SERVER_DIR not set; cannot run browser token refresh");
+    let Some(dir) = server_dir(None) else {
+        debug!("Copilot server path not configured; cannot run browser token refresh");
         return false;
     };
     let script = dir.join("extract_sydney_browser.py");
@@ -195,7 +304,7 @@ pub fn start_periodic_token_refresh() {
 }
 
 /// Start `server.py` if the Copilot proxy port isn't already listening.
-pub fn ensure_copilot_server() {
+pub fn ensure_copilot_server_from_config(config: &Config) {
     let port = copilot_port();
     if port_is_open(port) {
         return;
@@ -204,17 +313,26 @@ pub fn ensure_copilot_server() {
     if SPAWN_ATTEMPTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let Some(dir) = server_dir() else {
+    let Some(loc) = resolve_server_location(Some(config)) else {
         debug!(
-            "Copilot proxy not running and COPILOT_SERVER_DIR is unset (or has no server.py); \
-             skipping autostart"
+            "Copilot proxy not running and no server path is configured \
+             (COPILOT_SERVER_SCRIPT, COPILOT_SERVER_DIR, config.env, or \
+             provider_configs.lmstudio.options); skipping autostart"
         );
         return;
     };
+    let dir = &loc.dir;
 
-    let py = venv_python(&dir);
+    let py = venv_python(dir);
     let mut cmd = Command::new(&py);
-    cmd.arg("server.py").current_dir(&dir).stdin(Stdio::null());
+    cmd.arg(
+        loc.script
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "server.py".to_string()),
+    )
+    .current_dir(dir)
+    .stdin(Stdio::null());
     // Route output to a log file so we don't inherit the TUI's stdio.
     match std::fs::File::create(dir.join("server.autostart.log")) {
         Ok(file) => {
@@ -248,7 +366,7 @@ pub fn ensure_copilot_server() {
         Ok(_child) => {
             // Intentionally do not retain the Child: dropping it must NOT kill
             // the proxy, so it keeps running for the next session too.
-            debug!(port, dir = %dir.display(), "Spawning Copilot proxy (server.py)");
+            debug!(port, dir = %dir.display(), script = %loc.script.display(), "Spawning Copilot proxy");
             for _ in 0..40 {
                 if port_is_open(port) {
                     debug!(port, "Copilot proxy is up");
@@ -281,9 +399,37 @@ mod tests {
     #[test]
     fn server_dir_requires_server_py() {
         // Unset / bogus dir resolves to None (no autostart).
+        std::env::remove_var("COPILOT_SERVER_SCRIPT");
         std::env::set_var("COPILOT_SERVER_DIR", "/nonexistent/copilot/dir");
-        assert!(server_dir().is_none());
+        assert!(server_dir(None).is_none());
         std::env::remove_var("COPILOT_SERVER_DIR");
-        assert!(server_dir().is_none());
+        assert!(server_dir(None).is_none());
+    }
+
+    #[test]
+    fn resolve_server_script_path() {
+        std::env::remove_var("COPILOT_SERVER_DIR");
+        std::env::remove_var("COPILOT_SERVER_SCRIPT");
+        let dir = std::env::temp_dir().join(format!(
+            "mangocode-copilot-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.py");
+        std::fs::write(&script, "# stub\n").unwrap();
+
+        assert!(resolve_server_location_from_sources(
+            Some(script.display().to_string()),
+            None
+        )
+        .is_some());
+        assert!(resolve_server_location_from_sources(
+            None,
+            Some(dir.display().to_string())
+        )
+        .is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

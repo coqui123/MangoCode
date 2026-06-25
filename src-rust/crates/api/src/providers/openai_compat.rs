@@ -28,7 +28,8 @@ use super::copilot_pirate_tools::{
     append_copilot_tool_retry_turn, apply_tool_parse_to_response, copilot_response_is_bad,
     inject_tool_prompt_into_messages, messages_contain_tool_result,
     messages_contain_write_tool_call, provider_response_to_stream_events,
-    reframe_tool_messages_for_copilot, response_text_content, COPILOT_PROVIDER_RETRY_ATTEMPTS,
+    pin_latest_tool_result_in_system, reframe_tool_messages_for_copilot,
+    response_text_content, COPILOT_PROVIDER_RETRY_ATTEMPTS,
     COPILOT_TOOL_PROTOCOL_ERROR_PREFIX,
 };
 use super::openai::OpenAiProvider;
@@ -502,6 +503,9 @@ impl OpenAiCompatProvider {
             reframe_tool_messages_for_copilot(&mut messages);
             if !request.tools.is_empty() {
                 inject_tool_prompt_into_messages(&mut messages, &request.tools);
+                // Copilot-pirate flattens messages → one prompt; pin tool output
+                // into the system block so Sydney actually sees local results.
+                pin_latest_tool_result_in_system(&mut messages);
             }
         }
 

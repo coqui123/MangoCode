@@ -657,6 +657,9 @@ pub struct App {
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub is_streaming: bool,
+    /// Whether the terminal window currently has focus (tracked via crossterm
+    /// focus events). Used to suppress desktop notifications while focused.
+    pub terminal_focused: bool,
     pub streaming_text: String,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
@@ -1149,12 +1152,45 @@ fn sample_completion_verb(seed: usize) -> &'static str {
 }
 
 /// Format a duration in seconds to a human-readable string, e.g. "2m 5s".
-fn format_elapsed(secs: u64) -> String {
+pub fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("{}s", secs)
     } else {
         format!("{}m {}s", secs / 60, secs % 60)
     }
+}
+
+/// Terminal taskbar progress states for the OSC 9;4 sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressState {
+    /// Remove the progress indicator.
+    Clear,
+    /// Indeterminate (pulsing) progress — used while a tool runs.
+    Indeterminate,
+}
+
+/// Emit the OSC 9;4 terminal progress sequence (ConEmu / Windows Terminal /
+/// supporting emulators show it on the taskbar). Best-effort: terminals that
+/// don't understand it silently ignore the sequence. Skipped under `cfg!(test)`
+/// so it never pollutes test output.
+fn emit_terminal_progress(state: ProgressState) {
+    if cfg!(test) {
+        return;
+    }
+    use std::io::Write;
+    let seq = match state {
+        ProgressState::Clear => "\x1b]9;4;0;0\x07".to_string(),
+        ProgressState::Indeterminate => "\x1b]9;4;3;0\x07".to_string(),
+    };
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// Clear the terminal progress indicator. Public so terminal teardown paths
+/// can guarantee the taskbar indicator never lingers after exit.
+pub fn clear_terminal_progress() {
+    emit_terminal_progress(ProgressState::Clear);
 }
 
 impl App {
@@ -1200,6 +1236,7 @@ impl App {
             history_index: None,
             scroll_offset: 0,
             is_streaming: false,
+            terminal_focused: true,
             streaming_text: String::new(),
             status_message: None,
             spinner_verb: None,
@@ -2420,6 +2457,7 @@ impl App {
                 self.pending_query_cancel = true;
                 self.is_streaming = false;
                 self.spinner_verb = None;
+                clear_terminal_progress();
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.streaming_text.clear();
@@ -4362,11 +4400,22 @@ impl App {
 
         // Settings screen intercepts keys
         if self.settings_screen.visible {
+            let model_before = self.config.model.clone();
+            let provider_before = self.config.provider.clone();
             crate::settings_screen::handle_settings_key(
                 &mut self.settings_screen,
                 &mut self.config,
                 key,
             );
+            // The /config Model field edits `config.model` directly; mirror the
+            // canonical `set_model` follow-up so the live model name, cost
+            // tracker and status bar stay in sync without a restart.
+            if self.config.model != model_before || self.config.provider != provider_before {
+                let effective =
+                    mangocode_api::effective_model_for_config(&self.config, &self.model_registry);
+                self.cost_tracker.set_model(&effective);
+                self.model_name = effective;
+            }
             if let Some(message) = self.settings_screen.take_status_message() {
                 self.status_message = Some(message);
             }
@@ -4476,12 +4525,7 @@ impl App {
 
         // ESC should always stop an active stream.
         if key.code == KeyCode::Esc && self.is_streaming {
-            self.is_streaming = false;
-            self.spinner_verb = None;
-            self.streaming_text.clear();
-            self.tool_use_blocks.clear();
-            self.status_message = Some("Cancelled.".to_string());
-            self.restore_queued_input_for_editing();
+            self.cancel_active_stream();
             return false;
         }
 
@@ -4739,12 +4783,7 @@ impl App {
                         );
                     }
                 } else if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.restore_queued_input_for_editing();
+                    self.cancel_active_stream();
                 } else {
                     self.should_quit = true;
                 }
@@ -5347,12 +5386,7 @@ impl App {
                 }
 
                 if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.restore_queued_input_for_editing();
+                    self.cancel_active_stream();
                 } else {
                     self.should_quit = true;
                 }
@@ -6323,6 +6357,9 @@ impl App {
                 }
                 self.is_streaming = true;
                 self.sleep_inhibitor.set_turn_running(true);
+                if self.settings_screen.terminal_progress_bar {
+                    emit_terminal_progress(ProgressState::Indeterminate);
+                }
                 self.status_message = Some(format!("Running {}…", tool_name));
                 if let Some(existing) = self.tool_use_blocks.iter_mut().find(|b| b.id == tool_id) {
                     existing.status = ToolStatus::Running;
@@ -6387,12 +6424,25 @@ impl App {
                 self.spinner_verb = None;
                 self.status_message = None;
                 self.stall_start = None;
+                // Always clear the terminal progress indicator on turn end.
+                clear_terminal_progress();
                 // Record elapsed time and pick a completion verb
+                let mut elapsed_secs: Option<u64> = None;
                 if let Some(start) = self.turn_start.take() {
                     let secs = start.elapsed().as_secs();
+                    elapsed_secs = Some(secs);
                     let seed = self.frame_count as usize ^ (self.messages.len() * 7);
                     self.last_turn_elapsed = Some(format_elapsed(secs));
                     self.last_turn_verb = Some(sample_completion_verb(seed));
+                }
+                // Desktop notification when the turn finishes and the terminal
+                // is not focused (so the user who tabbed away gets pinged).
+                if self.settings_screen.notifications_enabled && !self.terminal_focused {
+                    let body = match elapsed_secs {
+                        Some(s) => format!("Turn complete in {}", format_elapsed(s)),
+                        None => "Turn complete".to_string(),
+                    };
+                    mangocode_query::proactive::send_notification("MangoCode", &body);
                 }
                 if !self.streaming_text.is_empty() {
                     let text = std::mem::take(&mut self.streaming_text);
@@ -6416,6 +6466,7 @@ impl App {
                 self.sleep_inhibitor.set_turn_running(false);
                 self.spinner_verb = None;
                 self.stall_start = None;
+                clear_terminal_progress();
                 self.streaming_text.clear();
                 self.tool_use_blocks.clear();
                 self.turn_start.take();
@@ -6460,6 +6511,9 @@ impl App {
                     _ => {}
                 }
             }
+            QueryEvent::MemoryUpdated { path } => {
+                self.memory_update_notification.show(&path);
+            }
         }
 
         // Update token count from tracker.
@@ -6472,6 +6526,19 @@ impl App {
 
     /// Run the TUI event loop. Returns `Some(input)` when the user submits
     /// a message, or `None` when the user quits.
+    /// Stop an in-flight stream in response to a user cancel (Esc / Ctrl+C /
+    /// interrupt keybinding). Clears transient streaming state and the terminal
+    /// progress indicator, then restores any queued input for editing.
+    fn cancel_active_stream(&mut self) {
+        self.is_streaming = false;
+        self.spinner_verb = None;
+        self.streaming_text.clear();
+        self.tool_use_blocks.clear();
+        self.status_message = Some("Cancelled.".to_string());
+        clear_terminal_progress();
+        self.restore_queued_input_for_editing();
+    }
+
     pub fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -6741,6 +6808,8 @@ impl App {
                     Event::Mouse(mouse_event) => {
                         self.handle_mouse_event(mouse_event);
                     }
+                    Event::FocusGained => self.terminal_focused = true,
+                    Event::FocusLost => self.terminal_focused = false,
                     _ => {}
                 }
                 self.stats_dialog.update_perf_metrics(

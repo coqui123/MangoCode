@@ -520,12 +520,27 @@ pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWar
 }
 
 /// Return `true` when auto-compaction should fire.
-pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
-    if state.disabled {
+///
+/// `enabled` is the user's `config.auto_compact` toggle — when `false`,
+/// auto-compaction never fires. `trigger_fraction` is `config.compact_threshold`
+/// (0.0–1.0); values outside that range fall back to the built-in default.
+pub fn should_auto_compact(
+    input_tokens: u64,
+    model: &str,
+    state: &AutoCompactState,
+    enabled: bool,
+    trigger_fraction: f64,
+) -> bool {
+    if !enabled || state.disabled {
         return false;
     }
+    let fraction = if trigger_fraction > 0.0 && trigger_fraction <= 1.0 {
+        trigger_fraction
+    } else {
+        AUTOCOMPACT_TRIGGER_FRACTION
+    };
     let window = context_window_for_model(model);
-    let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    let threshold = (window as f64 * fraction) as u64;
     input_tokens >= threshold
 }
 
@@ -700,8 +715,10 @@ pub async fn auto_compact_if_needed(
     input_tokens: u64,
     model: &str,
     state: &mut AutoCompactState,
+    enabled: bool,
+    trigger_fraction: f64,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact(input_tokens, model, state) {
+    if !should_auto_compact(input_tokens, model, state, enabled, trigger_fraction) {
         return None;
     }
 
@@ -1291,21 +1308,61 @@ mod tests {
             disabled: true,
             ..Default::default()
         };
-        assert!(!should_auto_compact(195_000, "claude-sonnet-4-6", &state));
+        assert!(!should_auto_compact(
+            195_000,
+            "claude-sonnet-4-6",
+            &state,
+            true,
+            AUTOCOMPACT_TRIGGER_FRACTION
+        ));
+    }
+
+    #[test]
+    fn test_should_not_compact_when_config_disabled() {
+        let state = AutoCompactState::default();
+        // Well over threshold, but the user turned auto-compact off.
+        assert!(!should_auto_compact(
+            195_000,
+            "claude-sonnet-4-6",
+            &state,
+            false,
+            AUTOCOMPACT_TRIGGER_FRACTION
+        ));
     }
 
     #[test]
     fn test_should_compact_at_90pct() {
         let state = AutoCompactState::default();
         // 90 % of 200k = 180k — should trigger
-        assert!(should_auto_compact(180_000, "claude-sonnet-4-6", &state));
+        assert!(should_auto_compact(
+            180_000,
+            "claude-sonnet-4-6",
+            &state,
+            true,
+            AUTOCOMPACT_TRIGGER_FRACTION
+        ));
     }
 
     #[test]
     fn test_should_not_compact_below_90pct() {
         let state = AutoCompactState::default();
         // 70 % of 200k = 140k — should NOT trigger
-        assert!(!should_auto_compact(140_000, "claude-sonnet-4-6", &state));
+        assert!(!should_auto_compact(
+            140_000,
+            "claude-sonnet-4-6",
+            &state,
+            true,
+            AUTOCOMPACT_TRIGGER_FRACTION
+        ));
+    }
+
+    #[test]
+    fn test_custom_threshold_lowers_trigger_point() {
+        let state = AutoCompactState::default();
+        // 60 % of 200k = 120k. Default 90% would NOT trigger, but a 0.5
+        // threshold should.
+        assert!(should_auto_compact(120_000, "claude-sonnet-4-6", &state, true, 0.5));
+        assert!(!should_auto_compact(120_000, "claude-sonnet-4-6", &state, true, 0.9));
     }
 
     // ---- Circuit breaker ----------------------------------------------------

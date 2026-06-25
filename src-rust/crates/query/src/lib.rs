@@ -653,6 +653,12 @@ pub struct QueryConfig {
     /// query turn. Background automation/proactive loops keep this disabled so
     /// peer messages only surface on explicit interactive/model turns.
     pub inject_coordination_inbox: bool,
+    /// Whether proactive auto-compaction is enabled (`config.auto_compact`).
+    /// When `false`, the query loop never auto-compacts.
+    pub auto_compact: bool,
+    /// Context-window fraction (0.0–1.0) at which auto-compaction triggers
+    /// (`config.compact_threshold`, resolved via `effective_compact_threshold`).
+    pub compact_threshold: f64,
 }
 
 impl Default for QueryConfig {
@@ -695,6 +701,8 @@ impl Default for QueryConfig {
                 crate::coordinator::AgentMode::Normal
             },
             inject_coordination_inbox: true,
+            auto_compact: true,
+            compact_threshold: 0.9,
         }
     }
 }
@@ -721,6 +729,8 @@ impl QueryConfig {
                 .append_system_prompt
                 .as_deref()
                 .is_some_and(|append| !append.trim().is_empty()),
+            auto_compact: cfg.auto_compact,
+            compact_threshold: cfg.effective_compact_threshold() as f64,
             ..Default::default()
         }
     }
@@ -755,6 +765,8 @@ impl QueryConfig {
                 .append_system_prompt
                 .as_deref()
                 .is_some_and(|append| !append.trim().is_empty()),
+            auto_compact: cfg.auto_compact,
+            compact_threshold: cfg.effective_compact_threshold() as f64,
             ..Default::default()
         }
     }
@@ -1278,6 +1290,11 @@ pub enum QueryEvent {
         state: TokenWarningState,
         pct_used: f64,
     },
+    /// A memory file was written/updated by session-memory persistence.
+    /// Carries a representative path so the UI can show a brief banner.
+    MemoryUpdated {
+        path: String,
+    },
 }
 
 fn record_query_event(
@@ -1377,6 +1394,15 @@ fn record_query_event(
                     "state": format!("{:?}", state),
                     "pct_used": pct_used,
                 }),
+            );
+        }
+        QueryEvent::MemoryUpdated { path } => {
+            recorder.record(
+                "memory.updated",
+                Some(turn_id.to_string()),
+                None,
+                None,
+                serde_json::json!({ "path": path }),
             );
         }
     }
@@ -3821,10 +3847,10 @@ async fn run_query_loop_inner(
                     };
 
                     // When the lmstudio slot points at the local Copilot proxy,
-                    // auto-start server.py if it isn't already listening (needs
-                    // COPILOT_SERVER_DIR; no-op otherwise).
+                    // auto-start server.py if it isn't already listening (path
+                    // from env, config.env, or provider_configs.lmstudio.options).
                     if mangocode_api::is_copilot_pirate_backend(&base_url) {
-                        crate::copilot_server::ensure_copilot_server();
+                        crate::copilot_server::ensure_copilot_server_from_config(&tool_ctx.config);
                         crate::copilot_server::refresh_copilot_token();
                         crate::copilot_server::start_periodic_token_refresh();
                     }
@@ -4905,8 +4931,13 @@ async fn run_query_loop_inner(
             }
         } else if stop == "end_turn" || stop == "tool_use" {
             // Proactive auto-compact (original path, used when reactive compact is off).
-            let should_preemptively_compact =
-                compact::should_auto_compact(usage.input_tokens, &config.model, &compact_state);
+            let should_preemptively_compact = compact::should_auto_compact(
+                usage.input_tokens,
+                &config.model,
+                &compact_state,
+                config.auto_compact,
+                config.compact_threshold,
+            );
             if should_preemptively_compact {
                 work_run.record_phase(
                     WorkRunPhase::CompactingContext,
@@ -4930,6 +4961,8 @@ async fn run_query_loop_inner(
                 usage.input_tokens,
                 &config.model,
                 &mut compact_state,
+                config.auto_compact,
+                config.compact_threshold,
             )
             .await
             {
@@ -5127,7 +5160,15 @@ async fn run_query_loop_inner(
                                 },
                             ) {
                                 let sm_client = std::sync::Arc::new(sm_client);
-                                tokio::spawn(async move {
+                                // Weak sender: must NOT keep the event channel
+                                // open, or headless mode would block on
+                                // event_task.await until this background
+                                // extraction's API call returns.
+                                let mem_event_tx =
+                                    event_tx.as_ref().map(|tx| tx.downgrade());
+                                // Tracked (not bare tokio::spawn) so one-shot
+                                // headless runs can drain it before exiting.
+                                memory_task_tracker().spawn(async move {
                                     let extractor =
                                         session_memory::SessionMemoryExtractor::new(&model_clone);
                                     match extractor
@@ -5137,16 +5178,36 @@ async fn run_query_loop_inner(
                                         Ok(memories) if !memories.is_empty() => {
                                             let target =
                                                 memory_dir_for_working_dir(&working_dir_clone);
-                                            if let Err(e) =
-                                                session_memory::SessionMemoryExtractor::persist(
-                                                    &memories, &target,
-                                                )
-                                                .await
+                                            match session_memory::SessionMemoryExtractor::persist(
+                                                &memories, &target,
+                                            )
+                                            .await
                                             {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "Failed to persist session memories"
-                                                );
+                                                Ok(()) => {
+                                                    // Surface a brief "memory updated"
+                                                    // banner in the UI, pointing at the
+                                                    // index the /memory command edits.
+                                                    // upgrade() yields None if the UI
+                                                    // (and its receiver) is already gone.
+                                                    if let Some(tx) = mem_event_tx
+                                                        .as_ref()
+                                                        .and_then(|w| w.upgrade())
+                                                    {
+                                                        let path = target
+                                                            .join("MEMORY.md")
+                                                            .to_string_lossy()
+                                                            .to_string();
+                                                        let _ = tx.send(
+                                                            QueryEvent::MemoryUpdated { path },
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "Failed to persist session memories"
+                                                    );
+                                                }
                                             }
                                         }
                                         Ok(_) => {} // no memories extracted
@@ -7428,6 +7489,43 @@ fn memory_dir_for_working_dir(working_dir: &std::path::Path) -> std::path::PathB
     memory_root_for_working_dir(working_dir).join("memory")
 }
 
+/// Process-global tracker for detached background memory-extraction tasks.
+///
+/// Session-memory persistence is spawned fire-and-forget from the query loop.
+/// Long-lived UIs never wait on these; one-shot (headless) runs would otherwise
+/// exit and kill them mid-write, so [`drain_pending_memory_writes`] gives them a
+/// bounded window to finish. Tasks deregister themselves on completion, so the
+/// tracker does not accumulate across a long interactive session.
+fn memory_task_tracker() -> &'static tokio_util::task::TaskTracker {
+    static TRACKER: std::sync::OnceLock<tokio_util::task::TaskTracker> = std::sync::OnceLock::new();
+    TRACKER.get_or_init(tokio_util::task::TaskTracker::new)
+}
+
+/// Await any in-flight background memory writes, up to `timeout`. Intended for
+/// one-shot entrypoints (headless `-p`) right before the process exits, so
+/// session-memory persistence isn't killed mid-flight. Returns `true` if all
+/// pending writes finished, `false` if the timeout elapsed first.
+///
+/// After this returns the tracker is closed; do not call it from a path that
+/// expects to keep spawning memory tasks afterwards (i.e. not the interactive
+/// UI, which simply never drains).
+pub async fn drain_pending_memory_writes(timeout: std::time::Duration) -> bool {
+    drain_tracker(memory_task_tracker(), timeout).await
+}
+
+/// Core drain logic, split out so it can be tested against a local tracker
+/// instead of the process-global singleton (which parallel tests would clobber).
+async fn drain_tracker(
+    tracker: &tokio_util::task::TaskTracker,
+    timeout: std::time::Duration,
+) -> bool {
+    if tracker.is_empty() {
+        return true;
+    }
+    tracker.close();
+    tokio::time::timeout(timeout, tracker.wait()).await.is_ok()
+}
+
 #[cfg(feature = "tool-agent")]
 fn conversations_dir_for_working_dir(working_dir: &std::path::Path) -> std::path::PathBuf {
     memory_root_for_working_dir(working_dir).join("conversations")
@@ -7604,6 +7702,71 @@ pub async fn run_single_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the background session-memory task holds only a *weak*
+    /// `QueryEvent` sender. If it held a strong clone, headless mode would block
+    /// on `event_task.await` — which drains the channel until every sender drops
+    /// — for the entire duration of the extraction's API call. A weak sender
+    /// must not keep the channel open once the last strong sender is dropped.
+    #[tokio::test]
+    async fn weak_event_sender_does_not_keep_channel_open() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueryEvent>();
+        let weak = tx.downgrade();
+
+        // A long-lived background job that only holds the weak sender, mirroring
+        // the detached memory-extraction task.
+        let bg = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            let _ = weak.upgrade();
+        });
+
+        drop(tx); // last strong sender gone
+
+        // Channel must close promptly even though `bg` is still alive. With a
+        // strong sender the recv would block for the full sleep and time out.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await;
+        assert!(
+            matches!(closed, Ok(None)),
+            "weak sender must not keep the QueryEvent channel open"
+        );
+
+        bg.abort();
+    }
+
+    #[tokio::test]
+    async fn drain_tracker_waits_for_pending_task() {
+        // The headless drain must block until a tracked background write
+        // finishes, so memory persists before the process exits.
+        let tracker = tokio_util::task::TaskTracker::new();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        tracker.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            done2.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(drain_tracker(&tracker, std::time::Duration::from_secs(5)).await);
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "drain must wait for the tracked task to finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_tracker_empty_returns_immediately() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        assert!(drain_tracker(&tracker, std::time::Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn drain_tracker_reports_timeout_for_slow_task() {
+        let tracker = tokio_util::task::TaskTracker::new();
+        tracker.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+
+        assert!(!drain_tracker(&tracker, std::time::Duration::from_millis(100)).await);
+    }
 
     #[test]
     fn unfulfilled_tool_intent_fires_on_clear_deferrals() {
@@ -8046,6 +8209,8 @@ mod tests {
             skill_qa_blocks: Vec::new(),
             agent_mode: crate::coordinator::AgentMode::Normal,
             inject_coordination_inbox: true,
+            auto_compact: true,
+            compact_threshold: 0.9,
         }
     }
 

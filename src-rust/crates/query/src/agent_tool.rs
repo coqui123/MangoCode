@@ -784,6 +784,8 @@ impl Tool for AgentTool {
             // Direct Tool::execute callers do not carry an active parent
             // QueryConfig, so fail closed for background maintenance paths.
             inject_coordination_inbox: false,
+            auto_compact: agent_ctx.config.auto_compact,
+            compact_threshold: agent_ctx.config.effective_compact_threshold() as f64,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

@@ -13,7 +13,10 @@ use std::{
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture,
+    },
     execute, queue,
     style::{
         Attribute as CtAttribute, Color as CtColor, Print, ResetColor, SetAttribute,
@@ -87,7 +90,7 @@ impl HybridTerminal {
         let mut stdout = io::stdout();
         // Keep mouse reporting off in main-buffer transcript mode so the
         // terminal owns wheel scrolling and native scrollback keeps working.
-        execute!(stdout, EnableBracketedPaste, Hide)?;
+        execute!(stdout, EnableBracketedPaste, EnableFocusChange, Hide)?;
         queue_base_style(&mut stdout)?;
         execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
         reset_sixel_blit_state();
@@ -135,6 +138,8 @@ impl HybridTerminal {
         if self.restored {
             return Ok(());
         }
+        // Clear any lingering taskbar progress indicator before leaving.
+        crate::app::clear_terminal_progress();
         self.leave_fullscreen(false)?;
         self.reset_scroll_region()?;
         self.clear_composer_area()?;
@@ -143,6 +148,7 @@ impl HybridTerminal {
             Show,
             DisableMouseCapture,
             DisableBracketedPaste,
+            DisableFocusChange,
             ResetColor
         )?;
         disable_raw_mode()?;
@@ -457,7 +463,9 @@ impl HybridTerminal {
                 }
                 self.render_live(app)
             }
-            QueryEvent::Status(_) | QueryEvent::TokenWarning { .. } => self.render_live(app),
+            QueryEvent::Status(_)
+            | QueryEvent::TokenWarning { .. }
+            | QueryEvent::MemoryUpdated { .. } => self.render_live(app),
             QueryEvent::Error(msg) => {
                 self.move_to_transcript_end()?;
                 if self.stream_open {

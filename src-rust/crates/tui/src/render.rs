@@ -221,7 +221,11 @@ pub fn reset_last_sixel_position() {
     });
 }
 
-fn spinner_char(frame_count: u64) -> char {
+fn spinner_char(frame_count: u64, reduce_motion: bool) -> char {
+    if reduce_motion {
+        // Static glyph — no animation when reduce-motion is enabled.
+        return SPINNER[0];
+    }
     let len = SPINNER.len() as u64;
     let stepped = frame_count
         .saturating_mul(5)
@@ -1600,6 +1604,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
             &mut live,
             block,
             app.frame_count,
+            app.settings_screen.reduce_motion,
             &app.expanded_tool_outputs,
         );
     }
@@ -2192,12 +2197,14 @@ fn render_tool_block_lines(
     lines: &mut Vec<Line<'static>>,
     block: &crate::app::ToolUseBlock,
     frame_count: u64,
+    reduce_motion: bool,
     expanded_ids: &std::collections::HashSet<String>,
 ) {
-    // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error
+    // ● icon: blinks Yellow↔DarkGray when running, solid Green/Red when done/error.
+    // With reduce-motion, the running icon stays a steady Yellow (no blink).
     let (icon_color, name_color) = match block.status {
         ToolStatus::Running => {
-            let blink_on = (frame_count / 4).is_multiple_of(2);
+            let blink_on = reduce_motion || (frame_count / 4).is_multiple_of(2);
             let c = if blink_on {
                 Color::Yellow
             } else {
@@ -2419,7 +2426,7 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
     } else if app.is_streaming {
         // Spinner glyph (turns red on stall)
         let mut s = vec![Span::styled(
-            spinner_char(app.frame_count).to_string(),
+            spinner_char(app.frame_count, app.settings_screen.reduce_motion).to_string(),
             Style::default()
                 .fg(spinner_color(app))
                 .add_modifier(Modifier::BOLD),
@@ -2434,7 +2441,11 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         let label = format!("{}…", raw_label.trim_end_matches('…'));
 
         s.push(Span::raw(" "));
-        s.extend(shimmer_spans(&label, app.frame_count));
+        s.extend(shimmer_spans(
+            &label,
+            app.frame_count,
+            app.settings_screen.reduce_motion,
+        ));
         s
     } else if let (Some(verb), Some(elapsed)) =
         (app.last_turn_verb, app.last_turn_elapsed.as_deref())
@@ -2468,11 +2479,18 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
 /// Uses glimmerSpeed=200ms with a 3-char shimmer window.
 ///
 /// At ~50ms per frame a 4-frame step ≈ 200ms.
-fn shimmer_spans(text: &str, frame_count: u64) -> Vec<Span<'static>> {
+fn shimmer_spans(text: &str, frame_count: u64, reduce_motion: bool) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
     if len == 0 {
         return Vec::new();
+    }
+    if reduce_motion {
+        // No sweep animation; render the label as a single static span.
+        return vec![Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::White),
+        )];
     }
 
     // Cycle length = text_len + 20 (10 off-screen on each side)
@@ -2784,6 +2802,22 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             parts.push(Span::styled(cost_str, Style::default().fg(Color::DarkGray)));
         }
 
+        // Turn duration — a live elapsed timer while a turn is running (when
+        // enabled in /config). The final per-turn duration is already shown in
+        // the status row after completion, so this only renders while streaming
+        // to avoid duplicating it.
+        if app.settings_screen.show_turn_duration && app.is_streaming {
+            if let Some(start) = app.turn_start {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("turn {}", crate::app::format_elapsed(start.elapsed().as_secs())),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
+
         // 3b. Token budget (feature-gated)
         #[cfg(feature = "token_budget")]
         if let Some(max_tokens) = app.token_budget {
@@ -2912,7 +2946,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // 8. Bridge badge
-        if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
+        if let Some(badge) =
+            app.bridge_state.status_badge(app.frame_count, app.settings_screen.reduce_motion)
+        {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }

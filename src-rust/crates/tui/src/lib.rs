@@ -13,7 +13,8 @@
 // - Plugin hint banners
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -328,6 +329,9 @@ pub fn setup_terminal_with_capabilities(
             return Err(e);
         }
     }
+    // Focus events drive desktop-notification suppression while focused.
+    // Best-effort: ignore failure on terminals that don't support it.
+    let _ = execute!(stdout, EnableFocusChange);
 
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
         let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
@@ -341,12 +345,15 @@ pub fn setup_terminal_with_capabilities(
 
 /// Restore the terminal to its original state.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    // Clear any lingering taskbar progress indicator before leaving.
+    crate::app::clear_terminal_progress();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableFocusChange
     )?;
     terminal.show_cursor()?;
     Ok(())

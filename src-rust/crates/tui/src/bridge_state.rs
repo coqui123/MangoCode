@@ -27,9 +27,13 @@ pub enum BridgeConnectionState {
 impl BridgeConnectionState {
     /// Return a styled status badge `Span` suitable for the status bar.
     /// Returns `None` when the state should not be shown (Disconnected).
-    pub fn status_badge(&self, spinner_frame: u64) -> Option<Span<'static>> {
+    pub fn status_badge(&self, spinner_frame: u64, reduce_motion: bool) -> Option<Span<'static>> {
         const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let sp = SPINNER[(spinner_frame as usize) % SPINNER.len()];
+        let sp = if reduce_motion {
+            SPINNER[0]
+        } else {
+            SPINNER[(spinner_frame as usize) % SPINNER.len()]
+        };
 
         match self {
             BridgeConnectionState::Disconnected => None,
@@ -101,7 +105,7 @@ mod tests {
     #[test]
     fn disconnected_produces_no_badge() {
         assert!(BridgeConnectionState::Disconnected
-            .status_badge(0)
+            .status_badge(0, false)
             .is_none());
     }
 
@@ -111,7 +115,7 @@ mod tests {
             session_url: "https://example.com".to_string(),
             peer_count: 2,
         };
-        let badge = state.status_badge(0).unwrap();
+        let badge = state.status_badge(0, false).unwrap();
         assert!(badge.content.contains("REMOTE"));
         assert!(badge.content.contains("2"));
     }
@@ -121,7 +125,7 @@ mod tests {
         let state = BridgeConnectionState::Failed {
             reason: "timeout".to_string(),
         };
-        let badge = state.status_badge(0).unwrap();
+        let badge = state.status_badge(0, false).unwrap();
         assert!(badge.content.contains("BRIDGE"));
     }
 }

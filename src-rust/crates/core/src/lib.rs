@@ -688,6 +688,16 @@ pub mod config {
         true
     }
 
+    /// Default `Config` used when a settings file (or its `config` object) is
+    /// absent. Auto-compact is on by default to match historical behavior and
+    /// the `--no-auto-compact` opt-out flag.
+    fn default_config() -> Config {
+        Config {
+            auto_compact: true,
+            ..Config::default()
+        }
+    }
+
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -796,6 +806,9 @@ pub mod config {
         pub theme: Theme,
         #[serde(default)]
         pub output_style: Option<String>,
+        /// Whether proactive auto-compaction is enabled. On by default; the
+        /// query engine gates compaction on this (also set via `--no-auto-compact`).
+        #[serde(default = "default_true")]
         pub auto_compact: bool,
         pub compact_threshold: f32,
         pub verbose: bool,
@@ -1180,7 +1193,7 @@ pub mod config {
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct Settings {
-        #[serde(default)]
+        #[serde(default = "default_config")]
         pub config: Config,
         #[serde(skip)]
         pub explicit_config_keys: std::collections::HashSet<String>,
@@ -1654,7 +1667,11 @@ pub mod config {
                 Self::from_json_str(&content)
                     .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path.display(), e))
             } else {
-                Ok(Self::default())
+                // No settings file yet: default with auto-compact enabled.
+                Ok(Self {
+                    config: default_config(),
+                    ..Self::default()
+                })
             }
         }
 
@@ -1737,7 +1754,11 @@ pub mod config {
                 Self::from_json_str(&content)
                     .map_err(|e| anyhow::anyhow!("failed to parse {}: {}", path.display(), e))
             } else {
-                Ok(Self::default())
+                // No settings file yet: default with auto-compact enabled.
+                Ok(Self {
+                    config: default_config(),
+                    ..Self::default()
+                })
             }
         }
 
@@ -1952,7 +1973,13 @@ pub mod config {
                 },
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
-                auto_compact: over.config.auto_compact || base.config.auto_compact,
+                // Inherit unless the override level *explicitly* set auto_compact,
+                // so a project file without the key can't re-enable a global opt-out.
+                auto_compact: if over.explicit_config_keys.contains("auto_compact") {
+                    over.config.auto_compact
+                } else {
+                    base.config.auto_compact
+                },
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold
                 } else {
@@ -5079,6 +5106,44 @@ mod tests {
                 .config
                 .agent_completion_policy,
             crate::config::AgentCompletionPolicy::Enforce
+        );
+    }
+
+    #[test]
+    fn auto_compact_defaults_on_when_absent() {
+        // Config object present without the key → on by default.
+        let s = crate::config::Settings::from_json_str(r#"{"config":{}}"#).unwrap();
+        assert!(s.config.auto_compact);
+        // No config object at all → on by default.
+        let s2 = crate::config::Settings::from_json_str(r#"{}"#).unwrap();
+        assert!(s2.config.auto_compact);
+        // Explicit opt-out is respected.
+        let s3 =
+            crate::config::Settings::from_json_str(r#"{"config":{"auto_compact":false}}"#).unwrap();
+        assert!(!s3.config.auto_compact);
+    }
+
+    #[test]
+    fn settings_merge_project_without_key_keeps_global_auto_compact_optout() {
+        // User disabled auto-compact globally; a project file that doesn't
+        // mention it must not silently re-enable it.
+        let global =
+            crate::config::Settings::from_json_str(r#"{"config":{"auto_compact":false}}"#).unwrap();
+        let project_other =
+            crate::config::Settings::from_json_str(r#"{"config":{"verbose":true}}"#).unwrap();
+        assert!(
+            !crate::config::Settings::merge(global.clone(), project_other)
+                .config
+                .auto_compact,
+            "project without auto_compact should inherit the global opt-out"
+        );
+        // A project that explicitly re-enables it wins.
+        let project_on =
+            crate::config::Settings::from_json_str(r#"{"config":{"auto_compact":true}}"#).unwrap();
+        assert!(
+            crate::config::Settings::merge(global, project_on)
+                .config
+                .auto_compact
         );
     }
 

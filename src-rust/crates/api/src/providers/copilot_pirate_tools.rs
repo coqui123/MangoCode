@@ -112,6 +112,20 @@ on the user's machine — NOT Microsoft Copilot in a cloud workspace. Your Copil
 For files/directories/cwd/commands: emit mango_tool_call blocks (Read/Glob for files, PowerShell on Windows for shell). \
 If a prior tool failed, try an alternative tool block — do not give up or tell me to run things manually.]";
 
+/// Header pinned into the system message so the latest local tool output survives
+/// Copilot-pirate's `messages_to_prompt` flattening (System block first, often
+/// 50k+ chars; conversation/tool turns at the tail get truncated or ignored).
+pub const PINNED_TOOL_RESULT_HEADER: &str = "## Latest local tool output (authoritative)";
+
+/// True when `content` is a reframed `role:tool` → `role:user` turn, a Copilot
+/// recovery nudge, or another synthetic user message — not the human's task.
+pub fn is_synthetic_copilot_user_turn(content: &str) -> bool {
+    content.contains(REFRAMED_TOOL_RESULT_MARKER)
+        || content.contains("[MangoCode Copilot recovery]")
+        || content.contains("[MangoCode/Copilot bridge:")
+        || content.starts_with("Wrong:")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {
     pub id: String,
@@ -453,6 +467,29 @@ pub fn looks_like_truncated_tool_block(text: &str) -> bool {
     t.starts_with('<') && open.starts_with(t)
 }
 
+/// Copilot claims local tools returned empty/no output even though MangoCode ran
+/// them. Common when the flattened Sydney prompt drops reframed tool results.
+pub fn looks_like_empty_tool_result_narration(text: &str) -> bool {
+    if text.contains(&format!("<{TOOL_TAG}>")) {
+        return false;
+    }
+    let lower = lower_normalized(text);
+    lower.contains("no content available")
+        || lower.contains("returned no content")
+        || lower.contains("returning no content")
+        || lower.contains("returned empty")
+        || lower.contains("tool channel")
+        || lower.contains("tool runtime is")
+        || lower.contains("local tool runtime")
+        || lower.contains("runtime isn't returning")
+        || lower.contains("runtime is not returning")
+        || lower.contains("isn't returning file contents")
+        || lower.contains("is not returning file contents")
+        || lower.contains("didn't get the output")
+        || lower.contains("did not get the output")
+        || lower.contains("glob ran but returned no content")
+}
+
 /// Copilot narrates a tool failure instead of emitting a retry block.
 pub fn looks_like_tool_error_narration(text: &str) -> bool {
     if text.contains(&format!("<{TOOL_TAG}>")) {
@@ -667,14 +704,18 @@ pub fn copilot_response_text_is_bad(
     }
     if post_tool_result {
         // A plain-text synthesis after a real result is valid; only flag
-        // explicit refusals (Copilot dropped the agent role). Skip error-
+        // explicit refusals (Copilot dropped the agent role) and the common
+        // "tools returned NO CONTENT AVAILABLE" hallucination when reframed
+        // results were dropped from the flattened prompt. Skip generic error-
         // narration — the model may correctly quote prior tool errors
         // ("no such file", "permission denied") in its synthesis.
-        return looks_like_tool_refusal_without_block(text);
+        return looks_like_tool_refusal_without_block(text)
+            || looks_like_empty_tool_result_narration(text);
     }
     looks_like_sandbox_hallucination(text)
         || looks_like_tool_refusal_without_block(text)
         || looks_like_tool_error_narration(text)
+        || looks_like_empty_tool_result_narration(text)
 }
 
 pub fn copilot_response_is_bad(
@@ -898,19 +939,68 @@ pub fn inject_tool_prompt_into_messages(messages: &mut Vec<Value>, tools: &[Tool
         );
     }
 
-    // Remind on the latest user turn — Copilot often ignores system-only instructions.
-    if let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-    {
-        if let Some(content) = last_user.get_mut("content") {
+    // Remind on the latest *human* user turn — Copilot often ignores system-only
+    // instructions. Do NOT append to reframed tool-result turns: that was the
+    // last user message after every tool run, which buried the fenced output.
+    if let Some(task_user) = messages.iter_mut().rev().find(|m| {
+        m.get("role").and_then(|v| v.as_str()) == Some("user")
+            && m.get("content")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !is_synthetic_copilot_user_turn(s))
+    }) {
+        if let Some(content) = task_user.get_mut("content") {
             if let Some(s) = content.as_str() {
                 if !s.contains("[MangoCode/Copilot bridge:") {
                     *content = Value::String(format!("{s}{USER_TURN_NUDGE}"));
                 }
             }
         }
+    }
+}
+
+/// Copilot-pirate flattens the OpenAI `messages` array into one Sydney prompt
+/// (`System: …\n\nUser: …\n\nAssistant: …`). The system block is enormous;
+/// reframed tool outputs sitting at the end of the array are often truncated or
+/// ignored, which makes Copilot claim "NO CONTENT AVAILABLE". Duplicate the
+/// latest reframed tool result into the system message so it stays salient.
+pub fn pin_latest_tool_result_in_system(messages: &mut [Value]) {
+    let latest = messages.iter().rev().find_map(|m| {
+        if m.get("role").and_then(|v| v.as_str()) != Some("user") {
+            return None;
+        }
+        let s = m.get("content")?.as_str()?;
+        if s.contains(REFRAMED_TOOL_RESULT_MARKER) {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    });
+    let Some(latest_result) = latest else {
+        return;
+    };
+
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|v| v.as_str()) != Some("system") {
+            continue;
+        }
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+        let Some(s) = content.as_str() else {
+            continue;
+        };
+        // Drop any prior pin from an earlier turn in the same history.
+        let base = if let Some(idx) = s.rfind(PINNED_TOOL_RESULT_HEADER) {
+            s[..idx].trim_end()
+        } else {
+            s
+        };
+        *content = Value::String(format!(
+            "{base}\n\n{PINNED_TOOL_RESULT_HEADER}\n\
+             REAL output from MangoCode running a tool on the user's PC (not empty, not cloud workspace):\n\n\
+             {latest_result}"
+        ));
+        break;
     }
 }
 
@@ -1355,6 +1445,54 @@ mod tests {
         let res = messages[0]["content"].as_str().unwrap();
         // Must use a longer fence so the inner ``` doesn't close the block.
         assert!(res.contains("````"));
+    }
+
+    #[test]
+    fn user_turn_nudge_skips_reframed_tool_result_turns() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are MangoCode."}),
+            json!({"role": "user", "content": "Read style.css"}),
+            json!({
+                "role": "assistant",
+                "content": "<mango_tool_call>\n{\"name\": \"Read\"}\n</mango_tool_call>"
+            }),
+            json!({
+                "role": "user",
+                "content": format!(
+                    "{REFRAMED_TOOL_RESULT_MARKER} Read — literal raw output]\n```\nbody {{}}\n```"
+                ),
+            }),
+        ];
+        inject_tool_prompt_into_messages(&mut messages, &[bash_tool()]);
+        let task = messages[1]["content"].as_str().unwrap();
+        assert!(task.contains("[MangoCode/Copilot bridge:"));
+        let tool_result = messages[3]["content"].as_str().unwrap();
+        assert!(!tool_result.contains("[MangoCode/Copilot bridge:"));
+    }
+
+    #[test]
+    fn pin_latest_tool_result_into_system() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "You are MangoCode."}),
+            json!({"role": "user", "content": "Read file"}),
+            json!({
+                "role": "user",
+                "content": format!(
+                    "{REFRAMED_TOOL_RESULT_MARKER} Read — literal raw output]\n```\n[name]\ncli\n```"
+                ),
+            }),
+        ];
+        pin_latest_tool_result_in_system(&mut messages);
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains(PINNED_TOOL_RESULT_HEADER));
+        assert!(system.contains("[name]"));
+    }
+
+    #[test]
+    fn empty_tool_result_narration_triggers_retry_post_tool() {
+        let text = "The local tool runtime is returning NO CONTENT AVAILABLE for every call.";
+        assert!(looks_like_empty_tool_result_narration(text));
+        assert!(copilot_response_text_is_bad(text, true, true, false));
     }
 
     #[test]

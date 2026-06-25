@@ -379,6 +379,10 @@ fn sync_query_config_for_runtime(
     query_config.verification_policy = config.verification_policy;
     query_config.reliability_profile = config.agent_reliability_profile;
     query_config.speed_profile = config.agent_speed_profile;
+    // Auto-compact on/off + threshold are user-configurable (via /config) and
+    // must be honored on every turn.
+    query_config.auto_compact = config.auto_compact;
+    query_config.compact_threshold = config.effective_compact_threshold() as f64;
     if let Some(level) = config.effort.as_deref().and_then(parse_effort_level_arg) {
         query_config.effort_level = Some(level);
     }
@@ -4340,6 +4344,14 @@ async fn run_headless(
         }
     };
 
+    // One-shot mode: session-memory persistence runs as detached background
+    // tasks that would be killed when this process exits. Give them a bounded
+    // window to finish so memory actually persists in `-p` runs. No-op when
+    // nothing is pending (the common short-conversation case).
+    if !mangocode_query::drain_pending_memory_writes(std::time::Duration::from_secs(15)).await {
+        tracing::warn!("Timed out waiting for background memory writes to finish");
+    }
+
     session.messages = messages;
     session.model = canonical_session_model(&tool_ctx.config, &query_config.model);
     session.working_dir = Some(tool_ctx.working_dir.display().to_string());
@@ -4907,6 +4919,10 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
     );
 
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Load persisted UI-setting toggles (reduceMotion, terminalProgressBar,
+    // showTurnDuration, notifications, …) from disk so the live app honors them
+    // before /config is ever opened.
+    app.settings_screen.reload_ui_mirrors();
     if disable_slash_commands {
         // No slash dispatch in this session, so suppress `/` autocomplete too.
         app.prompt_slash_commands.clear();
@@ -6289,7 +6305,12 @@ async fn run_interactive(args: InteractiveRunArgs) -> anyhow::Result<()> {
                     init_mascot(&mut app);
                     terminal.render_live(&app)?;
                 }
-                _ => {}
+                Event::FocusGained => {
+                    app.terminal_focused = true;
+                }
+                Event::FocusLost => {
+                    app.terminal_focused = false;
+                }
             }
             terminal.render_live(&app)?;
         }
