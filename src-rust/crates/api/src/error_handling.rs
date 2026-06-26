@@ -75,6 +75,19 @@ pub fn is_context_overflow(message: &str) -> bool {
         .any(|pattern| lower.contains(&pattern.to_lowercase()))
 }
 
+/// Detect a WebSocket "message too big" failure (close code 1009) surfaced by
+/// proxy-backed providers such as the Copilot-pirate / M365 Copilot bridge.
+/// Those backends abort the upstream socket when a single request frame exceeds
+/// their byte limit (commonly ~1 MB) and report it back as a 502. This is a
+/// request-size problem, not a transient server error, so it must NOT be
+/// retried — retrying re-sends the same oversized payload and fails again.
+pub fn is_websocket_frame_overflow(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("message too big")
+        || (lower.contains("exceeds limit of") && lower.contains("byte"))
+        || (lower.contains("frame") && lower.contains("exceeds limit") && lower.contains("byte"))
+}
+
 /// Convert an HTTP error response into the appropriate [`ProviderError`].
 ///
 /// Tries JSON parsing, then falls back to the raw body.  Context overflow is
@@ -99,6 +112,25 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             provider: provider.clone(),
             message,
             max_tokens: extract_token_limit(body),
+        };
+    }
+
+    // WebSocket-proxied backends (Copilot-pirate / M365 Copilot bridge) enforce a
+    // hard per-frame byte limit (~1 MB) and abort the upstream socket with close
+    // code 1009 ("message too big"), which surfaces here as a 502. Retrying the
+    // same oversized payload always fails, so treat it as a non-retryable
+    // request-size overflow with actionable guidance rather than a transient
+    // server error.
+    if is_websocket_frame_overflow(&message) || is_websocket_frame_overflow(body) {
+        return ProviderError::ContextOverflow {
+            provider: provider.clone(),
+            message: format!(
+                "Request exceeded the provider proxy's WebSocket frame limit \
+                 (~1 MB; upstream closed with code 1009 \"message too big\"). Shrink \
+                 the request — run /compact, attach fewer or smaller files, or raise \
+                 the proxy's max frame size — then retry. (proxy: {message})"
+            ),
+            max_tokens: None,
         };
     }
 
@@ -374,6 +406,41 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(413, "Request too large", &pid);
         assert!(matches!(err, ProviderError::ContextOverflow { .. }));
+    }
+
+    #[test]
+    fn test_websocket_frame_overflow_detection() {
+        // The real body the Copilot-pirate proxy returns on the 1 MB frame cap.
+        let body = "sent 1009 (message too big) frame with 7530 bytes after reading \
+                    1042385 bytes exceeds limit of 1048576 bytes; no close frame received";
+        assert!(is_websocket_frame_overflow(body));
+        // A handshake timeout is genuinely transient and must NOT match.
+        assert!(!is_websocket_frame_overflow("timed out during opening handshake"));
+        assert!(!is_websocket_frame_overflow("502 Bad Gateway"));
+    }
+
+    #[test]
+    fn test_frame_overflow_502_is_non_retryable_overflow() {
+        let pid = ProviderId::new("lm-studio");
+        let body = "sent 1009 (message too big) frame with 7530 bytes after reading \
+                    1042385 bytes exceeds limit of 1048576 bytes; no close frame received";
+        let err = parse_error_response(502, body, &pid);
+        assert!(matches!(err, ProviderError::ContextOverflow { .. }));
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_transient_502_stays_retryable_server_error() {
+        let pid = ProviderId::new("lm-studio");
+        let err = parse_error_response(502, "timed out during opening handshake", &pid);
+        assert!(matches!(
+            err,
+            ProviderError::ServerError {
+                is_retryable: true,
+                ..
+            }
+        ));
+        assert!(err.is_retryable());
     }
 
     #[test]

@@ -36,7 +36,6 @@ pub mod provider_types;
 // Provider abstraction traits (Phase 1B).
 pub mod auth;
 pub mod provider;
-pub mod stream_parser;
 pub mod transform;
 
 // Provider registry (Phase 1C).
@@ -91,7 +90,6 @@ fn effective_workload(config_workload: &str) -> String {
         .unwrap_or_else(|| config_workload.to_string())
 }
 
-pub use stream_parser::{JsonLinesStreamParser, SseStreamParser, StreamParser};
 pub use transform::MessageTransformer;
 
 // Phase 1C re-exports — provider registry.

@@ -16,12 +16,7 @@ const REMOTE_CACHE_FILENAME: &str = "feature_flags.json";
 const ENV_PREFIX: &str = "MANGOCODE_FLAG_";
 
 // Predefined flag names
-pub const FLAG_PROACTIVE_AGENT: &str = "proactive";
-pub const FLAG_CRITIC_PERMISSIONS: &str = "critic_permissions";
 pub const FLAG_LLM_COMPACTION: &str = "llm_compaction";
-pub const FLAG_PROMPT_CACHING: &str = "prompt_caching";
-pub const FLAG_AUTO_LSP: &str = "auto_lsp";
-pub const FLAG_HIERARCHICAL_MEMORY: &str = "hierarchical_memory";
 /// Enable preserve_thinking selectively on long/tool-heavy sessions.
 /// When enabled, preserve_thinking is injected for agentic runs once
 /// heuristic thresholds (turn count ≥ 4 OR tool calls ≥ 3) are met.
@@ -131,12 +126,7 @@ impl FeatureFlags {
 
     fn predefined_names() -> &'static [&'static str] {
         &[
-            FLAG_PROACTIVE_AGENT,
-            FLAG_CRITIC_PERMISSIONS,
             FLAG_LLM_COMPACTION,
-            FLAG_PROMPT_CACHING,
-            FLAG_AUTO_LSP,
-            FLAG_HIERARCHICAL_MEMORY,
             FLAG_PRESERVE_THINKING,
             FLAG_EXECUTION_SCRATCHPAD,
             FLAG_SELF_REVIEW,
@@ -406,7 +396,7 @@ mod tests {
             .into_iter()
             .map(|(n, _)| n)
             .collect();
-        assert!(names.iter().any(|n| n == FLAG_PROACTIVE_AGENT));
+        assert!(names.iter().any(|n| n == FLAG_PLAN_SEARCH));
         assert!(names.iter().any(|n| n == FLAG_LLM_COMPACTION));
     }
 

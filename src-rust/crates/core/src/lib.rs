@@ -123,10 +123,8 @@ pub use types::{
 pub mod skill_discovery;
 pub use cost::CostTracker;
 pub use feature_flags::{
-    FeatureFlagManager, FeatureFlags, FLAG_AUTO_LSP, FLAG_CRITIC_PERMISSIONS,
-    FLAG_EXECUTION_SCRATCHPAD, FLAG_HIERARCHICAL_MEMORY, FLAG_LLM_COMPACTION,
-    FLAG_PLAN_SEARCH, FLAG_PRESERVE_THINKING, FLAG_PROACTIVE_AGENT, FLAG_PROMPT_CACHING,
-    FLAG_SELF_REVIEW,
+    FeatureFlagManager, FeatureFlags, FLAG_EXECUTION_SCRATCHPAD, FLAG_LLM_COMPACTION,
+    FLAG_PLAN_SEARCH, FLAG_PRESERVE_THINKING, FLAG_SELF_REVIEW,
 };
 pub use history::ConversationSession;
 pub use keybindings::{
@@ -773,6 +771,28 @@ pub mod config {
         }
     }
 
+    impl ProviderConfig {
+        /// Returns true if `model_id` is permitted by this provider's
+        /// whitelist/blacklist. An empty whitelist allows every model; a
+        /// non-empty whitelist permits only matching ids. The blacklist always
+        /// takes precedence. A pattern matches by exact equality or substring,
+        /// so `"gpt-4"` matches `"gpt-4o"`.
+        pub fn allows_model(&self, model_id: &str) -> bool {
+            let matches = |patterns: &[String]| {
+                patterns
+                    .iter()
+                    .any(|p| !p.is_empty() && (model_id == p || model_id.contains(p.as_str())))
+            };
+            if !self.models_whitelist.is_empty() && !matches(&self.models_whitelist) {
+                return false;
+            }
+            if matches(&self.models_blacklist) {
+                return false;
+            }
+            true
+        }
+    }
+
     // ---- Config ----------------------------------------------------------
 
     fn default_provider() -> Option<String> {
@@ -819,7 +839,6 @@ pub mod config {
         pub allowed_tools: Vec<String>,
         pub disallowed_tools: Vec<String>,
         pub env: HashMap<String, String>,
-        pub enable_all_mcp_servers: bool,
         pub custom_system_prompt: Option<String>,
         pub append_system_prompt: Option<String>,
         pub disable_claude_mds: bool,
@@ -889,15 +908,12 @@ pub mod config {
     pub struct ResearchConfig {
         #[serde(default = "default_true")]
         pub enable_rendered_fallback: bool,
-        #[serde(default = "default_true")]
-        pub prefer_official_sources: bool,
     }
 
     impl Default for ResearchConfig {
         fn default() -> Self {
             Self {
                 enable_rendered_fallback: true,
-                prefer_official_sources: true,
             }
         }
     }
@@ -2010,8 +2026,6 @@ pub mod config {
                     v
                 },
                 env: merge_map(base.config.env, over.config.env),
-                enable_all_mcp_servers: over.config.enable_all_mcp_servers
-                    || base.config.enable_all_mcp_servers,
                 custom_system_prompt: over
                     .config
                     .custom_system_prompt

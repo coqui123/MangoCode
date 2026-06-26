@@ -6628,6 +6628,9 @@ impl App {
                     let pid = mangocode_core::ProviderId::new(&provider_id_str);
                     if let Some(provider) = registry.get(&pid) {
                         let provider = provider.clone();
+                        // Honor this provider's models_whitelist/models_blacklist.
+                        let model_filter =
+                            self.config.provider_configs.get(&provider_id_str).cloned();
                         let (tx, rx) = tokio::sync::mpsc::channel(1);
                         self.model_fetch_rx = Some(rx);
                         self.model_picker.loading_models = true;
@@ -6637,6 +6640,11 @@ impl App {
                                 Ok(models) => {
                                     let entries: Vec<crate::model_picker::ModelEntry> = models
                                         .into_iter()
+                                        .filter(|m| {
+                                            model_filter.as_ref().map_or(true, |pc| {
+                                                pc.allows_model(&m.id.to_string())
+                                            })
+                                        })
                                         .map(|m| {
                                             let ctx_k = m.context_window / 1000;
                                             crate::model_picker::ModelEntry {

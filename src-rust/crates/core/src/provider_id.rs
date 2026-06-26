@@ -49,10 +49,7 @@ impl ProviderId {
     pub const LM_STUDIO: &'static str = "lm-studio";
     pub const LLAMA_CPP: &'static str = "llama-cpp";
     pub const DEEPSEEK: &'static str = "deepseek";
-    pub const GITLAB: &'static str = "gitlab";
-    pub const CLOUDFLARE: &'static str = "cloudflare";
     pub const VENICE: &'static str = "venice";
-    pub const SAP: &'static str = "sap";
     pub const SAMBANOVA: &'static str = "sambanova";
     pub const HUGGINGFACE: &'static str = "huggingface";
     pub const NVIDIA: &'static str = "nvidia";

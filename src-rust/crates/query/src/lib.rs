@@ -3107,6 +3107,11 @@ async fn run_query_loop_inner(
     let mut max_tokens_recovery_count: u32 = 0;
     let mut copilot_agent_recovery_count: u32 = 0;
     let mut native_tool_intent_recovery_count: u32 = 0;
+    // Backoff retries for transient provider failures (5xx gateway errors such
+    // as a proxy "502 timed out during opening handshake"). Reset on every
+    // successful turn so a long session keeps a fresh budget.
+    let mut transient_retry_count: u32 = 0;
+    const TRANSIENT_RETRY_LIMIT: u32 = 4;
     // Execution scratchpad: per-turn state tracking for all models.
     // Provides deterministic scaffolding (plan / last tool / next step) to
     // reduce goal-drift in long agentic sessions.
@@ -3994,6 +3999,37 @@ async fn run_query_loop_inner(
                                 ));
                                 continue;
                             }
+                            // Transient provider failures (e.g. a proxy 502
+                            // "timed out during opening handshake", or an
+                            // overloaded gateway) are retried with exponential
+                            // backoff before giving up. Non-retryable errors
+                            // (auth, request-too-large, model-not-found, …) are
+                            // classified as such by the provider layer and fall
+                            // straight through to the error path below.
+                            if e.is_retryable() && transient_retry_count < TRANSIENT_RETRY_LIMIT {
+                                transient_retry_count += 1;
+                                let wait = std::time::Duration::from_secs(
+                                    1u64 << (transient_retry_count - 1),
+                                );
+                                warn!(
+                                    provider = %provider_id_str,
+                                    attempt = transient_retry_count,
+                                    limit = TRANSIENT_RETRY_LIMIT,
+                                    wait_secs = wait.as_secs(),
+                                    error = %e,
+                                    "Transient provider error — retrying after backoff"
+                                );
+                                if let Some(ref tx) = event_tx {
+                                    let _ = tx.send(QueryEvent::Status(format!(
+                                        "Provider error — retrying in {}s ({}/{})",
+                                        wait.as_secs(),
+                                        transient_retry_count,
+                                        TRANSIENT_RETRY_LIMIT
+                                    )));
+                                }
+                                tokio::time::sleep(wait).await;
+                                continue;
+                            }
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
                             let diagnostic = e.diagnostic();
                             let message = mangocode_api::format_provider_diagnostic(&diagnostic);
@@ -4352,6 +4388,7 @@ async fn run_query_loop_inner(
                     if !tool_use_blocks.is_empty() {
                         copilot_agent_recovery_count = 0;
                         native_tool_intent_recovery_count = 0;
+                        transient_retry_count = 0;
                         let tool_results = execute_model_tool_calls(
                             tool_use_blocks,
                             client,
@@ -5313,6 +5350,7 @@ async fn run_query_loop_inner(
                 max_tokens_recovery_count = 0;
                 copilot_agent_recovery_count = 0;
                 native_tool_intent_recovery_count = 0;
+                transient_retry_count = 0;
                 // Extract tool calls and execute them
                 let tool_calls = assistant_msg
                     .get_tool_use_blocks()
