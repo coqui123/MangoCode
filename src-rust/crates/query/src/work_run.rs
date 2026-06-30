@@ -2215,6 +2215,14 @@ fn project_graph_action_is_source_understanding(tool_input: &Value) -> bool {
         .and_then(Value::as_str)
         .map(|action| action.trim().to_ascii_lowercase().replace('-', "_"))
         .unwrap_or_else(|| "report".to_string());
+    // `persist` builds the project graph by reading and indexing the entire
+    // source tree — it IS a source-understanding action whose side output is the
+    // graph index. Classifying it as a mutation made indexing a source falsely
+    // trip the verification + source-grounding completion gates (a pure index
+    // run has no prior file reads, so the blanket "ran before source
+    // understanding" risk fired). The export actions below (html/tree/callflow,
+    // save_result) only render deliverables from an existing graph, so they stay
+    // classified as writes.
     !matches!(
         action.as_str(),
         "html"
@@ -2226,7 +2234,6 @@ fn project_graph_action_is_source_understanding(tool_input: &Value) -> bool {
             | "saveresult"
             | "global_add"
             | "global_remove"
-            | "persist"
     )
 }
 
@@ -2368,6 +2375,7 @@ fn is_enforceable_source_path(path: &str) -> bool {
                 | "build"
                 | "coverage"
                 | "generated"
+                | "graphify-out"
                 | "out"
                 | "outputs"
                 | "tmp"
@@ -4016,12 +4024,12 @@ mod tests {
     }
 
     #[test]
-    fn project_graph_write_actions_are_not_source_understanding_evidence() {
+    fn project_graph_export_actions_are_not_source_understanding_evidence() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
-        let messages = vec![Message::user("persist a project graph")];
+        let messages = vec![Message::user("export a project graph")];
         let mut run = WorkRun::new("session", &messages, dir.path(), &[tool("ProjectGraph")]);
-        let input = serde_json::json!({ "action": "persist", "out_dir": "graphify-out" });
+        let input = serde_json::json!({ "action": "html", "out_dir": "graphify-out" });
 
         assert!(!is_source_understanding_tool("ProjectGraph", &input));
 
@@ -4030,7 +4038,7 @@ mod tests {
             tool_input: &input,
             capabilities: &ToolCapabilities::mutating()
                 .with_affected_paths(vec!["graphify-out".to_string()]),
-            result: &ToolResult::success("persisted graph"),
+            result: &ToolResult::success("exported graph"),
             duration_ms: None,
             recorder: None,
             turn_id: "turn",
@@ -4041,6 +4049,45 @@ mod tests {
             "ProjectGraph",
             &serde_json::json!({ "action": "report" })
         ));
+    }
+
+    /// Indexing a source with `ProjectGraph action=persist` reads and indexes the
+    /// whole tree — it must count as source-understanding, not an unverified code
+    /// mutation. Regression for indexing runs falsely failing the completion
+    /// gate with "Code changed but no verification attempt succeeded" and
+    /// "Changed paths lack matching source-understanding evidence".
+    #[test]
+    fn project_graph_persist_is_source_understanding_and_leaves_run_ready() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let messages = vec![Message::user("index the source")];
+        let mut run = WorkRun::new("session", &messages, dir.path(), &[tool("ProjectGraph")]);
+        let input = serde_json::json!({ "action": "persist", "out_dir": "graphify-out" });
+
+        assert!(is_source_understanding_tool("ProjectGraph", &input));
+
+        run.record_tool_result(WorkRunToolRecord {
+            tool_name: "ProjectGraph",
+            tool_input: &input,
+            capabilities: &ToolCapabilities::mutating().with_affected_paths(vec![
+                "graphify-out".to_string(),
+                "graphify-out/graph.json".to_string(),
+                "graphify-out/GRAPH_REPORT.md".to_string(),
+            ]),
+            result: &ToolResult::success("persisted graph"),
+            duration_ms: None,
+            recorder: None,
+            turn_id: "turn",
+        });
+
+        // Indexing records understanding evidence and never registers a code
+        // mutation, so the completion gate stays Ready (no false verification or
+        // grounding blockers).
+        assert!(!run.source_evidence.is_empty(), "{run:?}");
+        assert!(run.changed_files.is_empty(), "{run:?}");
+        assert!(run.ungrounded_changed_paths().is_empty(), "{run:?}");
+        assert_eq!(run.mutation_version, 0, "{run:?}");
+        assert_eq!(run.readiness().status, CompletionReadinessStatus::Ready);
     }
 
     #[test]
